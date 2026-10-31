@@ -32,7 +32,8 @@
         "deepseek-pair",
         "deepseek-rtx",
         "glm-pair",
-        "minimax-pair"
+        "minimax-pair",
+        "nemotron"
       ]
     },
     "identity": {
@@ -163,6 +164,44 @@
           },
           "repeat_stable": {
             "type": "boolean"
+          },
+          "draft_witness": {
+            "type": "object",
+            "required": [
+              "status",
+              "drafted",
+              "verified",
+              "accepted"
+            ],
+            "properties": {
+              "status": {
+                "enum": [
+                  "drafted",
+                  "declined"
+                ]
+              },
+              "drafted": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "verified": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "accepted": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "plain_tokens_equal": {
+            "type": "boolean"
+          },
+          "plain_state_equal": {
+            "type": "boolean"
+          },
+          "c1_equal": {
+            "type": "boolean"
           }
         }
       }
@@ -171,6 +210,49 @@
       "$ref": "#/$defs/hash"
     },
     "reference_key": {
+      "type": "object"
+    },
+    "digest_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "check",
+          "identity",
+          "kv",
+          "verdict"
+        ],
+        "properties": {
+          "check": {
+            "type": "string"
+          },
+          "identity": {
+            "type": "string"
+          },
+          "kv": {
+            "$ref": "#/$defs/hash"
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/hash"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verdict": {
+            "enum": [
+              "EXACT",
+              "MISMATCH",
+              "NO-REFERENCE"
+            ]
+          }
+        }
+      }
+    },
+    "nemotron": {
       "type": "object"
     }
   },

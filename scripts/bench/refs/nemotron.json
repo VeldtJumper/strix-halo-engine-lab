@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "engine": "nemotron",
+  "$comment": "No measured public token references yet: every IDs/state row is NO-REFERENCE until a reviewed candidate is added under its reference SHA256. Drafter rows are always compared with drafting off in the same run. digest_pins hold the published R8 committed KV digests of strix-gemma4-bench --verify-rows all --context 64 for the Q4_K_M identities; they apply only to the pinned GGUF and its frozen rotary tables, else NO-REFERENCE. EXL3 has no published R8 pin.",
+  "identities": {},
+  "digest_pins": {
+    "verify-r8": {
+      "g4-v1": {
+        "kv": "1c225a27533862d6e65361495b61743c66d6cf0539d5d13c06c758f25d78f5ff",
+        "model_sha256": "c8af2b8aea10a690a1d9491db744a9446660173cb38fc489612b556615a69612"
+      },
+      "g4-a8-v1": {
+        "kv": "53db6a686959b936f48aaa4b9e87a7d38f1942a1ecd0d28810f1fcdb1599284f",
+        "model_sha256": "c8af2b8aea10a690a1d9491db744a9446660173cb38fc489612b556615a69612"
+      }
+    }
+  }
+}

@@ -68,7 +68,8 @@ resolved=$(py resolve "$engine" "$suite" "$contexts" "$gen_tokens" "$concurrency
 eval "$resolved"
 case $verify_models in full|cached|skip) ;; *) die "verify-models must be full, cached or skip" ;; esac
 [[ $json == 0 || $md == 0 ]] || die "choose --json or --md"
-export BENCH_VERIFY_MODELS="$verify_models" BENCH_MODEL_DIR="$model_dir" BENCH_BIN_DIR="$bin_dir" BENCH_ENGINE="$engine"
+# The selected profile decides per-profile assets, including for hash-models.
+export BENCH_VERIFY_MODELS="$verify_models" BENCH_MODEL_DIR="$model_dir" BENCH_BIN_DIR="$bin_dir" BENCH_ENGINE="$engine" BENCH_SELECTED_PROFILE="$profile"
 if [[ $action == hash-models ]]; then py hash-models; exit; fi
 load_profile "$engine"
 if [[ $status == pending-publication ]]; then

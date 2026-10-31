@@ -201,7 +201,7 @@ rewrites `DIR/results.md`. `--help` prints help. There is no implicit selected e
 
 | Parameter | Default and meaning |
 |---|---|
-| `--engine E` | Required for check/run/hash-models: `qwen`, `deepseek`, `glm`, `minimax`, `deepseek-rtx`, `all`. Aliases: `deepseek-pair`, `glm-pair`, `minimax-pair`. All dispatches sequentially. |
+| `--engine E` | Required for check/run/hash-models: `qwen`, `deepseek`, `glm`, `minimax`, `deepseek-rtx`, `nemotron`, `all`. Aliases: `deepseek-pair`, `glm-pair`, `minimax-pair`. All dispatches sequentially. |
 | `--suite quick\|full` | `full`; explicit parameters override suite defaults. Neither suite enables serve. |
 | `--contexts LIST` | Quick `1k`; full Qwen `1k,4k,8k,16k,32k`, DeepSeek pair `1k,8k,16k,32k`, others `1k,8k,32k`. Positive integers, comma separated; `k` = 1024. |
 | `--gen-tokens N` | Quick 128; full GLM 64, RTX 128, others 256. Minimum 2. |
@@ -209,7 +209,7 @@ rewrites `DIR/results.md`. `--help` prints help. There is no implicit selected e
 | `--warmup N` | Quick 0, full 1; nonnegative discarded repeats. |
 | `--concurrency LIST` | `1,4,8`; each 1..8, HTTP client workers and pair server slots. |
 | `--prompts kit\|FILE` | `kit`: eight original prompts. JSON array or object with `prompts` array, rows `id`, `category`, `text`; or one nonempty UTF-8 text line per prompt. IDs unique `[A-Za-z0-9_-]+`. |
-| `--profile P` | Qwen/DeepSeek/MiniMax/RTX `default`; GLM **r1b**. Allowlists below. |
+| `--profile P` | Qwen/DeepSeek/MiniMax/RTX/Nemotron `default`; GLM **r1b**. Allowlists below. |
 | `--only LIST` | `decode,prefill,exactness`; subset of these plus `serve`. Either decode or exactness schedules decode; omitting exactness clears its final array. |
 | `--serve` | Off; adds serve to only. GLM/RTX record a skip. |
 | `--bin-dir DIR` | `BENCH_BIN_DIR` or `build`; all selected-engine binaries required, including for reduced work. |
@@ -249,6 +249,7 @@ bash scripts/bench/bench.sh run --engine deepseek --peer user@node-b --suite qui
 bash scripts/bench/bench.sh run --engine glm --peer user@node-b --profile r1 --suite quick
 bash scripts/bench/bench.sh run --engine minimax --peer user@node-b --suite quick
 bash scripts/bench/bench.sh run --engine deepseek-rtx --bin-dir build-rtx --suite quick
+bash scripts/bench/bench.sh run --engine nemotron --profile default --suite quick --only exactness,serve
 # One-context quick check; serve sweep; available engines
 bash scripts/bench/bench.sh run --engine qwen --contexts 1k --only prefill --repeat 1 --warmup 0
 bash scripts/bench/bench.sh run --engine minimax --peer user@node-b --only serve --concurrency 1,4,8
@@ -604,6 +605,41 @@ one answering with a single token) returned the exact value in every case, and a
 identical token IDs. A second pilot of the reasoning and multi-key families at 8K and 32K (with short
 controls) is in the kit README. One or two seeds are a pilot, not a qualification: long context stays
 labelled unqualified until the full matrix, the reasoning families and continuation scoring pass.
+
+## Nemotron 3.5 Bolt E4B
+
+One node. Build the gemma4 family (`-DSTRIX_FAMILY_GEMMA4=ON`) and the targets `strix-gemma4-serve` and
+`strix-gemma4-bench`; `check` refuses a cache that does not enable the family. Profiles are `default`
+(`g4-v1`), `fast` (`g4-a8-v1`) and `quality` (EXL3 pack); each is its own population, and Q4_K_M and EXL3
+references never mix. Prompts need Python `tokenizers`. Assets live under `MODEL_DIR/nemotron/`:
+
+| Path | Profiles | Content |
+|---|---|---|
+| `Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf` | default, fast | Q4_K_M GGUF |
+| `drafter-mtp/` | default, fast | Optional MTP drafter, found next to the GGUF |
+| `bf16/` | quality | BF16 model directory; an optional `bf16/drafter-mtp/` is the quality drafter |
+| `exl3/` | quality | EXL3 pack directory (`--exl3-arm`) |
+| `rotary-tables/` | all | Frozen rotary tables (see the model README) |
+| `tokenizer.json` | all | Model tokenizer |
+
+A run starts one server per arm with the plain production command for the profile: drafting off
+(`--draft off --dflash off`: no drafter and no prompt lookup) and the shipped configuration (MTP drafter discovered, prompt lookup on). The C1 round of each arm sends every
+prompt once as a chat request and reads the engine receipt from the final SSE chunk: complete generated
+IDs, the committed state digest, the resolved profile and the acceptance counters. Exactness compares every
+drafter row with drafting off, IDs **and** state digest. The drafter arm needs a draft witness on every
+request (MTP drafter loaded, `mtp_confidence_resolved`, acceptance counters) and a positive control: at least
+one prompt that drafted, verified and accepted tokens. A missing witness fails the run; a prompt that
+legitimately did not draft is labelled `declined`, never counted as drafted. With `serve`, C4/C8 rounds run on
+the shipped arm and must reproduce its C1 IDs and state. HTTP rows are `http-c1-draft-off`, `http-c1`,
+`http-c4`, `http-c8`. The server runs one chat job at a time, so C4/C8 measure queueing, not batched decode.
+
+For `default` and `fast`, exactness also runs `strix-gemma4-bench --verify-rows all --context 64`
+(rows 1..8 host == serial == batched) and compares the R8 committed KV digest with the published pin for that
+identity in `refs/nemotron.json`. The pin applies only to the pinned GGUF; any other file is NO-REFERENCE.
+`quality` has no published R8 pin. Pending profile rows are never applied: each receipt must list them with
+one stderr notice, and an unqualified row fails the run. The resolved configuration comes from the measured
+receipts, so a run loads the model three times (verify, two arms) or twice for `quality`. Prefill is not
+measured by this adapter. Without `drafter-mtp/` the drafter arm is skipped and recorded as such.
 
 ## Known limitations
 

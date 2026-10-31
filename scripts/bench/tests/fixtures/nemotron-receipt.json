@@ -1,0 +1,130 @@
+{
+  "$comment": "Synthetic test-only engine receipt (drafter arm, default profile). Values are not measurements.",
+  "phase": {
+    "profile": {
+      "profile": "default",
+      "app": "engine",
+      "qualification": "qualified",
+      "drafter": "on (models/nemotron/drafter-mtp)",
+      "levers": {
+        "decode_identity": {
+          "value": "g4-v1",
+          "status": "builtin",
+          "switch": "STRIX_G4_IDENTITY",
+          "kind": "bit-changing",
+          "source": "test"
+        },
+        "draft": {
+          "value": "models/nemotron/drafter-mtp",
+          "status": "profile",
+          "switch": "STRIX_G4_DRAFT",
+          "kind": "exact",
+          "source": "test"
+        },
+        "draft_mode": {
+          "value": "auto",
+          "status": "builtin",
+          "switch": "STRIX_G4_DFLASH",
+          "kind": "exact",
+          "source": "test"
+        },
+        "draft_window": {
+          "value": "auto",
+          "status": "builtin",
+          "switch": "STRIX_G4_MTP_CONF",
+          "kind": "exact",
+          "source": "test"
+        },
+        "prefill_route": {
+          "value": "exact",
+          "status": "builtin",
+          "switch": "STRIX_G4_PREFILL",
+          "kind": "bit-changing",
+          "source": "test"
+        }
+      },
+      "pending": [],
+      "unqualified": []
+    },
+    "qualification": "qualified",
+    "decode_identity": "g4-v1",
+    "prefill_identity": "prefill-exact",
+    "row_cap": 8,
+    "sampling_identity": "splitmix64-cdf-v1",
+    "template_identity": "gemma4-native-template-v1",
+    "temperature": 0,
+    "max_tokens": 4,
+    "streams": 1,
+    "draft_kind": "mtp-assistant",
+    "draft_backend": "resident-device",
+    "draft_identity": "g4-mtp-test",
+    "draft_matrices": "bf16",
+    "draft_topk": 64,
+    "dflash_requested": "auto",
+    "dflash_admission": "measured-conservative-auto",
+    "off_switches": {
+      "STRIX_G4_DFLASH": true,
+      "STRIX_G4_DRAFT_MULTI": true
+    },
+    "mtp_confidence": {
+      "tau": 0.5
+    },
+    "mtp_confidence_resolved": {
+      "tau": 0.5,
+      "source": "builtin"
+    },
+    "rng_draws": 0,
+    "finish_reason": "length",
+    "frontier": 40,
+    "state_digest": "5b0e6c2a5b0e6c2a5b0e6c2a5b0e6c2a5b0e6c2a5b0e6c2a5b0e6c2a5b0e6c2a",
+    "target_calls": 3,
+    "target_rows": 6,
+    "acceptance": {
+      "cycles": 2,
+      "attempted": 4,
+      "eligible": 4,
+      "accepted": 3,
+      "emitted": 4,
+      "all_accepted": 1,
+      "depth_eligible": [
+        2,
+        2
+      ],
+      "depth_accepted": [
+        2,
+        1
+      ],
+      "rejection_depth": [
+        0,
+        1
+      ],
+      "windows": [
+        2,
+        2
+      ],
+      "calibration_probes": 0,
+      "auto_admitted_windows": [],
+      "multistream_auto_cycles": 0,
+      "multistream_auto_proposals": 0,
+      "multistream_auto_max_window": 0,
+      "confidence_cycles": 2,
+      "confidence_drafted": 4,
+      "confidence_unverified": 0
+    },
+    "timings": {
+      "prefill_ms": 12.5,
+      "decode_ms": 40.0,
+      "draft_ms": 5.0,
+      "context_ms": 0.5,
+      "verify_ms": 20.0,
+      "commit_ms": 1.0,
+      "session_setup_ms": 0.2,
+      "state_hash_scope": "completion/cancellation or explicit receipt; outside decode_ms"
+    },
+    "chat_policy": {
+      "enable_thinking": false,
+      "phase": 0,
+      "selection": "ordinary-chat"
+    }
+  }
+}
