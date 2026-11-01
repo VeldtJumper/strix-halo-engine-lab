@@ -1240,6 +1240,69 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             expect(yarn_environment_refusal({{"STRIX_QSA_CACHE_ONLY", value}}, 2).empty(), "YaRN accepts the cache-only QSA switch");
         expect(effective_prefill_argv(config.options)[2] == "--rope-yarn","YaRN receipt argv retains explicit opt-in");
     }
+    {
+        // Classification table: exact OFF switches and host diagnostics admit, arithmetic switches and unknowns refuse by name.
+        for (const auto& rule : yarn_environment_rules) {
+            expect(std::count_if(yarn_environment_rules.begin(), yarn_environment_rules.end(),
+                [&](const auto& other) { return other.name == rule.name; }) == 1 &&
+                std::none_of(qpf2k::defaults.begin(), qpf2k::defaults.end(),
+                    [&](const auto& item) { return rule.name == item.name; }),
+                "YaRN classification rows are unique and disjoint from the qpf2k items");
+            expect((rule.kind == YarnEnvironmentClass::refused) == !rule.why.empty() &&
+                ((rule.kind != YarnEnvironmentClass::off_switch && rule.kind != YarnEnvironmentClass::diagnostic) ||
+                    !rule.values.empty()), "YaRN refused rows carry a reason; OFF and diagnostic rows bound their values");
+        }
+        for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC",
+                "STRIX_QPF2K_WMMA_PIN", "STRIX_QPF2K_HC_UPCOPY", "STRIX_PREFILL_ROUTER_SELECT", "STRIX_ROUTER_STAGE_ACT",
+                "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE"}) {
+            auto off = request; off.environment[name] = "0";
+            const auto admitted = resolve(off, memory);
+            expect(yarn_environment_refusal({{name, "0"}}, 2).empty() && admitted.admitted,
+                "YaRN admits the exact OFF switch arm");
+            expect(admitted.environment.at(name) == "0", "YaRN keeps the explicit OFF value");
+            expect(yarn_environment_refusal({{name, "2"}}, 2) ==
+                std::string("YaRN execution environment not supported: ") + name + " (accepts " +
+                std::string(yarn_environment_rule(name)->values) + ')', "YaRN OFF switch values stay bounded");
+        }
+        for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC"})
+            expect(yarn_environment_refusal({{name, "1"}}, 2).empty(), "YaRN admits the explicit default arm of code-default items");
+        // Chunked GDN prefill keeps main's admission: no rotary site, any value (its option identity governs arithmetic).
+        expect(yarn_environment_rule("STRIX_QPF2K_GDN_FP16_CHUNK") &&
+            yarn_environment_rule("STRIX_QPF2K_GDN_FP16_CHUNK")->kind == YarnEnvironmentClass::nonrotary &&
+            yarn_environment_rule("STRIX_QPF2K_GDN_FP16_CHUNK")->values.empty(), "YaRN classifies the chunked GDN route as nonrotary");
+        for (const char* value : {"", "0", "1", "0x1"})
+            expect(yarn_environment_refusal({{"STRIX_QPF2K_GDN_FP16_CHUNK", value}}, 2).empty(),
+                "YaRN admits every chunked GDN route value as before");
+        for (const char* name : {"STRIX_PREFILL_TIMING", "STRIX_QSA_FAST_STATS", "STRIX_QPF2K_DENSE_TRACE",
+                "STRIX_QPF2K_HC_VERBOSE", "STRIX_PREFLIGHT"})
+            for (const char* value : {"0", "1"}) {
+                auto diagnostic = request; diagnostic.environment[name] = value;
+                expect(yarn_environment_refusal({{name, value}}, 2).empty() && resolve(diagnostic, memory).admitted,
+                    "YaRN admits host-only diagnostics");
+            }
+        expect(!yarn_environment_refusal({{"STRIX_PREFILL_TIMING", "verbose"}}, 2).empty(),
+            "YaRN diagnostic values stay bounded");
+        auto arithmetic = request; arithmetic.environment["STRIX_HCW_OUTPUT"] = "2";
+        expect(resolve(arithmetic, memory).error ==
+            "YaRN execution environment not supported: STRIX_HCW_OUTPUT (changes HC output arithmetic)",
+            "YaRN refuses arithmetic switches with their reason");
+        for (const char* value : {"0", "1"})
+            expect(!yarn_environment_refusal({{"STRIX_HCW_NORM16", value}}, 2).empty(),
+                "YaRN refuses arithmetic switches at every value");
+        auto unknown = request; unknown.environment["STRIX_MOCK_UNCLASSIFIED"] = "0";
+        expect(resolve(unknown, memory).error == "YaRN execution environment not supported: STRIX_MOCK_UNCLASSIFIED",
+            "YaRN keeps refusing unclassified variables by name, including OFF-looking values");
+        auto mixed = request;
+        mixed.environment["STRIX_PREFILL_TIMING"] = "1";
+        mixed.environment["STRIX_QSA_UNION_MERGE"] = "0";
+        mixed.environment["STRIX_HCW_OUTPUT"] = "2";
+        mixed.environment["STRIX_QSA_FAST_SPLITS"] = "4";
+        mixed.environment["STRIX_MOCK_UNCLASSIFIED"] = "1";
+        expect(resolve(mixed, memory).error == "YaRN execution environment not supported: "
+            "STRIX_HCW_OUTPUT (changes HC output arithmetic), STRIX_MOCK_UNCLASSIFIED, "
+            "STRIX_QSA_FAST_SPLITS (changes the QSA attend split combine)",
+            "YaRN refusal lists every offending variable and no admitted one");
+    }
     // Explicit YMTP shares target organization, with independent serial and pool controls.
     auto mtp=request;
     auto& mo=mtp.options;auto& mm=mo.mtp;
