@@ -174,6 +174,32 @@ void taps_tests() {
     lk::LookupConfig off; off.enabled = false;
     LK_CHECK(!lk::wraps(off, false, false, false) && !lk::wraps(off, true, true, false), "STRIX_G4_LOOKUP=0: not wrapped");
 }
+// A strong confidence-window drafter (MTP-like): every cycle a full window of 7 whose first 3 tokens are right
+// (4 tokens per cycle). On the repeating toy stream lookup is right through all 7 depths, so the selector must
+// learn to prefer it within one short reply.
+struct GoodInner final : en::DraftSession {
+    std::vector<std::uint32_t> committed, staged;
+    std::array<std::uint32_t, 7> propose(std::uint32_t, std::uint64_t) override { return {}; }
+    void append(std::span<const float>, std::span<const std::uint64_t>) override {}
+    void stage_rows(std::span<const float>, std::span<const float>, std::span<const std::uint32_t> next,
+                    std::span<const std::uint64_t>) override { staged.assign(next.begin(), next.end()); }
+    void publish() override { committed.insert(committed.end(), staged.begin(), staged.end()); staged.clear(); }
+    void discard() noexcept override { staged.clear(); }
+    [[nodiscard]] bool confidence_capable() const override { return true; }
+    Confident propose_confident(std::uint32_t anchor, std::uint64_t, std::uint32_t kmax, const en::ConfidenceConfig&) override {
+        Confident c;
+        if (committed.size() < 2 || kmax < 7) return c;
+        std::uint32_t a = committed[committed.size() - 2], b = anchor;
+        const LocalTarget t;
+        for (std::uint32_t d = 0; d < 7; ++d) {
+            const auto g = t.greedy(a, b);
+            c.tokens[d] = d < 3 ? g : 1;
+            a = b; b = g;
+        }
+        c.window = c.drafted = 7;
+        return c;
+    }
+};
 struct Run { std::vector<std::vector<std::uint32_t>> ids; std::uint64_t cycles = 0, accepted = 0, proposed = 0; };
 Run decode(const en::DraftFactory& f, const std::vector<std::vector<std::uint32_t>>& prompts, std::size_t streams, en::DraftMode mode) {
     Run run;
@@ -236,6 +262,14 @@ void coordinator_tests() {
     LK_CHECK(hybrid.cycles > 0 && hybrid.accepted > 0, "hybrid chose lookup over a useless inner drafter");
     std::printf("lookup: hybrid over a weak inner drafter: ids == OFF, %llu lookup cycles, %llu/%llu accepted\n",
                 (unsigned long long)hybrid.cycles, (unsigned long long)hybrid.accepted, (unsigned long long)hybrid.proposed);
+    const en::DraftFactory good = [] { return std::make_unique<GoodInner>(); };
+    const auto strong = decode(lk::hybrid_factory(good, cfg), prompts, 1, en::DraftMode::automatic);
+    for (std::size_t i = 0; i < prompts.size(); ++i) LK_CHECK(strong.ids[i] == off.ids[i], "hybrid (strong inner) ids == OFF (prompt %zu)", i);
+    LK_CHECK(strong.cycles > 0 && strong.accepted >= 6 * strong.cycles,
+             "hybrid chose full-length lookup windows over a strong 4-token inner drafter (%llu cycles, %llu accepted)",
+             (unsigned long long)strong.cycles, (unsigned long long)strong.accepted);
+    std::printf("lookup: hybrid over a strong inner drafter: ids == OFF, %llu lookup cycles, %llu/%llu accepted\n",
+                (unsigned long long)strong.cycles, (unsigned long long)strong.accepted, (unsigned long long)strong.proposed);
     const auto multi = decode(lookup_only, prompts, 3, en::DraftMode::automatic);
     for (std::size_t i = 0; i < prompts.size(); ++i) LK_CHECK(multi.ids[i] == off.ids[i], "3 streams ids == OFF (prompt %zu)", i);
     std::printf("lookup: 3 streams ids == OFF\n");
