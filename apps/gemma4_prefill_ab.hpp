@@ -8,6 +8,7 @@
 #include "gemma4/engine/runtime.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <iostream>
@@ -37,7 +38,7 @@ inline std::vector<std::string> split(const std::string& text) {
 inline std::string comparable(const Json& receipt) {
     Json out = Json::object();
     for (const auto& [key, value] : receipt.as_object())
-        if (key != "timings" && key != "prefill_levers" && key != "prefill_taps") out.set(key, value);
+        if (key != "timings" && key != "prefill_levers" && key != "prefill_taps" && key != "ab_run_ms") out.set(key, value);
     return out.dump();
 }
 inline double number(const Json& j, const char* object, const char* key) {
@@ -49,7 +50,8 @@ inline int run(int argc, char** argv) {
         std::vector<std::vector<std::string>> groups;
         std::vector<std::string> arms{"off", "on", "off"};
         std::vector<std::size_t> lengths;
-        unsigned warmup = 1;
+        unsigned warmup = 1, streams = 1;
+        bool decode = false; // --ab-decode: time the whole run (prompt + generation) and report generated tokens/s
         std::vector<char*> rest{argv[0]};
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -58,12 +60,14 @@ inline int run(int argc, char** argv) {
             else if (arg == "--ab-lengths") for (const auto& l : split(value())) lengths.push_back(std::stoull(l));
             else if (arg == "--ab-arms") arms = split(value());
             else if (arg == "--ab-warmup") warmup = unsigned(std::stoul(value()));
+            else if (arg == "--ab-streams") streams = unsigned(std::stoul(value()));
+            else if (arg == "--ab-decode") decode = true;
             else rest.push_back(argv[i]);
         }
         for (const auto& a : arms) if (a != "on" && a != "off") throw std::invalid_argument("--ab-arms takes on/off");
         if (groups.empty() || lengths.empty() || arms.empty())
             throw std::invalid_argument("usage: strix-gemma4-decode --ab-switch STRIX_G4_X[,..] --ab-lengths 512,2048 [--ab-arms off,on,off] "
-                                        "[--ab-warmup 1] <strix-gemma4-decode options with --ids IDS.txt>");
+                                        "[--ab-warmup 1] [--ab-streams N] [--ab-decode] <strix-gemma4-decode options with --ids IDS.txt>");
         for (const auto& g : groups) for (const auto& s : g)
             if (!s.starts_with("STRIX_G4_")) throw std::invalid_argument("lever switches are STRIX_G4_*");
         const auto options = e::parse_options(int(rest.size()), rest.data());
@@ -74,16 +78,31 @@ inline int run(int argc, char** argv) {
         e::Runtime runtime(options);
         const auto run = [&](const std::vector<std::string>& switches, std::size_t length, bool on) {
             for (const auto& s : switches) set_switch(s, on);
-            auto request = options.request;
-            request.prompt.resize(length);
-            for (std::size_t i = 0; i < length; ++i) request.prompt[i] = source[i % source.size()];
             e::Coordinator coordinator(*runtime.backend, runtime.drafts);
-            const auto slot = coordinator.submit(std::move(request));
+            // --ab-streams N: N concurrent requests, stream i's prompt starting i * 97 tokens into the ids.
+            std::vector<std::size_t> slots;
+            for (unsigned k = 0; k < streams; ++k) {
+                auto request = options.request;
+                request.prompt.resize(length);
+                for (std::size_t i = 0; i < length; ++i) request.prompt[i] = source[(i + std::size_t(k) * 97U) % source.size()];
+                slots.push_back(coordinator.submit(std::move(request)));
+            }
+            const auto begin = std::chrono::steady_clock::now();
             coordinator.run();
-            if (coordinator.result(slot).status == e::Status::failed) throw std::runtime_error("request failed: " + coordinator.result(slot).error);
-            auto receipt = coordinator.receipt(slot);
-            auto ids = Json::array(); for (const auto id : coordinator.result(slot).ids) ids.push(std::uint64_t(id));
+            const double run_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            auto ids = Json::array();
+            std::string digests;
+            std::uint64_t generated = 0;
+            for (const auto slot : slots) {
+                if (coordinator.result(slot).status == e::Status::failed) throw std::runtime_error("request failed: " + coordinator.result(slot).error);
+                for (const auto id : coordinator.result(slot).ids) ids.push(std::uint64_t(id));
+                generated += coordinator.result(slot).ids.size();
+                digests += coordinator.receipt(slot).find("state_digest")->as_string();
+            }
+            auto receipt = coordinator.receipt(slots.front());
             receipt.set("ids", ids);
+            if (streams > 1) receipt.set("state_digest", digests);
+            receipt.set("ab_run_ms", run_ms); receipt.set("ab_generated", generated);
             return receipt;
         };
         for (unsigned w = 0; w < warmup; ++w) (void)run(groups.front(), std::min<std::size_t>(lengths.front(), 512), true);
@@ -99,7 +118,7 @@ inline int run(int argc, char** argv) {
                 bool same = true, receipts = true;
                 for (const auto& arm : arms) {
                     auto receipt = run(switches, length, arm == "on");
-                    const auto ms = number(receipt, "timings", "prefill_ms");
+                    const auto ms = decode ? receipt.find("ab_run_ms")->as_double() : number(receipt, "timings", "prefill_ms");
                     const auto state = receipt.find("state_digest")->as_string(), produced = receipt.find("ids") ? receipt.find("ids")->dump() : "";
                     if (!first.set) { first.receipt = receipt; first.digest = state; first.ids = produced; first.set = true; }
                     const auto text = comparable(receipt), reference = comparable(first.receipt);
@@ -108,7 +127,13 @@ inline int run(int argc, char** argv) {
                     (arm == "on" ? on : off).push_back(ms);
                     Json line = Json::object();
                     line.set("ab_switch", name); line.set("arm", arm); line.set("rows", std::uint64_t(length));
-                    line.set("prefill_ms", ms); line.set("tokens_per_s", ms > 0 ? double(length - 1) * 1000.0 / ms : 0.0);
+                    if (decode) {
+                        const auto generated = receipt.find("ab_generated")->as_double();
+                        line.set("streams", std::uint64_t(streams)); line.set("run_ms", ms); line.set("generated", generated);
+                        line.set("generated_per_s", ms > 0 ? generated * 1000.0 / ms : 0.0);
+                    } else {
+                        line.set("prefill_ms", ms); line.set("tokens_per_s", ms > 0 ? double(length - 1) * 1000.0 / ms : 0.0);
+                    }
                     line.set("prefill_host_ms", number(receipt, "timings", "prefill_host_ms"));
                 line.set("context_ms", number(receipt, "timings", "context_ms")); line.set("commit_ms", number(receipt, "timings", "commit_ms"));
                     line.set("target_calls", *receipt.find("target_calls"));

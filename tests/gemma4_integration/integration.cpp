@@ -207,6 +207,7 @@ void device_tests() {
 }
 #endif
 void prefill_taps_tests();
+void decode_export_tests();
 void host_tests(bool off) {
     const auto model = tiny(); const Tables tables; CountBackend backend(model,tables.view());
     auto r = request(); const auto reference = serial(backend,r);
@@ -336,7 +337,7 @@ void host_tests(bool off) {
     e::Coordinator cancelled(backend); const auto cancelled_slot = cancelled.submit(r); const auto before_cancel = backend.calls;
     cancelled.cancel(cancelled_slot); cancelled.run(); CHECK(backend.calls == before_cancel);
     CHECK(cancelled.result(cancelled_slot).status == e::Status::cancelled);
-    if (!off) prefill_taps_tests();
+    if (!off) { prefill_taps_tests(); decode_export_tests(); }
     std::cout << "host: C1..C8, shared calls, unequal prompts, cancellation/reuse, DFlash windows/seeds/stops, sampling, costs and prompt taps passed\n";
 }
 
@@ -459,6 +460,74 @@ void prefill_taps_tests() {
         CHECK(log->empty_taps > 0);
     }
     set_env("STRIX_G4_PREFILL_PINNED_TAPS", nullptr);
+}
+
+// Decode passes as the device backend returns them with DECODE_EXPORT on:
+// device greedy winners (the shared better() rule), outputs checked before the
+// failure fence, and logits/taps left out when no row of the call exports them.
+class TrimBackend final : public e::Backend {
+public:
+    TrimBackend(const g4::ModelManifest& m, g4::RopeTables t) : host(m,t,1) {}
+    std::unique_ptr<e::StreamState> create_stream() override { return host.create_stream(); }
+    const g4::ModelConfig& config() const override { return host.config(); }
+    Json identity() const override { return host.identity(); }
+    g4::ForwardResult forward_rows(std::span<const g4::RowPlan> rows) override {
+        auto out = host.forward_rows(rows);
+        out.selected.assign(out.rows,0U);
+        for (std::size_t r = 0; r < out.rows; ++r) {
+            std::uint32_t best = 0;
+            for (std::uint32_t i = 1; i < out.vocab; ++i)
+                if (g4::better(out.logits[r*out.vocab+i],i,out.logits[r*out.vocab+best],best)) best = i;
+            out.selected[r] = best;
+        }
+        const bool logits = std::any_of(rows.begin(),rows.end(),[](const g4::RowPlan& p) { return p.export_logits; });
+        const bool taps = std::any_of(rows.begin(),rows.end(),[](const g4::RowPlan& p) { return p.export_taps; });
+        if (!logits) { out.logits.clear(); ++logits_skipped; } else ++logits_kept;
+        if (!taps) { out.taps.clear(); ++taps_skipped; }
+        out.device_checked = true;
+        return out;
+    }
+    e::HostBackend host;
+    std::size_t logits_skipped = 0, logits_kept = 0, taps_skipped = 0;
+};
+void decode_export_tests() {
+    const auto model = tiny(); const Tables tables;
+    e::HostBackend plain(model,tables.view(),1);
+    TrimBackend trimmed(model,tables.view());
+    const auto r = request(29);
+    auto sampled = r; sampled.sampling = {0.8F,0.9F,12,123,0};
+    for (const auto& req : {r, sampled}) {
+        const auto reference = serial(plain,req);
+        // No drafter: greedy passes need neither logits nor taps; sampled ones need logits.
+        trimmed.logits_skipped = trimmed.logits_kept = trimmed.taps_skipped = 0;
+        { e::Coordinator c(trimmed); const auto s = c.submit(req); c.run(); check_equal(c.result(s),reference); }
+        CHECK(trimmed.taps_skipped > 0);
+        // Greedy: every pass skips the logits. Sampled: prompt windows still skip
+        // them, decode passes must carry them (select_token would refuse otherwise).
+        CHECK(trimmed.logits_skipped > 0 && (trimmed.logits_kept > 0) == (req.sampling.temperature != 0));
+        // DFlash-, EAGLE- and MTP-shaped sessions: same ids, digest, acceptance and staged inputs as the full exports.
+        for (int family = 0; family < 3; ++family) {
+            std::array<std::shared_ptr<StageLog>,2> logs;
+            std::array<e::Result,2> results;
+            for (std::size_t trim = 0; trim < 2; ++trim) {
+                auto log = logs[trim] = std::make_shared<StageLog>();
+                e::DraftFactory factory = [=] { return std::make_unique<ShapeDraft>(family,reference.ids,req.prompt.size()-1,log); };
+                auto q = req; q.dflash = e::DraftMode::on;
+                trimmed.logits_skipped = trimmed.taps_skipped = 0;
+                e::Backend& backend = trim ? static_cast<e::Backend&>(trimmed) : static_cast<e::Backend&>(plain);
+                e::Coordinator c(backend,factory); const auto s = c.submit(q); c.run();
+                check_equal(c.result(s),reference);
+                results[trim] = c.result(s);
+                // Greedy drafting: only the MTP shape (no tap consumer) skips taps.
+                // Sampled requests run without a drafter, so every pass may skip them.
+                if (trim && req.sampling.temperature == 0) CHECK((trimmed.taps_skipped > 0) == (family == 2));
+            }
+            CHECK(results[0].ids == results[1].ids && results[0].digest == results[1].digest);
+            CHECK(results[0].acceptance.accepted == results[1].acceptance.accepted);
+            CHECK(logs[0]->hidden == logs[1]->hidden && logs[0]->positions == logs[1]->positions);
+            if (family != 2) CHECK(logs[0]->taps == logs[1]->taps);
+        }
+    }
 }
 
 class ScriptState final : public e::StreamState {

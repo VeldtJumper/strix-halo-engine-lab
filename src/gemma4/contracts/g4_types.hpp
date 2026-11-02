@@ -76,6 +76,9 @@ struct RowPlan {
     std::size_t output_row = 0;
     bool active = true; // inactive padding cannot touch state or arithmetic of peers
     bool export_hidden = false; // opt-in post-final-norm copy; no extra arithmetic
+    // Opt-out exports: a backend may leave logits (taps) out of the result when
+    // no row of the call asks for them. Arithmetic and state never depend on these.
+    bool export_logits = true, export_taps = true;
 };
 struct ForwardResult {
     std::size_t rows = 0;
@@ -83,6 +86,12 @@ struct ForwardResult {
     std::vector<float> logits; // [output_row, vocab], capped
     std::vector<float> taps;   // [output_row, 5, hidden], block 5/11/17/23/35, after scalar
     std::vector<float> hidden; // [output_row, hidden], empty unless requested; unrequested rows are zero
+    // Optional: the greedy winner of each output row by the shared better() tie
+    // rule over the capped logits (empty when the backend does not provide it).
+    std::vector<std::uint32_t> selected;
+    // The capped logits and the taps passed the backend's device finite fence;
+    // logits (taps) are empty when no row of the call exported them.
+    bool device_checked = false;
 };
 class Target {
 public:

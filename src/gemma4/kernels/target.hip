@@ -157,7 +157,8 @@ struct DeviceTarget::Impl {
     const void* a8_source[2] = {nullptr, nullptr};
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, candidates, winners, attention_counters;
     Buffer tickets;
-    PinnedBuffer host_tokens, host_positions, host_reads, host_writes, host_failure, host_logits, host_taps, host_winners;
+    PinnedBuffer host_tokens, host_positions, host_reads, host_writes, host_failure, host_logits, host_taps, host_winners,
+        host_hidden;
     std::vector<Candidate> selected;
     hipEvent_t start = nullptr, stop = nullptr;
     hipStream_t queue = nullptr;
@@ -495,6 +496,7 @@ DeviceTarget::DeviceTarget(const HostWeights& host, RopeTables tables, DeviceOpt
         b.host_logits.allocate(b.logits.size());
         b.host_taps.allocate(b.taps.size());
         b.host_winners.allocate(b.winners.size());
+        b.host_hidden.allocate(b.x.size());
     }
     if (options.profile || options.graph_timing) {
         hip_checked(hipEventCreate(&b.start));
@@ -508,6 +510,15 @@ const HostWeights& DeviceTarget::borrow_device_weights() const { return impl_->w
 const DeviceStats& DeviceTarget::stats() const {
     return impl_->stats;
 }
+namespace {
+// STRIX_G4_DECODE_EXPORT (read per pass; unset or 1 = on, 0 = off): logits and
+// taps reach the host only when a row of the pass exports them; every pass
+// returns the device greedy winners and reports its device finite fence.
+bool decode_export_trim() {
+    const auto* p = std::getenv("STRIX_G4_DECODE_EXPORT");
+    return !p || std::string_view(p) != "0";
+}
+} // namespace
 const std::vector<Candidate>& DeviceTarget::selected() const {
     return impl_->selected;
 }
@@ -563,9 +574,16 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
     b.stats.gpu_pass_ms = 0.0;
     b.stats.pass_weight_bytes = 0;
     b.selected.clear();
+    const bool trim = decode_export_trim();
+    const bool want_logits = !trim || std::any_of(rows.begin(), rows.end(), [](const RowPlan* r) { return r->export_logits; });
+    const bool want_taps = !trim || std::any_of(rows.begin(), rows.end(), [](const RowPlan* r) { return r->export_taps; });
+    const bool want_hidden = std::any_of(rows.begin(), rows.end(), [](const RowPlan* r) { return r->export_hidden; });
+    // With the trim on, exported hidden rows leave on the pass queue behind the head (no synchronous copy
+    // after the pass, so the decode step never waits on another queue's work).
+    const bool queued_hidden = want_hidden && trim && b.stats.pinned_io;
     if (!b.stats.pinned_io) {
-        result.logits.resize(result.rows * c.vocab);
-        result.taps.resize(result.rows * result.tap_width);
+        if (want_logits) result.logits.resize(result.rows * c.vocab);
+        if (want_taps) result.taps.resize(result.rows * result.tap_width);
     }
     if (!n)
         return result;
@@ -893,15 +911,20 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
         if (b.stats.pinned_io) {
             hip_checked(hipMemcpyAsync(b.host_failure.data(), b.failure.data(), sizeof(unsigned), hipMemcpyDeviceToHost,
                                        b.queue));
-            hip_checked(hipMemcpyAsync(b.host_logits.data(), b.logits.data(), std::size_t(n) * c.vocab * sizeof(float),
-                                       hipMemcpyDeviceToHost, b.queue));
-            hip_checked(hipMemcpyAsync(b.host_taps.data(), b.taps.data(), std::size_t(n) * result.tap_width * sizeof(float),
-                                       hipMemcpyDeviceToHost, b.queue));
+            if (want_logits)
+                hip_checked(hipMemcpyAsync(b.host_logits.data(), b.logits.data(), std::size_t(n) * c.vocab * sizeof(float),
+                                           hipMemcpyDeviceToHost, b.queue));
+            if (want_taps)
+                hip_checked(hipMemcpyAsync(b.host_taps.data(), b.taps.data(), std::size_t(n) * result.tap_width * sizeof(float),
+                                           hipMemcpyDeviceToHost, b.queue));
             hip_checked(hipMemcpyAsync(b.host_winners.data(), b.winners.data(), n * sizeof(Candidate),
                                        hipMemcpyDeviceToHost, b.queue));
+            if (queued_hidden)
+                hip_checked(hipMemcpyAsync(b.host_hidden.data(), b.x.data(), std::size_t(n) * c.hidden * sizeof(float),
+                                           hipMemcpyDeviceToHost, b.queue));
             // Allocate/clear the returned vectors while the queued device work runs.
-            result.logits.resize(result.rows * c.vocab);
-            result.taps.resize(result.rows * result.tap_width);
+            if (want_logits) result.logits.resize(result.rows * c.vocab);
+            if (want_taps) result.taps.resize(result.rows * result.tap_width);
         }
         synchronize(b.queue);
         if (b.options.graph_timing) {
@@ -916,12 +939,17 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             b.failure.download(&failure, sizeof(failure));
         if (failure)
             throw std::runtime_error("nonfinite execution or missing device KV tag");
-        if (std::any_of(rows.begin(),rows.end(),[](const RowPlan* r) { return r->export_hidden; })) {
-            std::vector<float> normalized(std::size_t(n) * c.hidden);
-            b.x.download(normalized.data(),normalized.size() * sizeof(float));
+        if (want_hidden) {
+            std::vector<float> normalized;
+            const float* hidden_data = b.host_hidden.as<float>();
+            if (!queued_hidden) {
+                normalized.resize(std::size_t(n) * c.hidden);
+                b.x.download(normalized.data(),normalized.size() * sizeof(float));
+                hidden_data = normalized.data();
+            }
             result.hidden.resize(result.rows * c.hidden);
             for (unsigned r = 0; r < n; ++r) if (rows[r]->export_hidden)
-                std::copy_n(normalized.data() + std::size_t(r) * c.hidden,c.hidden,
+                std::copy_n(hidden_data + std::size_t(r) * c.hidden,c.hidden,
                             result.hidden.data() + rows[r]->output_row * c.hidden);
         }
         std::vector<float> logits, taps;
@@ -930,23 +958,26 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
         const float* tap_data = b.host_taps.as<float>();
         const Candidate* selected_data = b.host_winners.as<Candidate>();
         if (!b.stats.pinned_io) {
-            logits.resize(std::size_t(n) * c.vocab);
-            taps.resize(std::size_t(n) * result.tap_width);
+            if (want_logits) logits.resize(std::size_t(n) * c.vocab);
+            if (want_taps) taps.resize(std::size_t(n) * result.tap_width);
             selection.resize(n);
-            b.logits.download(logits.data(), logits.size() * sizeof(float));
-            b.taps.download(taps.data(), taps.size() * sizeof(float));
+            if (want_logits) b.logits.download(logits.data(), logits.size() * sizeof(float));
+            if (want_taps) b.taps.download(taps.data(), taps.size() * sizeof(float));
             b.winners.download(selection.data(), n * sizeof(Candidate));
             logit_data = logits.data();
             tap_data = taps.data();
             selected_data = selection.data();
         }
         b.selected.resize(result.rows);
+        if (trim) { result.selected.assign(result.rows, 0U); result.device_checked = true; }
         for (unsigned r = 0; r < n; ++r) {
             const auto o = rows[r]->output_row;
-            std::copy_n(logit_data + std::size_t(r) * c.vocab, c.vocab, result.logits.data() + o * c.vocab);
-            std::copy_n(tap_data + std::size_t(r) * result.tap_width, result.tap_width,
-                        result.taps.data() + o * result.tap_width);
+            if (want_logits) std::copy_n(logit_data + std::size_t(r) * c.vocab, c.vocab, result.logits.data() + o * c.vocab);
+            if (want_taps)
+                std::copy_n(tap_data + std::size_t(r) * result.tap_width, result.tap_width,
+                            result.taps.data() + o * result.tap_width);
             b.selected[o] = selected_data[r];
+            if (trim) result.selected[o] = selected_data[r].id;
         }
         for (auto& [tx, p] : transactions) {
             (void)p;

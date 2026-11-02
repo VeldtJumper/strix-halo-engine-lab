@@ -443,10 +443,13 @@ bool Coordinator::step() {
                 }
             }
             const bool hidden = s.draft && s.draft->wants_hidden();
+            // Logits leave the device only for sampled decode rows (greedy rows use
+            // the backend's device winners), taps only for a drafter that reads them.
+            const bool logits = !w.prefill && s.request.sampling.temperature != 0, taps = s.draft && s.draft->wants_taps();
             for (std::size_t r = 0; r < w.rows; ++r) {
                 const auto token = w.prefill ? s.request.prompt[s.prompt_processed+r] :
                     (r ? w.proposals[r-1] : (s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back()));
-                plans.push_back({i,s.generation,position+r,token,w.tx.get(),plans.size(),true,hidden});
+                plans.push_back({i,s.generation,position+r,token,w.tx.get(),plans.size(),true,hidden,logits,taps});
             }
             remaining -= w.rows;
             ++index;
@@ -455,11 +458,19 @@ bool Coordinator::step() {
         const auto target_start = Clock::now();
         const auto out = backend_.forward_rows(plans);
         const auto verify_ms = elapsed(target_start);
-        require(out.rows == plans.size() && out.vocab == backend_.config().vocab &&
-            out.logits.size() == out.rows*out.vocab && out.tap_width == 5*backend_.config().hidden &&
-            out.taps.size() == out.rows*out.tap_width, "invalid backend result layout");
-        for (const auto x : out.logits) require(std::isfinite(x), "nonfinite backend logits");
-        for (const auto x : out.taps) require(std::isfinite(x), "nonfinite backend taps");
+        // A backend that checked its outputs on the device may omit logits/taps no
+        // row exported, and returns its greedy winners (the host tie rule).
+        const bool wanted_logits = std::any_of(plans.begin(),plans.end(),[](const RowPlan& p) { return p.export_logits; });
+        const bool wanted_taps = std::any_of(plans.begin(),plans.end(),[](const RowPlan& p) { return p.export_taps; });
+        require(out.rows == plans.size() && out.vocab == backend_.config().vocab && out.tap_width == 5*backend_.config().hidden &&
+            (out.logits.size() == out.rows*out.vocab || (out.device_checked && !wanted_logits && out.logits.empty())) &&
+            (out.taps.size() == out.rows*out.tap_width || (out.device_checked && !wanted_taps && out.taps.empty())) &&
+            (out.selected.empty() || out.selected.size() == out.rows) && (!out.device_checked || !out.selected.empty()),
+            "invalid backend result layout");
+        if (!out.device_checked) {
+            for (const auto x : out.logits) require(std::isfinite(x), "nonfinite backend logits");
+            for (const auto x : out.taps) require(std::isfinite(x), "nonfinite backend taps");
+        }
         const bool any_hidden = std::any_of(plans.begin(),plans.end(),[](const RowPlan& p) { return p.export_hidden; });
         require(!any_hidden || out.hidden.size() == out.rows*backend_.config().hidden, "missing exported hidden rows");
         for (auto& w : work) {
@@ -468,8 +479,14 @@ bool Coordinator::step() {
             dflash::Verdict verdict;
             if (!w.prefill) {
                 std::vector<std::uint32_t> selected;
-                for (std::size_t r = 0; r < w.rows; ++r)
-                    selected.push_back(select_token({out.logits.data()+(w.start+r)*out.vocab,out.vocab},s.request.sampling,s.out.rng_draws));
+                for (std::size_t r = 0; r < w.rows; ++r) {
+                    const auto row = w.start+r;
+                    if (s.request.sampling.temperature == 0 && out.device_checked) {
+                        require(out.selected[row] < out.vocab, "device winner outside vocabulary");
+                        selected.push_back(out.selected[row]);
+                    }
+                    else selected.push_back(select_token({out.logits.data()+row*out.vocab,out.vocab},s.request.sampling,s.out.rng_draws));
+                }
                 verdict = dflash::verify_greedy({w.proposals.data(),w.k},selected,
                     s.request.max_tokens-s.out.ids.size(),s.request.stop_ids,&w.delta);
                 processed = verdict.processed;
@@ -490,7 +507,8 @@ bool Coordinator::step() {
                 const auto width = std::size_t(backend_.config().hidden);
                 const std::span<const float> hidden = s.draft->wants_hidden() ?
                     std::span<const float>(out.hidden.data()+w.start*width,processed*width) : std::span<const float>{};
-                s.draft->stage_rows({out.taps.data()+w.start*out.tap_width,processed*out.tap_width},hidden,next,positions);
+                s.draft->stage_rows(out.taps.empty() ? std::span<const float>{} :
+                    std::span<const float>(out.taps.data()+w.start*out.tap_width,processed*out.tap_width),hidden,next,positions);
                 if (!hidden.empty()) s.last_hidden.assign(hidden.end()-std::ptrdiff_t(width),hidden.end());
                 w.context_ms += elapsed(begin);
             }
