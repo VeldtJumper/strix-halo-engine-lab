@@ -165,6 +165,34 @@ subject to their normal kernel/shape/resource checks.
 | `STRIX_QPF2K_DEFAULTS`, `STRIX_PREFILL_F16` | No | Injection policy / dense operand profile |
 | `STRIX_QWEN_ROPE_YARN` | Selects identity | Must agree with the resolved factor |
 
+Other explicit controls are classified by one table in
+`apps/qwen_yarn_admission.inc` (`yarn_environment_rules`). Classification
+admits a setting; it never changes what YaRN executes by default. A refusal
+lists every offending variable in one notice, each refused or out-of-range
+row with its reason, for example
+`YaRN execution environment not supported: STRIX_HCW_OUTPUT (changes HC output arithmetic), STRIX_UNKNOWN`.
+An unlisted variable keeps refusing by name, whatever its value.
+
+| Class | Environment item | Accepted | Reason |
+|---|---|---|---|
+| OFF switch | `STRIX_QSA_UNION_MERGE`, `STRIX_QSA_SCORE_ROWS64`, `STRIX_PREFILL_MOE_MERGE_VEC` | `0`, `1` | Code-default exact items; OFF restores the range union, 32-row scorer and scalar MoE merge over already rotated keys |
+| OFF switch | `STRIX_QPF2K_WMMA_PIN`, `STRIX_QPF2K_HC_UPCOPY`, `STRIX_PREFILL_ROUTER_SELECT` | `0`, `1` | Dense register pins, HC up-weight copy and router selection; no rotary work |
+| OFF switch | `STRIX_ROUTER_STAGE_ACT` | `0` | Unset is stage mode 2; `1` is another split and stays unclassified |
+| OFF switch | `STRIX_QSA_WINDOW_ATTN_V2` | `0`, `1` | Verify-window score over already rotated queries and keys |
+| OFF switch | `STRIX_PREFIX_CACHE` | `0` | Caching itself remains refused by the route guard |
+| Diagnostic | `STRIX_PREFILL_TIMING`, `STRIX_QSA_FAST_STATS`, `STRIX_QPF2K_DENSE_TRACE`, `STRIX_QPF2K_HC_VERBOSE`, `STRIX_PREFLIGHT`, `STRIX_STARTUP_MARKERS`, `STRIX_RELEASE_EVENTS` | `0`, `1` | Host clocks, stderr lines and host counters only |
+| Refused | `STRIX_HCW_OUTPUT`, `STRIX_HCW_NORM16`, `STRIX_QSA_FAST_SPLITS` | none | Change HC output/norm or QSA split arithmetic |
+| Refused | `STRIX_HCW_NORMFREE`, `STRIX_QSA_FAST_TILE`, `STRIX_QPF2K_GDN_PARTS` | none | Alternative routes not qualified on YaRN |
+| Refused | `STRIX_QPF2K_QSA_TRACE`, `STRIX_QPF2K_MOE_P1STATS`, `STRIX_QPF2K_GDN_CHECK`, `STRIX_GDN_PREFILL_CHECK`, `STRIX_QPF2K_HC_CHECK` | none | Device traces, counters and checks not audited for YaRN |
+| Refused | `STRIX_PLE_WARM`, `STRIX_PLE_WINDOW_WARM`, `STRIX_MODEL_REGISTER_MLOCK` | none | Page residency not audited for YaRN admission |
+
+The table also carries the previously admitted nonrotary controls (bundle
+scheduling, operational policies, the chunked GDN prefill route, decode pool,
+compact memory and the closed
+single-request MTP/PLE controls) with unchanged values. `STRIX_PREFILL_TIMING=1`
+reports host/enqueue spans, not device stage times. Use the OFF arms for A/B
+measurement while holding the numerical profile pair fixed.
+
 The B3-covered rotary sites are listed below. Paths with a table source use
 `with_qwen_rotary`; grouped/wave consumers read the table rows it constructs.
 File:line citations refer to the implementation inventory, not model qualification.
