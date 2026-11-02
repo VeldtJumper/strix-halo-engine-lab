@@ -677,12 +677,12 @@ Use two logits per wave with fused greedy partials.
 
 Combine eligible verification/row dispatch work.
 
-- **Preconditions:** Admitted single-session tiled decoder, supported fused steps; active MTP/HTTP/cohort routes are excluded from injection.
-- **Automatic selection:** Unspecified value becomes 1 only after decoder admission; explicit values win.
+- **Preconditions:** Admitted single-session tiled decoder, or the single-session MTP route (the documented MTP command: the group 3-4 --mtp* options, the window kernel organization and known-prefix window options, and no other route, low-level or --mtp* option, golden dump, metadata-only diagnostic, sampling, explicit n-gram mode, session or state import, recording, final-state validation or diagnostic control; qualified target and checkpoint), supported fused steps; HTTP, cohort and serving-prefix routes are excluded from injection.
+- **Automatic selection:** Unspecified value becomes 1 after decoder admission or on the single-session MTP route (the startup notice then reports `Qwen MTP route: STRIX_DISPATCH_FUSE=1 (automatic; ...)`); explicit values win.
 - **Fallback notice:** Unsupported operator shapes retain the prior launcher without a general decline notice. Declined routes do not receive this wrapper default.
 - **Exactness evidence:** Qualified profile-pair token IDs and terminal FP32 logits digests match; hold T, capacity and arithmetic fixed for operator comparisons.
 - **Off switch:** STRIX_DISPATCH_FUSE=0
-- **Measured gain:** No isolated measurement
+- **Measured gain:** MTP decode on the documented MTP command, default vs STRIX_DISPATCH_FUSE=0, same binary: code 1K, R2, R8 and prose 1K, R2, R8 decode time -0.3 to -3.2 % (B/A 0.968 to 0.997); tokens identical
 
 <a id="qwen-gsq"></a>
 

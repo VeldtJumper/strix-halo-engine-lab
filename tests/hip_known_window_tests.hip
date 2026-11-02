@@ -1,3 +1,4 @@
+#include "strix/dispatch_fuse.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_arena.hpp"
 #include "strix/execution_io.hpp"
@@ -1745,16 +1746,29 @@ std::uint32_t fold_mix(std::uint32_t x) {
 // payloads (quiet / signalling, both signs), Inf, -0 and denormals; 4 denormal gates. Flavors 3 and 5 plant, per
 // row, NaNs of different payloads in many different leaves of one stream (every tree level meets NaN with NaN),
 // two in one leaf of another, a single NaN and an Inf in others, and a NaN in the hidden row.
+// Activation storage of the fold and persistent HC fixtures: 2 (BF16 streams) or 4 (FP32 streams, --folds-fp32).
+std::uint32_t fold_activation_bytes = 2U;
+// FP32 streams take each BF16 corpus value as their upper half and, outside flavor 0, random lower payload bits.
 std::vector<unsigned char> fold_corpus_seed(std::uint64_t base, std::uint64_t bytes, std::span<const ExecutionDispatchContext> inject_rows,
     unsigned flavor, std::uint32_t state) {
     std::vector<unsigned char> seed(static_cast<std::size_t>(bytes));
-    for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
+    const std::uint32_t e = fold_activation_bytes;
+    for (std::size_t i = 0; i + e <= seed.size(); i += e) {
         state = state * 1664525U + 1013904223U;
         auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.0007F);
         if (flavor && flavor != 5U) value = fold_corpus_bf16(flavor, fold_mix(state ^ (flavor << 28U)), value);
-        std::memcpy(seed.data() + i, &value, sizeof(value));
+        if (e == 2U) std::memcpy(seed.data() + i, &value, sizeof(value));
+        else {
+            const std::uint32_t low = flavor ? fold_mix(state + 0x9e3779b9U) & 0xffffU : 0U;
+            const std::uint32_t wide = (static_cast<std::uint32_t>(value) << 16U) | low;
+            std::memcpy(seed.data() + i, &wide, sizeof(wide));
+        }
     }
-    const auto put16 = [&](std::uint64_t address, std::uint16_t bits) { std::memcpy(seed.data() + (address - base), &bits, 2U); };
+    // One activation element (BF16 bits; FP32 streams store them as the upper half).
+    const auto put16 = [&](std::uint64_t address, std::uint16_t bits) {
+        if (e == 2U) std::memcpy(seed.data() + (address - base), &bits, 2U);
+        else { const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16U; std::memcpy(seed.data() + (address - base), &wide, 4U); }
+    };
     const auto as_float = [](std::uint32_t u) { return std::bit_cast<float>(u); };
     for (std::uint32_t r = 0; r < inject_rows.size(); ++r) {
         const auto gates = resolve_dispatch_read(inject_rows[r], 2);
@@ -1768,7 +1782,7 @@ std::vector<unsigned char> fold_corpus_seed(std::uint64_t base, std::uint64_t by
         if (flavor == 3U || flavor == 5U) {
             const auto hyper = resolve_dispatch_read(inject_rows[r], 0), hidden = resolve_dispatch_read(inject_rows[r], 1);
             const std::uint64_t f = (static_cast<std::uint64_t>(r) * 397U + 11U) % 2560U;
-            const auto at = [&](std::uint32_t stream, std::uint64_t feature) { return hyper.address + 2U * ((stream % 4U) * 2560U + feature % 2560U); };
+            const auto at = [&](std::uint32_t stream, std::uint64_t feature) { return hyper.address + e * ((stream % 4U) * 2560U + feature % 2560U); };
             put16(at(r, f), static_cast<std::uint16_t>(0x7fa0U + r));
             put16(at(r + 1U, f), 0xff80U);
             put16(at(r + 1U, f + 512U), 0xffd7U);
@@ -1777,7 +1791,7 @@ std::vector<unsigned char> fold_corpus_seed(std::uint64_t base, std::uint64_t by
                 put16(at(r + 2U, f + (d ? 1U << (d - 1U) : 0U)), static_cast<std::uint16_t>((d % 2U ? 0xff80U : 0x7f80U) | (0x11U * d + r + 1U)));
             put16(at(r + 3U, f), 0x7fe1U);
             put16(at(r + 3U, f + 256U), 0xff83U);
-            put16(hidden.address + 2U * ((f + 512U) % 2560U), 0x7fb3U);
+            put16(hidden.address + e * ((f + 512U) % 2560U), 0x7fb3U);
         }
     }
     return seed;
@@ -1814,7 +1828,7 @@ bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool com
     const bool final_mix = mix_step.op == SerialOp::final_hyper_mix;
     require(mix_step.op == SerialOp::attn_hyper_mix || mix_step.op == SerialOp::mlp_hyper_mix || final_mix,
         "inject step is not followed by an HC step");
-    ExecutionBufferRequest request; request.parallel_moe_router = true;
+    ExecutionBufferRequest request; request.parallel_moe_router = true; request.activation_element_bytes = fold_activation_bytes;
     const auto serial = build_serial_execution_arena_plan(model, request, execution, io, 256U);
     const auto window = build_known_window_arena(serial, 256U, count);
     const auto scratch = owner.allocate(window.physical.total_bytes);
@@ -1853,12 +1867,14 @@ bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool com
     config.parallel = config.staged_projections = config.fused_injection = config.typed_projection = true;
     config.prefetch_rows = config.prefetch_q8_output = true;
     config.lane_chain_output = true; config.splitk_projection = true;
+    const auto activation = fold_activation_bytes == 4U ? HipActivationStorage::fp32 : HipActivationStorage::bf16;
+    config.activation = activation;
     ExecutionBindingRequest binding; binding.lane_chain_hyper_output = true;
     kernels::KernelRegistry registry;
     register_hip_hyper_mix_kernel_variant(model, binding, config, registry);
     require(registry.variants().size() == 1U, "HC serial selection is ambiguous");
     const auto mix_id = registry.variants().front().id;
-    HipElementwiseLauncherConfig elementwise{2560U, 4U, HipActivationStorage::bf16};
+    HipElementwiseLauncherConfig elementwise{2560U, 4U, activation};
     const auto inject_launcher = make_hip_inject_launcher("hip.inject.test", &elementwise);
     const auto combine_launcher = make_hip_moe_combine_launcher("hip.moe_combine.test", &elementwise);
     const auto contexts = [&](const ExecutionStep& s, std::string_view id) {
@@ -1887,11 +1903,15 @@ bool family_window_fold(SerialOp inject_op, std::uint32_t inject_layer, bool com
         for (const auto& weight : weights) require(read(weight.device) == weight.original, "folded HC rows changed weights");
         return read(scratch);
     };
+    // The separate launches, also where STRIX_DISPATCH_FUSE or STRIX_HC_PERSISTENT give the fold's HC step the
+    // persistent form.
+    hip_hyper_mix_testing_separate_launches(true);
     const auto reference = run([&] {
         if (combine) moe_combine_known_window_rows_launch(combine_rows, elementwise);
         inject_known_window_rows_launch(inject_rows, elementwise);
         hyper_mix_known_window_rows_launch(mix_rows, config);
     });
+    hip_hyper_mix_testing_separate_launches(false);
     require(reference != seed, "separate rows launches wrote nothing");
     const auto folded = [&] {
         const auto combine_views = combine ? moe_combine_known_window_rows_views(combine_rows, elementwise) : ElementwiseRowsViews{};
@@ -1962,7 +1982,7 @@ bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, st
     const bool final_mix = mix_step.op == SerialOp::final_hyper_mix;
     require(mix_step.op == SerialOp::attn_hyper_mix || mix_step.op == SerialOp::mlp_hyper_mix || final_mix,
         "inject step is not followed by an HC step");
-    ExecutionBufferRequest request; request.parallel_moe_router = true;
+    ExecutionBufferRequest request; request.parallel_moe_router = true; request.activation_element_bytes = fold_activation_bytes;
     const auto serial = build_serial_execution_arena_plan(model, request, execution, io, 256U);
     const auto window = build_known_window_arena(serial, 256U, count);
     const auto scratch = owner.allocate(window.physical.total_bytes);
@@ -2001,12 +2021,14 @@ bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, st
     config.parallel = config.staged_projections = config.fused_injection = config.typed_projection = true;
     config.prefetch_rows = config.prefetch_q8_output = true;
     config.lane_chain_output = true; config.splitk_projection = true;
+    const auto activation = fold_activation_bytes == 4U ? HipActivationStorage::fp32 : HipActivationStorage::bf16;
+    config.activation = activation;
     ExecutionBindingRequest binding; binding.lane_chain_hyper_output = true;
     kernels::KernelRegistry registry;
     register_hip_hyper_mix_kernel_variant(model, binding, config, registry);
     require(registry.variants().size() == 1U, "HC serial selection is ambiguous");
     const auto mix_id = registry.variants().front().id;
-    HipElementwiseLauncherConfig elementwise{2560U, 4U, HipActivationStorage::bf16};
+    HipElementwiseLauncherConfig elementwise{2560U, 4U, activation};
     const auto inject_launcher = make_hip_inject_launcher("hip.inject.test", &elementwise);
     const auto contexts = [&](const ExecutionStep& s, std::string_view id) {
         std::vector<ExecutionDispatchContext> out(count);
@@ -2726,6 +2748,35 @@ int main(int argc, char** argv) try {
         std::cout << "commit + combine fold: " << routed << " cases, every byte equals the commit and combine kernels\n";
         return 0;
     }
+    // FP32 streams (HipActivationStorage::fp32): the window folds (qpf2k_scale's FP32 order, inject_rows_kernel<float>,
+    // combine_rows_kernel<float>) and, with the persistent HC enabled, its FP32 instantiations, each against the
+    // separate launches over the finite and NaN-payload corpora (FP32 values with random low payload bits).
+    if (argc > 1 && std::string_view(argv[1]) == "--folds-fp32") {
+        fold_activation_bytes = 4U;
+        const auto last = static_cast<std::uint32_t>(ModelContract::qwen38_flash_next().hidden_layers - 1U);
+        std::uint32_t folded = 0, cases = 0;
+        for (unsigned flavor = 0; flavor < 6U; ++flavor)
+            for (const auto& [op, layer, combine] : {std::tuple{SerialOp::attn_inject, 0U, false},
+                     std::tuple{SerialOp::mlp_inject, 2U, false}, std::tuple{SerialOp::mlp_inject, last, false},
+                     std::tuple{SerialOp::mlp_inject, 2U, true}, std::tuple{SerialOp::mlp_inject, last, true}})
+                for (std::uint32_t rows : {2U, 4U, 8U}) {
+                    const bool f = family_window_fold(op, layer, combine, rows, flavor, true);
+                    require(f || combine, "an FP32 window inject fold fixture case was declined");
+                    folded += f ? 1U : 0U; ++cases;
+                }
+        std::cout << "FP32 window HC folds: " << folded << " of " << cases << " cases folded, every byte equals the separate launches\n";
+        if (strix_hc_persistent_enabled()) {
+            std::uint32_t fused = 0, pairs = 0;
+            const auto launches = hip_hyper_mix_testing_persistent_launches();
+            for (unsigned flavor = 0; flavor < 6U; ++flavor)
+                for (const auto& [op, layer] : {std::pair{SerialOp::attn_inject, 0U}, std::pair{SerialOp::mlp_inject, 1U},
+                         std::pair{SerialOp::mlp_inject, last}})
+                    for (std::uint32_t rows : {2U, 4U, 8U}) { fused += family_hyper_inject_rows(op, layer, rows, flavor, true) ? 1U : 0U; ++pairs; }
+            require(hip_hyper_mix_testing_persistent_launches() > launches, "FP32 persistent cases ran no persistent launch");
+            std::cout << "FP32 persistent HC: " << pairs << " pairs equal the separate launches (" << fused << " with the inject folded)\n";
+        }
+        return 0;
+    }
     // HC rows only (the persistent ctest runs this with STRIX_HC_PERSISTENT=1 and requires its launches).
     if (argc > 1 && std::string_view(argv[1]) == "--hc-uc-bench") {
         const auto sets = argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 24U;
@@ -2752,7 +2803,8 @@ int main(int argc, char** argv) try {
             require(fused == pairs, "STRIX_HC_PERSISTENT_INJECT=1 declined a fixture pair");
         // NaN-payload corpora (fold_corpus_seed / fold_norm_weights flavors 1..5) against the separate launches: the
         // persistent HC step alone over the whole arena, and the persistent inject fold over every live byte.
-        if (on("STRIX_HC_PERSISTENT")) {
+        // STRIX_HC_PERSISTENT=1, or STRIX_DISPATCH_FUSE=1 alone (persistent at 2 and 4 rows, 8 rows separate).
+        if (strix_hc_persistent_enabled()) {
             std::uint32_t nan_fused = 0, nan_pairs = 0;
             const auto launches = hip_hyper_mix_testing_persistent_launches();
             for (unsigned flavor = 1; flavor < 6U; ++flavor)

@@ -19,6 +19,7 @@
 #include <string>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -134,15 +135,16 @@ __device__ void store_activation(
             rounded >> 16U);
 }
 
-// Serial and window-row kernels share these per-element bodies.
+#include "hip_qpf2k_pinned.inc"
+// Serial and window-row kernels share these per-element bodies, operand-pinned (hip_qpf2k_pinned.inc) so the
+// fused forms that store the same values reproduce them for NaN inputs too.
 template <typename Storage>
 __device__ __forceinline__ void inject_element(const Storage* hyper, const Storage* hidden, float weight, Storage* output) {
-    const float result = load_activation(hyper) + load_activation(hidden) * weight;
-    store_activation(output, result);
+    store_activation(output, qpf2k_fmac(load_activation(hyper), weight, load_activation(hidden)));
 }
 template <typename Storage>
 __device__ __forceinline__ void combine_element(const Storage* shared, const Storage* routed, Storage* output) {
-    store_activation(output, load_activation(shared) + load_activation(routed));
+    store_activation(output, qpf2k_add(load_activation(shared), load_activation(routed)));
 }
 // Windows of 2/4/8 rows; cohorts of several sessions' windows up to 32 rows (inject cohort launches).
 constexpr std::uint32_t kElementwiseMaxRows = 32;

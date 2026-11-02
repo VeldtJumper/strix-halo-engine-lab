@@ -249,7 +249,12 @@ The admitted environment includes `STRIX_DISPATCH_FUSE=1`, `STRIX_INTPREFILL_DEN
 `STRIX_PREFILL_PIPE=255`, `STRIX_QSA_ATTEND_BATCH=1`, `STRIX_QSA_SCORE_PARK=1`, `STRIX_QSA_NORM_GROUP=1`,
 `STRIX_QSA_INDEX_ROWS=1`, `STRIX_LM_HEAD_COHORT_LEAN=1`, `STRIX_LM_HEAD_ROWS_LEAN=2`, the 13 QPF2K settings
 and `STRIX_PLE_RECLAIMABLE=auto`. These nine wrapper settings are injected only for the admitted decoder
-route; declined MTP/serving/cohort/diagnostic/model/memory routes keep historical defaults and explicit overrides.
+route; declined MTP/serving/cohort/diagnostic/model/memory routes keep historical defaults and explicit overrides,
+except that the single-session MTP route also takes `STRIX_DISPATCH_FUSE=1` for its verify windows: the explicit
+MTP command below (groups 1-4, plus the known-prefix window options), with no other route, low-level or `--mtp-*`
+option, cohort, HTTP or diagnostic control, on a qualified target and checkpoint. A `--mtp-golden-dump` run (which
+writes the reference from an unfused run), `--mtp-metadata-only`, sampling, an explicit `--mtp-ngram-draft` mode
+and session or state import keep the historical environment.
 Pre-main initialization retains the historical tiled settings and route-gated PLE reclaim for other clients.
 See the [full catalog](../optimizations.md#qwen-defaults) for every value and guard.
 
