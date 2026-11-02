@@ -29,7 +29,8 @@ las [familias de modelos](../model-families.md) y la [cualificación/rendimiento
 
 Solo Windows, opcional (opt-in): compile con `pwsh src/glm/rtxpf/producer/build.ps1` contra una exportación del código
 de tierstream, genere una vez el archivo de unidades con `glm_unit_file.exe` y ejecute
-`decode_qualification_window.py --full-card --allow-gpu`. Todos los pasos, el commit fijado de tierstream y las
+`decode_qualification_window.py --full-card --allow-gpu`. El propio servicio acepta también `--dgpu auto|<uuid>`
+para elegir la RTX PRO antes de iniciar CUDA (`off` se rechaza: no hay ruta en CPU). Todos los pasos, el commit fijado de tierstream y las
 opciones (`--profile`, `--print-effective-config`, `--vram-total-gib`) están en la
 [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
 

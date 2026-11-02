@@ -27,7 +27,8 @@ with the same tokens. `--identity r1` selects a different reference identity. Pr
 ## Run: one RTX PRO 6000
 
 Windows only, opt-in: build with `pwsh src/glm/rtxpf/producer/build.ps1` against a tierstream source export, build
-the unit file once with `glm_unit_file.exe`, then run `decode_qualification_window.py --full-card --allow-gpu`. Every
+the unit file once with `glm_unit_file.exe`, then run `decode_qualification_window.py --full-card --allow-gpu`. The service itself also takes
+`--dgpu auto|<uuid>` to pick the RTX PRO before CUDA starts (`off` is refused: no CPU path). Every
 step, the pinned tierstream commit and the options (`--profile`, `--print-effective-config`, `--vram-total-gib`) are
 in the [GLM RTX guide](../../../src/glm/rtxpf/README.md).
 

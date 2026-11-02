@@ -323,7 +323,22 @@ target counts are never reported as measured allocations.
 ## Service and wire
 
 Set `CUDA_VISIBLE_DEVICES` to one **full** PRO UUID, then launch only during an
-authorized device window:
+authorized device window. Or pass `--dgpu` instead of `--allow-gpu`; it is the
+same explicit GPU request and sets `CUDA_VISIBLE_DEVICES` itself before any
+CUDA call:
+
+- `--dgpu auto`: the sm_120 RTX PRO with the most memory, from NVML (no CUDA
+  context on any card; ties go to the lower UUID).
+- `--dgpu <uuid>`: that card, which must be an sm_120 RTX PRO (UUIDs from
+  `nvidia-smi -L`; hex case does not matter).
+- `--dgpu off`: refused (this service has no CPU or integrated-GPU path).
+
+`--dgpu` is refused when NVML cannot report the card's compute capability, and
+when `CUDA_VISIBLE_DEVICES` is also set to anything but the same full UUID
+(empty, an index, a list or a MIG id included). Without `--dgpu`, a card that
+NVML reports as not an sm_120 RTX PRO is refused before the runtime starts; when
+NVML cannot tell, the runtime's own device check refuses such a card after it
+starts (as before `--dgpu` existed).
 
 ```powershell
 BUILD_DIR/glm_native_service.exe --model MODEL_DIR --key-file import.key --capacity 8192 --row-tile auto --bind 127.0.0.1 --port 8097 --allow-gpu
