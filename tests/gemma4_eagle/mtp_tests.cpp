@@ -3,6 +3,7 @@
 #include "mtp_common.hpp"
 #include "gemma4/eagle/mtp/session.hpp"
 
+#include <cmath>
 #include <limits>
 
 using namespace mtp_test;
@@ -21,12 +22,12 @@ void recipes() {
         double m = -1e300, den = 0;
         for (auto j = first; j <= last; ++j) {
             double d = 0;
-            for (int i = 0; i < 512; ++i) d += double(q[i]) * kv.kf[j * 1024 + 512 + i];
+            for (std::size_t i = 0; i < 512; ++i) d += double(q[i]) * kv.kf[j * 1024 + 512 + i];
             s.push_back(d); m = std::max(m, d);
         }
         for (auto& x : s) { x = std::exp(x - m); den += x; }
         double worst = 0;
-        for (int i = 0; i < 512; ++i) {
+        for (std::size_t i = 0; i < 512; ++i) {
             double acc = 0;
             for (std::size_t j = 0; j < s.size(); ++j) acc += s[j] * kv.vf[(first + j) * 1024 + 512 + i];
             worst = std::max(worst, std::fabs(acc / den - out[i]));
@@ -172,6 +173,89 @@ void extend(const Table& table) {
     EAGLE_CHECK(s.propose_confident(78, 513, 6, c).drafted == 0, "anchor mismatch: nothing drafted");
 #endif
 }
+// r5b device kernels, host emulation of their changed reductions against the unchanged reference recipes.
+//   top-k: the bitonic network of topk_kernel (mtp::bitonic_pair, the exact device comparator) == top_clusters
+//          (repeated argmax), ids and order, with heavy ties, +-0 and non-power-of-two counts;
+//   attention max: attention_partial's strided (value, row) argmax + tree (256 threads) returns the bits of the
+//          serial "x > m" scan of the legacy kernel / attend_head, including +-0 ties;
+//   statistics: set_statistics never changes tokens; prob/margin are bit-identical when requested, 0 when not.
+void r5b_kernels(const Table& table) {
+    Rng r{31};
+    std::size_t lists = 0;
+    for (const std::uint32_t count : {2048U, 1500U, 64U, 3U})
+        for (int trial = 0; trial < 12; ++trial) {
+            std::vector<float> logits(count);
+            for (auto& x : logits) {
+                const auto u = r.below(8);
+                x = trial % 3 == 0 ? float(int(r.below(5)) - 2) // many exact ties
+                    : u == 0 ? 0.0F : u == 1 ? -0.0F : r.uniform();
+            }
+            const auto k = std::min<std::uint32_t>(count, trial % 2 ? 64U : 32U);
+            const auto want = mt::top_clusters(logits, k);
+            std::uint32_t N = 2;
+            while (N < count) N <<= 1U;
+            std::vector<float> value(N, -std::numeric_limits<float>::infinity());
+            std::vector<std::uint32_t> id(N);
+            for (std::uint32_t i = 0; i < N; ++i) { id[i] = i; if (i < count) value[i] = logits[i]; }
+            for (std::uint32_t size = 2; size <= N; size <<= 1U)
+                for (std::uint32_t stride = size >> 1U; stride; stride >>= 1U)
+                    for (std::uint32_t p = 0; p < N / 2U; ++p) mt::bitonic_pair(value.data(), id.data(), size, stride, p);
+            bool ok = true;
+            for (std::uint32_t i = 0; i < k; ++i) ok = ok && id[i] == want[i];
+            EAGLE_CHECK(ok, "bitonic top-%u of %u (trial %d) differs from repeated argmax", k, count, trial);
+            ++lists;
+        }
+    std::size_t maxima = 0;
+    for (const std::uint32_t n : {1U, 2U, 7U, 255U, 256U, 257U, 1024U, 2048U})
+        for (int trial = 0; trial < 20; ++trial) {
+            std::vector<float> score(n);
+            for (auto& x : score) {
+                const auto u = r.below(6);
+                x = trial % 2 ? (u < 3 ? (u == 0 ? 0.0F : -0.0F) : -r.uniform()) : float(int(r.below(4)) - 3) + (u == 0 ? -0.0F : 0.0F);
+            }
+            float serial = -std::numeric_limits<float>::infinity();
+            for (const float x : score) serial = x > serial ? x : serial;
+            constexpr std::uint32_t T = 256;
+            std::vector<float> bv(T, -std::numeric_limits<float>::infinity());
+            std::vector<std::uint32_t> bi(T, UINT32_MAX);
+            for (std::uint32_t t = 0; t < T; ++t)
+                for (std::uint32_t j = t; j < n; j += T)
+                    if (score[j] > bv[t]) { bv[t] = score[j]; bi[t] = j; }
+            for (std::uint32_t st = T / 2; st; st >>= 1U)
+                for (std::uint32_t t = 0; t < st; ++t)
+                    if (better(bv[t + st], bi[t + st], bv[t], bi[t])) { bv[t] = bv[t + st]; bi[t] = bi[t + st]; }
+            EAGLE_CHECK(same_bits(bv[0], serial), "attention max n %u trial %d: tree %a serial %a", n, trial, double(bv[0]), double(serial));
+            ++maxima;
+        }
+    // Statistics: tokens identical for every setting; requested statistics bit-identical to the full head.
+    const auto w = mt::Weights::random(mt::Config{}, 9);
+    Rope rope(1024);
+    TargetKv kv(600, 4);
+    std::vector<float> row(2560);
+    for (auto& x : row) x = 2 * r.uniform();
+    mt::HostDrafter d(w, rope.view(), table.view());
+    std::size_t depths = 0;
+    for (const std::uint64_t p : {1ULL, 64ULL, 513ULL, 599ULL}) {
+        const mt::Inputs in{77, p, row, kv.ring(p), kv.full()};
+        d.set_statistics(mt::statistic_all);
+        const auto all = d.draft(in, 7);
+        for (const std::uint32_t bits : {0U, mt::statistic_probability, mt::statistic_margin}) {
+            d.set_statistics(bits);
+            const auto x = d.draft(in, 7);
+            for (std::uint32_t i = 0; i < 7; ++i) {
+                EAGLE_CHECK(x.tokens[i] == all.tokens[i], "statistics %u p %llu depth %u token", bits, (unsigned long long)p, i + 1);
+                EAGLE_CHECK(same_bits(x.prob[i], bits & mt::statistic_probability ? all.prob[i] : 0.0F) &&
+                                same_bits(x.margin[i], bits & mt::statistic_margin ? all.margin[i] : 0.0F),
+                            "statistics %u p %llu depth %u prob %a margin %a", bits, (unsigned long long)p, i + 1,
+                            double(x.prob[i]), double(x.margin[i]));
+            }
+            depths += 7;
+        }
+    }
+    std::printf("mtp r5b kernels (host emulation): %zu bitonic top-k lists == repeated argmax, %zu tree maxima == serial "
+                "(+-0 ties), %zu depths: statistics off/partial keep tokens, requested statistics bit-identical\n",
+                lists, maxima, depths);
+}
 // Release layout: <model dir>/drafter-mtp/model.safetensors; absent drafter -> empty path (decode runs exact).
 void layout() {
     namespace fs = std::filesystem;
@@ -220,6 +304,7 @@ int main(int argc, char** argv) {
         else std::printf("SKIP fixture (usage: fixture_dir assistant_dir)\n");
         session(table);
         extend(table);
+        r5b_kernels(table);
         for (int i = 3; i < argc; ++i) { // optional extra checkpoints (e.g. fine-tuned exports): load + validate
             const auto w = mt::Weights::load(argv[i]);
             std::printf("loaded %s: hidden %u ffn %u full=%d%d%d%d scalars %.4g %.4g %.4g %.4g\n", argv[i], w.config.hidden,

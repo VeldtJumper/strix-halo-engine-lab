@@ -1,6 +1,8 @@
 // MTP assistant drafter device tests: DeviceDrafter == HostDrafter bit for bit (tokens, probabilities, margins) for
 // random weights (BF16 and Q8_0), positions around the 64-chunk/512-window edges, k = 1..7, HIP graphs on and off,
-// target sliding KV through the engine's tagged 512-slot ring; optional HF fixture; --bench for ms/step.
+// target sliding KV through the engine's tagged 512-slot ring; r5b kernels (GQA-tiled attention, bitonic top-k,
+// skipped statistics) == pre-r5b kernels (STRIX_G4_MTP_KERNELS=legacy) bit for bit; optional HF fixture;
+// --bench for ms/step: legacy (old) vs r5b (new).
 // usage: strix-gemma4-eagle-mtp-device-tests [fixture_dir assistant_dir]
 //        strix-gemma4-eagle-mtp-device-tests --bench <assistant_dir|random> [contexts...]
 #include "mtp_common.hpp"
@@ -18,13 +20,15 @@ struct Dev {
     template <class T> const T* as() const { return b.as<T>(); }
 };
 bool same(float a, float b) { return bit_cast<std::uint32_t>(a) == bit_cast<std::uint32_t>(b); }
-void set_graphs(bool on) {
+void set_env(const char* name, const char* value) {
 #ifdef _WIN32
-    _putenv_s("STRIX_G4_MTP_GRAPHS", on ? "1" : "0");
+    _putenv_s(name, value);
 #else
-    setenv("STRIX_G4_MTP_GRAPHS", on ? "1" : "0", 1);
+    setenv(name, value, 1);
 #endif
 }
+void set_graphs(bool on) { set_env("STRIX_G4_MTP_GRAPHS", on ? "1" : "0"); }
+void set_legacy(bool on) { set_env("STRIX_G4_MTP_KERNELS", on ? "legacy" : "r5b"); }
 
 // Device KV views of a TargetKv: full arrays for the full layer, the engine ring for the sliding layer at p.
 struct DeviceKv {
@@ -51,6 +55,11 @@ void device_vs_host(const Table& table, const gpu::Buffer& dtable, WeightFormat 
     auto model = std::make_shared<mt::DeviceModel>(w, rope.view(), dview);
     set_graphs(true);
     mt::DeviceDrafter graphed(model);
+    set_legacy(true);
+    mt::DeviceDrafter legacy(model); // pre-r5b kernels, graphs on
+    set_legacy(false);
+    mt::DeviceDrafter quiet(model);  // r5b, no statistics (the plain propose_window path)
+    quiet.set_statistics(0);
     set_graphs(false);
     mt::DeviceDrafter plain(model);
     DeviceKv dkv(kv);
@@ -63,19 +72,25 @@ void device_vs_host(const Table& table, const gpu::Buffer& dtable, WeightFormat 
         const auto h = host.draft(hin, k);
         const auto views = dkv.at(kv, p);
         mt::Inputs din{anchor, p, hrow, views.first, views.second};
-        for (auto* d : {&graphed, &plain}) {
+        for (auto* d : {&graphed, &plain, &legacy}) {
             const auto x = d->draft(din, k);
             for (std::uint32_t i = 0; i < k; ++i)
                 EAGLE_CHECK(x.tokens[i] == h.tokens[i] && same(x.prob[i], h.prob[i]) && same(x.margin[i], h.margin[i]),
-                            "%s %s p %llu depth %u: device %u/%a host %u/%a", name, d == &graphed ? "graph" : "plain",
-                            (unsigned long long)p, i + 1, x.tokens[i], double(x.prob[i]), h.tokens[i], double(h.prob[i]));
+                            "%s %s p %llu depth %u: device %u/%a host %u/%a", name,
+                            d == &graphed ? "graph" : d == &plain ? "plain" : "legacy", (unsigned long long)p, i + 1,
+                            x.tokens[i], double(x.prob[i]), h.tokens[i], double(h.prob[i]));
             EAGLE_CHECK(d->timings().launches == 44ULL * k, "%s launches %llu for k %u", name,
                         (unsigned long long)d->timings().launches, k);
         }
+        const auto y = quiet.draft(din, k);
+        for (std::uint32_t i = 0; i < k; ++i)
+            EAGLE_CHECK(y.tokens[i] == h.tokens[i] && y.prob[i] == 0.0F && y.margin[i] == 0.0F,
+                        "%s no-statistics p %llu depth %u: device %u host %u", name, (unsigned long long)p, i + 1, y.tokens[i], h.tokens[i]);
         depths += k;
         k = k % 7 + 1;
     }
-    std::printf("device == host (%s): %zu depths bit-identical, graphs on and off\n", name, depths);
+    std::printf("device == host (%s): %zu depths bit-identical, r5b graphs on and off, legacy kernels, no-statistics "
+                "tokens\n", name, depths);
     // extend(k) continues the device chain ([depth, k) segment graphs): bit-identical to the host chain from scratch
     // (= device draft(in, k) from scratch), graphs on and off, for several chunkings, launches = 44 x new depths.
     std::size_t extended = 0;
@@ -151,11 +166,15 @@ void bench(const std::string& source, std::vector<std::uint32_t> contexts, const
         TargetKv kv(maxp, 3);
         DeviceKv dkv(kv);
         std::vector<float> hidden(2560, 0.7F);
-        for (const bool graphs : {true, false}) {
+        for (const bool graphs : {true, false})
+        for (const bool old : {true, false}) {
             set_graphs(graphs);
+            set_legacy(old);
             mt::DeviceDrafter d(model);
-            std::printf("[%s %s top%u graphs=%d] weight bytes/step %.2f MB\n", source == "random" ? "random" : "checkpoint",
-                        format == WeightFormat::q8_0 ? "q8_0" : "bf16", topk, graphs ? 1 : 0, double(model->step_weight_bytes()) / 1e6);
+            if (!old) d.set_statistics(0); // production propose_window path (legacy always computes prob + margin)
+            std::printf("[%s %s top%u graphs=%d kernels=%s] weight bytes/step %.2f MB\n", source == "random" ? "random" : "checkpoint",
+                        format == WeightFormat::q8_0 ? "q8_0" : "bf16", topk, graphs ? 1 : 0, old ? "legacy" : "r5b",
+                        double(model->step_weight_bytes()) / 1e6);
             for (const auto p : contexts) {
                 const auto views = dkv.at(kv, p);
                 mt::Inputs in{1234, p, hidden, views.first, views.second};
@@ -169,10 +188,11 @@ void bench(const std::string& source, std::vector<std::uint32_t> contexts, const
                         ms[k] += d.timings().draft_ms / 15;
                     }
                 }
-                std::printf("  ctx %6u: GPU k1 %.3f k2 %.3f k4 %.3f k7 %.3f ms -> %.3f ms/depth; wall k1 %.3f k7 %.3f ms\n", p, ms[1],
+                std::printf("  %s ctx %6u: GPU k1 %.3f k2 %.3f k4 %.3f k7 %.3f ms -> %.3f ms/depth; wall k1 %.3f k7 %.3f ms\n", old ? "old" : "new", p, ms[1],
                             ms[2], ms[4], ms[7], (ms[7] - ms[1]) / 6, wall[1], wall[7]);
             }
         }
+        set_legacy(false);
     }
 }
 } // namespace
