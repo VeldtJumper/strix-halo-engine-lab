@@ -227,7 +227,7 @@ void kda_case(const KdaW& kw, const std::vector<unsigned>& chunks, std::mt19937&
         }
     }
     // prefill, every scan version (same bits)
-    for (unsigned sv : {1U, 3U}) {
+    for (unsigned sv : {1U, 3U, 5U}) {
         P::set_kda_scan_version(sv);
         const unsigned CMAX = *std::max_element(chunks.begin(), chunks.end());
         float *pS = zalloc<float>(SN), *pconv = zalloc<float>(CN);

@@ -19,7 +19,7 @@ void kda_prefill(const dev::KdaDev& k, const float* qkv, const float* f, const f
 // Profiling hook (bench only): when set, kda_prefill records 5 events (before prep, conv commit, scan, out, after).
 void set_kda_profile(hipEvent_t* ev5);
 // Explicit KDA scan version for bitwise gates and paired timing (same bits): 1 = v1 (shuffle tree), 3 = v3 (quad-DPP
-// tree); 0 = the default (v3; STRIX_GLM_PF_KDA_SCAN=1 restores v1).
+// tree), 5 = v5 (v3 with the batch fill off the serial path); 0 = the default (v5; STRIX_GLM_PF_KDA_SCAN=3 / 1).
 void set_kda_scan_version(unsigned v);
 
 // ---- DSA indexer + MLA. The slot holds positions [0, t0) on entry.
