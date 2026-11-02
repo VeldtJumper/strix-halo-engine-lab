@@ -22,6 +22,7 @@ import urllib.request
 # Path-based importlib loaders do not add this module directory to sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import interface
+import nemotron
 from hash_cache import ModelHashes
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -51,6 +52,9 @@ PROFILES = {
 }
 PROFILES['glm-pair'] = (['strix-glm5-rank'], ['glm'])
 PROFILES['minimax-pair'] = (['strix-minimax-rank', 'strix-minimax-serve'], ['minimax'])
+# Per-profile assets: default/fast use the Q4_K_M GGUF, quality the BF16 directory plus the EXL3 pack.
+PROFILES['nemotron'] = (nemotron.BINARIES, nemotron.assets())
+OPTIONAL = {'nemotron': nemotron.optional_assets()}
 # Actual adopted asset pins: include/strix/deepseek41_model.hpp:133-137;
 # include/strix/mtp_draft_profiles.hpp:47-48. Unknown pins stay null.
 PINS = {
@@ -166,7 +170,9 @@ def hardware():
 
 def asset_files():
     result = []
-    for role in PROFILES[ENGINE][1]:
+    # Optional assets (the Nemotron drafter) are hashed when present; their absence is reported, never hidden.
+    roles = PROFILES[ENGINE][1] + [r for r in OPTIONAL.get(ENGINE, []) if (MODELS / r).exists()]
+    for role in roles:
         p = MODELS / role
         if p.is_dir():
             files = sorted(x for x in p.rglob('*') if x.is_file() and not any(part.startswith('.') for part in x.relative_to(p).parts))
@@ -221,6 +227,13 @@ def precheck():
         for key, value in [('STRIX_DS41_TRELLIS','ON'), ('STRIX_DS41_TRELLIS_API','dense_r1')]:
             match = re.search(r'^' + key + r':[^=]+=(.*)$', text, re.M)
             if match and match.group(1) != value: problems.append('build identity mismatch: ' + key + '=' + match.group(1))
+    if ENGINE == 'nemotron':
+        import importlib.util
+        if importlib.util.find_spec('tokenizers') is None: problems.append('Python tokenizers package required for Nemotron prompts')
+        if cache.exists():
+            match = re.search(r'^STRIX_FAMILY_GEMMA4:[^=]+=(.*)$', cache.read_text(encoding='utf-8', errors='replace'), re.M)
+            if not match or match.group(1).upper() not in ('ON', '1', 'TRUE', 'YES'):
+                problems.append('build identity mismatch: STRIX_FAMILY_GEMMA4 must be ON')
     if ENGINE in ('glm-pair', 'minimax-pair'):
         import importlib.util
         if importlib.util.find_spec('tokenizers') is None: problems.append('Python tokenizers package required for EXL3 prompts')
@@ -307,6 +320,10 @@ def prompts(out):
 
 
 def tokenize(path):
+    if ENGINE == 'nemotron':
+        from tokenizers import Tokenizer
+        # Raw text identity; the server applies the chat template and reports its own prompt token count.
+        return Tokenizer.from_file(str(MODELS / nemotron.TOKENIZER)).encode(path.read_text(encoding='utf-8'), add_special_tokens=False).ids
     if ENGINE in ('glm-pair', 'minimax-pair'):
         from tokenizers import Tokenizer
         model = MODELS / ('glm' if ENGINE == 'glm-pair' else 'minimax')
@@ -468,6 +485,7 @@ def sanitize_file(path):
 
 
 def build_warnings():
+    if ENGINE == 'nemotron': return nemotron.warnings(MODELS)
     if ENGINE != 'deepseek-pair': return []
     cache = BIN / 'CMakeCache.txt'
     if not cache.exists(): return ['Cannot confirm dense_r1 build identity: CMakeCache.txt unavailable']
@@ -789,6 +807,12 @@ def initialize(out):
         rotary = qwen_rotary_reference(configs)
         if rotary:
             reference_key['rotary_identity'] = rotary
+    if ENGINE=='nemotron':
+        projections = {label: config['settings'].get('numerics') for label, config in configs.items() if label.startswith('serve-')}
+        if len({json.dumps(x, sort_keys=True) for x in projections.values()}) > 1:
+            raise ValueError('conflated identities: drafter arms report different numerical projections')
+        if projections:
+            reference_key['numerics'] = next(iter(projections.values()))
     reference_sha = hashlib.sha256(json.dumps(reference_key, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     dump(out / 'identity.json', {'schema_version': 1, 'kit_version': VERSION, 'engine': ENGINE,
                                 'repo_commit': inv['repo_commit'], 'tracked_dirty': inv['tracked_dirty'],
@@ -1008,8 +1032,11 @@ def finalize(out, write_refs=False, status='complete'):
                                   'verdict': verdict, 'repeat_stable': stable, **candidate})
         if stable:
             candidates[key] = candidate
+    if data['engine'] == 'nemotron':
+        nemotron.augment(data, out, refs, known, read)
     if 'exactness' not in data.get('params', {'only':['exactness']}).get('only', []):
         data['exactness'] = []
+        data.pop('digest_checks', None)
     data['logs'] = [p.name for p in sorted(out.glob('*.log'))]
     # Plain and speculative modes must agree within this run, independently of published refs.
     for e in data['exactness']:
@@ -1063,6 +1090,17 @@ def validate(d):
         for key in ('prompt_sha256', 'token_ids_sha256'):
             if not re.fullmatch('[0-9a-f]{64}', e[key]):
                 raise ValueError('invalid exactness digest')
+        witness = e.get('draft_witness')
+        if witness is not None and (witness.get('status') not in ('drafted', 'declined')
+                                    or any(type(witness.get(x)) is not int or witness[x] < 0 for x in ('drafted', 'verified', 'accepted'))):
+            raise ValueError('invalid draft witness')
+        if d['engine'] == 'nemotron' and e['mode'].startswith('spec') and witness is None:
+            raise ValueError('missing draft witness')
+    for c in d.get('digest_checks', []):
+        if c.get('verdict') not in ('EXACT', 'MISMATCH', 'NO-REFERENCE') or not re.fullmatch('[0-9a-f]{64}', c.get('kv', '')):
+            raise ValueError('invalid digest check')
+        if c['verdict'] != 'NO-REFERENCE' and not re.fullmatch('[0-9a-f]{64}', c.get('reference') or ''):
+            raise ValueError('digest check verdict without reference')
     for p in d.get('logs', []):
         if Path(p).name != p or '\\' in p:
             raise ValueError('log path must be basename only')
@@ -1111,7 +1149,10 @@ def report(path):
         lines.append(f"| {m['prompt_id']} / {m['mode']}{scope} (n={m['repeat_count']}) | {expected} | {m['median']:.3f} ({m['min']:.3f}-{m['max']:.3f}) {m['unit']} | {f'{ratio:.3f}' if ratio else '--'} | {check} |")
     lines += ['', '| Prompt / mode / requested length | Exactness |', '|---|---|']
     for e in d['exactness']:
-        lines.append(f"| {e['prompt_id']} / {e['mode']} / {e['generate_length']} | {e['verdict']} |")
+        witness = f" (draft witness: {e['draft_witness']['status']}, accepted {e['draft_witness']['accepted']})" if 'draft_witness' in e else ''
+        lines.append(f"| {e['prompt_id']} / {e['mode']} / {e['generate_length']} | {e['verdict']}{witness} |")
+    for c in d.get('digest_checks', []):
+        lines.append(f"| {c['check']} / {c['identity']} / KV `{c['kv'][:16]}` | {c['verdict']} |")
     lines += ['', 'NO-REFERENCE is unqualified. Candidate references require maintainer review and an independent run.', '']
     for s in d.get('skipped', []):
         lines.append('Skipped: ' + s)
@@ -1337,6 +1378,10 @@ def main(args):
         if not 0 < port <= 65535:
             raise ValueError('HTTP port must be in 1..65535')
         with socket.socket() as s:
+            # POSIX SO_REUSEADDR still refuses a port with a live listener; it only ignores the previous arm's
+            # TIME_WAIT connections, which would otherwise fail a sequential arm on the same port.
+            if os.name == 'posix':
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(('localhost', port))
     elif action == 'not-run':
         path = Path(args[1]) / 'not-run.json'
@@ -1354,7 +1399,14 @@ def main(args):
         # census RUN_DIR TRACE [dispatch_census.py options]
         attach_census(Path(args[1]), Path(args[2]), args[3:])
     elif action == 'skipped':
-        dump(Path(args[1]) / 'skipped.json', [args[2]])
+        path = Path(args[1]) / 'skipped.json'
+        notes = read(path) if path.exists() else []
+        dump(path, notes + [args[2]] if args[2] not in notes else notes)
+    elif action == 'nemotron-http':
+        nemotron.serve_arm(sys.modules[__name__], Path(args[1]), args[2], args[3], args[4])
+    elif action == 'nemotron-verify':
+        dump(Path(args[1]) / 'verify-r8.json', nemotron.parse_verify(Path(args[2]).read_text(encoding='utf-8', errors='replace'),
+                                                                     nemotron.selected_profile()))
     else:
         raise ValueError('unknown helper command')
     return 0

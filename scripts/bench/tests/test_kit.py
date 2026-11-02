@@ -717,5 +717,242 @@ class KitTests(unittest.TestCase):
             k.pairs(self.arm_files(invalid))
 
 
+N = k.nemotron
+
+
+def nemotron_phase(arm='on', profile='default', digest=None, attempted=4, accepted=3):
+    """Synthetic engine receipt derived from the test-only fixture."""
+    phase = copy.deepcopy(k.read(HERE / 'fixtures/nemotron-receipt.json')['phase'])
+    phase['profile']['profile'] = profile
+    if profile == 'fast':
+        phase['decode_identity'] = 'g4-a8-v1'
+        phase['profile']['levers']['prefill_route']['status'] = 'pending'
+        phase['profile']['pending'] = [{'lever': 'prefill_route', 'target': 'g4-wmma-pf-v2', 'runs': 'exact'}]
+    if digest:
+        phase['state_digest'] = digest
+    phase['acceptance'].update(attempted=attempted, eligible=attempted, accepted=accepted)
+    if arm == 'off':
+        for key in ('draft_kind', 'draft_backend', 'draft_identity', 'draft_matrices', 'draft_topk',
+                    'mtp_confidence', 'mtp_confidence_resolved'):
+            phase.pop(key, None)
+        phase['profile']['drafter'] = 'off (switch)'
+        phase['acceptance'].update(attempted=0, eligible=0, accepted=0, cycles=0)
+        for key in ('confidence_cycles', 'confidence_drafted', 'confidence_unverified'):
+            phase['acceptance'].pop(key)
+    return phase
+
+
+def sse_lines(phase, ids, finish='length', done=True, usage=True, error=False):
+    chunk = lambda choice, **extra: ('data: ' + json.dumps(dict(choices=[choice], **extra)) + '\n').encode()
+    lines = [chunk({'index': 0, 'delta': {'role': 'assistant', 'content': 'x'}, 'finish_reason': None})]
+    if error:
+        lines.append(b'data: {"error":{"message":"failed"}}\n')
+    lines.append(chunk({'index': 0, 'delta': {}, 'finish_reason': finish},
+                       strix={'phases': [phase], 'budget_continued': False, 'generated_ids': ids}))
+    if usage:
+        lines.append(('data: ' + json.dumps({'choices': [], 'usage': {'prompt_tokens': 20, 'completion_tokens': len(ids),
+                                                                     'total_tokens': 20 + len(ids)}}) + '\n').encode())
+    if done:
+        lines.append(b'data: [DONE]\n')
+    return lines
+
+
+class FakeServer:
+    """urlopen stand-in: /health and chat completions with per-prompt IDs; no network."""
+    def __init__(self, arm, profile='default', ids_for=None, phase_for=None):
+        self.arm, self.profile = arm, profile
+        self.ids_for = ids_for or (lambda text: [len(text) % 7 + 1, 2, 3, 4])
+        self.phase_for = phase_for or (lambda text: nemotron_phase(arm, profile, digest=format(len(text), '064x')))
+
+    def __call__(self, req, timeout=None):
+        server = self
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def __iter__(self):
+                text = json.loads(req.data)['messages'][0]['content']
+                return iter(sse_lines(server.phase_for(text), server.ids_for(text)))
+        return Response()
+
+
+class NemotronTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = Path(self.tmp.name)
+
+    def test_receipt_fixture_and_draft_witness(self):
+        on = nemotron_phase()
+        N.check_receipt(on)
+        self.assertEqual(N.draft_witness(on, 'on')['status'], 'drafted')
+        self.assertEqual(N.draft_witness(nemotron_phase(accepted=0), 'on')['status'], 'declined')
+        self.assertEqual(N.draft_witness(nemotron_phase('off'), 'off')['status'], 'off')
+        for missing in ('mtp_confidence_resolved', 'draft_kind'):
+            broken = nemotron_phase(); broken.pop(missing)
+            with self.assertRaisesRegex(ValueError, 'missing draft witness'):
+                N.draft_witness(broken, 'on')
+        broken = nemotron_phase(); broken['acceptance'].pop('confidence_drafted')
+        with self.assertRaisesRegex(ValueError, 'missing draft witness'):
+            N.draft_witness(broken, 'on')
+        with self.assertRaisesRegex(ValueError, 'drafting-off arm'):
+            N.draft_witness(nemotron_phase(), 'off')
+        broken = nemotron_phase(); broken['acceptance'].pop('accepted')
+        with self.assertRaisesRegex(ValueError, 'acceptance counter'):
+            N.check_receipt(broken)
+        broken = nemotron_phase(); broken.pop('state_digest')
+        with self.assertRaisesRegex(ValueError, 'state_digest'):
+            N.check_receipt(broken)
+
+    def test_profile_population_checks(self):
+        N.check_profile(nemotron_phase(), 'default', [])
+        fast = nemotron_phase(profile='fast')
+        notice = 'profile fast: prefill_route pending g4-wmma-pf-v2 (exact runs)'
+        N.check_profile(fast, 'fast', [notice])
+        with self.assertRaisesRegex(ValueError, 'stderr notice'):
+            N.check_profile(fast, 'fast', [])
+        with self.assertRaisesRegex(ValueError, 'selected profile'):
+            N.check_profile(nemotron_phase(), 'fast', [])
+        unqualified = nemotron_phase(); unqualified['profile']['qualification'] = 'unqualified: prefill_route'
+        with self.assertRaisesRegex(ValueError, 'unqualified'):
+            N.check_profile(unqualified, 'default', [])
+        # Q4_K_M and EXL3 references never mix.
+        mixed = nemotron_phase(); mixed['exl3_identity'] = 'g4-exl3-v3'
+        with self.assertRaisesRegex(ValueError, 'EXL3'):
+            N.check_profile(mixed, 'default', [])
+        with self.assertRaisesRegex(ValueError, 'EXL3 identity'):
+            N.check_profile(nemotron_phase(profile='quality'), 'quality', [])
+        a8 = nemotron_phase(); a8['decode_identity'] = 'g4-a8-v1'
+        with self.assertRaisesRegex(ValueError, 'decode identity'):
+            N.check_profile(a8, 'default', [])
+        bits = N.numerics(nemotron_phase(), 'models')
+        self.assertEqual(bits, N.numerics(nemotron_phase('off'), 'models'))
+        self.assertNotIn('draft', bits['levers'])
+
+    def test_sse_parser_rejects_truncation(self):
+        clock = iter(range(100)).__next__
+        first, final, usage = N.read_sse(sse_lines(nemotron_phase(), [1, 2]), clock, 0)
+        self.assertEqual(N.phase_of(final)[1], [1, 2])
+        for kwargs, message in ((dict(done=False), 'no \\[DONE\\]'), (dict(usage=False), 'usage'),
+                                (dict(error=True), 'generation error')):
+            with self.assertRaisesRegex(ValueError, message):
+                N.read_sse(sse_lines(nemotron_phase(), [1, 2], **kwargs), clock, 0)
+        _, final, _ = N.read_sse(sse_lines(nemotron_phase(), [1, 2]), clock, 0)
+        final['strix']['phases'].append(nemotron_phase())
+        with self.assertRaisesRegex(ValueError, 'one engine receipt'):
+            N.phase_of(final)
+        _, final, _ = N.read_sse(sse_lines(nemotron_phase(), []), clock, 0)
+        with self.assertRaisesRegex(ValueError, 'generated IDs'):
+            N.phase_of(final)
+
+    def run_arms(self, on_server=None, profile='default', levels='1,4'):
+        texts = {'chat': 'Hello there', 'code': 'Write a function'}
+        prompts = [{'id': x, 'tokens': 3, 'sha256': k.id_hash([i + 1, 2, 3]), 'construction': 'test-only'}
+                   for i, x in enumerate(texts)]
+        k.dump(self.out / 'prompts.json', prompts)
+        env = {'BENCH_SELECTED_PROFILE': profile, 'BENCH_ONLY': 'exactness,serve', 'BENCH_REPEATS': '1',
+               'BENCH_WARMUP': '0', 'BENCH_GEN_TOKENS': '4'}
+        for arm, server, arm_levels in (('off', FakeServer('off', profile), '1'), ('on', on_server or FakeServer('on', profile), levels)):
+            (self.out / ('server-' + arm + '.log')).write_text(N.READY + '\n', encoding='utf-8')
+            with patch.object(N.urllib.request, 'urlopen', server), patch.object(k, 'prompt_texts', return_value=texts), \
+                    patch.object(N.time, 'sleep'), patch.dict(k.os.environ, env):
+                N.serve_arm(k, self.out, 18880, arm, arm_levels)
+        fixture = k.read(HERE / 'fixtures/results.json')
+        identity = {key: value for key, value in fixture.items() if key not in ('measurements', 'exactness', 'prompts')}
+        identity.update(engine='nemotron', params={'only': ['exactness', 'serve'], 'profile': profile})
+        k.dump(self.out / 'identity.json', identity)
+
+    def test_arms_end_to_end_exactness(self):
+        self.run_arms()
+        k.finalize(self.out)
+        d = k.read(self.out / 'results.json')
+        self.assertEqual(d['status'], 'complete')
+        modes = {(e['prompt_id'], e['mode']): e for e in d['exactness']}
+        self.assertEqual(set(modes), {(p, m) for p in ('chat', 'code') for m in ('plain', 'spec', 'spec-c4')})
+        # Missing references are NO-REFERENCE, never EXACT.
+        self.assertEqual({e['verdict'] for e in d['exactness']}, {'NO-REFERENCE'})
+        spec = modes[('chat', 'spec')]
+        self.assertTrue(spec['plain_tokens_equal'] and spec['plain_state_equal'])
+        self.assertEqual(spec['draft_witness']['status'], 'drafted')
+        self.assertTrue(modes[('code', 'spec-c4')]['c1_equal'])
+        http = k.read(self.out / 'http-measurements.json')
+        self.assertEqual({m['prompt_id'] for m in http}, {'http-c1-draft-off', 'http-c1', 'http-c4'})
+        self.assertEqual(set(d['nemotron']), {'off', 'on'})
+
+    def test_arms_reject_drafter_divergence_and_missing_witness(self):
+        ids = lambda text: [9, 9, 9, 9] if text.startswith('Hello') else [len(text) % 7 + 1, 2, 3, 4]
+        self.run_arms(FakeServer('on', ids_for=ids))
+        k.finalize(self.out)
+        d = k.read(self.out / 'results.json')
+        self.assertEqual(d['status'], 'mismatch')
+        self.assertEqual(next(e for e in d['exactness'] if e['prompt_id'] == 'chat' and e['mode'] == 'spec')['verdict'], 'MISMATCH')
+        # Same IDs but a different committed state is also a mismatch.
+        self.tmp.cleanup(); self.out.mkdir()
+        state = lambda text: nemotron_phase('on', digest='f' * 64)
+        self.run_arms(FakeServer('on', phase_for=state))
+        k.finalize(self.out)
+        self.assertEqual(k.read(self.out / 'results.json')['status'], 'mismatch')
+        self.tmp.cleanup(); self.out.mkdir()
+        def no_window(text):
+            phase = nemotron_phase('on', digest=format(len(text), '064x')); phase.pop('mtp_confidence_resolved'); return phase
+        with self.assertRaisesRegex(ValueError, 'missing draft witness'):
+            self.run_arms(FakeServer('on', phase_for=no_window))
+        self.tmp.cleanup(); self.out.mkdir()
+        idle = lambda text: nemotron_phase('on', digest=format(len(text), '064x'), attempted=0, accepted=0)
+        with self.assertRaisesRegex(ValueError, 'positive control'):
+            self.run_arms(FakeServer('on', phase_for=idle))
+
+    def test_finalize_rejects_sample_without_witness(self):
+        self.run_arms(levels='1')
+        rows = [json.loads(x) for x in (self.out / 'samples.jsonl').read_text().splitlines()]
+        for row in rows:
+            row.pop('draft_witness', None)
+        (self.out / 'samples.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'missing draft witness'):
+            k.finalize(self.out)
+        d = k.read(HERE / 'fixtures/results.json')
+        d['engine'] = 'nemotron'
+        d['exactness'][0]['mode'] = 'spec'
+        d['exactness'][0].pop('draft_witness', None)
+        with self.assertRaisesRegex(ValueError, 'missing draft witness'):
+            k.validate(d)
+
+    def test_verify_rows_and_digest_pins(self):
+        pins = k.read(HERE.parent / 'refs/nemotron.json')['digest_pins']
+        pin = pins['verify-r8']['g4-v1']
+        rows = ''.join(json.dumps({'gate': 'verify_rows', 'identity': 'g4-v1', 'verdict': 'EXACT', 'rows': r,
+                                   'kv': pin['kv'] if r == 8 else format(r, '064x')}) + '\n' for r in range(1, 9))
+        check = N.parse_verify('{"profile":{}}\n' + rows, 'default')
+        self.assertEqual(check['kv'], pin['kv'])
+        with self.assertRaisesRegex(ValueError, 'rows 1..8'):
+            N.parse_verify(rows.split('\n', 1)[1], 'default')
+        with self.assertRaisesRegex(ValueError, 'differs from the profile'):
+            N.parse_verify(rows, 'fast')
+        files = [{'role': N.Q4, 'name': 'Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf', 'sha256': pin['model_sha256']}]
+        self.assertEqual(N.digest_verdict(check, pins, files)['verdict'], 'EXACT')
+        self.assertEqual(N.digest_verdict(dict(check, kv='0' * 64), pins, files)['verdict'], 'MISMATCH')
+        self.assertEqual(N.digest_verdict(check, pins, [dict(files[0], sha256='1' * 64)])['verdict'], 'NO-REFERENCE')
+        self.assertEqual(N.digest_verdict(check, pins, [dict(files[0], sha256=None)])['verdict'], 'NO-REFERENCE')
+        self.assertEqual(N.digest_verdict(dict(check, identity='g4-exl3-v3'), pins, files)['verdict'], 'NO-REFERENCE')
+
+    def test_reference_key_uses_one_numerical_projection(self):
+        inv = dict(build_options={}, binary_sha256s=[], model_files=[], repo_commit='0' * 40,
+                   tracked_dirty=False, hardware=dict(rocm_version=None, hip_version=None, kernel='test'))
+        k.dump(self.out / 'local-inventory.json', inv)
+        bits = N.numerics(nemotron_phase(), 'models')
+        for arm in ('off', 'on'):
+            k.dump(self.out / ('effective-serve-' + arm + '.json'), {'environment': {}, 'arguments': [], 'settings': {'numerics': bits}})
+        env = {'BENCH_PROFILE': 'g4-v1-q4km:default', 'BENCH_SUITE': 'quick', 'BENCH_PROMPTS': 'kit'}
+        with patch.object(k, 'ENGINE', 'nemotron'), patch.dict(k.os.environ, env):
+            k.initialize(self.out)
+            with_drafter = k.read(self.out / 'identity.json')['reference_sha256']
+            (self.out / 'effective-serve-on.json').unlink()
+            k.initialize(self.out)
+            self.assertEqual(k.read(self.out / 'identity.json')['reference_sha256'], with_drafter)
+            k.dump(self.out / 'effective-serve-on.json', {'settings': {'numerics': dict(bits, decode_identity='g4-a8-v1')}})
+            with self.assertRaisesRegex(ValueError, 'conflated identities'):
+                k.initialize(self.out)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

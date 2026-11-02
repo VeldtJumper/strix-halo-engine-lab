@@ -253,6 +253,28 @@
       "tolerance": 0.15,
       "workload_match": false,
       "$comment": "README.md How fast / GLM-5.3 Flash, 2026-10-26: Exact chunked prefill 32K."
+    },
+    {
+      "engine": "nemotron",
+      "profile": "default",
+      "prompt_id": "*",
+      "mode": "plain",
+      "value": 55.8,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "docs/models/nemotron-3.5-bolt-e4b/README.md Measured: default profile C1 plain decode, 256-token English chat. Kit rows are native decode timing of 128-token kit prompts through the server; context only."
+    },
+    {
+      "engine": "nemotron",
+      "profile": "default",
+      "prompt_id": "*",
+      "mode": "spec",
+      "value": 91.9,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "docs/models/nemotron-3.5-bolt-e4b/README.md Measured: default profile C1 shipped (MTP drafter + prompt lookup, ids identical to drafting off), 256-token English chat. Context only. README C4/C8 rows are native batch aggregates; the README HTTP serve rows use a different mixed-prompt workload, so no HTTP row is listed."
     }
   ]
 }

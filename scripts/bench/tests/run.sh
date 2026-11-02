@@ -17,7 +17,7 @@ for f in scripts/bench/bench.sh scripts/bench/fetch-models.sh scripts/bench/lib/
 done
 printf 'PASS bash syntax\n'
 bash scripts/bench/bench.sh list >"$tmp/list"
-[[ $(wc -l <"$tmp/list") -ge 5 ]]
+[[ $(wc -l <"$tmp/list") -ge 6 ]]
 printf 'PASS engine list\n'
 mkdir -p "$tmp/bin" "$tmp/models"
 cat >"$tmp/bin/ssh" <<'SHIM'
@@ -74,15 +74,27 @@ grep -q 'BatchMode=yes' "$BENCH_SSH_RECORD"
 grep -q 'inventory' "$BENCH_SSH_RECORD"
 printf 'PASS pair check records remote inventory command in SSH shim\n'
 : >"$BENCH_SSH_RECORD"
-for e in qwen deepseek-pair glm-pair minimax-pair deepseek-rtx; do
+for e in qwen deepseek-pair glm-pair minimax-pair deepseek-rtx nemotron; do
     bash scripts/bench/bench.sh run --engine "$e" --peer node-b --peer-repo /path/to/repo --dry-run --suite full --serve >"$tmp/$e-preview"
 done
 # Dry-run must never contact SSH; it prints quoted remote commands for review.
 [[ ! -s $BENCH_SSH_RECORD ]]
 grep -q 'node B (SSH, setsid, PID file, same timeout)' "$tmp/deepseek-pair-preview"
-printf 'PASS all five dry-runs, no GPU/assets/SSH execution\n'
+# Nemotron: R8 verify, then one server per arm (drafting off first), C4/C8 on the shipped arm only.
+grep -q -- '--verify-rows all --context 64' "$tmp/nemotron-preview"
+[[ $(grep -c 'strix-gemma4-serve' "$tmp/nemotron-preview") == 2 ]]
+grep -q -- '--draft off --dflash off' "$tmp/nemotron-preview"
+grep -q 'HTTP arm=off concurrency=1 ' "$tmp/nemotron-preview"
+grep -q 'HTTP arm=on concurrency=1,4,8 ' "$tmp/nemotron-preview"
+bash scripts/bench/bench.sh run --engine nemotron --profile quality --suite quick --only exactness,serve --dry-run >"$tmp/nemotron-quality" 2>&1
+grep -q -- '--exl3-arm models/nemotron/exl3' "$tmp/nemotron-quality"
+if grep -q -- '--verify-rows' "$tmp/nemotron-quality"; then printf 'quality must not run the Q4_K_M R8 verify\n' >&2; exit 1; fi
+grep -q 'SKIP verify-r8' "$tmp/nemotron-quality"
+if bash scripts/bench/bench.sh run --engine nemotron --profile r1 --dry-run >/dev/null 2>&1; then exit 1; fi
+printf 'PASS all six dry-runs, no GPU/assets/SSH execution\n'
 bash scripts/bench/tests/effective_config.sh
 bash scripts/bench/tests/single_config.sh
+bash scripts/bench/tests/nemotron_shims.sh
 bash scripts/bench/tests/pair_args.sh
 printf 'PASS pair argument mapping and SSH shell quoting\n'
 cp scripts/bench/tests/fixtures/results.json "$tmp/results.json"
@@ -93,11 +105,11 @@ printf 'PASS fixture schema and markdown render\n'
 "$BENCH_PYTHON" scripts/bench/tests/test_kit.py
 # Public machine endpoints must contain exactly one JSON document on stdout.
 bash scripts/bench/bench.sh list --json >"$tmp/list.json"
-"$BENCH_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert len(d["engines"])==5' "$tmp/list.json"
+"$BENCH_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert len(d["engines"])==6' "$tmp/list.json"
 bash scripts/bench/bench.sh check --engine qwen --json --bin-dir "$tmp/absent" --model-dir "$tmp/absent" >"$tmp/check.json" || true
 "$BENCH_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert not d["ok"] and "warnings" in d' "$tmp/check.json"
 bash scripts/bench/bench.sh run --engine all --json --bin-dir "$tmp/absent" --model-dir "$tmp/absent" >"$tmp/all.json"
-"$BENCH_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert len(d["engines"])==5 and all(e["skipped"] for e in d["engines"])' "$tmp/all.json"
+"$BENCH_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert len(d["engines"])==6 and all(e["skipped"] for e in d["engines"])' "$tmp/all.json"
 for e in qwen deepseek glm minimax deepseek-rtx; do
     bash scripts/bench/bench.sh run --engine "$e" --peer node-b --contexts 2k,16k --only prefill --dry-run >"$tmp/$e-prefill"
     grep -q '2048' "$tmp/$e-prefill"

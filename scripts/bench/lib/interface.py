@@ -7,11 +7,12 @@ import shlex
 import subprocess
 import sys
 
-ENGINES = ['qwen', 'deepseek', 'glm', 'minimax', 'deepseek-rtx']
+ENGINES = ['qwen', 'deepseek', 'glm', 'minimax', 'deepseek-rtx', 'nemotron']
 ALIASES = {'deepseek': 'deepseek-pair', 'glm': 'glm-pair', 'minimax': 'minimax-pair'}
 ALLOW = {'qwen': ['default', 'plain', 'baseline', 'gsq', *['mtp-k'+str(i) for i in range(1,9)]],
          'deepseek-pair': ['default','greedy','dspark','baseline'], 'glm-pair': ['r1b','r1','mtp','baseline'],
-         'minimax-pair': ['default','greedy','dspark','baseline'], 'deepseek-rtx': ['default','baseline']}
+         'minimax-pair': ['default','greedy','dspark','baseline'], 'deepseek-rtx': ['default','baseline'],
+         'nemotron': ['default','fast','quality']}
 
 def resolve(args, kit):
     engine,suite,ctx,gen,conc,rep,warm,profile,prompts,only,serve = args
@@ -65,7 +66,7 @@ def prompt_set(source,kit):
 
 def help_text():
     print('''bench.sh list [--json] | check --engine E [--peer HOST] [--json]
-bench.sh run --engine qwen|deepseek|glm|minimax|deepseek-rtx|all [options]
+bench.sh run --engine qwen|deepseek|glm|minimax|deepseek-rtx|nemotron|all [options]
 Aliases: deepseek-pair, glm-pair, minimax-pair.
 --contexts 1k,8k,32k  --gen-tokens N  --concurrency 1,4,8
 --prompts kit|FILE   --repeat N       --warmup N
@@ -83,6 +84,7 @@ Examples:
   bench.sh run --engine glm --peer node-b --profile r1
   bench.sh run --engine minimax --peer node-b
   bench.sh run --engine deepseek-rtx --bin-dir build-rtx
+  bench.sh run --engine nemotron --profile fast --only exactness,serve
   bench.sh run --engine qwen --contexts 1k --only prefill --repeat 1 --warmup 0
   bench.sh run --engine minimax --peer node-b --only serve --concurrency 1,4,8
 See docs/reproduce.md for assets, profile allowlists, timing and JSON contracts.''')

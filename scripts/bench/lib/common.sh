@@ -8,8 +8,8 @@ declare -A effective_remote_dirs=() effective_decode_env=()
 py() { "${BENCH_PYTHON:-python3}" "$BENCH_ROOT/scripts/bench/lib/kit.py" "$@"; }
 die() { printf 'bench: %s\n' "$*" >&2; exit 1; }
 load_profile() {
-    case $1 in qwen|deepseek-pair|glm-pair|minimax-pair|deepseek-rtx) ;;
-        *) die 'select --engine qwen|deepseek-pair|glm-pair|minimax-pair|deepseek-rtx' ;;
+    case $1 in qwen|deepseek-pair|glm-pair|minimax-pair|deepseek-rtx|nemotron) ;;
+        *) die 'select --engine qwen|deepseek-pair|glm-pair|minimax-pair|deepseek-rtx|nemotron' ;;
     esac
     # These are project-owned files selected by the closed enum above.
     # shellcheck source=/dev/null
