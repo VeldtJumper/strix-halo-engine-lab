@@ -243,10 +243,10 @@ Prefill (tok/s; todos los perfiles usan prefill exacto):
 | 512 | 532 | 551 | 794 | 2,077 |
 | 2K | 535 | 538 | 815 | 2,062 |
 | 8K | 509 | 509 | 746 | 1,881 |
-| 16K | 404 | 403 | 618 | 1,684 |
-| 32K | 358 | 355 | 520 | 1,373 |
+| 16K | 462 | 465 | 638 | 1,689 |
+| 32K | 397 | 399 | 533 | 1,376 |
 
-Las filas de 16K y 32K proceden de una sesión anterior; las demás, de esta sesión. El prefill exacto usa aritmética FP32 sin contracción, así que los ids de token y el estado son idénticos en todas
+El prefill exacto usa aritmética FP32 sin contracción, así que los ids de token y el estado son idénticos en todas
 las longitudes; `quality` usa el prefill exacto de muchas filas de EXL3. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura
 las pasadas de ocho filas con los mismos bytes. El prefill WMMA del perfil `fast` está pendiente de cualificación y no
 se aplica.

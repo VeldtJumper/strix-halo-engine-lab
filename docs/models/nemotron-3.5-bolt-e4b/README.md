@@ -228,10 +228,10 @@ Prefill (tok/s; every profile uses exact prefill):
 | 512 | 532 | 551 | 794 | 2,077 |
 | 2K | 535 | 538 | 815 | 2,062 |
 | 8K | 509 | 509 | 746 | 1,881 |
-| 16K | 404 | 403 | 618 | 1,684 |
-| 32K | 358 | 355 | 520 | 1,373 |
+| 16K | 462 | 465 | 638 | 1,689 |
+| 32K | 397 | 399 | 533 | 1,376 |
 
-The 16K and 32K rows come from an earlier session; the other rows from this session. Exact prefill uses FP32 arithmetic without contraction, so token ids and state are identical at every length;
+Exact prefill uses FP32 arithmetic without contraction, so token ids and state are identical at every length;
 `quality` runs the exact many-row EXL3 prefill. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restores the eight-row passes with
 the same bytes. The `fast` profile's WMMA prefill is pending qualification and is not applied.
 
