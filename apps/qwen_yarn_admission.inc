@@ -187,9 +187,11 @@ inline bool yarn_environment_value_accepted(const YarnEnvironmentRule& rule, std
         first = bar + 1U;
     }
 }
+// The only STRIX_QPF2K_SCHED value YaRN admits; a defaulted schedule resolves to it.
+inline constexpr const char* yarn_qualified_schedule = "12";
 inline std::string yarn_environment_refusal(const Environment& environment, unsigned factor) {
     if (const auto it = environment.find("STRIX_QPF2K_SCHED");
-        it != environment.end() && it->second != "12")
+        it != environment.end() && it->second != yarn_qualified_schedule)
         return "YaRN requires STRIX_QPF2K_SCHED=12; got " + it->second;
     // Every offending variable is listed; a lone unclassified name keeps the historical notice.
     std::vector<std::string> unsupported;
@@ -280,6 +282,9 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
             const auto it = result.environment.find(name);
             return it == result.environment.end() ? nullptr : it->second.c_str();
         }, [&](const char* name, const char* value) {
+            // A defaulted schedule stays at YaRN's audited 12 (the native default 14 adds bit 2, which YaRN's owner
+            // inventory and qualification do not cover). An explicit value other than 12 still refuses below.
+            if (std::string_view(name) == "STRIX_QPF2K_SCHED") value = yarn_qualified_schedule;
             result.environment.emplace(name, value); return true;
         });
         for (const auto& entry : qpf2k::defaults)

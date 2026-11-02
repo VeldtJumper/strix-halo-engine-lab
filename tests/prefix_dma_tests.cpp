@@ -289,6 +289,32 @@ void prefix_dma_tests() {
             require(prefix_state_cache_identity(in) == original, "profile metadata preserves prefix namespace");
             if (saved) ::setenv(name, saved->c_str(), 1); else ::unsetenv(name);
         }
+        {
+            // STRIX_QPF2K_SCHED bit 2 where the route never defers (MTP bridge/HTTP, defaulted CLI prefix cache): the
+            // namespace binds the executed schedule, so 14 there keeps the schedule-12 entries; a deferring route,
+            // 13 and the startup provenance marker behave as before.
+            const char* old=std::getenv("STRIX_QPF2K_SCHED");
+            const std::optional<std::string> saved=old?std::optional<std::string>{old}:std::nullopt;
+            const auto key=[&](const char* sched,bool defers) {
+                ::setenv("STRIX_QPF2K_SCHED",sched,1);
+                in.effective_execution=prefix_effective_execution_signature("effective-cli",false,false,{},prefill_options_active(),defers);
+                return prefix_state_cache_identity(in);
+            };
+            const auto twelve=key("12",true);
+            require(key("12",false)==twelve,"schedule 12 has no bit 2 to mask");
+            require(key("14",false)==twelve,"a non-deferring route keeps the schedule-12 prefix namespace");
+            require(key("14",true)!=twelve,"a deferring route binds schedule 14");
+            require(key("13",false)!=twelve && key("15",false)==key("13",true),"only bit 2 is masked");
+            ::setenv("STRIX_QPF2K_SCHED","14",1);
+            in.effective_execution=prefix_effective_execution_signature("effective-cli",false,false);
+            const auto unmarked=prefix_state_cache_identity(in);
+            ::setenv("STRIX_QPF2K_PRE_INJECTED","1",1);
+            in.effective_execution=prefix_effective_execution_signature("effective-cli",false,false);
+            require(prefix_state_cache_identity(in)==unmarked,"startup provenance marker is not part of the namespace");
+            ::unsetenv("STRIX_QPF2K_PRE_INJECTED");
+            if(saved) ::setenv("STRIX_QPF2K_SCHED",saved->c_str(),1); else ::unsetenv("STRIX_QPF2K_SCHED");
+            in.effective_execution=signature();
+        }
         for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_POOL_PACKED",
                 "STRIX_QSA_DECODE_POOL","STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_QSA_DECODE_POOL_CHECK","STRIX_PREFILL_MOE_MERGE_VEC",
                 "STRIX_QPF2K_DEFAULTS","STRIX_BASELINE","STRIX_QPF2K_QSA_MASK","STRIX_QPF2K_MOE_ROUTE_BF16"}) {

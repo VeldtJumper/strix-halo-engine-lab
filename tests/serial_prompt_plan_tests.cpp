@@ -1,4 +1,5 @@
 #include "strix/known_prompt_chunks.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -85,6 +86,36 @@ int main(int argc,char** argv) {
                 require(refused && calls.size()==count,"unsupported continuation refuses before writes");
             }
         }
+    }
+    if(schedule&2U) {
+        // A CLI prefix-state cache with a defaulted schedule drops bit 2 (qpf2k::cli_sched_defers): the same units
+        // without the deferral, so the full-T boundaries stay save/resume points. With bit 2 they are not.
+        const std::vector<std::uint32_t> prompt(8193,1);
+        KnownPromptChunkRequest r;
+        r.prompt_tokens=prompt;r.vocab_size=16;r.context_capacity=16384;r.eos_token_id=15;
+        r.logical_rows=2048;r.tiled_prefill=true;r.output_policy=KnownWindowOutputPolicy::terminal_row;
+        r.schedule_extensions=true;r.ladder_tail_rows={1024,256};
+        std::vector<Call> calls;
+        Backend blocks(2048,calls),tail1(1024,calls),tail2(256,calls),serial(1,calls);
+        const auto plan=[&](bool defer) {
+            r.schedule_defer=defer;
+            KnownPromptChunkCursor c(r,blocks,serial);c.set_tail_backend(tail1);c.set_tail_backend(tail2);
+            return c.cold_plan();
+        };
+        const auto deferred=plan(true),kept=plan(false);
+        require(std::any_of(deferred.begin(),deferred.end(),[](const auto& u){return u.deferred;}),"bit 2 defers blocks");
+        require(std::none_of(kept.begin(),kept.end(),[](const auto& u){return u.deferred;}),"schedule_defer=false defers nothing");
+        require(deferred.size()==kept.size(),"dropping bit 2 keeps the units");
+        for(std::size_t i=0;i<kept.size();++i) {auto u=deferred[i];u.deferred=false;require(u==kept[i],"dropping bit 2 keeps each unit");}
+        for(const std::uint64_t b:{2048U,4096U,6144U}) {
+            require(!known_prompt_full_t_prefix(deferred,b,2048),"deferred blocks are no cache boundaries");
+            require(known_prompt_full_t_prefix(kept,b,2048),"without bit 2 every full-T boundary is a cache boundary");
+        }
+        r.schedule_defer=false;
+        KnownPromptChunkCursor run(r,blocks,serial);run.set_tail_backend(tail1);run.set_tail_backend(tail2);
+        require(run.can_resume_at(4096),"a cached run without bit 2 can resume at a full-T boundary");
+        while(run.advance()) {}
+        require(std::none_of(calls.begin(),calls.end(),[](const Call& c){return c.deferred;}),"no backend call is deferred");
     }
     std::cout<<"serial prompt plan PASS schedule "<<schedule<<'\n';
 }

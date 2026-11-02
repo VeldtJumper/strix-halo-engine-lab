@@ -4,7 +4,10 @@
 
 namespace strix::decode_cli {
 // Family matching only. Never use this filtered contract as a storage namespace.
-inline ModelContentIdentity cache_family_execution_signature(std::string_view cli, bool baseline, bool gsq, const RotaryIdentity& rotary = {}) {
+// `sched_defers`: whether the runner executes STRIX_QPF2K_SCHED bit 2 (cache_runner_defers). Where it does not, the
+// signature binds the schedule the runner executes (bit 2 masked), as the scheduler field of the family does.
+inline ModelContentIdentity cache_family_execution_signature(std::string_view cli, bool baseline, bool gsq, const RotaryIdentity& rotary = {},
+    bool sched_defers = true) {
     // Length-framed, sorted runtime environment also covers launcher-only controls.
     // Include post-resolver suppression separately: injected values can remain present
     // while their readers suppress them for baseline or GSQ owners.
@@ -14,9 +17,15 @@ inline ModelContentIdentity cache_family_execution_signature(std::string_view cl
     for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16"})
         long_context+=std::string(";")+name+"="+(qpf2k::long_context_item_enabled(name,gsq)?"1":"0");
+    std::vector<std::string> executed;
+    if (const char* v = std::getenv("STRIX_QPF2K_SCHED")) {
+        const auto raw = static_cast<std::uint64_t>(std::strtoull(v, nullptr, 0));
+        if (const auto run = qpf2k::effective_sched(raw, sched_defers); run != raw)
+            executed.push_back("STRIX_QPF2K_SCHED=" + std::to_string(run));
+    }
     const auto canonical=session_family_numerical_config(std::string(cli)+";prefix-execution-v4;baseline="+
         std::to_string(baseline || qpf2k::baseline)+";gsq="+std::to_string(gsq)+
-        ";defaulted="+std::to_string(qpf2k::defaulted_items)+long_context,rotary);
+        ";defaulted="+std::to_string(qpf2k::defaulted_items)+long_context,rotary,executed);
     return sha256_bytes(std::as_bytes(std::span(canonical.data(),canonical.size())));
 }
 // Auto vocabulary selection can read any of these files as prompts change.

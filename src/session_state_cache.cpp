@@ -89,7 +89,8 @@ ModelContentIdentity session_cached_file_hash(const std::filesystem::path& path,
     require(identity()==key,"session content file changed during hashing");
     cache.emplace(key,h); return h;
 }
-static std::string numerical_config(std::string_view cli, const RotaryIdentity& rotary, bool family) {
+static std::string numerical_config(std::string_view cli, const RotaryIdentity& rotary, bool family,
+    std::span<const std::string> replace = {}) {
     std::vector<std::string> env;
 #ifdef _WIN32
     auto p=_environ;
@@ -109,6 +110,8 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
         // The last-layer cache-only QSA step writes the same persistent state as the full step.
         if (value.starts_with("STRIX_QSA_CACHE_ONLY=")) continue;
         if (value.starts_with("GPU_TURN_") || value.starts_with("GPU_WINDOW=") || value.starts_with("STRIX_HASH_CACHE=")) continue;
+        // Startup provenance of injected defaults (qpf2k::pre_injected_env); the values themselves stay bound.
+        if (value.starts_with("STRIX_QPF2K_PRE_INJECTED=")) continue;
         // This observer does not alter the single tiled-MTP execution/flush order.
         // PROMPT_STATE, PREFIX_CACHE, SERIAL_LOGITS and FINAL_STATE remain in the match:
         // their consumers can flush pending windows or synchronize a device readback.
@@ -119,7 +122,14 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
         if (value.starts_with("STRIX_SESSION_DIRECT_IO=") || value.starts_with("STRIX_SESSION_READAHEAD=") ||
             value.starts_with("STRIX_SESSION_CHUNKED=")) continue;
         for (const auto prefix : {"STRIX_", "HIP_", "HSA_", "AMD_", "ROCR_", "GPU_"})
-            if (value.starts_with(prefix)) { env.emplace_back(*p); break; }
+            if (value.starts_with(prefix)) {
+                const auto it = std::find_if(replace.begin(), replace.end(), [&](const std::string& r) {
+                    const auto equal = r.find('=');
+                    return equal != std::string::npos && value.starts_with(std::string_view(r).substr(0, equal + 1U));
+                });
+                if (it != replace.end()) env.emplace_back(*it); else env.emplace_back(*p);
+                break;
+            }
     }
     std::sort(env.begin(),env.end());
     Writer w; w.str("qwen-effective-execution-v3");
@@ -133,8 +143,16 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
 std::string session_numerical_config(std::string_view cli, const RotaryIdentity& rotary) {
     return numerical_config(cli,rotary,false);
 }
+std::string session_numerical_config(std::string_view cli, const RotaryIdentity& rotary,
+    std::span<const std::string> replace) {
+    return numerical_config(cli,rotary,false,replace);
+}
 std::string session_family_numerical_config(std::string_view cli, const RotaryIdentity& rotary) {
     return numerical_config(cli,rotary,true);
+}
+std::string session_family_numerical_config(std::string_view cli, const RotaryIdentity& rotary,
+    std::span<const std::string> replace) {
+    return numerical_config(cli,rotary,true,replace);
 }
 PrefixCacheBuffer encode_session_checkpoint(const SessionCheckpoint& c,const PrefixCacheAllocator& alloc) {
     frontier_valid(c.frontier);

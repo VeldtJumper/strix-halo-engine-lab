@@ -1037,6 +1037,14 @@ std::uint32_t prefix_cache_unit(const O& options) {
 
 }  // namespace
 
+// Whether the route owning a prefix-state namespace can execute STRIX_QPF2K_SCHED bit 2. The MTP bridge (CLI --mtp,
+// HTTP, cohorts) never defers; the CLI cursor drops a defaulted bit 2 under a prefix-state cache, but a session/RTX
+// registry without one defers, so a registry keeps the conservative answer (a miss, never a shared key).
+static bool prefix_namespace_sched_defers(const strix::decode_cli::Options& options, bool rtx_state_registry) {
+    if (options.mtp.enabled || options.http_serve) return false;
+    return strix::qpf2k::cli_sched_defers(!rtx_state_registry);
+}
+
 #ifndef STRIX_DECODE_ENTRY
 #define STRIX_DECODE_ENTRY main
 #endif
@@ -1044,7 +1052,10 @@ std::uint32_t prefix_cache_unit(const O& options) {
 // range predicate. This never replaces the storage/certificate identity.
 static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
     const strix::decode_cli::Options& options, const strix::ModelContract& source_model,
-    const strix::ModelManifest& manifest, const strix::MappedModelFile& mapped) {
+    const strix::ModelManifest& manifest, const strix::MappedModelFile& mapped, strix::decode_cli::CacheRunner runner) {
+    // The schedule this runner executes (STRIX_QPF2K_SCHED bit 2 is inert off the CLI cursor), in the scheduler field
+    // and in the numerical contract alike.
+    const bool sched_defers=strix::decode_cli::cache_runner_defers(runner);
     auto model=source_model;
     model.attention_kv_storage=options.attention_kv_storage;
     strix::SerialSessionStateLayoutRequest family_layout;
@@ -1072,13 +1083,13 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
     cache_family.profile_pair=std::to_string(strix::numerical_profile_pair_identity(profiles));
     cache_family.output_policy=std::to_string(static_cast<unsigned>(options.known_prefix_output_policy));
     cache_family.numerical_contract=strix::model_content_identity_hex(cache_family_execution_signature(
-        cache_family_execution_cli(options),options.baseline,strix::qpf2k::has_gsq_gate(manifest),model.rotary_identity()));
+        cache_family_execution_cli(options),options.baseline,strix::qpf2k::has_gsq_gate(manifest),model.rotary_identity(),sched_defers));
     cache_family.tails=options.known_prefix_tail_rows;
     const auto number=[](const char* name,std::uint64_t fallback) {
         const char* value=std::getenv(name); return value?static_cast<std::uint64_t>(std::strtoull(value,nullptr,0)):fallback;
     };
     auto& c=cache_family.scheduler;
-    c.schedule=number("STRIX_QPF2K_SCHED",0); c.pipe=number("STRIX_PREFILL_PIPE",0);
+    c.schedule=strix::qpf2k::effective_sched(number("STRIX_QPF2K_SCHED",0),sched_defers); c.pipe=number("STRIX_PREFILL_PIPE",0);
     c.groups=strix::decode_cli::MtpBatchRunner::prompt_batching(); c.group_rows=strix::decode_cli::MtpBatchRunner::prompt_group_rows(); c.group_owner=(number("STRIX_PROMPT_BATCH_ROWS",0)>options.known_prefix_prefill_rows);
     c.cohort=strix::decode_cli::MtpBatchRunner::prompt_window_cohort(); c.small=number("STRIX_BATCH_PROMPT_SMALL",0)!=0;
     c.windows=number("STRIX_PROMPT_WINDOW",1)!=0;
@@ -1467,7 +1478,9 @@ static int run_decode_entry(
         if (text.starts_with("STRIX_") && equal != std::string_view::npos) {
             const auto name = text.substr(0, equal);
             if (strix::qwen::profile::metadata_environment(name)) continue;
-            const bool injected = (name == "STRIX_QPF2K_MOE_DEFAULTED" && strix::qpf2k::pre_injected_moe_marker) ||
+            // The pre-injection marker is startup provenance (it survives an image restart), never a request.
+            const bool injected = name == strix::qpf2k::pre_injected_env ||
+                (name == "STRIX_QPF2K_MOE_DEFAULTED" && strix::qpf2k::pre_injected_moe_marker) ||
                 std::any_of(strix::qpf2k::defaults.begin(), strix::qpf2k::defaults.end(), [&](const auto& item) {
                     return name == item.name && (strix::qpf2k::pre_injected & strix::qpf2k::bit(item.item));
                 });
@@ -1605,7 +1618,9 @@ static int run_decode_entry(
     if (options.moe_shared_overlap && !options.deferred_moe_status)
         throw std::invalid_argument("MoE shared overlap requires the resolved eager deferred-status owner");
     if (options.print_cache_family) {
-        const auto identity=resolved_cache_family(options,model,manifest,mapped);
+        // The schedule the route executes (STRIX_QPF2K_SCHED bit 2 is inert on HTTP/MTP), as qualification compares it.
+        const auto identity=resolved_cache_family(options,model,manifest,mapped,
+            options.http_serve?strix::decode_cli::CacheRunner::single_mtp:strix::decode_cli::CacheRunner::cli);
         std::cout << strix::decode_cli::cache_family_identity_json(identity).dump() << '\n';
         return 0;
     }
@@ -3457,7 +3472,8 @@ static int run_decode_entry(
             for(const auto& arg : strix::decode_cli::effective_prefill_argv(options))
                 execution_cli += std::to_string(arg.size())+":"+arg;
             in.effective_execution = strix::decode_cli::prefix_effective_execution_signature(
-                execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity(), effective.prefill_option_mask);
+                execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity(), effective.prefill_option_mask,
+                prefix_namespace_sched_defers(options, rtx_state_registry));
             if (!options.prefix_cache_dir.empty()) in.engine_build = strix::decode_cli::prefix_state_cache_engine_build();
             in.state_layout_identity = state_layout.layout_identity;
             in.runtime_compatibility_identity = identities.compatibility_identity;
@@ -3512,7 +3528,8 @@ static int run_decode_entry(
                 for(const auto& arg : strix::decode_cli::effective_prefill_argv(options))
                     execution_cli += std::to_string(arg.size())+":"+arg;
                 in.effective_execution = strix::decode_cli::prefix_effective_execution_signature(
-                    execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity());
+                    execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity(),
+                    strix::prefill_options_active(), prefix_namespace_sched_defers(options, rtx_state_registry));
                 if (!options.prefix_cache_dir.empty()) in.engine_build = strix::decode_cli::prefix_state_cache_engine_build();
                 in.state_layout_identity = state_layout.layout_identity;
                 in.runtime_compatibility_identity = identities.compatibility_identity;
@@ -4061,7 +4078,7 @@ static int run_decode_entry(
         if(inspect_qualified_family) {
             // Hash work is deferred until a release row exists. Paths never serve
             // as asset identity; unknown assets leave the family unmatched.
-            cache_family=resolved_cache_family(options,model,manifest,mapped);
+            cache_family=resolved_cache_family(options,model,manifest,mapped,cache_runner);
         }
         strix::decode_cli::finalize_cache_family(options,cache_runner,
             static_cast<std::uint32_t>(batch_slots?batch_slots:1),cache_family);
@@ -5066,6 +5083,8 @@ static int run_decode_entry(
             // Teacher-forced: no headless block, and the serial suffix rows are scored like serial rows.
             paired.all_row_heads = options.teacher_forced_score;
             paired.schedule_extensions = true;
+            // A prefix-state cache with a defaulted schedule drops bit 2 (deferred blocks are no save/resume points).
+            paired.schedule_defer = strix::qpf2k::cli_sched_defers(static_cast<bool>(prefix_state));
             paired.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
             paired.emission_hook = request.emission_hook;
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
@@ -5075,7 +5094,8 @@ static int run_decode_entry(
                 strix::decode_cli::QwenTiledPlanConfig plan;
                 plan.rows=paired.logical_rows;
                 const char* sched=std::getenv("STRIX_QPF2K_SCHED");
-                plan.schedule=sched?static_cast<std::uint32_t>(std::strtoul(sched,nullptr,0)):0U;
+                plan.schedule=static_cast<std::uint32_t>(strix::qpf2k::effective_sched(
+                    sched?std::strtoul(sched,nullptr,0):0UL,paired.schedule_defer));
                 plan.suppressed=strix::qpf2k::suppressed(strix::qpf2k::Item::sched,known_prefix_backend->gsq_model());
                 const auto policy=[](strix::KnownWindowOutputPolicy p) {
                     return p==strix::KnownWindowOutputPolicy::state_only?strix::decode_cli::QwenPlanOutput::state_only:

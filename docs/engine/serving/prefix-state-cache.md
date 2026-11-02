@@ -589,8 +589,10 @@ in that request. Single-route certificates and segments never mix with batch.
 
 A group owner created by `STRIX_PROMPT_BATCH_ROWS > T` declines even when
 `STRIX_PROMPT_BATCH=0`; the receipt names `group-owner:prompt-batch-rows`.
-SMALL, a separate group owner, schedule bit 2, state import/export and resumed
-sessions decline certification. The next writer must be the same T owner/stream:
+SMALL, a separate group owner, state import/export and resumed
+sessions decline certification. Schedule bit 2 (part of the default
+`STRIX_QPF2K_SCHED=14`) is inert on this route, so the plan, its identity and
+certification use the schedule-12 equivalent. The next writer must be the same T owner/stream:
 a full-T unit, or a partial T unit with nesting ruled out. The nesting check
 conservatively treats every active 8192-row nesting configuration as possible,
 including profiles/ladders that might themselves decline nesting. No producer

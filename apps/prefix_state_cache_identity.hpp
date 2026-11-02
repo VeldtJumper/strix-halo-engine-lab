@@ -5,13 +5,19 @@
 #include "strix/session_state_cache.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include <span>
+#include <string>
 #include <stdexcept>
 #include <vector>
 namespace strix::decode_cli {
 // Everything that changes the state the tiled prefill produces for a token prefix. Fields that
 // cannot change it under one profile (the decode identities when T divides the prefix) are kept
 // anyway: a key must never be shared by two configurations whose outputs could differ.
-inline ModelContentIdentity prefix_effective_execution_signature(std::string_view cli, bool baseline, bool gsq, const RotaryIdentity& rotary = {}, unsigned prefill_mask = prefill_options_active()) {
+// `sched_defers`: whether the route that owns this namespace can execute STRIX_QPF2K_SCHED bit 2. Where it cannot
+// (the MTP bridge: CLI --mtp, HTTP, cohorts; a CLI prefix-state cache run with a defaulted schedule), bit 2 is
+// inert: the same kernels, rows, order and save points run as with schedule 12, so the namespace binds the
+// executed schedule and entries written under the former default 12 still hit. A deferring route binds the value.
+inline ModelContentIdentity prefix_effective_execution_signature(std::string_view cli, bool baseline, bool gsq, const RotaryIdentity& rotary = {}, unsigned prefill_mask = prefill_options_active(),
+    bool sched_defers = true) {
     // Length-framed, sorted runtime environment also covers launcher-only controls.
     // Include post-resolver suppression separately: injected values can remain present
     // while their readers suppress them for baseline or GSQ owners.
@@ -25,11 +31,17 @@ inline ModelContentIdentity prefix_effective_execution_signature(std::string_vie
     const bool route_bf16 = !baseline && !qpf2k::baseline && !gsq && moe_route_bf16_environment_requested(
         std::getenv("STRIX_QPF2K_MOE_ROUTE_BF16"), std::getenv("STRIX_BASELINE"), std::getenv("STRIX_QPF2K_DEFAULTS"));
     long_context += std::string(";STRIX_QPF2K_MOE_ROUTE_BF16=") + (route_bf16 ? "1" : "0");
+    std::vector<std::string> executed;
+    if (const char* v = std::getenv("STRIX_QPF2K_SCHED")) {
+        const auto raw = static_cast<std::uint64_t>(std::strtoull(v, nullptr, 0));
+        if (const auto run = qpf2k::effective_sched(raw, sched_defers); run != raw)
+            executed.push_back("STRIX_QPF2K_SCHED=" + std::to_string(run));
+    }
     const auto canonical=session_numerical_config(std::string(cli)+";prefix-execution-v5;baseline="+
         std::to_string(baseline || qpf2k::baseline)+";gsq="+std::to_string(gsq)+
         ";defaulted="+std::to_string(qpf2k::defaulted_items)+long_context+
         ";prefill_mask="+std::to_string(prefill_mask)+";prefill_identity="+prefill_identity_name(prefill_mask)+
-        ";prefill_identity_hash="+std::to_string(prefill_identity_hash(prefill_mask)),rotary);
+        ";prefill_identity_hash="+std::to_string(prefill_identity_hash(prefill_mask)),rotary,executed);
     return sha256_bytes(std::as_bytes(std::span(canonical.data(),canonical.size())));
 }
 struct PrefixStateCacheIdentityInputs {

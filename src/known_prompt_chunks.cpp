@@ -130,7 +130,7 @@ bool KnownPromptChunkCursor::advance() {
         try {windows_.finish_deferred();} catch(...) {progress_.failed=true;has_logits_=false;selection_.reset();throw;}
     }
     static const bool defer_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&2UL)!=0UL;}();
-    const bool defer=headless&&defer_env&&!defaults_off&&request_.schedule_extensions&&!tail&&backend==&windows_&&remaining-block>=(balanced?16U:request_.logical_rows);
+    const bool defer=headless&&defer_env&&!defaults_off&&request_.schedule_extensions&&request_.schedule_defer&&!tail&&backend==&windows_&&remaining-block>=(balanced?16U:request_.logical_rows);
     const auto rows=window?block:1U;
     const KnownPromptChunkUnit unit{progress_.next_position,progress_.next_position+rows,
         window?backend->logical_rows():1U,window&&!tail,balanced,merged_unit,defer,headless,state_only};

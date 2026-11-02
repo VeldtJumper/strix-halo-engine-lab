@@ -143,6 +143,7 @@ subject to their normal kernel/shape/resource checks.
 | `STRIX_QPF2K_MOE_DA16` | No | Expert activation/down |
 | `STRIX_QPF2K_MOE_ROUTE` | No | Expert routing |
 | `STRIX_QPF2K_MOE_DEFAULTED` | No | Two-bit MoE provenance mask; both defaults produce `3` |
+| `STRIX_QPF2K_PRE_INJECTED` | No | Startup provenance of the injected defaults across an image restart; never a request (the environment sweep skips it) |
 | `STRIX_PLE_RECLAIMABLE` | No | Page reclaim |
 | `STRIX_STARTUP_MARKERS` | No | Optional monotonic startup diagnostics (`0`/`1`) |
 | `STRIX_INTPREFILL_DENSE_ROWS` | No | Projection row grouping |
@@ -212,8 +213,9 @@ File:line citations refer to the implementation inventory, not model qualificati
   `block_score_rows_kernel` (unpooled index-key normalization/rotation).
 
 YaRN requires effective `STRIX_QPF2K_SCHED=12` before reclaim or estimation.
-Other schedule values, including unset with default injection disabled, refuse
-by name; native scheduling is unchanged. The
+A defaulted schedule resolves to `12` on YaRN (the native default is `14`, which
+adds bit 2). Other schedule values, including an explicit `14` and unset with
+default injection disabled, refuse by name; native scheduling is unchanged. The
 inventory covers merged primary CSR and the pruned tail owners for schedule 12.
 
 `STRIX_STARTUP_MARKERS=1` emits stderr lines of the form
