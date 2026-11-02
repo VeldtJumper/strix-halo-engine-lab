@@ -369,6 +369,13 @@ bool prefill_hc_fuse() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_HC_FUSE");
     return !(v && v[0] == '0');
 }
+// STRIX_DS41_PREFILL_HC_COLLAPSE (read per call; default on with HC_FUSE, =0 off): that fused expansion also writes the
+// next site's collapsed rows (the collapse uses the expansion's own pre), so the site's RMSNorm reads x instead of the
+// 4-copy stream; same bits
+bool prefill_hc_collapse() {
+    const char* v = std::getenv("STRIX_DS41_PREFILL_HC_COLLAPSE");
+    return !(v && v[0] == '0');
+}
 // STRIX_DS41_PREFILL_FINAL_KV=all (default since P17.5: 8K prefill +1.8 %, bitwise) | none | <comma-separated layers>
 bool prefill_final_kv(std::uint32_t layer) {
     static const std::vector<bool> on = [] {
@@ -1934,6 +1941,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     std::vector<std::uint32_t> trace_router;  // options.trace: this layer's router ids until the layer's end
     const bool hc_fuse = prefill_hc_fuse();
     bool hc_mixed = false;  // hc_fuse: the next site's mixes came with the expansion before it
+    const bool hc_collapse = hc_fuse && prefill_hc_collapse();
+    bool hc_collapsed = false;  // hc_collapse: the next site's collapsed rows are in x (written with the expansion)
     // the collapse's mixes of a site from row r0 (attn: the previous layer's ffn mixes, identity before the first)
     const auto collapse_mixes = [&](const std::string& site, std::uint32_t r0) -> const ds41::HcMix* {
         return site == "attn" ? (m.identity_pre ? nullptr : m.mix_ffn.p + r0) : m.mix_attn.p + r0;
@@ -2048,7 +2057,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             v.eps = 1e-20F;
             v.out = const_cast<float*>(v.x);
             v.out_stride = n;
-            if (!q && hc_fuse) {  // the collapse of the stream, as hc_pre
+            if (!q && hc_collapsed) hc_collapsed = false;  // x holds the collapse, as hc_pre would have written it
+            else if (!q && hc_fuse) {  // the collapse of the stream, as hc_pre
                 v.x = nullptr;
                 v.x_stride = 0;
                 v.hc_stream = stream_now() + std::size_t{r0} * stream_row;
@@ -2634,6 +2644,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.launches = 1;
                 v.form = 2;
                 v.tile = no >= 8U ? 8U : 0U;  // 0: by the row count (1, 2 or 4)
+                // the next site's collapse uses this expansion's mixes (mix_attn after attn, mix_ffn after ffn) from its
+                // first row: o0 for the ffn site, the next layer's x0 for its attention
+                if (hc_collapse && (attn || lrows[layer + 1U].x0 == o0)) {
+                    v.collapse_out = m.x.p + std::size_t{o0} * H;
+                    hc_collapsed = true;
+                }
                 ds41::enqueue_hc_site(v, st);
                 hc_mixed = true;
             } else if (no > 0U)

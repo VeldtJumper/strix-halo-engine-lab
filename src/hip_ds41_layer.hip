@@ -615,82 +615,113 @@ __device__ __forceinline__ float site_stream_value(const float* __restrict__ sub
 // and not stored): the fn values of the chunk are loaded once for the tile, the G rows' stream values go to LDS,
 // then wave w computes the chunk dots of fn rows 3w..3w+2 for every row of the tile and wave g the sum of squares
 // of tile row g. The last of the tile's partial blocks (one counter per tile) runs the split + Sinkhorn of tile
-// row g on wave g.
-template <bool Expand, bool Mix, unsigned G>
+// row g on wave g. Collapse (with Expand and Mix): the block takes the chunk at the same hidden offset in each of the
+// hc copies in turn (each chunk as above) and also stores the collapse of the expanded values with the expansion's
+// pre (as norm_input: from 0, ascending copies) to v.collapse_out.
+template <bool Expand, bool Mix, unsigned G, bool Collapse = false>
 __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
                                                   const HcMix* __restrict__ em, float* __restrict__ stream,
                                                   const std::uint16_t* __restrict__ fn, float* __restrict__ partial,
                                                   std::uint32_t* __restrict__ counters, unsigned mix_chunks, float* lds,
                                                   unsigned& last) {
     static_assert(G <= site_waves, "one wave per tile row");
-    constexpr unsigned pad = site_x_per_thread * site_threads;
+    static_assert(!Collapse || (Expand && Mix), "the collapse comes with the expansion and the mixes");
+    constexpr unsigned pad = site_x_per_thread * site_threads, copies = Collapse ? hc_copies : 1U;
     float (*xs)[pad] = reinterpret_cast<float (*)[pad]>(lds);
     const unsigned H = v.hidden, n = hc_copies * H, w = threadIdx.x / wave, l = threadIdx.x % wave, rows = v.rows;
-    const unsigned c = blockIdx.x % mix_chunks, tile = blockIdx.x / mix_chunks, r0 = tile * G, c0 = c * chunk, kc = c0 / H, i0 = c0 % H;
-    float x[G][site_x_per_thread];
+    const unsigned per_tile = mix_chunks / copies, b = blockIdx.x % per_tile, tile = blockIdx.x / per_tile, r0 = tile * G;
+    float y[G][site_x_per_thread];
 #pragma unroll
-    for (unsigned g = 0; g < G; ++g) {
-        const unsigned r = r0 + g < rows ? r0 + g : rows - 1U;
-        const float* srow = stream + static_cast<std::size_t>(r) * n + c0;
+    for (unsigned g = 0; g < G; ++g)
 #pragma unroll
-        for (unsigned u = 0; u < site_x_per_thread; ++u) {  // past the chunk: a repeat of its last value, not stored (no branch)
-            const unsigned e = threadIdx.x + u * site_threads < chunk ? threadIdx.x + u * site_threads : chunk - 1U;
-            x[g][u] = site_stream_value<Expand>(sub, residual, em, srow, r, kc, i0 + e, H, e);
-        }
-    }
-    std::uint16_t raw[site_mixes][chunk_k];
-    if constexpr (Mix) {
-        const std::uint16_t* f = fn + static_cast<std::size_t>(w * site_mixes) * n + c0 + l;
-#pragma unroll
-        for (unsigned j = 0; j < site_mixes; ++j)
-#pragma unroll
-            for (unsigned k = 0; k < chunk_k; ++k) raw[j][k] = f[static_cast<std::size_t>(j) * n + k * wave];
-    }
-#pragma unroll
-    for (unsigned g = 0; g < G; ++g) {
-        float* srow = stream + static_cast<std::size_t>(r0 + g) * n + c0;
-#pragma unroll
-        for (unsigned u = 0; u < site_x_per_thread; ++u) {  // xs is padded to whole passes: its stores need no branch
-            const unsigned e = threadIdx.x + u * site_threads;
-            xs[g][e] = x[g][u];
-            if constexpr (Expand)
-                if (r0 + g < rows && ((u + 1U) * site_threads <= chunk || e < chunk)) srow[e] = x[g][u];
-        }
-    }
-    if constexpr (Mix) {
-        __syncthreads();
-        float f[site_mixes][chunk_k];
-#pragma unroll
-        for (unsigned j = 0; j < site_mixes; ++j)
-#pragma unroll
-            for (unsigned k = 0; k < chunk_k; ++k) f[j][k] = f16_to_float_select(raw[j][k]);
+        for (unsigned u = 0; u < site_x_per_thread; ++u) y[g][u] = 0.0F;
+    for (unsigned q = 0; q < copies; ++q) {
+        if (q) __syncthreads();  // the previous copy's dots have read xs
+        const unsigned c = q * per_tile + b, c0 = c * chunk, kc = c0 / H, i0 = c0 % H;
+        float x[G][site_x_per_thread];
 #pragma unroll
         for (unsigned g = 0; g < G; ++g) {
-            const unsigned r = r0 + g;
-            if (r >= rows) break;
-            float acc[site_mixes] = {};
-            float sq = 0.0F;
+            const unsigned r = r0 + g < rows ? r0 + g : rows - 1U;
+            const float* srow = stream + static_cast<std::size_t>(r) * n + c0;
 #pragma unroll
-            for (unsigned k = 0; k < chunk_k; ++k) {
-                const float xv = xs[g][k * wave + l];
-                if (w == g) sq = sq + xv * xv;
-#pragma unroll
-                for (unsigned j = 0; j < site_mixes; ++j) acc[j] = acc[j] + f[j][k] * xv;
+            for (unsigned u = 0; u < site_x_per_thread; ++u) {  // past the chunk: a repeat of its last value, not stored (no branch)
+                const unsigned e = threadIdx.x + u * site_threads < chunk ? threadIdx.x + u * site_threads : chunk - 1U;
+                x[g][u] = site_stream_value<Expand>(sub, residual, em, srow, r, kc, i0 + e, H, e);
             }
-            const std::size_t base = static_cast<std::size_t>(r) * mix_waves;
+            if constexpr (Collapse) {
+                const float pre = em[r].pre[kc];
 #pragma unroll
-            for (unsigned j = 0; j < site_mixes; ++j) {
-                const float s = site_butterfly(acc[j]);
-                if (l == 0) partial[(base + w * site_mixes + j) * mix_chunks + c] = s;
-            }
-            if (w == g) {
-                const float s = site_butterfly(sq);
-                if (l == 0) partial[(base + hc_mix_count) * mix_chunks + c] = s;
+                for (unsigned u = 0; u < site_x_per_thread; ++u) y[g][u] = y[g][u] + pre * x[g][u];
             }
         }
+        std::uint16_t raw[site_mixes][chunk_k];
+        if constexpr (Mix) {
+            const std::uint16_t* f = fn + static_cast<std::size_t>(w * site_mixes) * n + c0 + l;
+#pragma unroll
+            for (unsigned j = 0; j < site_mixes; ++j)
+#pragma unroll
+                for (unsigned k = 0; k < chunk_k; ++k) raw[j][k] = f[static_cast<std::size_t>(j) * n + k * wave];
+        }
+#pragma unroll
+        for (unsigned g = 0; g < G; ++g) {
+            float* srow = stream + static_cast<std::size_t>(r0 + g) * n + c0;
+#pragma unroll
+            for (unsigned u = 0; u < site_x_per_thread; ++u) {  // xs is padded to whole passes: its stores need no branch
+                const unsigned e = threadIdx.x + u * site_threads;
+                xs[g][e] = x[g][u];
+                if constexpr (Expand)
+                    if (r0 + g < rows && ((u + 1U) * site_threads <= chunk || e < chunk)) srow[e] = x[g][u];
+            }
+        }
+        if constexpr (Mix) {
+            __syncthreads();
+            float f[site_mixes][chunk_k];
+#pragma unroll
+            for (unsigned j = 0; j < site_mixes; ++j)
+#pragma unroll
+                for (unsigned k = 0; k < chunk_k; ++k) f[j][k] = f16_to_float_select(raw[j][k]);
+#pragma unroll
+            for (unsigned g = 0; g < G; ++g) {
+                const unsigned r = r0 + g;
+                if (r >= rows) break;
+                float acc[site_mixes] = {};
+                float sq = 0.0F;
+#pragma unroll
+                for (unsigned k = 0; k < chunk_k; ++k) {
+                    const float xv = xs[g][k * wave + l];
+                    if (w == g) sq = sq + xv * xv;
+#pragma unroll
+                    for (unsigned j = 0; j < site_mixes; ++j) acc[j] = acc[j] + f[j][k] * xv;
+                }
+                const std::size_t base = static_cast<std::size_t>(r) * mix_waves;
+#pragma unroll
+                for (unsigned j = 0; j < site_mixes; ++j) {
+                    const float s = site_butterfly(acc[j]);
+                    if (l == 0) partial[(base + w * site_mixes + j) * mix_chunks + c] = s;
+                }
+                if (w == g) {
+                    const float s = site_butterfly(sq);
+                    if (l == 0) partial[(base + hc_mix_count) * mix_chunks + c] = s;
+                }
+            }
+        }
+    }
+    if constexpr (Collapse) {
+        const unsigned i0 = b * chunk;
+#pragma unroll
+        for (unsigned g = 0; g < G; ++g) {
+            float* crow = v.collapse_out + static_cast<std::size_t>(r0 + g) * H + i0;
+#pragma unroll
+            for (unsigned u = 0; u < site_x_per_thread; ++u) {
+                const unsigned e = threadIdx.x + u * site_threads;
+                if (r0 + g < rows && ((u + 1U) * site_threads <= chunk || e < chunk)) crow[e] = y[g][u];
+            }
+        }
+    }
+    if constexpr (Mix) {
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");  // the partials before the increment (no acquire needed here)
         __syncthreads();
-        if (threadIdx.x == 0) last = atomicAdd(counters + tile, 1U) == mix_chunks - 1U;
+        if (threadIdx.x == 0) last = atomicAdd(counters + tile, 1U) == per_tile - 1U;
         __syncthreads();
         if (!last) return;
         // Acquire at agent scope, as in site_body.
@@ -779,6 +810,14 @@ __global__ __launch_bounds__(site_threads) void hc_site_fast_kernel(HcSiteView v
     else
         site_fast_norm<Expand>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
                                blockIdx.x - partial_blocks, norm_chunks, norm_part, lds, sq);
+}
+// Expansion + mixes + the collapse with the expansion's pre (HcSiteView::collapse_out): partial blocks only.
+template <unsigned G>
+__global__ __launch_bounds__(site_threads) void hc_site_collapse_kernel(HcSiteView v, unsigned mix_chunks) {
+    __shared__ float lds[G * site_x_per_thread * site_threads];
+    __shared__ unsigned last;
+    site_fast_partial<true, true, G, true>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
+                                           last);
 }
 using SiteFastKernel = void (*)(HcSiteView, unsigned, unsigned, unsigned, unsigned);
 template <unsigned G> SiteFastKernel site_fast_kernel(bool expand, bool mix) {
@@ -2072,7 +2111,11 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
                 (!v.fn || (v.base && v.scale && v.mixes_out && v.partial && v.counters && v.iters >= 1 &&
                            v.mixes_out != v.expand_mixes && v.mixes_out != v.collapse_mixes)) &&
                 (!v.norm_weight || ((v.out || v.codes) && (!v.out || v.out_stride >= H) &&
-                                    (!v.codes || (v.deltas && v.sums && v.a8_stride >= H && v.a8_stride % 32U == 0)))),
+                                    (!v.codes || (v.deltas && v.sums && v.a8_stride >= H && v.a8_stride % 32U == 0)))) &&
+                (!v.collapse_out || (v.sub && v.fn && !v.norm_weight && v.form == 2 && v.launches == 1 &&
+                                     !overlap(v.stream, stream_bytes, v.collapse_out, stream_bytes / hc_copies) &&
+                                     !overlap(v.residual, stream_bytes, v.collapse_out, stream_bytes / hc_copies) &&
+                                     !overlap(v.sub, stream_bytes / hc_copies, v.collapse_out, stream_bytes / hc_copies))),
             "hc site view");
     // STRIX_DS41_HC_SITE_FAST=0: the previous site kernel (and its one-launch row limit); same bits either way.
     static const bool fast_env = [] { const char* e = std::getenv("STRIX_DS41_HC_SITE_FAST"); return !(e && e[0] == '0'); }();
@@ -2108,6 +2151,13 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         unsigned part = v.norm_part ? v.norm_part : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;  // measured (cold fn, R 1-8)
         part = part < norm_chunks ? part : norm_chunks;
         const unsigned tiles = (v.rows + g - 1U) / g;
+        if (v.collapse_out) {  // one block per hidden chunk (every copy) and tile of at most 4 rows (8: ~100 VGPRs spilled)
+            const unsigned gc = g < 4U ? g : 4U, ctiles = (v.rows + gc - 1U) / gc;
+            const auto kernel = gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>;
+            hipLaunchKernelGGL(kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);
+            check(hipGetLastError(), "hc site collapse launch");
+            return;
+        }
         const unsigned partial_blocks = v.fn || v.sub ? mix_chunks * tiles : 0U;
         const unsigned norm_blocks = v.norm_weight ? (norm_chunks + part - 1U) / part * v.rows : 0U;
         const bool expand = v.sub != nullptr, mix = v.fn != nullptr;
@@ -2932,6 +2982,7 @@ LaunchAccess launch_access(const HcSiteView& v) {
     a.write(v.codes, R * v.a8_stride);
     a.write(v.deltas, R * v.a8_stride / 32 * 4);
     a.write(v.sums, R * v.a8_stride / 32 * 4);
+    a.write(v.collapse_out, R * H * 4);
     return a;
 }
 

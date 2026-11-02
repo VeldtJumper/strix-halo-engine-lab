@@ -1662,6 +1662,22 @@ Prefill moved the 4-copy FP32 hyper-connection stream through separate passes: t
 - **Measured gain:** Removes a read of the 4-copy FP32 stream at each sublayer boundary (not across an Engram layer's inject or a change of the output rows) and the collapsed-row write + read at both sites. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order): 8.238 / 29.481 s with STRIX_DS41_PREFILL_HC_FUSE=0 vs 8.009 / 28.000 s default (-2.8 / -5.0 %).
 - **Public evidence:** [Prefill hyper-connection sites](../src/hip_deepseek41_prefill.hip)
 
+<a id="ds-prefill-hc-collapse"></a>
+
+### Prefill hyper-connection collapse with the expansion
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_HC_COLLAPSE`. **Default:** on (with `STRIX_DS41_PREFILL_HC_FUSE`).
+
+The collapse that feeds a site's RMSNorm uses the mixes of the expansion just before it. The fused expansion therefore takes the same hidden chunk of all four copies in one block, keeps the collapse of the values it stores, and writes the collapsed rows; the site's RMSNorm then reads those rows instead of the 4-copy stream. Every value is formed by the same operations in the same order.
+
+- **Preconditions:** Device prefill path with STRIX_DS41_PREFILL_HC_FUSE on; boundaries whose expansion is fused with the next mixes and whose next site starts at the same row.
+- **Automatic selection:** On at every such boundary.
+- **Fallback notice:** None.
+- **Exactness evidence:** The collapsed rows are formed with the same operations in the same order as the separate collapse: device tests against the separate expansion, mix and collapse kernels (row tiles 1-4, incomplete tiles, signed zeros, subnormals, infinities and NaNs) are bitwise equal; two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens in every arm.
+- **Off switch:** STRIX_DS41_PREFILL_HC_COLLAPSE=0
+- **Measured gain:** The next site's RMSNorm reads the 20 KB collapsed row instead of the 80 KB 4-copy stream. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, four GPU turns in alternating arm order): 8.008 / 28.017 s with STRIX_DS41_PREFILL_HC_COLLAPSE=0 vs 7.996 / 27.809 s default (-0.2 / -0.7 %, 32,499 tokens faster in 3 of 4 turns).
+- **Public evidence:** [Hyper-connection site kernels](../src/hip_ds41_layer.hip)
+
 <a id="ds-fast-moe-order"></a>
 
 ### FAST MoE block order

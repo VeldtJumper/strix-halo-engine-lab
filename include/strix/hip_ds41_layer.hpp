@@ -85,6 +85,10 @@ struct HcSiteView {
     std::uint32_t form = 0;
     // Fast form: rows per partial block (1, 2, 4, 8) and chunks per norm block (1-8); 0 by the row count. Same bits for all.
     std::uint32_t tile = 0, norm_part = 0;
+    // Not null (with sub and fn, no norm_weight, form 2, one launch): also the collapse of the expanded stream with
+    // expand_mixes[r].pre to collapse_out[r * hidden + i] (as the collapse a NormView with hc_stream reads), same bits;
+    // tiles of at most 4 rows.
+    float* collapse_out = nullptr;
 };
 inline constexpr std::uint32_t hc_site_one_launch_rows = 4;  // previous kernel, measured: one launch wins at 1-4 rows, loses at 8
 inline constexpr std::uint32_t hc_site_fast_one_launch_rows = 8;  // fast kernel

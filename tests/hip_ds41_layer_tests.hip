@@ -354,6 +354,45 @@ void synthetic(std::mt19937& rng) {
             }
         }
     }
+    // Expansion + mixes + the collapse with the expansion's pre (collapse_out), every tile twice (counters back at zero),
+    // against the host expansion / mixes / collapse; the inputs carry signed zeros, subnormals, infinities and NaNs.
+    for (const std::uint32_t sr : {1U, 2U, 3U, 6U, 8U, 9U, 17U}) {
+        auto res = random_vector(rng, std::size_t{sr} * n, 1.0F), sb = random_vector(rng, std::size_t{sr} * hidden, 1.0F);
+        const float specials[] = {-0.0F, 0.0F, 1e-40F, -1e-40F, INFINITY, -INFINITY, NAN};
+        for (std::size_t i = 0; i < sb.size(); i += 997) sb[i] = specials[(i / 997) % 7];
+        for (std::size_t i = 3; i < res.size(); i += 1999) res[i] = specials[(i / 1999) % 7];
+        const auto em = host_mixes(random_vector(rng, std::size_t{sr} * n, 1.0F), sr, hidden, fn, base, scale, 1e-6F, 1e-20F);
+        Device<float> dres(res), dsb(sb), partial(hc_mix_partial_floats(sr, hidden)), st(std::size_t{sr} * n), x(std::size_t{sr} * hidden),
+            sref(std::size_t{sr} * n), xref(std::size_t{sr} * hidden);
+        Device<HcMix> dem(em), mixes(sr);
+        // the separate kernels (STRIX_DS41_PREFILL_HC_FUSE=0): expansion, mixes, collapse
+        enqueue_hc_expand(dsb.p, dres.p, dem.p, sr, hidden, sref.p, nullptr);
+        enqueue_hc_collapse(sref.p, dem.p, sr, hidden, xref.p, nullptr);
+        const auto stream_ref = sref.down(), x_ref = xref.down();
+        const auto mix_ref = dev_mixes(sref, sr, hidden, dfn, dbase, dscale, 1e-6F, 1e-20F);
+        Device<std::uint32_t> counters(std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U));
+        for (int pass = 0; pass < 8; ++pass) {
+            st.up(std::vector<float>(std::size_t{sr} * n, -1.0F));
+            x.up(std::vector<float>(std::size_t{sr} * hidden, -1.0F));
+            HcSiteView v;
+            v.rows = sr; v.hidden = hidden; v.stream = st.p; v.launches = 1; v.form = 2;
+            static constexpr std::uint32_t tiles[] = {1, 2, 4, 8};
+            v.tile = tiles[pass % 4];
+            v.sub = dsb.p; v.residual = dres.p; v.expand_mixes = dem.p;
+            v.fn = dfn.p; v.base = dbase.p; v.scale = dscale.p; v.mixes_out = mixes.p; v.partial = partial.p; v.counters = counters.p;
+            v.collapse_out = x.p;
+            enqueue_hc_site(v, nullptr);
+            const auto access = launch_access(v);
+            bool covered = false;
+            for (std::uint32_t i = 0; i < access.count; ++i)
+                covered = covered || access.ranges[i].pointer == static_cast<const void*>(v.collapse_out);
+            expect(covered, "site launch access covers collapse_out");
+            const bool ok = same_bits(st.down(), stream_ref) && same_mix(mixes.down(), mix_ref) && same_bits(x.down(), x_ref) &&
+                            counters.down() == std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U);
+            expect(ok, "site launch with collapse bitwise, rows=" + std::to_string(sr) + " tile " + std::to_string(v.tile) + " pass " +
+                           std::to_string(pass));
+        }
+    }
     {
         // In place (x == out): one block per row, never the split form.
         const auto x = random_vector(rng, std::size_t{2} * hidden, 2.0F), w = random_vector(rng, hidden, 1.0F);
