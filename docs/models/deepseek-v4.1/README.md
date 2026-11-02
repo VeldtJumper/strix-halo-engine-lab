@@ -13,6 +13,15 @@ profiles. How the tables are read and what "exact" covers: [methodology](../../m
 
 ## Run: the pair
 
+**Weights:** [hyukudan/deepseek-v4.1-flash-gguf-mirror](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror) (the GGUF),
+[hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6) (dense overlay) and
+[hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3)
+(trellis packs; production is `ours-K4` plus the `ours-K5` head, as listed in `mixB.txt`). Directory layout:
+[reproduce](../../reproduce.md).
+
+**Hardware:** two Strix Halo nodes with 128 GB each, linked by two USB4 cables (one also works), with the
+[strix-halo-usb4-driver](https://github.com/hyukudan/strix-halo-usb4-driver) module built for the running kernel.
+
 Run one rank on each node with matching assets and environment; set `R` to 0 or 1 locally:
 
 ```sh
