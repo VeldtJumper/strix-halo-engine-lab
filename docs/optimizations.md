@@ -40,7 +40,7 @@ See the [command-line contract](getting-started/engine-reference.md#command-line
 The fast path is the default in all five public engines. Use the plain recommended command and inspect its
 resolution before adding overrides. `ON` means enabled; `auto` means enabled when admission guards pass;
 `opt-in` requires an explicit selection. An unlisted isolated gain means unmeasured, not zero.
-The [JSON catalog](optimizations.json) provides the same controls for tools; the [README](../README.md#optimizations)
+The [JSON catalog](optimizations.json) provides the same controls for tools; the [measured gains page](measured-gains.md#optimizations)
 is the compact overview. Run commands and agent instructions are in [AGENTS.md](../AGENTS.md).
 
 Exactness requires fixed model content, prompt, state, profile pair and capacity. Qwen fast FP16 prefill,
