@@ -14,6 +14,15 @@ el par en sí: [dos nodos por USB4](../../pair.es.md).
 
 ## Ejecución: el par
 
+**Pesos:** [hyukudan/deepseek-v4.1-flash-gguf-mirror](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror) (el GGUF),
+[hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6) (capa densa) y
+[hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3)
+(paquetes trellis; producción usa `ours-K4` más la cabeza `ours-K5`, según `mixB.txt`). Estructura de directorios:
+[reproducción](../../reproduce.md).
+
+**Hardware:** dos nodos Strix Halo de 128 GB cada uno, unidos por dos cables USB4 (también funciona con uno), con el
+módulo de [strix-halo-usb4-driver](https://github.com/hyukudan/strix-halo-usb4-driver) compilado para el kernel en uso.
+
 Ejecute un rank en cada nodo con assets y entorno coincidentes; establezca `R` en 0 o 1 localmente:
 
 ```sh
