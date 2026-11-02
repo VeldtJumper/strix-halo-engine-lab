@@ -3785,7 +3785,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     list(APPEND strix_ds41_dspark_hip_targets strix-ds41-dspark-rank)
     # DSpark windows inside BatchForward (several requests per step): drafting contexts per request, the planner
     add_library(strix_ds41_batch_dspark STATIC src/hip_deepseek41_batch_dspark.hip)
-    target_link_libraries(strix_ds41_batch_dspark PUBLIC strix_ds41_dspark_hip strix_ds41_batch_forward)
+    target_link_libraries(strix_ds41_batch_dspark PUBLIC strix_ds41_dspark_hip strix_ds41_batch_forward strix_lookup)
     list(APPEND strix_ds41_dspark_hip_targets strix_ds41_batch_dspark)
     add_executable(strix-deepseek41-dspark-rank apps/deepseek41_dspark_rank_main.hip)
     target_link_libraries(strix-deepseek41-dspark-rank PRIVATE strix_ds41_dspark_hip strix_ds41_device_forward strix_dist)
