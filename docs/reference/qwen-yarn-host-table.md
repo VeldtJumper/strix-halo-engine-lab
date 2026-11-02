@@ -152,7 +152,7 @@ subject to their normal kernel/shape/resource checks.
 | `STRIX_QSA_INDEX_ROWS` | No | Index projection batching |
 | `STRIX_LM_HEAD_COHORT_LEAN` | No | Head projection; HTTP remains excluded |
 | `STRIX_LM_HEAD_ROWS_LEAN` | No | Head projection |
-| `STRIX_DISPATCH_FUSE` | No | Dispatch organization; verification/MTP remain excluded |
+| `STRIX_DISPATCH_FUSE` | No | Dispatch organization; the YaRN MTP route keeps it off |
 | `STRIX_QPF2K_SCORE_ROWS` | No | Stage-batch scorer row tiling over already rotated pooled keys |
 | `STRIX_PREFILL_PLE_BATCH` | No | PLE projection batching |
 | `STRIX_QPF2K_SHARED_PRE` | No | Shared-expert projection |

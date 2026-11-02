@@ -449,6 +449,49 @@ inline void admit_product_profile(Options& o) {
     }
 }
 
+// Diagnostic or execution controls that keep a request on its explicit route.
+inline bool explicit_execution_control(const Environment& environment) {
+    for (const char* name : {"STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST"}) {
+        const auto control = environment.find(name);
+        if (control != environment.end() && !control->second.empty() && control->second != "0") return true;
+    }
+    return false;
+}
+// The checkpoint content the automatic organization is qualified for (not GSQ, the validated content identity).
+inline bool qualified_checkpoint_content(const ModelManifest& manifest, std::string_view verified_content) {
+    return !qpf2k::has_gsq_gate(manifest) && verified_content == validated_model_content_identity;
+}
+// The plain documented MTP command: no oracle or state it writes or reads besides the independent golden (no
+// golden dump, metadata-only diagnostic, RTX state import, session save/load/continuation or prefix-cache restore),
+// greedy selection (no sampling option) and the default n-gram policy (no explicit --mtp-ngram-draft mode, no
+// copy-wide rows). The default auto n-gram extension is part of the plain command and stays admitted.
+inline bool plain_mtp_command(const Options& o) noexcept {
+    const auto& m = o.mtp;
+    return m.golden_dump.empty() && !m.metadata_only && !o.rtx_state_import &&
+        !m.sample_options && !mtp_sampling(m) && !m.sample_timing_schedule &&
+        !m.ngram_draft && !m.ngram_off && !m.ngram_context && !m.ngram_copy_edit && !m.ngram_wide_only &&
+        m.copy_wide_rows.empty() && m.cohort_mode.empty() &&
+        o.session_save.empty() && o.session_load.empty() && o.session_then_prompt.empty() && o.session_logits.empty() &&
+        !o.session_live_control && !o.session_mtp_fixed &&
+        !o.prefix_cache_host_bytes && o.prefix_cache_dir.empty() && o.prefix_cache_then_prompts.empty();
+}
+// The single-session MTP route: MTP owned only by the documented MTP window organization
+// (mtp_window_organization_option: the documented group 3-4 --mtp* options, the window kernel organization and the
+// known-prefix window options; any other route-owning or low-level option excludes it), the plain MTP command
+// (plain_mtp_command), no cohort, HTTP, serving prefix, prefix roundtrip, prompt lookup, scoring, recording or
+// final-state validation, no diagnostic/execution control, a qualified target and checkpoint. Its declined
+// resolution also takes STRIX_DISPATCH_FUSE. Every fused form is
+// operand-pinned to, and fixture-checked byte for byte against, the separate launches, so the window organization
+// flags do not change the result; the exclusions only keep routes whose configuration identity, diagnostics or
+// qualification must not change. YaRN resolves separately; STRIX_DISPATCH_FUSE=0 (or any explicit value) wins.
+inline bool single_session_mtp_route(const Options& o, const Environment& environment, const ModelManifest& manifest,
+    std::string_view verified_content, const PrefillCapabilities& capabilities) {
+    return o.mtp.enabled && o.mtp.cohort.empty() && !o.route_owned_beyond_mtp && plain_mtp_command(o) &&
+        !o.http_serve && o.serving_prefix_files.empty() && !o.prefix_cache_roundtrip &&
+        !o.prompt_lookup && !o.teacher_forced_score && o.raw_recording_path.empty() && o.validation_final_state_path.empty() &&
+        o.rotary.mode() != RotaryMode::yarn && !explicit_execution_control(environment) &&
+        qualified_checkpoint_content(manifest, verified_content) && capabilities.target_qualified;
+}
 inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view verified_content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
@@ -502,9 +545,11 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         result.environment["STRIX_QPF2K_DEFAULTS"] = "0";
         result.sources["STRIX_QPF2K_DEFAULTS"] = OptionSource::baseline;
     }
+    const bool single_session_mtp = single_session_mtp_route(o, request.environment, manifest, verified_content, capabilities);
     const auto decline = [&](std::string reason) {
         result.reason = std::move(reason);
-        if (!baseline) inject(qpf2k::historical_items);
+        if (!baseline) inject(qpf2k::historical_items |
+            (single_session_mtp ? qpf2k::bit(qpf2k::Item::dispatch_fuse) : 0U));
         if (o.prefill_profile_deferred && !o.numerical_profile_explicit) o.numerical_profile = dense_a8_profile;
         const auto schedule = result.environment.find("STRIX_QPF2K_SCHED");
         const bool injected_gsq = qpf2k::has_gsq_gate(manifest) && schedule != result.environment.end() &&
@@ -557,11 +602,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     if (o.route_owned || o.any_low_level_flag || o.known_prefix_window || o.prompt_lookup || o.http_serve ||
         o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() || o.mtp.supplied || o.mtp.enabled || !o.mtp.cohort.empty() || o.teacher_forced_score ||
         !o.raw_recording_path.empty() || !o.validation_final_state_path.empty()) return decline("explicit-route");
-    for (const char* name : {"STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST"}) {
-        const auto control = request.environment.find(name);
-        if (control != request.environment.end() && !control->second.empty() && control->second != "0")
-            return decline("explicit-diagnostic-or-execution-control");
-    }
+    if (explicit_execution_control(request.environment)) return decline("explicit-diagnostic-or-execution-control");
     for (const auto& entry : qpf2k::defaults)
         if (!(qpf2k::exact_prefill_items & qpf2k::bit(entry.item)) &&
             env_is(request.environment, entry.name, "0")) return decline("feature-disabled");
@@ -574,8 +615,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
             "STRIX_KNOWN_PREFIX_EXPERT_UNION", "STRIX_KNOWN_WINDOW_ROUTER_ROWS", "STRIX_KNOWN_PREFIX_PREFILL_ROWS"})
         if (env_is(request.environment, name, "0")) return decline("feature-disabled");
     if (o.tokens.size() < 16U || !o.generate_tokens) return decline("prompt-not-eligible");
-    if (qpf2k::has_gsq_gate(manifest) || verified_content != validated_model_content_identity)
-        return decline("checkpoint-content-not-qualified");
+    if (!qualified_checkpoint_content(manifest, verified_content)) return decline("checkpoint-content-not-qualified");
     if (!capabilities.target_qualified) return decline("target-not-qualified");
     if (!capabilities.a8_runtime) return decline("a8-runtime-not-built");
     if (!o.context_explicit && (o.tokens.size() > model.max_position_embeddings ||
@@ -1552,6 +1592,10 @@ inline std::string effective_config_notice(const EffectiveConfig& config) {
         return line + "\n";
     }
     if (!config.error.empty()) return config.error + '\n';
+    // The single-session MTP route keeps its explicit prefill and takes the automatic window dispatch fusion.
+    if (config.reason == "explicit-route" && config.sources.contains("STRIX_DISPATCH_FUSE") &&
+        config.sources.at("STRIX_DISPATCH_FUSE") == OptionSource::automatic)
+        return "Qwen MTP route: STRIX_DISPATCH_FUSE=1 (automatic; STRIX_DISPATCH_FUSE=0 keeps the separate window launches)\n";
     if (config.reason == "baseline" || config.reason == "explicit-route") return {};
     return "Qwen auto-prefill declined: " + config.reason + "; using serial prefill\n";
 }

@@ -1458,7 +1458,7 @@ static int run_decode_entry(
         }
         });
     };
-    if (target_input_export) options.route_owned = true;
+    if (target_input_export) options.route_owned = options.route_owned_beyond_mtp = true;
     auto requested_environment = strix::decode_cli::requested_prefill_environment();
 #if defined(__linux__)
     if (yarn) for (auto entry = ::environ; entry && *entry; ++entry) {

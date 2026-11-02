@@ -15,6 +15,7 @@
 #include "../apps/ple_resident_fallback.hpp"
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include "strix/prompt_terminal_diagnostics.hpp"
@@ -162,6 +163,50 @@ std::vector<std::string> mtp_fixture(){
         "--mtp-golden-max-bytes","4096","--mtp-replay-host-bytes","8192",
         "--mtp-runtime-bytes","16384","--mtp-target-capture-bytes","8192",
         "--mtp-policy-id","7","--mtp-candidate-depth","2"};
+}
+// The explicit MTP command of docs/getting-started/engine-reference.md ("Command line", groups 1-4; placeholders
+// filled as in mtp_fixture) with the known-prefix window options of the measured MTP campaign argv.
+std::vector<std::string> documented_mtp_argv(){
+    const std::string sha(64,'1');
+    return {"decoder","target.gguf","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","30","31","32","--generate","256",
+        // 1. Target model and generation.
+        "--context","8192","--execution-mode","eager","--residency","register","--optimization-profile","auto",
+        "--numerical-profile","hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1",
+        // 2. Kernel organization required by the windows.
+        "--q51-slot-parallel-down","--batched-moe-activation","--q4k-a8g32-gate-up","--grouped-exact-q51-down",
+        "--deferred-moe-status","--parallel-moe-router","--wave-moe-router-topk",
+        "--virtual-q8-gdn-input","--prefetch-q8-gdn-input","--virtual-q8-gdn-output",
+        "--wave8-q8-gdn-input","--wave8-q8-gdn-output","--wave8-q8-qsa-output",
+        "--prefetch-q8-lm-head","--wave8-q8-lm-head","--virtual-q8-lm-head",
+        "--prefetch-q8-qsa-input","--prefetch-q8-shared-expert",
+        "--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
+        "--typed-fused-hyper-projections","--prefetch-typed-hyper-rows",
+        "--prefetch-q8-hyper-output","--lane-chain-hyper-output",
+        // 3. MTP sidecar, provenance and budgets.
+        "--mtp","--mtp-sidecar","sidecar.gguf","--mtp-sidecar-logical-name","mtp-sidecar","--mtp-sidecar-sha256",sha,
+        "--mtp-sidecar-bytes","1024","--mtp-target-sha256",sha,"--mtp-target-content",sha,
+        "--mtp-source-repository","publisher/model","--mtp-source-revision","pinned-revision","--mtp-source-path","sidecar.gguf",
+        "--mtp-converter-revision","converter-revision","--mtp-converter-sha256",sha,"--mtp-norm-converter-sha256",sha,
+        "--mtp-conversion","effective-norm-embedding-first-v1",
+        "--mtp-normalized-rounding","bf16-rne","--mtp-projection-rounding","bf16-rne","--mtp-sidecar-residency","register",
+        "--mtp-header-bytes","33554432","--mtp-sidecar-retained-bytes","3221225472","--mtp-sidecar-setup-bytes","4294967296",
+        "--mtp-golden","independent.bin","--mtp-golden-sha256",sha,"--mtp-golden-max-bytes","67108864",
+        "--mtp-replay-host-bytes","67108864","--mtp-runtime-bytes","134217728","--mtp-target-capture-bytes","16777216",
+        "--mtp-policy-id","1","--mtp-candidate-depth","7","--mtp-max-hidden-error","0","--mtp-max-logit-error","0",
+        // 4. Speculative decode.
+        "--mtp-target-window-rows","8","--mtp-target-window-rows-set","2,4,8",
+        "--mtp-window-arena-bytes","2147483648","--mtp-window-capture-bytes","67108864",
+        "--mtp-window-checkpoint-bytes","8589934592","--mtp-window-total-bytes","17179869184",
+        "--mtp-window-history-intervals","8192",
+        "--mtp-window-expert-union","--mtp-window-expert-union-bytes","65536",
+        "--mtp-window-prefix","--mtp-window-hyper-mix","--mtp-window-qsa-rows",
+        "--mtp-draft-chain","--mtp-spec-min-p","0.85","--mtp-draft-q4",
+        "--mtp-draft-vocab","auto:data/draft-vocab","--mtp-draft-context-vocab","4096",
+        // Known-prefix window options of the campaign argv.
+        "--known-prefix-window","--known-prefix-full-rows","--known-prefix-workspace-budget-bytes","8589934592",
+        "--known-prefix-host-metadata-budget-bytes","1073741824","--known-prefix-uma-budget-bytes","128849018880",
+        "--known-prefix-host-headroom-bytes","4294967296","--known-prefix-output-policy","terminal-row",
+        "--known-prefix-expert-union","--known-window-router-rows","--known-prefix-prefill-rows","8192"};
 }
 constexpr std::uint64_t gib_bytes = UINT64_C(1024) * 1024U * 1024U;
 void resident_fallback_tests() {
@@ -2984,7 +3029,8 @@ int main(int argc, char** arguments) {
                 const auto it = expected_env.find(name);
                 return it == expected_env.end() ? nullptr : it->second.c_str();
             }, [&](const char* name, const char* value) { return expected_env.emplace(name,value).second; },
-                qpf2k::historical_items);
+                qpf2k::historical_items | (single_session_mtp_route(input.options, input.environment, manifest,
+                    validated_model_content_identity, capabilities) ? qpf2k::bit(qpf2k::Item::dispatch_fuse) : 0U));
         }
         expect(actual.environment == expected_env, "fallback environment equals historical environment plus explicit controls");
     };
@@ -3103,6 +3149,133 @@ int main(int argc, char** arguments) {
         historical_equal(owned,absent);
         expect(!absent.environment.contains("STRIX_PREFILL_PIPE") && !absent.environment.contains("STRIX_LM_HEAD_COHORT_LEAN"),
             "declined serving/MTP/cohort injects no wrapper settings");
+        // Only the single-session MTP route (route 0) takes the window dispatch fusion; cohort, serving and HTTP do not.
+        expect(route == 0 ? absent.environment.contains("STRIX_DISPATCH_FUSE") &&
+                absent.environment.at("STRIX_DISPATCH_FUSE") == "1" &&
+                absent.sources.at("STRIX_DISPATCH_FUSE") == OptionSource::automatic
+            : !absent.environment.contains("STRIX_DISPATCH_FUSE"), "dispatch fusion is injected on the single-session MTP route only");
+        if (route == 0) {
+            auto off = owned; off.environment["STRIX_DISPATCH_FUSE"] = "0";
+            const auto kept = resolve(off,memory);
+            expect(kept.environment.at("STRIX_DISPATCH_FUSE") == "0" &&
+                kept.sources.at("STRIX_DISPATCH_FUSE") == OptionSource::explicit_value,
+                "STRIX_DISPATCH_FUSE=0 keeps the single-session MTP route unfused");
+            expect(effective_config_notice(absent).find("Qwen MTP route: STRIX_DISPATCH_FUSE=1 (automatic") == 0U &&
+                effective_config_notice(kept).find("STRIX_DISPATCH_FUSE") == std::string::npos,
+                "the startup notice reports the automatic MTP-route dispatch fusion only when injected");
+            // Every other owner of the MTP request keeps the historical environment: route options beyond --mtp*,
+            // low-level or known-prefix options, recording, final-state validation and diagnostic controls.
+            const auto unfused = [&](const char* why, auto&& change) {
+                auto other = owned;
+                change(other);
+                const auto resolved = resolve(other, memory);
+                historical_equal(other, resolved);
+                expect(!resolved.environment.contains("STRIX_DISPATCH_FUSE"), why);
+            };
+            unfused("an option beyond --mtp keeps the MTP route unfused", [](auto& r) { r.options.route_owned_beyond_mtp = true; });
+            unfused("STRIX_QRTX_STEP_DUMP keeps the MTP route unfused", [](auto& r) { r.environment["STRIX_QRTX_STEP_DUMP"] = "1"; });
+            unfused("STRIX_RTX_EXPORT_STATE keeps the MTP route unfused", [](auto& r) { r.environment["STRIX_RTX_EXPORT_STATE"] = "1"; });
+            // Options that need their own companions to resolve at all: the route predicate alone.
+            const auto route_with = [&](const char* why, auto&& change) {
+                auto other = owned.options;
+                change(other);
+                expect(!single_session_mtp_route(other, owned.environment, manifest, validated_model_content_identity, capabilities), why);
+            };
+            // The documented MTP command takes the item: its window organization owns only the MTP route.
+            auto documented = owned;
+            documented.options = parse(documented_mtp_argv());
+            expect(documented.options.any_low_level_flag && documented.options.known_prefix_window &&
+                documented.options.route_owned && !documented.options.route_owned_beyond_mtp,
+                "the documented MTP window organization owns only the MTP route");
+            const auto fused = resolve(documented, memory);
+            expect(fused.environment.contains("STRIX_DISPATCH_FUSE") && fused.environment.at("STRIX_DISPATCH_FUSE") == "1" &&
+                fused.sources.at("STRIX_DISPATCH_FUSE") == OptionSource::automatic,
+                "the documented MTP command takes the automatic dispatch fusion");
+            auto documented_off = documented; documented_off.environment["STRIX_DISPATCH_FUSE"] = "0";
+            const auto documented_kept = resolve(documented_off, memory);
+            expect(documented_kept.environment.at("STRIX_DISPATCH_FUSE") == "0" &&
+                documented_kept.sources.at("STRIX_DISPATCH_FUSE") == OptionSource::explicit_value,
+                "STRIX_DISPATCH_FUSE=0 keeps the documented MTP command unfused");
+            // One more low-level option outside the documented organization owns its own route.
+            auto extra_argv = documented_mtp_argv();
+            extra_argv.insert(extra_argv.end(), {"--coalesce-gap", "0"});
+            auto extra = documented;
+            extra.options = parse(extra_argv);
+            expect(extra.options.route_owned_beyond_mtp, "a low-level option outside the MTP organization owns its own route");
+            expect(!resolve(extra, memory).environment.contains("STRIX_DISPATCH_FUSE"),
+                "a low-level option outside the MTP organization keeps the MTP route unfused");
+            // One more --mtp* option outside the documented groups 3-4 owns its own route: the allow-list is explicit,
+            // not a --mtp prefix. The golden dump (the documented benchmarking step, in place of --mtp-golden and
+            // --mtp-golden-sha256) must write its oracle from an unfused run.
+            const auto without_golden = [](std::vector<std::string> args) {
+                for (const char* key : {"--mtp-golden", "--mtp-golden-sha256"}) {
+                    const auto at = std::find(args.begin(), args.end(), std::string(key));
+                    if (at != args.end()) args.erase(at, at + 2);
+                }
+                return args;
+            };
+            const std::vector<std::pair<const char*, std::vector<std::string>>> extra_mtp = {
+                {"--mtp-golden-dump keeps the documented MTP command unfused", {"--mtp-golden-dump", "prompt.golden"}},
+                {"--mtp-ngram-draft=off keeps the documented MTP command unfused", {"--mtp-ngram-draft=off"}},
+                {"--mtp-calibration-rows keeps the documented MTP command unfused", {"--mtp-calibration-rows", "8"}},
+            };
+            for (const auto& [why, flag] : extra_mtp) {
+                auto args = flag.front() == std::string("--mtp-golden-dump") ? without_golden(documented_mtp_argv()) :
+                    documented_mtp_argv();
+                args.insert(args.end(), flag.begin(), flag.end());
+                auto one_more = documented;
+                try {
+                    one_more.options = parse(args);
+                } catch (const std::exception& error) {
+                    std::cerr << why << ": " << error.what() << '\n';
+                    expect(false, why);
+                    continue;
+                }
+                expect(one_more.options.route_owned_beyond_mtp, why);
+                expect(!single_session_mtp_route(one_more.options, one_more.environment, manifest,
+                    validated_model_content_identity, capabilities), why);
+                expect(!resolve(one_more, memory).environment.contains("STRIX_DISPATCH_FUSE"), why);
+            }
+            // The exact documented argv still takes the injection (above); the predicate also refuses the oracle- and
+            // state-producing, sampling and n-gram modes when they are set without their own flag.
+            const auto documented_route_with = [&](const char* why, auto&& change) {
+                auto other = documented.options;
+                expect(single_session_mtp_route(other, documented.environment, manifest, validated_model_content_identity,
+                    capabilities), "the documented MTP command is the single-session MTP route");
+                change(other);
+                expect(!single_session_mtp_route(other, documented.environment, manifest, validated_model_content_identity,
+                    capabilities), why);
+            };
+            documented_route_with("a golden dump keeps the MTP route unfused", [](auto& o) { o.mtp.golden_dump = "prompt.golden"; });
+            documented_route_with("the metadata-only diagnostic keeps the MTP route unfused", [](auto& o) { o.mtp.metadata_only = true; });
+            documented_route_with("RTX state import keeps the MTP route unfused", [](auto& o) { o.rtx_state_import = true; });
+            documented_route_with("sampling keeps the MTP route unfused", [](auto& o) { o.mtp.sample_options = true; o.mtp.sample_temperature = 0.7; });
+            documented_route_with("the adaptive sample schedule keeps the MTP route unfused", [](auto& o) { o.mtp.sample_timing_schedule = true; });
+            documented_route_with("an explicit n-gram draft keeps the MTP route unfused", [](auto& o) { o.mtp.ngram_draft = true; });
+            documented_route_with("n-gram off keeps the MTP route unfused", [](auto& o) { o.mtp.ngram_off = true; });
+            documented_route_with("the n-gram copy drafter keeps the MTP route unfused", [](auto& o) { o.mtp.ngram_copy_edit = true; });
+            documented_route_with("copy-wide rows keep the MTP route unfused", [](auto& o) { o.mtp.copy_wide_rows = {16U}; });
+            documented_route_with("a session save keeps the MTP route unfused", [](auto& o) { o.session_save = "s.bin"; });
+            documented_route_with("a session load keeps the MTP route unfused", [](auto& o) { o.session_load = "s.bin"; });
+            documented_route_with("a prefix-cache restore keeps the MTP route unfused", [](auto& o) { o.prefix_cache_dir = "cache"; });
+            for (const char* key : {"--mtp-golden-dump", "--mtp-metadata-only", "--mtp-sample-temperature", "--mtp-sample-seed",
+                     "--mtp-ngram-draft", "--mtp-copy-wide-rows", "--mtp-calibration-rows", "--mtp-cohort-request",
+                     "--mtp-draft-profile", "--mtp-draft-exact", "--mtp-bundle", "--mtp-prefill-gate", "--mtp-k"})
+                expect(!mtp_window_organization_option(key) && !mtp_window_organization_option(std::string(key) + "=1"),
+                    "only the documented group 3-4 --mtp* options are in the MTP window organization");
+            route_with("raw recording keeps the MTP route unfused", [](auto& o) { o.raw_recording_path = "raw.bin"; });
+            route_with("final-state validation keeps the MTP route unfused", [](auto& o) { o.validation_final_state_path = "final.bin"; });
+            expect(!owned.options.route_owned_beyond_mtp && owned.options.route_owned,
+                "the --mtp* options own the route without owning one beyond MTP");
+            auto qualified = capabilities;
+            expect(single_session_mtp_route(owned.options, owned.environment, manifest, validated_model_content_identity, qualified),
+                "the fixture MTP request is the single-session MTP route");
+            qualified.target_qualified = false;
+            expect(!single_session_mtp_route(owned.options, owned.environment, manifest, validated_model_content_identity, qualified),
+                "an unqualified target keeps the MTP route unfused");
+            expect(!single_session_mtp_route(owned.options, owned.environment, manifest, "other-content", capabilities),
+                "an unqualified checkpoint keeps the MTP route unfused");
+        }
         if(route==3) {
             expect(!absent.environment.contains("STRIX_DISPATCH_FUSE") &&
                 !absent.environment.contains("STRIX_WINDOW_INJECT_NORM") &&

@@ -513,7 +513,7 @@ __device__ __forceinline__ std::uint32_t qpf2k_round_bf16(float value) {
     const auto bits = __float_as_uint(value);
     return (bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U;
 }
-// Operand-pinned FP32 operations: qpf2k_add / qpf2k_mul / qpf2k_fmac (hip_hyper_mix_launcher.hip, with the measured
+// Operand-pinned FP32 operations: qpf2k_add / qpf2k_mul / qpf2k_fmac (hip_qpf2k_pinned.inc, with the measured
 // operand order of each base kernel).
 template <unsigned D> __device__ __forceinline__ float qpf2k_from_lane(float value) {
     return __shfl_down(value, D, 32);

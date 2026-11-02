@@ -258,6 +258,7 @@ struct Options {
     std::optional<unsigned> resolved_prefill_option_mask;
     bool automatic_prefill = false;
     bool route_owned = false;
+    bool route_owned_beyond_mtp = false; // route_owned by an option outside mtp_window_organization_option (or by export)
     bool yarn_mtp_draft_top2=false,yarn_mtp_q4_all=true,yarn_mtp_greedy_rows=true,yarn_mtp_pipeline=true;
     bool yarn_mtp_pool_off = false;
     bool ple_rolling_explicit_opt_in = false, qsa_mtp_pool_explicit_opt_in = false;
@@ -665,6 +666,50 @@ inline void validate_serving_prefix_cache_limits(const Options& options) {
         throw std::invalid_argument("serving prefix cache requires serving files and all four positive explicit bounded limits");
 }
 
+// The documented MTP window organization (docs/getting-started/engine-reference.md "Command line", groups 1-4,
+// and the known-prefix window options of docs/engine/prefill/known-prefix-prefill.md): the group 3 and 4 --mtp*
+// options listed one by one, the kernel organization the windows require and the known-prefix window, router-row
+// and budget options. A request that adds nothing beyond these still owns only the MTP route
+// (route_owned_beyond_mtp stays false). Every other --mtp* option of the parser (golden dump, metadata only,
+// sampling, n-gram modes, copy-wide rows, calibration rows, cohorts, draft profile/exact, bundle, prefill gate,
+// adaptive/k/spec) owns a route of its own.
+inline bool mtp_window_organization_option(std::string_view argument) {
+    const auto key = argument.substr(0, argument.find('='));
+    for (const std::string_view option : {
+        // 3. MTP sidecar, provenance and budgets.
+        "--mtp", "--mtp-sidecar", "--mtp-sidecar-logical-name", "--mtp-sidecar-sha256", "--mtp-sidecar-bytes",
+        "--mtp-target-sha256", "--mtp-target-content",
+        "--mtp-source-repository", "--mtp-source-revision", "--mtp-source-path",
+        "--mtp-converter-revision", "--mtp-converter-sha256", "--mtp-norm-converter-sha256", "--mtp-conversion",
+        "--mtp-normalized-rounding", "--mtp-projection-rounding", "--mtp-sidecar-residency",
+        "--mtp-header-bytes", "--mtp-sidecar-retained-bytes", "--mtp-sidecar-setup-bytes",
+        "--mtp-golden", "--mtp-golden-sha256", "--mtp-golden-max-bytes",
+        "--mtp-replay-host-bytes", "--mtp-runtime-bytes", "--mtp-target-capture-bytes",
+        "--mtp-policy-id", "--mtp-candidate-depth", "--mtp-max-hidden-error", "--mtp-max-logit-error",
+        // 4. Speculative decode.
+        "--mtp-target-window-rows", "--mtp-target-window-rows-set",
+        "--mtp-window-arena-bytes", "--mtp-window-capture-bytes", "--mtp-window-checkpoint-bytes", "--mtp-window-total-bytes",
+        "--mtp-window-history-intervals", "--mtp-window-expert-union", "--mtp-window-expert-union-bytes",
+        "--mtp-window-prefix", "--mtp-window-hyper-mix", "--mtp-window-qsa-rows",
+        "--mtp-draft-chain", "--mtp-spec-min-p", "--mtp-draft-q4", "--mtp-draft-vocab", "--mtp-draft-context-vocab"})
+        if (key == option) return true;
+    for (const std::string_view option : {
+        "--q51-slot-parallel-down", "--batched-moe-activation", "--q4k-a8g32-gate-up", "--grouped-exact-q51-down",
+        "--deferred-moe-status", "--parallel-moe-router", "--wave-moe-router-topk",
+        "--virtual-q8-gdn-input", "--prefetch-q8-gdn-input", "--virtual-q8-gdn-output",
+        "--wave8-q8-gdn-input", "--wave8-q8-gdn-output", "--wave8-q8-qsa-output",
+        "--prefetch-q8-lm-head", "--wave8-q8-lm-head", "--virtual-q8-lm-head",
+        "--prefetch-q8-qsa-input", "--prefetch-q8-shared-expert",
+        "--parallel-hyper-mix", "--staged-hyper-projections", "--fused-staged-hyper-mix",
+        "--typed-fused-hyper-projections", "--prefetch-typed-hyper-rows",
+        "--prefetch-q8-hyper-output", "--lane-chain-hyper-output",
+        "--known-prefix-window", "--known-prefix-full-rows", "--known-prefix-expert-union", "--known-window-router-rows",
+        "--known-prefix-prefill-rows", "--known-prefix-tail-rows", "--known-prefix-output-policy",
+        "--known-prefix-workspace-budget-bytes", "--known-prefix-host-metadata-budget-bytes",
+        "--known-prefix-uma-budget-bytes", "--known-prefix-host-headroom-bytes"})
+        if (key == option) return true;
+    return false;
+}
 inline bool is_low_level_optimization_option(std::string_view argument) {
     for (const std::string_view option : {
         "--parallel-hyper-mix", "--staged-hyper-projections", "--fused-staged-hyper-mix",
@@ -1892,7 +1937,12 @@ inline Options parse_options(
             !argument.starts_with("--optimization-profile") && argument != "--prefill-moe-route-bf16" &&
             !argument.starts_with("--numerical-profile") &&
             !argument.starts_with("--prefill-numerical-profile") && !argument.starts_with("--execution-mode") &&
-            !argument.starts_with("--residency") && !operational_session_option(argument)) options.route_owned = true;
+            !argument.starts_with("--residency") && !operational_session_option(argument)) {
+            options.route_owned = true;
+            // The documented MTP window organization owns the MTP route itself; any other option owns a route of
+            // its own.
+            if (!mtp_window_organization_option(argument)) options.route_owned_beyond_mtp = true;
+        }
 
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);

@@ -2572,6 +2572,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-known-window-hc-persistent-tests COMMAND strix-hip-known-window-tests --hc-rows)
         set_tests_properties(strix-hip-known-window-hc-persistent-tests PROPERTIES ENVIRONMENT "STRIX_HC_PERSISTENT=1;STRIX_HC_PERSISTENT_INJECT=1")
         add_test(NAME strix-hip-known-window-fold-tests COMMAND strix-hip-known-window-tests --window-folds)
+        # STRIX_DISPATCH_FUSE=1 alone: persistent HC at 2 and 4 rows, the inject + norm fold at 8 rows.
+        add_test(NAME strix-hip-known-window-hc-fuse-tests COMMAND strix-hip-known-window-tests --hc-rows)
+        set_tests_properties(strix-hip-known-window-hc-fuse-tests PROPERTIES ENVIRONMENT "STRIX_DISPATCH_FUSE=1")
+        add_test(NAME strix-hip-known-window-fold-fuse-tests COMMAND strix-hip-known-window-tests --window-folds)
+        set_tests_properties(strix-hip-known-window-fold-fuse-tests PROPERTIES ENVIRONMENT "STRIX_DISPATCH_FUSE=1")
+        # FP32 streams: the folds and the persistent HC against the separate launches.
+        add_test(NAME strix-hip-known-window-fp32-fold-tests COMMAND strix-hip-known-window-tests --folds-fp32)
+        set_tests_properties(strix-hip-known-window-fp32-fold-tests PROPERTIES ENVIRONMENT "STRIX_HC_PERSISTENT=1;STRIX_HC_PERSISTENT_INJECT=1")
         add_executable(strix-hip-qsa-committed-pool-tests tests/hip_qsa_committed_pool_tests.hip)
         set_target_properties(strix-hip-qsa-committed-pool-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")

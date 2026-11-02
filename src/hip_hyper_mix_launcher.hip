@@ -215,35 +215,7 @@ __device__ void store_activation(
             rounded >> 16U);
 }
 
-// Operand-pinned FP32 operations. IEEE results do not depend on operand order except for which NaN payload survives
-// when two NaN operands meet; the compiler commutes fadd / fmul / fma multiplicands freely, so the fold and
-// persistent kernels pin the base kernels' measured operand order (src0 first; gfx1151 ISA of the separate
-// launches, window and tiled instantiations alike) to equal their bytes for NaN inputs too:
-//   combine_rows_kernel  v_add_f32  shared, routed
-//   inject_rows_kernel   v_fmac_f32 hyper += gate * hidden        (src0 gate)
-//   norm leaves          v_fmac_f32 sum += value * value
-//   norm LDS tree        v_add_f32  r[l + s], r[l]                (upper first, every level)
-//   normalized           v_mul_f32  inverse, value (BF16 rows; FP32 rows: value, inverse); v_mul_f32 (that), weight
-//   output stream mix    v_fmac_f32 mixed += normalized * sig
-__device__ __forceinline__ float qpf2k_add(float src0, float src1) {
-    float d;
-    asm volatile("v_add_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
-    return d;
-}
-__device__ __forceinline__ float qpf2k_mul(float src0, float src1) {
-    float d;
-    asm volatile("v_mul_f32 %0, %1, %2" : "=v"(d) : "v"(src0), "v"(src1));
-    return d;
-}
-__device__ __forceinline__ float qpf2k_fmac(float acc, float src0, float src1) {
-    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(acc) : "v"(src0), "v"(src1));
-    return acc;
-}
-// The normalisation's first product in the norm kernel's operand order for the activation format.
-template <typename Storage> __device__ __forceinline__ float qpf2k_scale(float inverse, float value) {
-    if constexpr (std::is_same_v<Storage, float>) return qpf2k_mul(value, inverse);
-    else return qpf2k_mul(inverse, value);
-}
+#include "hip_qpf2k_pinned.inc"
 
 __device__ std::uint8_t iq4_local_scale(
     const IQ4XSBlock& block,
@@ -704,19 +676,19 @@ __global__ void prepare_hyper_norm_kernel(
     float sum = 0.0F;
     for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
         const float value = load_activation(input, base + feature);
-        sum += value * value;
+        sum = qpf2k_fmac(sum, value, value);
     }
     reduction[lane] = sum;
     __syncthreads();
     for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        if (lane < stride) reduction[lane] = qpf2k_add(reduction[lane + stride], reduction[lane]);
         __syncthreads();
     }
     if (lane == 0) inverse = rsqrtf(reduction[0] / static_cast<float>(hidden) + epsilon);
     __syncthreads();
     for (std::uint32_t feature = lane; feature < hidden; feature += kThreads)
-        normalized[base + feature] = load_activation(input, base + feature) * inverse *
-            load_norm_weight(norm, norm_type, stream * hidden + feature);
+        normalized[base + feature] = qpf2k_mul(qpf2k_scale<Storage>(inverse, load_activation(input, base + feature)),
+            load_norm_weight(norm, norm_type, stream * hidden + feature));
 }
 
 __global__ void parallel_hyper_lowrank_kernel(
@@ -1570,7 +1542,7 @@ __global__ void staged_hyper_output_kernel(
             __syncthreads();
         }
         if (active)
-            mixed += normalized[static_cast<std::uint64_t>(row) * width + stream * hidden + feature] * sigmoid(gate);
+            mixed = qpf2k_fmac(mixed, sigmoid(gate), normalized[static_cast<std::uint64_t>(row) * width + stream * hidden + feature]);
     }
     if (active)
         store_activation(&output[static_cast<std::uint64_t>(row) * hidden + feature],
@@ -1610,7 +1582,7 @@ __device__ void q8_batched_hyper_output_role(
             __syncthreads();
         }
         if (active)
-            mixed += normalized[static_cast<std::uint64_t>(row) * width + stream * hidden + feature] * sigmoid(gate);
+            mixed = qpf2k_fmac(mixed, sigmoid(gate), normalized[static_cast<std::uint64_t>(row) * width + stream * hidden + feature]);
     }
     if (active)
         store_activation(&output[static_cast<std::uint64_t>(row) * hidden + feature],
@@ -1791,19 +1763,19 @@ __global__ void rows_prepare_hyper_norm_kernel(Rows rows, const void* norm, std:
     float sum = 0.0F;
     for (std::uint32_t feature = lane; feature < hidden; feature += kThreads) {
         const float value = load_activation(input, base + feature);
-        sum += value * value;
+        sum = qpf2k_fmac(sum, value, value);
     }
     reduction[lane] = sum;
     __syncthreads();
     for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        if (lane < stride) reduction[lane] = qpf2k_add(reduction[lane + stride], reduction[lane]);
         __syncthreads();
     }
     if (lane == 0) inverse = rsqrtf(reduction[0] / static_cast<float>(hidden) + epsilon);
     __syncthreads();
     for (std::uint32_t feature = lane; feature < hidden; feature += kThreads)
-        normalized[base + feature] = load_activation(input, base + feature) * inverse *
-            load_norm_weight(norm, norm_type, stream * hidden + feature);
+        normalized[base + feature] = qpf2k_mul(qpf2k_scale<Storage>(inverse, load_activation(input, base + feature)),
+            load_norm_weight(norm, norm_type, stream * hidden + feature));
 }
 
 // Window rows: the inject step (and, with Combine, the MoE combine before it) folded into the HC
@@ -2034,7 +2006,7 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, un
         for(unsigned r=0;r<R;++r) if(r<valid) {
 #pragma unroll
             for(unsigned offset=16U;offset!=0U;offset/=2U)
-                sums[r]=sums[r]+__shfl_xor(sums[r],static_cast<int>(offset),32);
+                sums[r]=qpf2k_add(sums[r],__shfl_xor(sums[r],static_cast<int>(offset),32));
         }
         if(lane==0U) {
 #pragma unroll
@@ -2060,10 +2032,11 @@ __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Rows 
     if(t<count && r<valid) {
         float total=0.0F;
 #pragma unroll
-        for(unsigned k=0;k<16U;++k)total=total+red[t][k][r];
+        for(unsigned k=0;k<16U;++k)total=qpf2k_add(total,red[t][k][r]);
         const float scaled=total/static_cast<float>(streams);
-        if(is_inject)tiled(rows.injection[t], rows.tile_injection, rows)[first+r]=2.0F*sigmoid(scaled);
-        else tiled(rows.low[t], rows.tile_normalized, rows)[first+r]=scaled*sigmoid(scaled);
+        const float value=qpf2k_mul(is_inject?2.0F:scaled,sigmoid(scaled));
+        if(is_inject)tiled(rows.injection[t], rows.tile_injection, rows)[first+r]=value;
+        else tiled(rows.low[t], rows.tile_normalized, rows)[first+r]=value;
     }
 }
 
@@ -2137,8 +2110,9 @@ __global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(
 #pragma unroll
         for(unsigned k=0;k<16U;++k)total_dot=total_dot+red[t][k][r];
         const float scaled=total_dot/static_cast<float>(streams);
-        if(is_inject)tiled(rows.injection[t], rows.tile_injection, rows)[first+r]=2.0F*sigmoid(scaled);
-        else tiled(rows.low[t], rows.tile_normalized, rows)[first+r]=scaled*sigmoid(scaled);
+        const float value=qpf2k_mul(is_inject?2.0F:scaled,sigmoid(scaled));
+        if(is_inject)tiled(rows.injection[t], rows.tile_injection, rows)[first+r]=value;
+        else tiled(rows.low[t], rows.tile_normalized, rows)[first+r]=value;
     }
 }
 
@@ -2184,7 +2158,7 @@ __device__ void rows_q8_batched_hyper_output_role(const Rows& rows, std::uint32_
             __syncthreads();
         }
         if (active)
-            mixed += tiled(rows.normalized[row], rows.tile_normalized, rows)[stream * hidden + feature] * sigmoid(gate);
+            mixed = qpf2k_fmac(mixed, sigmoid(gate), tiled(rows.normalized[row], rows.tile_normalized, rows)[stream * hidden + feature]);
     }
     if (active)
         store_activation(&static_cast<Storage*>(tiled(rows.output[row], rows.tile_output, rows))[feature], mixed / static_cast<float>(streams));
@@ -2301,7 +2275,7 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
     for(std::uint32_t t=stream;t<count;t+=streams){
         float mixed=0.0F;const auto feature=first+lane;
         for(std::uint32_t s=0;s<streams;++s)
-            mixed+=tiled(rows.normalized[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z)[static_cast<std::uint64_t>(s)*hidden+feature]*sig[(t*streams+s)*32U+lane];
+            mixed=qpf2k_fmac(mixed,tiled(rows.normalized[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z)[static_cast<std::uint64_t>(s)*hidden+feature],sig[(t*streams+s)*32U+lane]);
         store_activation(&static_cast<Storage*>(tiled(rows.output[t], rows.tile_output, rows, blockIdx.z * looped_tiles(rows) + z))[feature],mixed/static_cast<float>(streams));
     }
     }
@@ -2350,7 +2324,7 @@ __global__ void rows_lane_chain_split_hyper_output_kernel(Rows rows, const void*
     for(std::uint32_t t=wave;t<Count;t+=G*streams){
         float mixed=0.0F;const auto feature=first+lane;
         for(std::uint32_t s=0;s<streams;++s)
-            mixed+=tiled(rows.normalized[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z)[static_cast<std::uint64_t>(s)*hidden+feature]*sig[(t*streams+s)*32U+lane];
+            mixed=qpf2k_fmac(mixed,tiled(rows.normalized[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z)[static_cast<std::uint64_t>(s)*hidden+feature],sig[(t*streams+s)*32U+lane]);
         store_activation(&static_cast<Storage*>(tiled(rows.output[t], rows.tile_output, rows, blockIdx.z * looped_tiles(rows) + z))[feature],mixed/static_cast<float>(streams));
     }
     }
@@ -2417,7 +2391,8 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
     for (std::uint32_t t = stream; t < Count; t += streams) {
         float mixed = 0.0F; const auto feature = first + lane;
         for (std::uint32_t s2 = 0; s2 < streams; ++s2)
-            mixed += tiled(rows.normalized[t], rows.tile_normalized, rows)[static_cast<std::uint64_t>(s2) * hidden + feature] * sig[(t * streams + s2) * 32U + lane];
+            mixed = qpf2k_fmac(mixed, tiled(rows.normalized[t], rows.tile_normalized, rows)[static_cast<std::uint64_t>(s2) * hidden + feature],
+                sig[(t * streams + s2) * 32U + lane]);
         store_activation(&static_cast<Storage*>(tiled(rows.output[t], rows.tile_output, rows))[feature], mixed / static_cast<float>(streams));
     }
 }
@@ -2480,7 +2455,7 @@ struct PersistInjectRows {
 };
 template <typename Storage, std::uint32_t Count, bool Inject = false>
 __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void rows_persistent_hyper_mix_kernel(HyperRows rows,
-    const void* __restrict__ norm, std::uint32_t norm_type, float epsilon, const unsigned char* __restrict__ down,
+    const void* __restrict__ norm, std::uint32_t norm_type, float epsilon, std::uint32_t hidden_size, const unsigned char* __restrict__ down,
     const float* __restrict__ inject, const unsigned char* __restrict__ up, unsigned* counter, unsigned base,
     unsigned* queue, unsigned queue_base, PersistInjectRows injected, unsigned long long* trace, bool up_late) {
     constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
@@ -2541,7 +2516,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
             const float partner = __shfl_down(v, d, 32);
             if (lane < d) v = qpf2k_add(partner, v);
         }
-        if (lane == 0U) inverse_lds[half] = rsqrtf(v / static_cast<float>(kPersistHidden) + epsilon);
+        if (lane == 0U) inverse_lds[half] = rsqrtf(v / static_cast<float>(hidden_size) + epsilon);
     }
     persist_lds_barrier();
     if (norm_wave) {
@@ -2618,7 +2593,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
                     for (unsigned r = 0; r < kUnitOutputs; ++r) {
 #pragma unroll
                         for (unsigned offset = 16U; offset != 0U; offset /= 2U)
-                            sums[t][r] = sums[t][r] + __shfl_xor(sums[t][r], static_cast<int>(offset), 32);
+                            sums[t][r] = qpf2k_add(sums[t][r], __shfl_xor(sums[t][r], static_cast<int>(offset), 32));
                         if (lane == 0U) red[t0 + t][tile][r] = sums[t][r];
                     }
             }
@@ -2643,7 +2618,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
                     sum = fmaf(x[s].w, w[s].w, sum);
                 }
 #pragma unroll
-                for (unsigned offset = 16U; offset != 0U; offset /= 2U) sum = sum + __shfl_xor(sum, static_cast<int>(offset), 32);
+                for (unsigned offset = 16U; offset != 0U; offset /= 2U) sum = qpf2k_add(sum, __shfl_xor(sum, static_cast<int>(offset), 32));
                 if (lane == 0U) red[t][tile][0] = sum;
             }
         }
@@ -2653,9 +2628,9 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
             if (unit < kLowUnits || r == 0U) {
                 float total = 0.0F;
 #pragma unroll
-                for (unsigned k = 0; k < 16U; ++k) total = total + red[t][k][r];
+                for (unsigned k = 0; k < 16U; ++k) total = qpf2k_add(total, red[t][k][r]);
                 const float scaled = total / static_cast<float>(kPersistStreams);
-                if (unit < kLowUnits) rows.low[t][unit * kUnitOutputs + r] = scaled * sigmoid(scaled);
+                if (unit < kLowUnits) rows.low[t][unit * kUnitOutputs + r] = qpf2k_mul(scaled, sigmoid(scaled));
                 else rows.injection[t][unit - kLowUnits] = 2.0F * sigmoid(scaled);
             }
         }
@@ -2748,18 +2723,19 @@ template <unsigned D> __device__ __forceinline__ float static_xor(float value) {
         return __uint_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
     } else return __int_as_float(__builtin_amdgcn_mov_dpp(bits, 0x160 + static_cast<int>(D), 0xf, 0xf, false));
 }
+// Pinned like the queue form's reduction (own value first), so the exchange cannot fold into a DPP source operand.
 __device__ __forceinline__ float static_xor_sum(float sum) {
-    sum = sum + static_xor<16U>(sum);
-    sum = sum + static_xor<8U>(sum);
-    sum = sum + static_xor<4U>(sum);
-    sum = sum + static_xor<2U>(sum);
-    return sum + static_xor<1U>(sum);
+    sum = qpf2k_add(sum, static_xor<16U>(sum));
+    sum = qpf2k_add(sum, static_xor<8U>(sum));
+    sum = qpf2k_add(sum, static_xor<4U>(sum));
+    sum = qpf2k_add(sum, static_xor<2U>(sum));
+    return qpf2k_add(sum, static_xor<1U>(sum));
 }
 constexpr std::uint32_t kStaticOutputs = kPersistRank / kPersistBlocks, kStaticUnits = kStaticOutputs / kPersistUnitOutputs;
 static_assert(kStaticOutputs == 8U && kStaticUnits == 4U && kPersistStreams <= kPersistBlocks);
 template <typename Storage, std::uint32_t Count, bool Inject, unsigned Prefetch, bool Early, bool UpEarly, bool Coalesced = false, bool UpCoalesced = false>
 __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void rows_static_hyper_mix_kernel(HyperRows rows,
-    const void* __restrict__ norm, std::uint32_t norm_type, float epsilon, const unsigned char* __restrict__ down,
+    const void* __restrict__ norm, std::uint32_t norm_type, float epsilon, std::uint32_t hidden_size, const unsigned char* __restrict__ down,
     const float* __restrict__ inject, const unsigned char* __restrict__ up, unsigned* counter, unsigned base,
     PersistInjectRows injected, unsigned long long* trace) {
     static_assert(Prefetch >= 1U && Prefetch <= kStaticUnits);
@@ -2901,7 +2877,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
             const float partner = __shfl_down(v, d, 32);
             if (lane < d) v = qpf2k_add(partner, v);
         }
-        if (lane == 0U) inverse_lds[half] = rsqrtf(v / static_cast<float>(kPersistHidden) + epsilon);
+        if (lane == 0U) inverse_lds[half] = rsqrtf(v / static_cast<float>(hidden_size) + epsilon);
     }
     persist_lds_barrier();
     if (norm_wave) {
@@ -3057,14 +3033,14 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
         const unsigned t = threadIdx.x / kStaticOutputs, r = threadIdx.x % kStaticOutputs;
         float total = 0.0F;
 #pragma unroll
-        for (unsigned k = 0; k < 16U; ++k) total = total + red[t][k][r];
+        for (unsigned k = 0; k < 16U; ++k) total = qpf2k_add(total, red[t][k][r]);
         const float scaled = total / static_cast<float>(kPersistStreams);
-        rows.low[t][g * kStaticOutputs + r] = scaled * sigmoid(scaled);
+        rows.low[t][g * kStaticOutputs + r] = qpf2k_mul(scaled, sigmoid(scaled));
     } else if (inject_block && threadIdx.x - Count * kStaticOutputs < Count) {
         const unsigned t = threadIdx.x - Count * kStaticOutputs;
         float total = 0.0F;
 #pragma unroll
-        for (unsigned k = 0; k < 16U; ++k) total = total + red_inject[t][k];
+        for (unsigned k = 0; k < 16U; ++k) total = qpf2k_add(total, red_inject[t][k]);
         const float scaled = total / static_cast<float>(kPersistStreams);
         rows.injection[t][g] = 2.0F * sigmoid(scaled);
     }
@@ -4683,7 +4659,7 @@ bool launch_static_hyper_rows(const PreparedHyperMix& p, const HyperRows& rows, 
     const auto* inject = p.inject_runtime ? reinterpret_cast<const float*>(p.inject_runtime->address) : nullptr;
     hipLaunchKernelGGL(kernel, dim3(kPersistBlocks), dim3(512U), 0,
         stream, rows, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type, config.rms_epsilon,
-        reinterpret_cast<const unsigned char*>(p.down_runtime->address), inject,
+        config.hidden_size, reinterpret_cast<const unsigned char*>(p.down_runtime->address), inject,
         reinterpret_cast<const unsigned char*>(p.up_runtime->address), barrier.counter, barrier.issued, injected,
         std::getenv("STRIX_HC_PERSISTENT_TRACE") ? barrier.trace : nullptr);
     persistent_hyper_last_trace.store(barrier.trace);
@@ -4718,7 +4694,7 @@ bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& ro
     const auto* inject = p.inject_runtime ? reinterpret_cast<const float*>(p.inject_runtime->address) : nullptr;
     hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<Storage, Count, Inject>), dim3(kPersistBlocks), dim3(512U), 0,
         stream, rows, reinterpret_cast<const void*>(p.norm_runtime->address), p.norm_manifest->ggml_type, config.rms_epsilon,
-        reinterpret_cast<const unsigned char*>(p.down_runtime->address), inject,
+        config.hidden_size, reinterpret_cast<const unsigned char*>(p.down_runtime->address), inject,
         reinterpret_cast<const unsigned char*>(p.up_runtime->address), barrier.counter, barrier.issued, barrier.counter + 16, barrier.queued, injected,
         std::getenv("STRIX_HC_PERSISTENT_TRACE") ? barrier.trace : nullptr, persistent_up_late());
     persistent_hyper_last_trace.store(barrier.trace);
@@ -4751,7 +4727,7 @@ bool launch_persistent_hyper_draft(const std::uint16_t* input, const float* norm
         constexpr auto kernel = rows_static_hyper_mix_kernel<std::uint16_t, 1U, false, 1U, false, false>;
         if (persistent_kernel_resident<kernel, 1U, false>()) {
             hipLaunchKernelGGL(kernel, dim3(kPersistBlocks), dim3(512U), 0, stream, rows, static_cast<const void*>(norm), 0U, epsilon,
-                static_cast<const unsigned char*>(down), inject, static_cast<const unsigned char*>(up), barrier.counter, barrier.issued,
+                kPersistHidden, static_cast<const unsigned char*>(down), inject, static_cast<const unsigned char*>(up), barrier.counter, barrier.issued,
                 PersistInjectRows{}, static_cast<unsigned long long*>(nullptr));
             check_hip(hipGetLastError(), "MTP draft static persistent HC launch");
             barrier.issued += 2U * kPersistBlocks;
@@ -4760,7 +4736,7 @@ bool launch_persistent_hyper_draft(const std::uint16_t* input, const float* norm
         }
     }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<std::uint16_t, 1U, false>), dim3(kPersistBlocks), dim3(512U), 0,
-        stream, rows, static_cast<const void*>(norm), 0U, epsilon, static_cast<const unsigned char*>(down), inject,
+        stream, rows, static_cast<const void*>(norm), 0U, epsilon, kPersistHidden, static_cast<const unsigned char*>(down), inject,
         static_cast<const unsigned char*>(up), barrier.counter, barrier.issued, barrier.counter + 16, barrier.queued, PersistInjectRows{},
         static_cast<unsigned long long*>(nullptr), persistent_up_late());
     check_hip(hipGetLastError(), "MTP draft persistent HC launch");
