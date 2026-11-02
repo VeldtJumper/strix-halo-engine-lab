@@ -236,6 +236,17 @@ Logits and the 32 generated ids equal the published references at all three leng
 separate turns, one load per arm): MoE v2 −5.9 / −6.9 / −8.0 %, Engram lookahead −3.3 % at 32,499 and −2.8 % at
 44,699 tokens, attention lean −1.4 to −2.4 %.
 
+Also **on by default**: the deferred decoder cone of non-final prefill pieces (`STRIX_DS41_DEFER_DECODER=0` to
+disable). A long prompt's earlier pieces no longer run the decoder layers' cone; the last piece builds everything
+decoding needs. Same logits and generated ids. Server TTFT, one client, cache off, cold English prompts, 2 nodes,
+default profile, mean of two GPU turns per arm:
+
+| Prompt | Lever off | Now | Change |
+|---|---:|---:|---:|
+| 8,399 tokens (one piece) | 8.30 s | **8.19 s** | - |
+| 32,499 tokens (two pieces) | 29.90 s | **28.92 s** | −3.3 % |
+| 44,699 tokens (three pieces) | 43.07 s | **40.51 s** | −5.9 % |
+
 `--profile fast` turns on the relaxed-order MoE lever `STRIX_DS41_FAST_MOE=1`: **8.53 / 29.24 / 41.90 s** on the same
 prompts. It changes logits; its quality qualification is in progress, and `default` is unchanged.
 

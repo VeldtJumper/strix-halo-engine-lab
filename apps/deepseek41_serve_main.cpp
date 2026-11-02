@@ -772,6 +772,9 @@ public:
         bool step(std::uint32_t end, std::uint32_t budget) override {
             const auto N = static_cast<std::uint32_t>(prompt_.size());
             if (at_ == N) return true;
+            // after a piece that deferred its decoder (DevicePrefill::set_decoder_deferral) the continuation it was admitted
+            // for runs at least that far (a shorter one would read decoder ring entries the deferred piece never wrote)
+            if (!ptask_ && pin_end_ > at_ && end < pin_end_) end = pin_end_;
             if (ptask_ ? end != piece_end_ : (end <= at_ || end > N || (end != N && end % 8U != 0U)))
                 throw std::runtime_error("prefill task: bad unit end " + std::to_string(end));
             const auto t1 = Clock::now();
@@ -781,6 +784,19 @@ public:
                 std::vector<std::uint32_t> inside;
                 for (const auto p : points_)
                     if (p > at_ && p < end) inside.push_back(p);
+                // a piece whose decode state, logits and seed nobody reads (no cache insert at its end, no in-run
+                // snapshot in it or in the next piece) defers its decoder cone to the next piece of the default plan
+                defer_next_ = 0;
+                if (end < N && inside.empty()) {
+                    const auto it = std::upper_bound(ends_.begin(), ends_.end(), end);
+                    const std::uint32_t next = it == ends_.end() ? N : *it;
+                    const bool insert_here = sp_.cache_ && insert_ && end % sp_.a_.prefix_block == 0U && std::binary_search(ends_.begin(), ends_.end(), end);
+                    const bool points_next = std::any_of(points_.begin(), points_.end(), [&](std::uint32_t p) { return p > end && p < next; });
+                    if (!insert_here && !points_next) {
+                        sp_.prefill_->set_decoder_deferral(next - end);
+                        defer_next_ = next;
+                    }
+                }
                 sp_.prefill_->set_snapshot_points(std::move(inside));
                 // the next piece of the default plan: its Engram rows are read while this piece runs
                 if (end < N) {
@@ -813,6 +829,7 @@ public:
             }
             at_ = end;
             ++out_.pieces;
+            pin_end_ = r_.decoder_deferred ? defer_next_ : 0U;
             if (sp_.diagnostics_) sp_.row_layers_ += r_.row_layers;
             if (end != N && sp_.cache_ && insert_ && end % sp_.a_.prefix_block == 0U && std::binary_search(ends_.begin(), ends_.end(), end)) {
                 const auto ti = Clock::now();
@@ -895,6 +912,7 @@ public:
         Clock::time_point t0_;
         std::uint32_t at_ = 0;
         std::vector<std::uint32_t> ends_;
+        std::uint32_t defer_next_ = 0, pin_end_ = 0;  // decoder deferral: the next piece's end asked for / admitted
         std::vector<std::uint32_t> points_;  // --prefix-inrun-snapshots: snapshot points inside the runs (plan_prefill_runs)
         strix::deepseek41::PrefillResult r_;
         strix::deepseek41::AttentionState state_;

@@ -512,6 +512,10 @@ struct DevicePrefill::Impl {
     // Engram lookahead (set_engram_lookahead, STRIX_DS41_ENGRAM_LOOKAHEAD default on, =0 off): the next run's tokens,
     // and the thread that reads this rank's rows of them into the reader's payload cache after this run's own read.
     std::vector<std::uint32_t> engram_next;
+    // decoder deferral (set_decoder_deferral): the next run's continuation rows (0: none), and whether the last run left
+    // the decoder state for its continuation to complete (the state accessors refuse until then)
+    std::uint32_t defer_next = 0;
+    bool state_incomplete = false;
     std::vector<ds41::EngramRowRequest> engram_ahead_requests;
     std::vector<std::uint8_t> engram_ahead_out;
     std::thread engram_ahead;
@@ -1113,6 +1117,7 @@ const char* expert_kind_tensor(const std::string& kind) {
 
 DevicePrefill::DraftSeed DevicePrefill::draft_seed() const noexcept {
     const auto& m = *impl_;
+    if (m.state_incomplete) return DraftSeed{};  // a deferred run leaves no seed
     return DraftSeed{{m.seed[0].p, m.seed[1].p, m.seed[2].p}, m.seed_rows, m.seed_first};
 }
 
@@ -1216,6 +1221,7 @@ struct PrefillTask::State {
             if (cancel_req) {
                 cancelled = finished = parked = true;
                 m->cancel_broken = true;  // even an unstarted abandoned task needs run/import before extend
+                m->defer_next = 0;        // and drops its one-shot decoder-deferral request
                 m->task = nullptr;
                 cv.notify_all();
                 return;
@@ -1237,6 +1243,7 @@ struct PrefillTask::State {
         }
         if (!ok) {
             m->cancel_broken = true;  // the sequence's state is partial
+            m->defer_next = 0;
             try {
                 drain();
             } catch (...) {
@@ -1498,6 +1505,34 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // layers every row; decoder layer L its attention input from x0 (layer 20: every row, for the compressor and the
     // index keys every decoder reads), its window K/V from k0 and its whole output from o0, as plan_suffix_replay
     // gives them, rounded down to the attention window so the windows of every layer line up (the extra rows are exact).
+    // Decoder deferral (set_decoder_deferral, STRIX_DS41_DEFER_DECODER default on): admitted when the continuation's
+    // own cone, as this code plans it (rounded down to W, with the draft rows), starts at least one attention window
+    // after the continuation's first row in every decoder layer, so it reads no decoder ring entry of this run.
+    const std::uint32_t first_decoder = ds41::SuffixReplayGeometry{}.first_decoder;
+    bool defer = false;
+    {
+        const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
+        static const bool defer_on = [] { const char* v = std::getenv("STRIX_DS41_DEFER_DECODER"); return !(v && std::strcmp(v, "0") == 0); }();
+        if (next_rows != 0U && defer_on && m.options.cone && m.options.layers == c.num_hidden_layers && m.options.layers > first_decoder &&
+            m.snap_points.empty() && (P0 + T) % W == 0U) {
+            ds41::SuffixReplayGeometry g;
+            g.layers = c.num_hidden_layers;
+            g.draft_rows = m.options.draft_rows;
+            defer = true;
+            for (const auto& pl : ds41::plan_suffix_replay(g, 0U, next_rows).layers)
+                if (pl.layer >= first_decoder && pl.out_begin / W * W < attn::kWindow) defer = false;
+        }
+        if (m.distributed() && m.options.cone && m.options.layers == c.num_hidden_layers) {  // both ranks: the same decision
+            const std::array<std::uint32_t, 2> mine{defer ? 1U : 0U, defer ? next_rows : 0U};
+            std::array<std::uint32_t, 2> other{};
+            m.options.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(other)),
+                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x64656631U, P0});
+            if (other != mine)
+                throw std::runtime_error("deepseek41 prefill: the ranks disagree on the decoder deferral of the run at " + std::to_string(P0));
+        }
+    }
+    result.decoder_deferred = defer;
+    if (defer) result.next_token = 0xFFFFFFFFU;
     struct Rows { std::uint32_t x0 = 0, k0 = 0, o0 = 0; };
     std::vector<Rows> rows(m.options.layers);
     if (m.options.cone && m.options.layers == c.num_hidden_layers) {
@@ -1525,8 +1560,22 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
             }
         }
+        if (defer) {  // decoder layers: no output and no window rows; a compressed-KV source keeps every input row
+            for (std::uint32_t l = first_decoder; l < m.options.layers; ++l) {
+                auto& r = rows[l];
+                r.o0 = r.k0 = T;
+                r.x0 = m.roles[l].owns_kv ? 0U : T;
+            }
+        }
         result.row_layers = 0;
         for (const auto& r : rows) result.row_layers += T - r.o0;
+        // the continuation of a deferred run: no decoder layer may read a ring entry of that run (rows before P0)
+        if (m.state_incomplete && P0 != 0U)
+            for (std::uint32_t l = first_decoder; l < m.options.layers; ++l)
+                if (rows[l].o0 < attn::kWindow)
+                    throw std::logic_error("deepseek41 prefill: this run's decoder cone reaches into the previous run, which deferred its decoder");
+    } else if (m.state_incomplete && P0 != 0U) {
+        throw std::logic_error("deepseek41 prefill: a run without the cone cannot continue a deferred run");
     } else {
         result.row_layers = std::uint64_t{T} * m.options.layers;
     }
@@ -1875,6 +1924,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     std::vector<std::uint32_t> trace_router;  // options.trace: this layer's router ids until the layer's end
     for (const auto& s : m.plan.steps) {
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
+        if (defer && (s.layer < 0 ? s.op == Op::head || s.op == Op::argmax : layer >= first_decoder)) {
+            // deferred decoder: only a compressed-KV source's attention input and its compressor run (no head)
+            const bool source = s.layer >= 0 && m.roles[layer].owns_kv;
+            if (!source || !(s.op == Op::attention || ((s.op == Op::hc_mix || s.op == Op::hc_pre || s.op == Op::rms_norm) && s.site == "attn")))
+                continue;
+        }
         if (s.layer >= 0 && s.layer != cut_layer) {  // a layer starts: hc / norms / q_a / kv (and Engram)
             if (cut_layer >= 0) cut(PrefillUnitLevel::layer, s.layer, "pre");
             else if (m.task != nullptr) m.task->layer = s.layer, m.task->kind = "setup+pre";
@@ -2286,6 +2341,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     if (r.owns_kv) compress((mine ? m.ckv.p : m.peer_ckv.p) + at, (mine ? m.cscore.p : m.peer_cscore.p) + at, w0, n);
                 }
                 mark_part(1);
+                if (defer && layer >= first_decoder) return;  // deferred: the compressed entries are in; no rows, no ring save
                 // TP: the peer's K-half of the chunk at `pending` (if any), then y = h0 + h1 of its rows
                 std::uint32_t pending = T;
                 float* staged_half = nullptr;
@@ -2911,7 +2967,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
     }
     join_engram(0xFFFFFFFFU);
-    if (seed_n != 0U) {  // every seed row on both ranks, in position order (row_split: 8-row windows alternate)
+    if (seed_n != 0U && !defer) {  // every seed row on both ranks, in position order (row_split: 8-row windows alternate)
         const std::size_t rb = std::size_t{hc} * H * 4U;
         for (std::uint32_t j = 0; j < 3U; ++j) {
             if (split) {
@@ -2931,7 +2987,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
         }
     }
-    m.seed_rows = seed_n;
+    m.seed_rows = defer ? 0U : seed_n;
     m.seed_first = P0 + seed_begin;
     check(hipStreamSynchronize(st), "prefill");
     if (m.options.stream_experts) {
@@ -2943,6 +2999,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     m.rows_done = P0 + T;
     m.local_rows_done = Tn;
     m.last_row_local = last_local;
+    m.state_incomplete = defer;
 #ifdef STRIX_DS41_PREFILL_FP16_LT
     if (m.fast_used) {
         // FP16 output form: no value of this run may have left the FP16 range (checked after the timed run)
@@ -2957,6 +3014,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
 
 std::vector<std::pair<std::string, std::uint64_t>> DevicePrefill::state_hashes() const {
     const auto& m = *impl_;
+    if (m.state_incomplete) throw std::logic_error("deepseek41 prefill: the last run deferred its decoder (its continuation completes the state)");
     namespace attn = ds41::attn;
     std::vector<std::pair<std::string, std::uint64_t>> out;
     const std::uint32_t T = m.rows_done;
@@ -3045,10 +3103,13 @@ void DevicePrefill::import_state(const AttentionState& s) {
     m.last_row_local = false;
     check(hipStreamSynchronize(st), "import state");
     m.cancel_broken = false;
+    m.state_incomplete = false;  // a complete state replaces a deferred run's (only after the import succeeded)
+    m.defer_next = 0;
 }
 
 AttentionState DevicePrefill::export_state() const {
     const auto& m = *impl_;
+    if (m.state_incomplete) throw std::logic_error("deepseek41 prefill: the last run deferred its decoder (its continuation completes the state)");
     namespace attn = ds41::attn;
     AttentionState s;
     const std::uint32_t T = m.rows_done;
@@ -3132,6 +3193,11 @@ void DevicePrefill::set_engram_lookahead(std::span<const std::uint32_t> next) {
     if (!on) impl_->engram_next.clear();
 }
 
+void DevicePrefill::set_decoder_deferral(std::uint32_t next_rows) {
+    if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
+    impl_->defer_next = next_rows;
+}
+
 void DevicePrefill::set_snapshot_points(std::vector<std::uint32_t> positions) {
     if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
     std::sort(positions.begin(), positions.end());
@@ -3141,6 +3207,7 @@ void DevicePrefill::set_snapshot_points(std::vector<std::uint32_t> positions) {
 
 AttentionState DevicePrefill::export_state_at(std::uint32_t position) const {
     const auto& m = *impl_;
+    if (m.state_incomplete) throw std::logic_error("deepseek41 prefill: the last run deferred its decoder (its continuation completes the state)");
     namespace attn = ds41::attn;
     const auto it = std::find(m.snap_points.begin(), m.snap_points.end(), position);
     if (it == m.snap_points.end() || position > m.rows_done)

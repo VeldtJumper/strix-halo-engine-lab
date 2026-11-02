@@ -135,6 +135,7 @@ struct PrefillResult {
     std::vector<PrefillLayerTrace> trace; // options.trace
     std::vector<float> logits;        // last row (world 2 without gather_logits: this rank's slice, other entries zero)
     std::uint32_t next_token = 0;
+    bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
     double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
@@ -285,6 +286,15 @@ public:
     // cache, so the next run's read is served from host memory (the same bytes; nothing else changes). A next run with
     // other tokens or boundaries reads what the cache misses as before. STRIX_DS41_ENGRAM_LOOKAHEAD=0: ignored.
     void set_engram_lookahead(std::span<const std::uint32_t> next);
+    // The next run (run / extend / begin) is followed by `next_rows` more rows of the same sequence and nobody reads its
+    // decode state, logits or seed: its decoder layers then skip their cone (only the first decoder layer's compressed-KV /
+    // index-key entries of every row, which the later runs read, are computed). Admitted only for the full layer set with
+    // the cone, no snapshot points in the run, and a following run of `next_rows` whose own cone (rounded to the window
+    // rows, with its draft rows) starts at least one attention window after its first row, so it reads no decoder ring
+    // entry of the deferred run; the caller must then run that continuation (an extend of at least `next_rows` rows).
+    // Both ranks must ask the same (the run checks it and throws on a mismatch). Until the next run completes,
+    // export_state / export_state_at / state_hashes refuse and draft_seed is empty. STRIX_DS41_DEFER_DECODER=0: never admitted.
+    void set_decoder_deferral(std::uint32_t next_rows);
     [[nodiscard]] AttentionState export_state_at(std::uint32_t position) const;
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
