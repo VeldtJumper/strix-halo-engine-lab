@@ -102,6 +102,10 @@ window, threshold stored per drafter), which lifted C1 with the drafter from 85.
 tok/s (`default` / `fast` / `quality`, measured when it shipped); `STRIX_G4_MTP_CONF=0` restores the previous window
 policy.
 
+Decode passes return the device's greedy token per row and copy logits and hidden-state taps to the host only when a
+request or drafter reads them: +1.9 / +4.6 / +5.9 % at C1 / C4 / C8 with the drafter off and +3.3 / +8.3 / +9.3 % with
+the MTP drafter on (`default`, short prompts, same bytes); `STRIX_G4_DECODE_EXPORT=0` restores the full copies.
+
 Single-request decode also drafts from the text itself (prompt lookup): it proposes the continuation of the longest
 earlier match of the last tokens in the prompt and output, and the main model verifies every token, so token ids equal
 drafting off. It pays off where the output copies from the context. Agent code-edit prompt (a 2.2K-token Python file

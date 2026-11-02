@@ -107,6 +107,11 @@ probabilidad acumulada, con umbral guardado por drafter), lo que subió C1 con d
 92.9 / 100.6 / 83.8 tok/s (`default` / `fast` / `quality`, medido cuando se incorporó); `STRIX_G4_MTP_CONF=0` restaura
 la política de ventana anterior.
 
+Las pasadas de decode devuelven el token greedy calculado en el dispositivo para cada fila y copian logits y taps de
+estado oculto al host solo cuando una petición o el drafter los lee: +1.9 / +4.6 / +5.9 % en C1 / C4 / C8 sin drafter y
++3.3 / +8.3 / +9.3 % con el drafter MTP (`default`, prompts cortos, mismos bytes); `STRIX_G4_DECODE_EXPORT=0` restaura
+las copias completas.
+
 El decode de una petición también propone tokens a partir del propio texto (prompt lookup): propone la continuación
 de la coincidencia anterior más larga de los últimos tokens del prompt y de la salida, y el modelo principal verifica
 cada token, así que los ids de los tokens son iguales a los obtenidos sin draft. Compensa cuando la salida copia del
