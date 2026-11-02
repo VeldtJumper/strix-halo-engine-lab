@@ -26,7 +26,18 @@ void configure(const TierOpenConfig& c,Handles& h,ts_budget& b,ts_options& o){
     if(p.three_tier){o.dg_disk_tier=1;o.dg_disk_prefetch=c.disk_prefetch?1u:0u;o.dg_disk_staging=std::uint32_t(p.staging);
         // Each read in flight holds one staging buffer.
         expert_need(c.disk_queue<=std::max<std::uint64_t>(p.staging,1),"disk queue exceeds the staging buffers (raise --tier-staging)");
-        o.dg_disk_queue=c.disk_queue;o.dg_clean_evict=c.clean_evict?1u:0u;}
+        o.dg_disk_queue=c.disk_queue;o.dg_clean_evict=c.clean_evict?1u:0u;
+        if(c.landing_blocks){o.dg_landing_blocks=c.landing_blocks;o.dg_landing_max_queued=c.landing_max_queued;o.dg_landing_ttl=c.landing_ttl;
+#ifdef SS_DG_LANDING_YIELD
+            o.dg_landing_chunk=c.landing_chunk;
+#endif
+        }}
+    // The landing group goes to the library together, and only with the blocks the plan billed (three-tier).
+    expert_need(c.landing_blocks==p.landing_blocks&&(p.three_tier||!c.landing_blocks),"landing blocks != budget");
+    expert_need(c.landing_blocks||(!c.landing_max_queued&&!c.landing_ttl&&!c.landing_chunk),"landing options without landing blocks");
+#ifndef SS_DG_LANDING_YIELD
+    expert_need(c.landing_chunk==0,"--tier-landing-chunk needs a tierstream with SS_DG_LANDING_YIELD");
+#endif
     if(c.source_size){h.source.volume=c.source_volume;h.source.index=c.source_index;h.source.size=c.source_size;o.source_identity_n=1;o.source_identities=&h.source;}
     // The device-gated context charges its own arena, tables, pinned blocks and
     // staging to GLM's ledger by name (no whole-device sample at open).
@@ -47,7 +58,13 @@ class Binding final:public TierCacheApi {
     Handles h_;TierView view_{};CacheCounters before_{};std::uint64_t unit_=0;unsigned pred_=0,pred_through_=0;bool flush_ready_=false;std::string last_error_;StepPlan plan_;
     CacheCounters read(){ts_dg_stats s{};ts_ok(ts_stats_dg(h_.ctx,&s),"stats");CacheCounters c;c.lookups=s.lookups;c.misses=s.misses;c.fetched=s.fetched;c.prefetched=s.prefetched;c.resurrected=s.resurrected;c.covered=s.covered;c.bank_serves=s.bank_serves;c.file_reads=s.disk_reads;c.file_bytes=s.disk_read_bytes;c.file_ns=s.disk_read_ns;
         c.evicted=s.evicted;c.drops=s.disk_drops;c.writebacks=s.writebacks_done;c.stalled=s.stalled;c.timeouts=s.device_timeouts;c.free_slots=s.free_slots;
-        c.file_wait_ns=s.disk_wait_ns;c.clean_drops=s.clean_drops;c.clean_drop_bytes=s.clean_drop_bytes;return c;}
+        c.file_wait_ns=s.disk_wait_ns;c.clean_drops=s.clean_drops;c.clean_drop_bytes=s.clean_drop_bytes;
+        c.landing_issued=s.landing_issued;c.landing_promoted=s.landing_promoted;c.landing_late=s.landing_late;c.landing_wait_ns=s.landing_wait_ns;c.landing_expired=s.landing_expired;c.landing_dropped_full=s.landing_dropped_full;c.landing_read_bytes=s.landing_read_bytes;c.landing_cancelled=s.landing_cancelled;
+        c.landing_expired_layer=s.landing_expired_layer;c.landing_skipped_passed=s.landing_skipped_passed;
+#ifdef SS_DG_LANDING_YIELD
+        c.landing_yields=s.landing_yields;c.landing_aborted_bytes=s.landing_aborted_bytes;
+#endif
+        return c;}
 public:
     explicit Binding(const TierOpenConfig& c){
         ts_budget b;ts_options o;configure(c,h_,b,o);ts_ok(ts_open(h_.desc,&b,h_.plan,&o,&h_.ctx),"open");flush_ready_=o.dg_flush_ready!=0;

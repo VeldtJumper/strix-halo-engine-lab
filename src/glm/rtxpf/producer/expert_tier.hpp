@@ -153,13 +153,16 @@ struct TierBudgetIn {
     // The library's per-reader bounce buffers beyond its own one: with dg_disk_queue > 1 each
     // disk reader holds one (up to a unit's covering read), billed to pinned host memory.
     std::uint32_t disk_readers=0;
+    // The library's landing blocks (dg_landing_blocks): pinned, one host stride each, outside the
+    // pinned tier; billed whenever requested (the library allocates them only with a file tier).
+    std::uint32_t landing_blocks=0;
     bool file_tier=true;
 };
 struct TierBudget {
-    std::uint64_t slots=0,resident=0,pinned=0,disk=0,spare_slots=0,host_spares=0,staging=0,ring=0,disk_readers=0;
+    std::uint64_t slots=0,resident=0,pinned=0,disk=0,spare_slots=0,host_spares=0,staging=0,ring=0,disk_readers=0,landing_blocks=0;
     bool three_tier=false;std::string refuse;
     std::uint64_t device_bytes(std::uint64_t unit)const{return slots*unit;}
-    std::uint64_t host_bytes(std::uint64_t unit)const{return (pinned+host_spares+staging+disk_readers)*unit;}
+    std::uint64_t host_bytes(std::uint64_t unit)const{return (pinned+host_spares+staging+disk_readers+landing_blocks)*unit;}
 };
 // Arena-only budgets (--tier-vram-gib / --tier-ram-gib, and the default sizing
 // from free memory): ss_budget_plan with the arena budget as its device cap (the
@@ -372,7 +375,8 @@ GLM_HOST_DEVICE inline std::uint64_t unit_address(std::uint64_t base,std::int32_
 // (covered), or by a demand copy (fetched); prefetched are speculative copies.
 // Every copy has one source: a pinned RAM block or a file staging buffer filled
 // by exactly one file read (disk_reads), so RAM copies = copies - file reads.
-struct CacheCounters {std::uint64_t lookups=0,misses=0,fetched=0,prefetched=0,resurrected=0,covered=0,bank_serves=0,file_reads=0,file_bytes=0,file_ns=0,evicted=0,drops=0,writebacks=0,stalled=0,timeouts=0,free_slots=0,file_wait_ns=0,clean_drops=0,clean_drop_bytes=0;};
+struct CacheCounters {std::uint64_t lookups=0,misses=0,fetched=0,prefetched=0,resurrected=0,covered=0,bank_serves=0,file_reads=0,file_bytes=0,file_ns=0,evicted=0,drops=0,writebacks=0,stalled=0,timeouts=0,free_slots=0,file_wait_ns=0,clean_drops=0,clean_drop_bytes=0,
+    landing_issued=0,landing_promoted=0,landing_late=0,landing_wait_ns=0,landing_expired=0,landing_dropped_full=0,landing_read_bytes=0,landing_cancelled=0,landing_expired_layer=0,landing_skipped_passed=0,landing_yields=0,landing_aborted_bytes=0;};
 inline Json cache_delta(const CacheCounters& a,const CacheCounters& b,std::uint64_t unit_bytes){
     auto d=[](std::uint64_t x,std::uint64_t y){expert_need(y>=x,"cache counters went backwards");return y-x;};
     const auto look=d(a.lookups,b.lookups),miss=d(a.misses,b.misses),fetch=d(a.fetched,b.fetched),pre=d(a.prefetched,b.prefetched),file=d(a.file_reads,b.file_reads);
@@ -382,7 +386,13 @@ inline Json cache_delta(const CacheCounters& a,const CacheCounters& b,std::uint6
     j.set("ram_copies",fetch+pre-file);j.set("file_reads",file);j.set("file_bytes",d(a.file_bytes,b.file_bytes));j.set("file_read_ns",d(a.file_ns,b.file_ns));j.set("h2d_bytes",(fetch+pre)*unit_bytes);
     j.set("evicted",d(a.evicted,b.evicted));j.set("disk_drops",d(a.drops,b.drops));j.set("writebacks",d(a.writebacks,b.writebacks));j.set("stalled",d(a.stalled,b.stalled));j.set("free_slots",b.free_slots);
     // The service's wall time waiting on file reads (< file_read_ns once reads overlap) and clean drops (no D2H).
-    j.set("file_wait_ns",d(a.file_wait_ns,b.file_wait_ns));j.set("clean_drops",d(a.clean_drops,b.clean_drops));j.set("clean_drop_bytes",d(a.clean_drop_bytes,b.clean_drop_bytes));return j;
+    j.set("file_wait_ns",d(a.file_wait_ns,b.file_wait_ns));j.set("clean_drops",d(a.clean_drops,b.clean_drops));j.set("clean_drop_bytes",d(a.clean_drop_bytes,b.clean_drop_bytes));
+    // Two-stage file prefetch (landing blocks): promoted = demand misses served from a landing block.
+    j.set("landing_issued",d(a.landing_issued,b.landing_issued));j.set("landing_promoted",d(a.landing_promoted,b.landing_promoted));j.set("landing_late",d(a.landing_late,b.landing_late));j.set("landing_wait_ns",d(a.landing_wait_ns,b.landing_wait_ns));
+    j.set("landing_expired",d(a.landing_expired,b.landing_expired));j.set("landing_dropped_full",d(a.landing_dropped_full,b.landing_dropped_full));j.set("landing_read_bytes",d(a.landing_read_bytes,b.landing_read_bytes));j.set("landing_cancelled",d(a.landing_cancelled,b.landing_cancelled));
+    j.set("landing_expired_layer",d(a.landing_expired_layer,b.landing_expired_layer));j.set("landing_skipped_passed",d(a.landing_skipped_passed,b.landing_skipped_passed));
+    // Chunked landing reads (dg_landing_chunk): chunk boundaries that yielded to a demand read, and bytes of cancelled landings not read.
+    j.set("landing_yields",d(a.landing_yields,b.landing_yields));j.set("landing_aborted_bytes",d(a.landing_aborted_bytes,b.landing_aborted_bytes));return j;
 }
 // Cache token ownership. A failure after begin leaves the library token without
 // its end kernel, so the cache is never reused: every later begin reports the

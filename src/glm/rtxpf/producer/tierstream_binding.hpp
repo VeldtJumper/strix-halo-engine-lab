@@ -48,6 +48,10 @@ struct TierOpenConfig {
     std::string weight_dirs;std::uint32_t drive_readers=0;
     // ss_options.dg_disk_queue (1..64, <= staging) / dg_clean_evict; three-tier opens only.
     std::uint32_t disk_queue=1;bool clean_evict=false;
+    // ss_options.dg_landing_blocks / dg_landing_max_queued / dg_landing_ttl (three-tier with disk_queue > 1; 0 = off).
+    std::uint32_t landing_blocks=0,landing_max_queued=0,landing_ttl=0;
+    // ss_options.dg_landing_chunk (SS_DG_LANDING_YIELD): 0 = 4 MiB chunks, 0xFFFFFFFF = whole landing reads.
+    std::uint32_t landing_chunk=0;
 };
 // The tierstream commit this build compiled (CMake pin / snapshot STAMP), for health.
 const char* tierstream_commit();
@@ -63,7 +67,7 @@ inline TierLibraryBudget library_budget(const TierBudget& b,std::uint64_t unit,s
     TierLibraryBudget l;const std::uint64_t host_stride=align_up(unit,4096),slack=64ULL<<20;
     l.ring_slots=2*max_ids+1;l.device_bytes=(b.slots+2ULL*max_ids+1)*unit+keys*4+slack;
     // +1 staging unit, +4 startup load buffers, + one bounce per disk reader (dg_disk_queue > 1).
-    l.host_bytes=(b.pinned+b.host_spares+b.staging+1+4+b.disk_readers)*host_stride+(16ULL<<20)+slack;return l;
+    l.host_bytes=(b.pinned+b.host_spares+b.staging+1+4+b.disk_readers+b.landing_blocks)*host_stride+(16ULL<<20)+slack;return l;
 }
 std::unique_ptr<TierCacheApi> open_tierstream(const TierOpenConfig&);
 // CPU backend: runs every library admission rule (descriptor, plan, budgets,

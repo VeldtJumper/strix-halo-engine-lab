@@ -224,6 +224,11 @@ int main(int argc,char** argv){p::install_crash_report();try{
         else if(a=="--drive-readers"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)>=1&&std::stoul(value)<=32,"--drive-readers 1..32");dopts.drive_readers=unsigned(std::stoul(value));}
         else if(a=="--tier-disk-queue"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)>=1&&std::stoul(value)<=64,"--tier-disk-queue 1..64");dopts.tier_disk_queue=unsigned(std::stoul(value));}
         else if(a=="--tier-clean-evict"){w::require(value=="0"||value=="1","--tier-clean-evict 0|1");dopts.tier_clean_evict=value=="1";}
+        else if(a=="--tier-landing-blocks"){w::require(!value.empty()&&value.size()<=4&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)<=4096,"--tier-landing-blocks 0..4096");dopts.tier_landing_blocks=unsigned(std::stoul(value));}
+        else if(a=="--tier-landing-max-queued"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)<=64,"--tier-landing-max-queued 0..64");dopts.tier_landing_max_queued=unsigned(std::stoul(value));}
+        else if(a=="--tier-landing-ttl"){w::require(!value.empty()&&value.size()<=4&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)<=1024,"--tier-landing-ttl 0..1024");dopts.tier_landing_ttl=unsigned(std::stoul(value));}
+        else if(a=="--tier-landing-chunk"){w::require(value=="whole"||(value.find_first_not_of("0123456789")==std::string::npos&&!value.empty()&&value.size()<=10),"--tier-landing-chunk BYTES|whole");
+            const auto n=value=="whole"?0xFFFFFFFFull:std::stoull(value);w::require(n<=0xFFFFFFFFull&&(n==0xFFFFFFFFull||n%4096==0),"--tier-landing-chunk BYTES (0 or a multiple of 4096)|whole");dopts.tier_landing_chunk=std::uint32_t(n);}
         else if(a=="--disk-prefetch")dopts.disk_prefetch=value=="1";else if(a=="--unit-manifest-sha256")dopts.unit_manifest_sha256=value;else if(a=="--bind")bind=value;else if(a=="--port")port=unsigned(std::stoul(value));else if(a=="--capacity")capacity=unsigned(std::stoul(value));else if(a=="--row-tile")tile=value=="auto"?0:unsigned(std::stoul(value));else if(a=="--max-device-layers")max_device_layers=p::layer_limit(value);else if(a=="--max-pinned-layers")max_pinned_layers=p::layer_limit(value);else if(a=="--host-floor-gib"){auto n=std::stoul(value);w::require(n<=1024,"host floor range");host_floor_gib=unsigned(n);}else throw std::runtime_error("unknown service option");}}
     // --profile default|fast|quality (profile.hpp, the DS RTX resolver's structure): one switch selects every lever;
     // per-lever options stay expert overrides (CLI > environment > profile > builtin). A pending row never refuses the
@@ -256,6 +261,9 @@ int main(int argc,char** argv){p::install_crash_report();try{
     if(auto* e=prof.find("predicted_prefetch");e&&(e->status==rp::Status::pending||e->status==rp::Status::profile||e->status==rp::Status::unqualified))dopts.tier_predict=e->value=="1";
     // After every profile-derived value: self-speculation exports two rows per layer through the tierstream cache.
     w::require(!dopts.spec_lookup||dopts.mtp_spec,"--spec-lookup drafts for the self-speculation verify (--mtp-self-spec 1)");
+    // Landing (tierstream dg_landing_*): the sub-options need the blocks, and the landing reads run on the read pool.
+    w::require(dopts.tier_landing_blocks||(!dopts.tier_landing_max_queued&&!dopts.tier_landing_ttl&&!dopts.tier_landing_chunk),"--tier-landing-max-queued / -ttl / -chunk need --tier-landing-blocks N > 0");
+    w::require(!dopts.tier_landing_blocks||(dopts.expert_tier=="tierstream"&&dopts.tier_disk_queue>1),"--tier-landing-blocks needs the tierstream cache and --tier-disk-queue > 1");
     w::require(!dopts.mtp_spec||(dopts.routes_out.empty()&&dopts.expert_tier=="tierstream"),
                "--mtp-self-spec: tierstream expert tier only, not with --routes-out (it records one row per layer)");
     if(auto* e=use("prefill_tile_large");e&&e->status==rp::Status::unqualified){auto* rt=prof.find("row_tile");if(!rt||rt->status!=rp::Status::explicit_cli)tile=std::min(8192u,capacity/32*32);}

@@ -116,7 +116,10 @@ tarjeta completa. Se desactiva con `--prefill-overlap 0`.
 Con 24 GiB de VRAM + 32 GiB de
 RAM del host (la mayoría de los expertos leídos del archivo de unidades en disco) también funciona de forma exacta: TTFT
 **60.3 s** con 1K y **62.4 s** con 8K con el solapamiento del prefill (63.4 / 73.7 s sin él en la misma ventana); decode
-de **0.67 tok/s** en caliente (0.63 en frío). Compilación, archivo de unidades y opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
+de **0.67 tok/s** en caliente (0.63 en frío). Con el prefetch de archivo en dos etapas opcional
+(`--tier-landing-blocks 16`, tres unidades en franjas) el decode fue un 20-40 % más rápido que sin él en las mismas
+ventanas, con salida idéntica (las repeticiones variaron entre un 15 y un 55 %). Compilación, archivo de unidades y
+opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
 
 ## Todos los valores predeterminados incorporados de GLM
 

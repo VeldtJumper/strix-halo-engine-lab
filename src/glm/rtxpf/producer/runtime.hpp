@@ -22,6 +22,13 @@ struct DecodeOptions {
     // a device victim with no free pinned block goes to its file with no D2H copy and displaces no
     // pinned unit). Placement / IO only: same bytes. Defaults keep today's behaviour until measured.
     unsigned tier_disk_queue=1;bool tier_clean_evict=false;
+    // Two-stage file prefetch (tierstream dg_landing_*): predictions of file-homed units are read into
+    // landing_blocks pinned blocks (never a GPU slot); a demand copies from there. Needs a file tier and
+    // tier_disk_queue > 1; billed as pinned host units. Placement only (same bytes); 0 = off until measured.
+    unsigned tier_landing_blocks=0,tier_landing_max_queued=0,tier_landing_ttl=0;
+    // tierstream dg_landing_chunk (SS_DG_LANDING_YIELD): landing reads run in chunks that yield their reader to a
+    // demand read (0 = 4 MiB chunks; 0xFFFFFFFF = whole, unchunked landing reads). Used only with landing blocks.
+    std::uint32_t tier_landing_chunk=0;
     double vram_total_gib=-1,ram_total_gib=-1; // whole-device caps (< 0: none = the device room / host above the floor)
     double tier_vram_gib=-1,tier_ram_gib=-1; // < 0: everything left after prefill residency / the host floor
     unsigned tier_spare_slots=16,tier_host_spares=8,tier_staging=8;
