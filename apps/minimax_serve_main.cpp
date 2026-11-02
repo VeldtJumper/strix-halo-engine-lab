@@ -625,6 +625,7 @@ sv::Json policy_json(Shared& shared, bool drafter) {
     b.set("gap_ms", sv::Json(p.gap_ms));
     b.set("dspark", sv::Json(drafter && (p.dspark_mode == ds::Mode::on || shared.dspark_contexts != 0)));
     b.set("dspark_mode", sv::Json(ds::mode_name(p.dspark_mode)));
+    b.set("lookup", sv::Json(p.lookup));
     b.set("dspark_effective", sv::Json(p.dspark_mode == ds::Mode::on && drafter ? "on" : p.dspark_mode == ds::Mode::automatic && p.dspark_prior == ds::Prior::structural_v1 && drafter ? "per_request" : "plain"));
     b.set("dspark_assets", sv::Json(drafter));
     b.set("dspark_live", sv::Json(static_cast<std::int64_t>(shared.dspark_live)));
@@ -655,6 +656,10 @@ sv::Json policy_json(Shared& shared, bool drafter) {
     k.set("drafts", sv::Json(static_cast<std::int64_t>(c.drafts)));
     k.set("drafted", sv::Json(static_cast<std::int64_t>(c.drafted)));
     k.set("accepted", sv::Json(static_cast<std::int64_t>(c.accepted)));
+    k.set("lookup_windows", sv::Json(static_cast<std::int64_t>(c.lookup_windows)));
+    k.set("lookup_drafted", sv::Json(static_cast<std::int64_t>(c.lookup_drafted)));
+    k.set("lookup_accepted", sv::Json(static_cast<std::int64_t>(c.lookup_accepted)));
+    k.set("lookup_s", sv::Json(c.lookup_s));
     sv::Json h = sv::Json::array();
     for (auto v : c.rows_hist) h.as_array().push_back(sv::Json(static_cast<std::int64_t>(v)));
     k.set("rows_hist", std::move(h));
@@ -708,6 +713,10 @@ sv::Json admin_sched(const sv::HttpRequest& req, Shared& shared, bool drafter) {
         if (const auto* v = body.find("dspark_inflight")) {
             if (!v->is_number()) throw std::invalid_argument("dspark_inflight: 0..8");
             p.inflight = ds::parse_inflight(v->dump().c_str());
+        }
+        if (const auto* v = body.find("lookup")) {
+            if (!v->is_bool()) throw std::invalid_argument("lookup: boolean required");
+            p.lookup = v->as_bool();
         }
         if (const auto* v = body.find("draft_slots"); v && v->is_number()) p.draft_slots = static_cast<std::uint32_t>(std::clamp<std::int64_t>(v->as_int(), 1, 8));
         if (body.find("reset_counters")) shared.counters = Counters{};
@@ -945,6 +954,8 @@ int main(int argc, char** argv) {
             shared.unlimited_reason = eng.prefill_unlimited_reason();
             shared.policy.gap_ms = ms::gap_ms(std::getenv("STRIX_MM_SERVE_GAP_MS"));
             shared.policy.dspark_mode = dspark_mode;
+            const char* lookup_env = std::getenv("STRIX_MM_LOOKUP");
+            shared.policy.lookup = lookup_env == nullptr || std::strcmp(lookup_env, "0") != 0;
             shared.policy.dspark_prior = dspark_prior;
             shared.policy.inflight = dspark_inflight;
             shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(env_num("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));

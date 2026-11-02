@@ -6,6 +6,7 @@
 #include "minimax_session.hpp"
 #include "minimax/dspark/minimax_dspark.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
+#include "strix/lookup/index.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -54,6 +56,7 @@ struct Policy : ms::RequestPolicy {
     ds::Prior dspark_prior = ds::Prior::structural_v1;
     std::uint32_t inflight = 1;   // DSpark contexts kept while <= this many requests are in flight (measurement: C2 slower)
     std::uint32_t draft_slots = 8;  // at most this many slots draft in one cycle
+    bool lookup = true;             // prompt-lookup windows (STRIX_MM_LOOKUP at startup; /admin/sched "lookup")
     std::uint64_t epoch = 0;      // bumped by every change (the lead resets its cost tables / gates)
 };
 struct Counters {
@@ -62,6 +65,9 @@ struct Counters {
     std::uint64_t cancels = 0;  // open prefills abandoned (client gone)
     // DSpark coverage: cycles with >= 2 windows (k >= 1), of which with unequal k; windows with a rejected draft
     std::uint64_t multi_windows = 0, unequal_windows = 0, rejections = 0;
+    // prompt lookup: windows drafted from the request's own context, their rows and accepted tokens; host time
+    std::uint64_t lookup_windows = 0, lookup_drafted = 0, lookup_accepted = 0;
+    double lookup_s = 0;
     std::uint64_t steps = 0, step_rows = 0, units = 0, prefills = 0, drafts = 0, drafted = 0, accepted = 0, plain_cycles = 0,
                   draft_cycles = 0;
     std::array<std::uint64_t, kStepRows + 1> rows_hist{};
@@ -98,6 +104,20 @@ struct Running {
     ds::Prior dspark_prior = ds::Prior::structural_v1;
     ds::SurvivalController survival{16};
     double tau = 1.0;      // EMA of emitted tokens per drafting cycle (which slots draft first)
+    // Prompt lookup (rank 0 only, strix/lookup/index.hpp): an index over the prompt and every committed token; each
+    // cycle's longest-match candidate is shadow-scored token by token on what the request commits (per match-length
+    // bucket and depth, decayed). Exact: verification decides every token.
+    struct LookupPending {
+        std::uint64_t first = 0;  // stream position of the candidate's first token
+        std::uint32_t count = 0, done = 0, bucket = 0;
+        std::array<std::uint32_t, ds::block> token{};
+    };
+    std::unique_ptr<strix::lookup::Index> lk;
+    std::uint64_t lk_next = 0;  // stream position of the next committed token
+    std::vector<LookupPending> lk_pending;
+    std::array<std::array<double, ds::block>, 5> lk_eligible{}, lk_accepted{};
+    std::array<double, 5> lk_evidence{};
+    double ds_tokens = 0, ds_cost = 0, ds_n = 0;  // this request's DSpark windows (decayed): emitted tokens, cycle seconds
 };
 
 inline bool is_stop(const Running& r, std::uint32_t id) {
@@ -113,6 +133,7 @@ struct Costs {
     void reset() { *this = Costs{}; }
     static void ema(double& c, double x) { c = c <= 0 ? x : 0.8 * c + 0.2 * x; }
     void observe(unsigned shape, std::uint32_t rows, double s) { ema(v[shape][rows], s); }
+    [[nodiscard]] bool measured(unsigned shape, std::uint32_t rows) const { return v[shape][rows] > 0; }
     [[nodiscard]] double at(unsigned shape, std::uint32_t rows) const {
         for (unsigned sh : {shape, 0U}) {
             double base = 0;
@@ -161,6 +182,11 @@ public:
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
         timeline_on_ = v != nullptr && std::strcmp(v, "1") == 0;
         if (timeline_on_) timeline_origin_ = Time::now();
+        // prompt lookup: on / off is the policy (STRIX_MM_LOOKUP at startup); STRIX_MM_LOOKUP_MARGIN (1..2),
+        // STRIX_MM_LOOKUP_TOKENS (index capacity)
+        if (const char* m = std::getenv("STRIX_MM_LOOKUP_MARGIN"); m != nullptr && *m) lookup_margin_ = std::clamp(std::atof(m), 1.0, 2.0);
+        if (const char* t = std::getenv("STRIX_MM_LOOKUP_TOKENS"); t != nullptr && *t)
+            lookup_tokens_ = static_cast<std::uint32_t>(std::clamp(std::atoll(t), 1024LL, 1LL << 20));
     }
 
     void loop() try {
@@ -782,6 +808,12 @@ private:
         r->x.prefill_wall_ms = r->stats.prefill_ms;
         r->pos = r->stats.prompt_tokens;
         r->last = next;
+        {
+            const auto l0 = Time::now();
+            lookup_start(*r, next);
+            const double ls = secs(l0, Time::now());
+            add([&](Counters& k2) { k2.lookup_s += ls; });
+        }
         r->decode_start = Time::now();
         if (!r->job.ticket->cancelled()) (void)emit(r, std::span(&next, 1));
         else finish(r, "cancelled");
@@ -820,19 +852,104 @@ private:
         }
         // drafting slots: contexts, room for the block, more than one token to go; the budget is the step's free rows
         const std::uint32_t budget = kStepRows - n;
-        std::vector<std::uint32_t> cand;
-        if (keep && budget > 0)
+        // DSpark drafts this cycle for a slot with a context, room for its block and tokens to go, while the gate is open
+        // (asked once per cycle: the gate's draft() spends its backoff)
+        const auto dspark_eligible = [&](std::uint32_t s) {
+            const auto& r = run_slots_[s];
+            return keep && r->context && r->pos + ds::block + 1 < capacity_ && r->stats.generated_tokens + 1 < r->job.job.max_tokens;
+        };
+        bool any_eligible = false;
+        if (budget > 0)
+            for (auto s : order) any_eligible = any_eligible || dspark_eligible(s);
+        const bool gate_open = any_eligible && gates_[n].draft();
+        // prompt lookup first: a slot drafts its window from its own context where the lower-bound rate (tokens per
+        // priced cycle, rows only, no draft) beats its alternative (its measured DSpark windows while it may draft,
+        // else a plain row) by the margin; DSpark then plans the other slots in the rows left
+        std::map<std::uint32_t, std::array<std::uint32_t, ds::block>> lk_tok;
+        std::map<std::uint32_t, std::uint32_t> lk_k;
+        std::uint32_t lk_rows = 0;
+        double lk_extra = 0;  // expected tokens beyond one per slot from the lookup windows chosen this cycle
+        // with several requests in the step, lookup runs only in cycles where DSpark drafts no slot: their alternatives
+        // are not comparable per slot (DSpark's draft-slot ranking and its batch yield are decided later)
+        if (pol_.lookup && (n == 1 || !gate_open)) {
+            const auto l0 = Time::now();
+            const unsigned shape = n == 1 ? 1U : 2U;
+            const double base = costs_.at(0, n);
+            // a cycle of `rows` rows: its measured cost, else at least the nearest measured smaller cycle plus ~0.3 of a
+            // one-row step per extra row (measurement: N4 84.8 vs N1 45.3 ms; the table's own extrapolation assumes 0.12)
+            const double row = kLookupRowCost * costs_.at(0, 1);
+            const auto cycle = [&](std::uint32_t rows) {
+                const double c = costs_.at(shape, rows);
+                if (costs_.measured(shape, rows)) return c;
+                double ref = base;  // the nearest measured smaller cycle of this shape (else the plain one) plus a row each
+                std::uint32_t ref_rows = n;
+                for (std::uint32_t q = rows - 1; q > n; --q)
+                    if (costs_.measured(shape, q)) {
+                        ref = costs_.at(shape, q);
+                        ref_rows = q;
+                        break;
+                    }
+                return std::max(c, ref + row * (rows - ref_rows));
+            };
             for (auto s : order) {
-                const auto& r = run_slots_[s];
-                if (r->context && r->pos + ds::block + 1 < capacity_ && r->stats.generated_tokens + 1 < r->job.job.max_tokens) cand.push_back(s);
+                auto& r = run_slots_[s];
+                if (!r->lk || r->lk_next != r->pos + 1) continue;  // not current
+                const auto m = r->lk->longest({}, kLookupMin, ds::block);
+                if (m.length < kLookupMin || m.available == 0) continue;
+                const std::uint32_t b = m.length < 4U ? 1U : m.length < 8U ? 2U : m.length < 16U ? 3U : 4U;
+                for (auto& x : r->lk_eligible[b]) x *= kLookupDecay;
+                for (auto& x : r->lk_accepted[b]) x *= kLookupDecay;
+                const bool enough = r->lk_evidence[b] >= kLookupEvidence;
+                r->lk_evidence[b] = r->lk_evidence[b] * kLookupDecay + 1.0;
+                if (r->lk_pending.size() < kLookupPending) {
+                    Running::LookupPending p;
+                    p.first = r->pos + 1;
+                    p.count = std::min<std::uint32_t>(m.available, ds::block);
+                    p.bucket = b;
+                    for (std::uint32_t j = 0; j < p.count; ++j) p.token[j] = m.next[j];
+                    r->lk_pending.push_back(p);
+                }
+                if (!enough || budget <= lk_rows) continue;
+                const bool dspark_may = gate_open && dspark_eligible(s);  // DSpark would draft it this cycle
+                if (dspark_may && r->ds_n < 3.0) continue;  // the alternative is measured first
+                const double ds_rate = r->ds_cost > 0 ? r->ds_tokens / r->ds_cost : 0.0;
+                // tokens per second of the whole cycle: every decoding slot pays for the window's rows
+                const double now_rate = (n + lk_extra) / (lk_rows != 0 ? cycle(n + lk_rows) : base);
+                const double alternative = std::max(now_rate, dspark_may ? ds_rate : 0.0) * lookup_margin_;
+                const std::uint64_t room = std::min<std::uint64_t>(r->job.job.max_tokens - r->stats.generated_tokens - 1, capacity_ - r->pos - 1);
+                const auto depth = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>({m.available, ds::block, room, budget - lk_rows}));
+                double best = alternative, survival = 1.0, yield = 1.0, best_yield = 1.0;
+                std::uint32_t cap = 0;
+                for (std::uint32_t j = 0; j < depth; ++j) {
+                    // Beta(1,2) minus one posterior standard deviation per depth (the Nemotron / DeepSeek selector)
+                    const double cnt = r->lk_eligible[b][j] + 3.0, q = (r->lk_accepted[b][j] + 1.0) / cnt;
+                    survival *= std::max(0.0, q - std::sqrt(q * (1.0 - q) / (cnt + 1.0)));
+                    yield += survival;
+                    const double rate = (n + lk_extra + yield - 1.0) / cycle(n + lk_rows + j + 1);
+                    if (rate > best) best = rate, cap = j + 1, best_yield = yield;
+                }
+                if (cap == 0) continue;
+                auto& t = lk_tok[s];
+                for (std::uint32_t j = 0; j < cap; ++j) t[j] = m.next[j];
+                lk_k[s] = cap;
+                lk_rows += cap;
+                lk_extra += best_yield - 1.0;
             }
+            const double ls = secs(l0, Time::now());
+            add([&](Counters& k2) { k2.lookup_s += ls; });
+        }
+        std::vector<std::uint32_t> cand;
+        if (keep && budget > lk_rows)
+            for (auto s : order)
+                if (lk_k.count(s) == 0 && dspark_eligible(s)) cand.push_back(s);
         bool drafted = false;
         std::map<std::uint32_t, Drafts> drafts;
         const auto c0 = Time::now();
         double t_draft = 0;
-        if (!cand.empty() && gates_[n].draft()) {
+        if (!cand.empty() && gate_open) {
             std::sort(cand.begin(), cand.end(), [&](auto a, auto b) { return run_slots_[a]->tau > run_slots_[b]->tau; });
-            cand.resize(std::min<std::size_t>({cand.size(), budget, pol_.draft_slots}));
+            cand.resize(std::min<std::size_t>({cand.size(), static_cast<std::size_t>(budget - lk_rows), pol_.draft_slots}));
             Control c;
             c.command = static_cast<std::uint32_t>(Command::draft);
             c.round = round_++;
@@ -869,14 +986,14 @@ private:
                 }
             }
             std::stable_sort(inc.begin(), inc.end(), [](const Inc& a, const Inc& b) { return a.gain > b.gain; });
-            const std::size_t jmax = std::min<std::size_t>(inc.size(), budget);
+            const std::size_t jmax = std::min<std::size_t>(inc.size(), budget - lk_rows);
             const unsigned shape = n == 1 ? 1U : 2U;
             std::size_t best = 0;
-            double best_rate = static_cast<double>(n) / costs_.at(0, n), g = 0;
+            double best_rate = (static_cast<double>(n) + lk_extra) / costs_.at(lk_rows != 0 ? shape : 0U, n + lk_rows), g = 0;
             for (std::size_t j = 1; j <= jmax; ++j) {
                 g += inc[j - 1].gain;
-                const double cost = costs_.draft * static_cast<double>(drafts.size()) + costs_.at(shape, n + static_cast<std::uint32_t>(j));
-                const double rate = (static_cast<double>(n) + g) / cost;
+                const double cost = costs_.draft * static_cast<double>(drafts.size()) + costs_.at(shape, n + lk_rows + static_cast<std::uint32_t>(j));
+                const double rate = (static_cast<double>(n) + lk_extra + g) / cost;
                 if (rate > best_rate) {
                     best_rate = rate;
                     best = j;
@@ -895,8 +1012,12 @@ private:
             auto& r = run_slots_[s];
             const std::uint32_t first = c.rows;
             c.row[c.rows++] = mm::Row{s, r->last, r->pos};
-            const std::uint32_t ks = k.count(s) ? k[s] : 0U;
-            for (std::uint32_t i = 0; i < ks; ++i) c.row[c.rows++] = mm::Row{s, drafts[s].tokens[i], r->pos + 1 + i};
+            if (lk_k.count(s) != 0) {  // a lookup window
+                for (std::uint32_t i = 0; i < lk_k[s]; ++i) c.row[c.rows++] = mm::Row{s, lk_tok[s][i], r->pos + 1 + i};
+            } else {
+                const std::uint32_t ks = k.count(s) ? k[s] : 0U;
+                for (std::uint32_t i = 0; i < ks; ++i) c.row[c.rows++] = mm::Row{s, drafts[s].tokens[i], r->pos + 1 + i};
+            }
             span_of.push_back({first, c.rows - first});
         }
         const auto summary = timeline_on_ ? timeline_step(c) : std::string{};
@@ -910,6 +1031,8 @@ private:
         const bool windows = c.rows > n;
         costs_.observe(windows ? (n == 1 ? 1U : 2U) : 0U, c.rows, t_step);
         std::uint32_t emitted_total = 0, accepted_total = 0, drafted_total = 0, windows_n = 0, rejected_n = 0;
+        std::uint32_t lk_windows = 0, lk_drafted = 0, lk_accepted = 0;
+        double lk_commit_s = 0;
         std::uint32_t k_min = ~0U, k_max = 0;
         for (std::size_t i = 0; i < order.size(); ++i) {
             const std::uint32_t s = order[i];
@@ -931,7 +1054,20 @@ private:
                     k_min = std::min(k_min, ks);
                     k_max = std::max(k_max, ks);
                     rejected_n += v.accepted < ks ? 1U : 0U;
+                    r->ds_tokens = r->ds_tokens * kLookupDecay + static_cast<double>(v.emitted.size());
+                    r->ds_cost = r->ds_cost * kLookupDecay + t_draft / static_cast<double>(drafts.size()) + t_step;
+                    r->ds_n = r->ds_n * kLookupDecay + 1.0;
                 }
+            }
+            if (lk_k.count(s) != 0) {
+                ++lk_windows;
+                lk_drafted += rows - 1;
+                lk_accepted += v.accepted;
+            }
+            if (r->lk) {
+                const auto l0 = Time::now();
+                for (std::size_t e = 0; e < v.emitted.size(); ++e) lookup_commit(*r, v.emitted[e], r->pos + 1 + e);
+                lk_commit_s += secs(l0, Time::now());
             }
             ++r->x.cycles;
             r->pos += v.accepted + 1;
@@ -944,7 +1080,7 @@ private:
         const double complete = secs(op0, Time::now());
         cycle_cost_[n] = std::max(complete, cycle_cost_[n] * 0.98);
         if (drafted) gates_[n].observe(true, emitted_total, t_cycle, costs_.at(0, n) / n);
-        else if (!cand.empty() || budget > 0) gates_[n].observe(false, n, t_cycle / n, 0.0);
+        else if (lk_rows == 0 && (!cand.empty() || budget > 0)) gates_[n].observe(false, n, t_cycle / n, 0.0);
         add([&](Counters& k2) {
             k2.step_s += t_step;
             k2.draft_s += t_draft;
@@ -954,6 +1090,10 @@ private:
             if (windows_n >= 2) ++k2.multi_windows;
             if (windows_n >= 2 && k_min != k_max) ++k2.unequal_windows;
             k2.rejections += rejected_n;
+            k2.lookup_windows += lk_windows;
+            k2.lookup_drafted += lk_drafted;
+            k2.lookup_accepted += lk_accepted;
+            k2.lookup_s += lk_commit_s;
             if (drafted) {
                 ++k2.draft_cycles;
                 k2.drafts += drafts.size();
@@ -1066,6 +1206,47 @@ private:
     bool nested_needs_decode_ = false;
     Policy pol_;
     Costs costs_;
+    // prompt lookup (the Nemotron / DeepSeek selector's constants): shortest match, pending candidates per request,
+    // evidence decay, candidates a bucket needs
+    static constexpr std::uint32_t kLookupMin = 2, kLookupPending = 16;
+    static constexpr double kLookupDecay = 0.98, kLookupEvidence = 4.0, kLookupRowCost = 0.3;
+    double lookup_margin_ = 1.0;
+    std::uint32_t lookup_tokens_ = 1U << 16;
+    // the request's index: its prompt (last lookup_tokens_ tokens), then the first generated token at the prompt's end
+    void lookup_start(Running& r, std::uint32_t first) {
+        if (!pol_.lookup) return;
+        r.lk = strix::lookup::make_ngram_index({lookup_tokens_, 64});
+        const auto& prompt = r.job.job.prompt;
+        const std::size_t from = prompt.size() > lookup_tokens_ ? prompt.size() - lookup_tokens_ : 0;
+        for (std::size_t i = from; i < prompt.size(); ++i) r.lk->append(prompt[i]);
+        r.lk_next = prompt.size();
+        lookup_commit(r, first, prompt.size());
+    }
+    // the token the request committed at stream `position`: scores the pending candidates waiting for it, then joins the
+    // index; a position out of sequence ends lookup for the request
+    void lookup_commit(Running& r, std::uint32_t token, std::uint64_t position) {
+        if (!r.lk) return;
+        if (position != r.lk_next) {
+            r.lk.reset();
+            r.lk_pending.clear();
+            return;
+        }
+        ++r.lk_next;
+        for (auto it = r.lk_pending.begin(); it != r.lk_pending.end();) {
+            auto& c = *it;
+            if (c.first + c.done != position) {
+                ++it;
+                continue;
+            }
+            r.lk_eligible[c.bucket][c.done] += 1.0;
+            const bool hit = c.token[c.done] == token;
+            if (hit) r.lk_accepted[c.bucket][c.done] += 1.0;
+            ++c.done;
+            if (!hit || c.done == c.count) it = r.lk_pending.erase(it);
+            else ++it;
+        }
+        r.lk->append(token);
+    }
     std::array<double, kStepRows + 1> cycle_cost_{};
     ms::LayerModel layer_;
     std::atomic<bool>& stop_;

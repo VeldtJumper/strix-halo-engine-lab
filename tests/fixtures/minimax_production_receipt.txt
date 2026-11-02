@@ -18,6 +18,7 @@ receipt rank
 argv $M 0 usb4-auto $OUT --slots 8 --capacity 8256 --max-rows 4096 --gate oracle-A --gate-layers 6 --decode-check prompts/p1k.u32:24 --decode-check prompts/chat-prose.u32:16 --session 1k:prompts/p1k.u32:64 --session 8k:prompts/p8k.u32:16 --batch prompts/p1k.u32:24:1,2,4,8 --session jtb:chat/json-table.u32:256 --session cpy:chat/code-py.u32:256 --session pen:chat/prose-en.u32:256 --dspark-exl3 minimax-drafts/dspark-exl3-K4fc --spec jtb:chat/json-table.u32:256:auto --spec cpy:chat/code-py.u32:256:auto --spec pen:chat/prose-en.u32:256:auto
 plain $M 0 usb4-auto $OUT
 env STRIX_MM_SERVE_DSPARK=auto
+env STRIX_MM_LOOKUP=1
 env STRIX_MMX_MOE_WIDE=2
 env STRIX_MMX_MOE_GU_INTERLEAVE=1
 env STRIX_MMX_MOE_SINGLE=1
@@ -61,6 +62,7 @@ receipt serve
 argv $M --rank 0 --transport usb4-auto --slots 8 --port 18321 --resume-check prompts/p1k.u32:1/7/60,p4608.u32:7
 plain $M --rank 0
 env STRIX_MM_SERVE_DSPARK=auto
+env STRIX_MM_LOOKUP=1
 env STRIX_MMX_MOE_WIDE=2
 env STRIX_MMX_MOE_GU_INTERLEAVE=1
 env STRIX_MMX_MOE_SINGLE=1

@@ -83,10 +83,12 @@ struct FakeEngine {
         active = parked; parked = {};
     }
     ml::Drafts draft(unsigned, unsigned, std::uint64_t) { return {}; }
+    unsigned pattern = 0;  // 1: the next token depends on the position: period 9, one deviation every 27 positions
     std::vector<unsigned> step(std::span<const mm::Row> rows, unsigned) {
         FakeClock::advance(50);
         std::vector<unsigned> out;
-        for (const auto& r : rows) out.push_back(100 + r.slot);
+        for (const auto& r : rows)
+            out.push_back(pattern == 0 ? 100 + r.slot : 100 + r.slot + static_cast<unsigned>(r.pos % 27 == 13 ? 7 : r.pos % 9 % 4));
         return out;
     }
 };
@@ -401,6 +403,60 @@ int main() {
         (void)s.run(40000, &service);
         const auto stats = s.tickets.at(1)->stats();
         check(stats.generated_tokens == 1 && stats.finish == "length", "context-clamped session generation finishes with length");
+    }
+    {
+        // Prompt lookup: a repeating stream drafts lookup windows (fewer step cycles); the emitted tokens equal lookup off.
+        ml::Counters k{};
+        unsigned deepest = 0;  // the most rows any request's window had in one step (drafts beyond its anchor)
+        const auto run = [&](bool lookup, unsigned& steps, unsigned& window_rows, unsigned pattern = 0, unsigned requests = 1,
+                             unsigned tokens = 40) {
+            Scenario s(ms::Sched::off);
+            s.shared.policy.lookup = lookup;
+            s.engine.pattern = pattern;
+            for (unsigned q = 0; q < requests; ++q) s.submit(0, q + 1, 64 + 7 * q, tokens);
+            const auto r = s.run();
+            steps = count(r, ms::Command::step);
+            window_rows = 0;
+            deepest = 0;
+            for (const auto& c : r.controls) {
+                if (c.command != static_cast<unsigned>(ms::Command::step)) continue;
+                window_rows += c.rows - std::min(c.rows, requests);
+                for (unsigned i = 0, run_len = 0; i < c.rows; ++i) {  // consecutive rows of one slot beyond its anchor
+                    run_len = i > 0 && c.row[i].slot == c.row[i - 1].slot ? run_len + 1 : 0;
+                    deepest = std::max(deepest, run_len);
+                }
+            }
+            k = s.shared.counters;
+            std::vector<unsigned> ids;
+            for (unsigned q = 0; q < requests; ++q) {
+                bool done = false;
+                const auto got = s.tickets.at(q + 1)->wait(std::chrono::milliseconds(0), done);
+                ids.insert(ids.end(), got.begin(), got.end());
+            }
+            return ids;
+        };
+        unsigned steps_on = 0, rows_on = 0, steps_off = 0, rows_off = 0;
+        const auto on = run(true, steps_on, rows_on), off = run(false, steps_off, rows_off);
+        check(on.size() == 40 && on == off, "prompt lookup emits the tokens of lookup off");
+        check(rows_off == 0 && rows_on > 0 && steps_on < steps_off, "prompt lookup drafts windows on a repeating stream");
+        // position-dependent stream: lookup proposals are partly rejected and windows vary in depth
+        const auto pon = run(true, steps_on, rows_on, 1, 1, 200);
+        const auto pk = k;
+        const auto pon_deepest = deepest;
+        const auto poff = run(false, steps_off, rows_off, 1, 1, 200);
+        check(pon.size() == 200 && pon == poff, "prompt lookup with rejected drafts emits the tokens of lookup off");
+        std::cout << "lookup position-dependent: windows " << pk.lookup_windows << " drafted " << pk.lookup_drafted << " accepted "
+                  << pk.lookup_accepted << " deepest " << pon_deepest << std::endl;
+        check(pk.lookup_windows > 0 && pk.lookup_accepted < pk.lookup_drafted && pon_deepest >= 2,
+              "position-dependent stream: lookup drafts are rejected and windows go deeper than one row");
+        // four requests in one step (C4): every request's tokens equal lookup off
+        const auto con = run(true, steps_on, rows_on, 0, 4, 200);
+        const auto ck = k;
+        const auto coff = run(false, steps_off, rows_off, 0, 4, 200);
+        check(con.size() == 800 && con == coff, "prompt lookup at C4 emits the tokens of lookup off");
+        std::cout << "lookup C4: windows " << ck.lookup_windows << " drafted " << ck.lookup_drafted << " accepted " << ck.lookup_accepted
+                  << " rows " << rows_on << std::endl;
+        check(ck.lookup_windows > 0 && rows_on > 0, "prompt lookup drafts windows with four requests in the step");
     }
     std::cout << "production Lead traces: " << failures << " failures\n";
     return failures == 0 ? 0 : 1;

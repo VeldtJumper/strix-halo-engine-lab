@@ -37,6 +37,8 @@ namespace {
 // Measurement evidence for the adopted production defaults.
 constexpr Item kItems[] = {
     {"serve_dspark", "STRIX_MM_SERVE_DSPARK", "auto", "0", "Frozen structural-v1 admission; per-content node qualification pending"},
+    {"serve_lookup", "STRIX_MM_LOOKUP", "1", "0",
+     "Serve measurement: token ids identical in every arm; copy-heavy rewrite C1 without a DSpark draft 23.65/23.44 -> 26.01/25.69 tok/s, agent / prose / C4 neutral"},
     {"serve_sched", "STRIX_MM_SERVE_SCHED", "interleave", "off", "Bounded serving policy; GPU qualification pending"},
     {"serve_service", "STRIX_MM_SERVE_SERVICE_MS", "250", "0", "Soft service opportunity target; GPU qualification pending"},
     {"serve_nest", "STRIX_MM_SERVE_NEST", "1", "0", "Nested short admission; extended resume-check GPU qualification pending"},

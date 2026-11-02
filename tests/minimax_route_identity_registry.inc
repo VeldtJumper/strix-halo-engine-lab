@@ -123,3 +123,5 @@
 {"decode-moe-tight-grid", 'a', "v4 routed grid.y = min(32, 4N)+1; map_slot rejects y > count before work/counters", "rank --xb-check cfg g vs -: decode logits bitwise N1/N4/N8 + verify window; mm_defaults.cpp moe_tight_grid", ""},
 // src/minimax/engine/engine.hip: xb_warm_o
 {"decode-warm-o", 'a', "cache state only (side-stream reads, sink store); no consumer of its data", "rank --xb-check cfg o vs -: decode logits bitwise N1/N4/N8 + verify window; --ab xbwarmo matched replay; mm_defaults.cpp xb_warm_o", ""},
+// src/minimax/serve/minimax_lead.hpp: lookup_start / lookup_commit / cycle prompt lookup
+{"serve-prompt-lookup", 'a', "draft source only (rank 0 chooses window rows from strix_lookup); greedy verify decides every token", "minimax_lead_tests prompt lookup emits the tokens of lookup off; serve A/B ids_fnv per workload with STRIX_MM_LOOKUP=0", ""},

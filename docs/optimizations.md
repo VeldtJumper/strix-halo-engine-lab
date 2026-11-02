@@ -40,7 +40,7 @@ See the [command-line contract](getting-started/engine-reference.md#command-line
 The fast path is the default in all five public engines. Use the plain recommended command and inspect its
 resolution before adding overrides. `ON` means enabled; `auto` means enabled when admission guards pass;
 `opt-in` requires an explicit selection. An unlisted isolated gain means unmeasured, not zero.
-The [JSON catalog](optimizations.json) provides the same controls for tools; the [measured gains page](measured-gains.md#optimizations)
+The [JSON catalog](optimizations.json) provides the same controls for tools; the [README](../README.md#optimizations)
 is the compact overview. Run commands and agent instructions are in [AGENTS.md](../AGENTS.md).
 
 Exactness requires fixed model content, prompt, state, profile pair and capacity. Qwen fast FP16 prefill,
@@ -2291,6 +2291,22 @@ rows returned before any work, so at N = 1 about 10,000 empty CTAs per launch ar
 - **Off switch:** STRIX_MMX_MOE_TIGHT_GRID=0
 - **Measured gain:** C1 8K two-node decode 45.12-45.18 -> 44.60-44.68 ms/token (-1.2 %).
 - **Implementation / evidence:** [MoE launches](../src/minimax/moe/mmx_moe.hip), [rank gates](../apps/minimax_rank_main.cpp) (`--ab moegrid`, `--xb-check` cfg `g`)
+
+<a id="mm-serve-lookup"></a>
+
+### Serve prompt lookup
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_LOOKUP` (startup), `/admin/sched {"lookup": bool}` (runtime). **Default:** on.
+
+Rank 0 keeps a prompt-lookup index (`include/strix/lookup/index.hpp`) per request over its prompt and committed tokens.
+Each cycle's longest earlier match is scored against what the request then commits (per match length and depth). A
+request drafts its window from the match where the expected tokens per second of the whole cycle beat its alternative
+(its measured DSpark windows while DSpark may draft, else a plain row); DSpark plans the other requests in the rows left.
+
+- **Exactness evidence:** draft source only, greedy verification decides every token; generated token IDs identical with lookup on and off in every measured arm.
+- **Off switch:** STRIX_MM_LOOKUP=0; /admin/sched lookup false; STRIX_MM_BASELINE=1
+- **Measured gain:** Two-node serve, one load, lookup switched per request batch: copy-heavy rewrite (C1, DSpark off) 23.65 / 23.44 -> 26.01 / 25.69 tok/s (+9.8 %); agent edit / agent JSON / prose at C1 and four concurrent requests equal within noise (DSpark keeps drafting where it is admitted; no lookup window at C4 on these prompts).
+- **Counters:** `/admin/sched` counters lookup_windows, lookup_drafted, lookup_accepted, lookup_s.
 
 <a id="mm-serve-dspark"></a>
 
