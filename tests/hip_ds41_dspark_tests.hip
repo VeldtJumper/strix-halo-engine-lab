@@ -389,6 +389,89 @@ void test_two_ranks(const Files& f) {
               << results[0][0].candidates[0] << " + " << results[1][0].candidates[0] << '\n';
 }
 
+// Candidate-form Markov chain (STRIX_DS41_DSPARK_MARKOV=cand). With C = a half's size every position is a candidate:
+// the drafts equal the one-rank host draft (full vocabulary), and a half smaller than C runs the full chain (restricted
+// vocabulary). With the default C / |H|: one rank and two ranks give the same tokens and confidence (full and restricted
+// vocabulary: core ids then extras, H filtered to the domain), and the agreement with the full chain is printed.
+void test_cand(const Files& f) {
+    const auto model = load_model(f);
+    const auto& w = model->w;
+    const auto seed = normal_values(static_cast<std::size_t>(130) * main_width, 1.0F, 77);
+    const auto accepted = normal_values(static_cast<std::size_t>(3) * main_width, 1.0F, 78);
+    Vocab restricted;
+    restricted.core = 0;
+    for (std::uint32_t id = 0; id < 40000U; id += 2U) restricted.extra.push_back(id);
+    restricted.extra.push_back(1001U);
+    State host;
+    const auto host_main = main_rows(w, seed, 130);
+    append(w, host, std::span<const float>(host_main).first(static_cast<std::size_t>(128) * hidden), 128);
+    append(w, host, std::span<const float>(host_main).subspan(static_cast<std::size_t>(128) * hidden), 2);
+    const auto h1 = draft(w, host, 1000U, false);
+    append(w, host, main_rows(w, accepted, 3), 3);
+    const auto h2 = draft(w, host, h1.tokens[3], false);
+    const auto h3 = draft(w, host, h1.tokens[3], false, restricted);
+    const Draft* host_drafts[3] = {&h1, &h2, &h3};
+    // the three drafts of test_two_ranks on `world` ranks (world 1: one drafter)
+    const auto run = [&](std::uint32_t world) {
+        std::vector<std::array<Draft, 3>> out(world);
+        auto [ta, tb] = strix::dist::memory_pair();
+        std::unique_ptr<strix::dist::Transport> transports[2] = {std::move(ta), std::move(tb)};
+        std::exception_ptr errors[2];
+        std::vector<std::thread> ranks;
+        for (std::uint32_t r = 0; r < world; ++r)
+            ranks.emplace_back([&, r] {
+                try {
+                    std::unique_ptr<strix::dist::Communicator> comm;
+                    std::uint64_t request = 0;
+                    DeviceDrafter d(w);
+                    if (world == 2U) {
+                        comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{r, 2U, 1U, 89U}, std::move(transports[r]), std::size_t{4} << 20U);
+                        d.set_rank(r, 2U, [&](void* stream, const void* local, void* remote, std::size_t bytes) {
+                            comm->exchange(static_cast<hipStream_t>(stream), local, remote, bytes,
+                                           strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::argmax), 0U, request++});
+                        });
+                    }
+                    d.append_hidden(std::span<const float>(seed).first(static_cast<std::size_t>(128) * main_width), 128);
+                    d.append_hidden(std::span<const float>(seed).subspan(static_cast<std::size_t>(128) * main_width), 2);
+                    out[r][0] = d.draft(1000U, false);
+                    d.append_hidden(accepted, 3);
+                    out[r][1] = d.draft(h1.tokens[3], false);
+                    d.set_vocabulary(restricted);
+                    out[r][2] = d.draft(h1.tokens[3], false);
+                } catch (...) { errors[r] = std::current_exception(); }
+            });
+        for (auto& t : ranks) t.join();
+        for (auto& e : errors) if (e) std::rethrow_exception(e);
+        return out;
+    };
+    const auto same = [](const Draft& a, const Draft& b) {
+        const std::vector<std::uint32_t> at(a.tokens.begin(), a.tokens.end()), bt(b.tokens.begin(), b.tokens.end());
+        const std::vector<float> ac(a.confidence.begin(), a.confidence.end()), bc(b.confidence.begin(), b.confidence.end());
+        return mismatches(at, bt) + mismatches(ac, bc);
+    };
+    setenv("STRIX_DS41_DSPARK_MARKOV", "cand", 1);
+    setenv("STRIX_DS41_DSPARK_MARKOV_C", std::to_string((vocab + 1U) / 2U).c_str(), 1);
+    for (const std::uint32_t world : {1U, 2U}) {
+        const auto out = run(world);
+        for (std::uint32_t r = 0; r < world; ++r)
+            for (std::uint32_t k = 0; k < 3U; ++k)
+                report("markov cand C = half, " + std::to_string(world) + " rank(s), rank " + std::to_string(r) + ", draft " + std::to_string(k) +
+                           ": tokens and confidence = full one-rank host",
+                       same(out[r][k], *host_drafts[k]));
+    }
+    unsetenv("STRIX_DS41_DSPARK_MARKOV_C");
+    const auto one = run(1U), two = run(2U);
+    std::size_t agree = 0;
+    for (std::uint32_t k = 0; k < 3U; ++k) {
+        for (std::uint32_t r = 0; r < 2U; ++r)
+            report("markov cand default C / |H|, two ranks, rank " + std::to_string(r) + ", draft " + std::to_string(k) + " = one rank",
+                   same(two[r][k], one[0][k]));
+        for (std::uint32_t j = 1; j <= block_size; ++j) agree += one[0][k].tokens[j] == host_drafts[k]->tokens[j] ? 1U : 0U;
+    }
+    std::cout << "markov cand default C / |H|: " << agree << " of " << 3U * block_size << " draft tokens = the full chain's\n";
+    setenv("STRIX_DS41_DSPARK_MARKOV", "full", 1);
+}
+
 // Bench mode (STRIX_DS41_DSPARK_BENCH=1): no host reference; seed 130 rows, then draft steps and
 // 3-row appends, for one-pass kernel traces.
 void bench(const Files& f) {
@@ -434,10 +517,12 @@ int main() try {
         bench(f);
         return 0;
     }
+    setenv("STRIX_DS41_DSPARK_MARKOV", "full", 1);  // the host reference drafts with the full chain (test_cand sets cand)
     test_synthetic();
     if (!f.q2.empty() && !f.dspark.empty()) {
         test_real(f);
         test_two_ranks(f);
+        test_cand(f);
     }
     else std::cout << "real drafter checks skipped (set STRIX_DS41_Q2_GGUF and STRIX_DS41_DSPARK_GGUF)\n";
     if (failures) {

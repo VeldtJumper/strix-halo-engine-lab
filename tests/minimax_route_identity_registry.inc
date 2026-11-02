@@ -76,7 +76,7 @@
 {"io-cache", 'a', "model tensor content+dtype+rank slices", "weight loader sizes/format validation; actual dependency notices preserved", ""},
 // src/minimax/dspark/hip_minimax_dspark.hip:755
 {"draft-native-linears", 'a', "drafter model dtype+matrix+reduction contract", "hip_minimax_dspark_tests.hip linears/attention bitwise gates; mm_defaults.cpp draft linears contract", ""},
-// src/minimax/dspark/markov_cand.hip:472
+// src/minimax/dspark/markov_cand.hip:26
 {"markov-topc", 'a', "vocabulary+C+candidate score contract", "hip_markov_cand_tests.hip payload v1/v2 vs CPU; mm_defaults.cpp markov_topc_v2", ""},
 // src/minimax/engine/engine.hip:436
 {"operation-plan", 'b', "model+operation kind+arithmetic profile+ordered units", "apps/minimax_rank_main.cpp teacher-force comparison explicitly rounding not bitwise; not a gate between identities", ""},

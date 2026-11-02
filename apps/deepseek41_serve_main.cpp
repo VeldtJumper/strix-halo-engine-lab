@@ -397,6 +397,14 @@ bool dspark_coop_on() {
     return env == nullptr || std::strcmp(env, "0") != 0;
 }
 
+// The DSpark Markov chain form (DeviceDrafter::markov_config): a cooperative draft of the candidate chain exchanges a
+// payload of its C and |H|, so both ranks must use the same; it joins the serve identity the hello compares.
+std::string dspark_markov_identity(const Args& a) {
+    if (a.dspark.empty()) return {};
+    const auto m = strix::ds41::dspark::DeviceDrafter::markov_config();
+    return m.cand ? "|markov cand " + std::to_string(m.C) + " " + std::to_string(m.H) : std::string{};
+}
+
 Control hello(const Args& a) {
     Control c;
     c.command = static_cast<std::uint32_t>(Command::hello);
@@ -421,7 +429,7 @@ Control hello(const Args& a) {
     // exchange the same bytes and tags, which no CRC or framing check can tell apart.
     const auto ns = strix::deepseek41::prefix_namespace_from_env(strix::ds41::expert_tp::enabled_from_env()).text;
     c.prefix_ns = fnv(strix::deepseek41::sched::serve_identity_text(
-        ns, a.dspark.empty() ? 0U : std::filesystem::file_size(a.dspark), a.dspark_ranks, a.dspark_window, a.dspark_vocab));
+        ns, a.dspark.empty() ? 0U : std::filesystem::file_size(a.dspark), a.dspark_ranks, a.dspark_window, a.dspark_vocab + dspark_markov_identity(a)));
     // Resource limits occupy previously zero hello fields. OFF keeps the original
     // 512 bytes; defaults sampled on different hosts negotiate a common minimum.
     c.pkey = a.session_ram_bytes;
@@ -463,7 +471,7 @@ std::string hello_mismatch(const Control& mine, const Control& peer) {
         peer.prefix_bytes != mine.prefix_bytes || peer.prefix_disk != mine.prefix_disk || peer.prefix_flags != mine.prefix_flags)
         return "the prefill path or the prefix cache differ between the ranks";
     if (peer.prefix_ns != mine.prefix_ns)
-        return "the serve identities differ between the ranks (weights overlay / trellis / EP map content, EP vs expert TP, or DSpark drafter / ranks / window / vocabulary)";
+        return "the serve identities differ between the ranks (weights overlay / trellis / EP map content, EP vs expert TP, or DSpark drafter / ranks / window / vocabulary / STRIX_DS41_DSPARK_MARKOV)";
     return {};
 }
 

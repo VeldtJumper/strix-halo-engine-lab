@@ -89,6 +89,17 @@ public:
     // id; 8 bytes) through `exchange`; both ranks take the better (larger value, lower id), so the tokens
     // equal the one-rank draft. Everything else of the drafter is replicated (same inputs, same bits).
     void set_rank(std::uint32_t rank, std::uint32_t world, RankExchange exchange);
+    // Markov chain form, read from the environment at construction (both ranks of a split head must agree):
+    // STRIX_DS41_DSPARK_MARKOV=cand (default: every step scores each domain half's top-C head logits of the row plus H,
+    // the |H| domain ids of largest Markov-head row norm; one payload exchange per draft instead of one per step with two
+    // ranks; the drafts can differ from full, the target verifies them as always) | full (every step scores the whole domain).
+    // STRIX_DS41_DSPARK_MARKOV_C / _H: C and |H|. A half smaller than C runs the full chain.
+    struct MarkovConfig {
+        bool cand = true;
+        std::uint32_t C = 4096, H = 8192;
+    };
+    [[nodiscard]] static MarkovConfig markov_config();
+    [[nodiscard]] MarkovConfig markov() const noexcept;
     // Forgets every appended row (new sequence).
     void reset();
     [[nodiscard]] ContextSnapshot export_context() const;

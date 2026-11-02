@@ -75,6 +75,7 @@ private:
     unsigned C_, nh_, hmax_;  // hmax_: padded length of the owned-H value arrays (same on both ranks)
     std::size_t payload_ = 0;
     std::uint32_t *hid_own_ = nullptr, *hid_peer_ = nullptr;  // device: H members owned by this rank / by the peer
+    std::uint32_t* hpos_own_ = nullptr;                          // device: their positions in this rank's logits
     unsigned nh_own_ = 0, nh_peer_ = 0;
     unsigned char *dpay_own_ = nullptr, *dpay_peer_ = nullptr;
     unsigned char *hsend_ = nullptr, *hrecv_ = nullptr;  // pinned
