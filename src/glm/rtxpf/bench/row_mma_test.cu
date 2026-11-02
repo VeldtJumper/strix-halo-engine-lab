@@ -43,12 +43,37 @@ static void projection_case(unsigned in,unsigned out,unsigned bits,unsigned rows
     ck(cudaMalloc(&decoded,std::size_t(in)*out*2),"m");ck(cudaMalloc(&raw1,std::size_t(rows)*out*4),"m");ck(cudaMalloc(&raw2,std::size_t(rows)*out*4),"m");ck(cudaMalloc(&prob,sizeof(Problem)),"m");
     layer_decode<<<in/16*(out/16),256>>>(w,decoded);
     ck(gemm<Row>(op,decoded,raw1,rows,in,out,prob,nullptr),"gemm");
-    launch_row_project(w,op,raw2,rows,nullptr);ck(cudaDeviceSynchronize(),"sync");
     std::vector<float> a(std::size_t(rows)*out),b(a.size());
-    ck(cudaMemcpy(a.data(),raw1,a.size()*4,cudaMemcpyDeviceToHost),"d2h");ck(cudaMemcpy(b.data(),raw2,b.size()*4,cudaMemcpyDeviceToHost),"d2h");
-    char name[128];std::snprintf(name,sizeof name,"projection K%u %ux%u rows %u",bits,in,out,rows);verdict(name,a,b);
+    ck(cudaMemcpy(a.data(),raw1,a.size()*4,cudaMemcpyDeviceToHost),"d2h");
+    for(bool r2:{false,true}){
+        launch_row_project(w,op,raw2,rows,nullptr,r2);ck(cudaDeviceSynchronize(),"sync");
+        ck(cudaMemcpy(b.data(),raw2,b.size()*4,cudaMemcpyDeviceToHost),"d2h");
+        char name[128];std::snprintf(name,sizeof name,"projection%s K%u %ux%u rows %u",r2?" r2":"",bits,in,out,rows);verdict(name,a,b);}
     cudaFree(decoded);cudaFree(raw1);cudaFree(raw2);cudaFree(prob);cudaFree(op);
     cudaFree((void*)w.packed);cudaFree((void*)w.suh);cudaFree((void*)w.svh);
+}
+
+// Dense FP16 [n][k] weights: row_dense == the CUTLASS column-major projection GEMM (KDA ordinary projections).
+static void dense_case(unsigned in,unsigned out,unsigned rows){
+    auto w=upload(random_halves(std::size_t(in)*out,-1.f,1.f));auto op=upload(random_halves(std::size_t(rows)*in,-2.f,2.f));
+    float *y1,*y2;Problem* prob;ck(cudaMalloc(&y1,std::size_t(rows)*out*4),"m");ck(cudaMalloc(&y2,std::size_t(rows)*out*4),"m");ck(cudaMalloc(&prob,sizeof(Problem)),"m");
+    ck(gemm<Col>(op,w,y1,rows,in,out,prob,nullptr),"gemm col");launch_row_dense(w,op,y2,rows,in,out,nullptr);ck(cudaDeviceSynchronize(),"sync");
+    std::vector<float> p(std::size_t(rows)*out),q(p.size());ck(cudaMemcpy(p.data(),y1,p.size()*4,cudaMemcpyDeviceToHost),"d2h");ck(cudaMemcpy(q.data(),y2,q.size()*4,cudaMemcpyDeviceToHost),"d2h");
+    char name[128];std::snprintf(name,sizeof name,"dense fp16 %ux%u rows %u",in,out,rows);verdict(name,p,q);
+    cudaFree(w);cudaFree(op);cudaFree(y1);cudaFree(y2);cudaFree(prob);
+}
+// FP32 index projections: projection_fp32_row (rows <= 4) == projection_fp32_tiled, trellis (FP16 operand, [K][N]
+// weights) and ordinary (FP32 x, [N][K] weights) operands.
+static void fp32_case(unsigned in,unsigned out,unsigned rows,bool ord){
+    auto w=upload(random_halves(std::size_t(in)*out,-1.f,1.f));
+    std::uniform_real_distribution<float> u(-2.f,2.f);std::vector<float> xs(std::size_t(rows)*in);for(auto& v:xs)v=u(rng);
+    auto x=upload(xs);auto a=upload(random_halves(std::size_t(rows)*in,-2.f,2.f));
+    float *y1,*y2;ck(cudaMalloc(&y1,std::size_t(rows)*out*4),"m");ck(cudaMalloc(&y2,std::size_t(rows)*out*4),"m");
+    projection_fp32_tiled<<<dim3((out+31)/32,(rows+7)/8),128>>>(ord?x:nullptr,ord?nullptr:a,w,y1,rows,in,out,ord);
+    projection_fp32_row<<<dim3((out+255)/256,rows),256>>>(ord?x:nullptr,ord?nullptr:a,w,y2,in,out,ord);ck(cudaDeviceSynchronize(),"sync");
+    std::vector<float> p(std::size_t(rows)*out),q(p.size());ck(cudaMemcpy(p.data(),y1,p.size()*4,cudaMemcpyDeviceToHost),"d2h");ck(cudaMemcpy(q.data(),y2,q.size()*4,cudaMemcpyDeviceToHost),"d2h");
+    char name[128];std::snprintf(name,sizeof name,"fp32 %s %ux%u rows %u",ord?"ordinary":"trellis",in,out,rows);verdict(name,p,q);
+    cudaFree(w);cudaFree(x);cudaFree(a);cudaFree(y1);cudaFree(y2);
 }
 
 static void moe_case(unsigned experts,unsigned hidden,unsigned inter,unsigned rows,CutlassExecution& exec,cudaStream_t s){
@@ -64,19 +89,23 @@ static void moe_case(unsigned experts,unsigned hidden,unsigned inter,unsigned ro
     float *y1,*y2;ck(cudaMalloc(&y1,x.size()*4),"y");ck(cudaMalloc(&y2,x.size()*4),"y");
     Call v{rows,experts,hidden,inter,dx,dids,dw,dex,y1};
     ck(enqueue_cutlass(v,ws,bytes,s,exec),"grouped");ck(cudaStreamSynchronize(s),"sync");
-    v.y=y2;v.row_gemv=true;ck(enqueue_cutlass(v,ws,bytes,s,exec),"row");ck(cudaStreamSynchronize(s),"sync");
-    std::vector<float> a(x.size()),b(x.size());ck(cudaMemcpy(a.data(),y1,a.size()*4,cudaMemcpyDeviceToHost),"d2h");ck(cudaMemcpy(b.data(),y2,b.size()*4,cudaMemcpyDeviceToHost),"d2h");
-    char name[128];std::snprintf(name,sizeof name,"moe experts %u %ux%u rows %u",experts,hidden,inter,rows);verdict(name,a,b);
+    std::vector<float> a(x.size()),b(x.size());ck(cudaMemcpy(a.data(),y1,a.size()*4,cudaMemcpyDeviceToHost),"d2h");
+    for(bool r2:{false,true}){
+        v.y=y2;v.row_gemv=true;v.row_r2=r2;ck(enqueue_cutlass(v,ws,bytes,s,exec),"row");ck(cudaStreamSynchronize(s),"sync");
+        ck(cudaMemcpy(b.data(),y2,b.size()*4,cudaMemcpyDeviceToHost),"d2h");
+        char name[128];std::snprintf(name,sizeof name,"moe%s experts %u %ux%u rows %u",r2?" r2":"",experts,hidden,inter,rows);verdict(name,a,b);}
     for(auto& e:ex)for(const Matrix* m:{&e.gate,&e.up,&e.down}){cudaFree((void*)m->packed);cudaFree((void*)m->suh);cudaFree((void*)m->svh);}
     cudaFree(dex);cudaFree(dx);if(dids)cudaFree(dids);if(dw)cudaFree(dw);cudaFree(ws);cudaFree(y1);cudaFree(y2);
 }
 
 int main(){
-    if(Projection<Row>::sufficient()<=0){std::fprintf(stderr,"projection GEMM setup failed\n");return 2;} // smem attribute, as prepare_kda
+    if(Projection<Row>::sufficient()<=0||Projection<Col>::sufficient()<=0){std::fprintf(stderr,"projection GEMM setup failed\n");return 2;} // smem attribute, as prepare_kda
     // decode shapes: KDA qkv/out, DSA kva/qb/out, MTP eh; replay rows 1..32
     for(unsigned bits=3;bits<=6;++bits)
         for(unsigned rows:{1u,2u,7u,16u,17u,31u,32u}){projection_case(4096,512,bits,rows);projection_case(1536,4096,bits,rows);}
     projection_case(4096,24576,4,32);projection_case(8192,4096,5,1);projection_case(16384,4096,3,1);
+    for(unsigned rows:{1u,16u,17u,32u}){dense_case(4096,128,rows);dense_case(128,8192,rows);dense_case(4096,64,rows);}
+    for(unsigned rows=1;rows<=4;++rows){fp32_case(4096,1536,rows,false);fp32_case(1536,4096,rows,false);fp32_case(4096,128,rows,true);fp32_case(4096,32,rows,true);}
     cudaStream_t s,d;ck(cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking),"stream");ck(cudaStreamCreateWithFlags(&d,cudaStreamNonBlocking),"stream");
     CutlassExecution exec{};exec.decode_stream=d;
     auto ev=[](){cudaEvent_t e;ck(cudaEventCreateWithFlags(&e,cudaEventDisableTiming),"event");return e;};

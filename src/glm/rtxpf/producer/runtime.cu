@@ -10,6 +10,7 @@
 #include "head_select.hpp"
 #include "runtime.hpp"
 #include "decode_timeline.hpp"
+#include <cuda_profiler_api.h>
 #include "policy.hpp"
 #include "state_slices.hpp"
 #include "strix/serve/json.hpp"
@@ -111,15 +112,17 @@ __global__ __launch_bounds__(256) void hc_pre_kernel(const float* X, const float
 
 // hc_pre_kernel with the 24 chains fed from shared memory: all 256 threads stage F (recomputed as
 // Xr[i]*rr, the value F holds) and the 24 rows in 256-column chunks, the next chunk in registers
-// while lanes 0..23 run the same ascending __fmaf_rn chains. Every value is hc_pre_kernel's.
+// while lanes 0..23 run the same ascending __fmaf_rn chains. Every value is hc_pre_kernel's. V4 (row-kernels
+// round 2, and the 2-4 row verify): rows padded to 260 floats, four operands per shared-memory read.
+template <bool V4>
 __global__ __launch_bounds__(256) void hc_pre_staged(const float* X, const float* fn, const float* base,
                                                      const float* scale, float* F, float* mix, float* xc) {
     constexpr unsigned n = kHc * kHidden, C = 256;
     __shared__ float s[256];
     __shared__ float z[kHcMix];
     __shared__ float m[kHcMix];
-    __shared__ float sf[C];
-    __shared__ float srow[kHcMix][C + 1];
+    __shared__ __align__(16) float sf[C];
+    __shared__ __align__(16) float srow[kHcMix][V4 ? C + 4 : C + 1];  // V4 stride 260: 16-byte reads, conflict-free per quarter warp
     const unsigned r = blockIdx.x, l = threadIdx.x;
     const float* Xr = X + static_cast<std::size_t>(r) * n;
     float* Fr = F + static_cast<std::size_t>(r) * n;
@@ -142,9 +145,20 @@ __global__ __launch_bounds__(256) void hc_pre_staged(const float* X, const float
 #pragma unroll
             for (unsigned q = 0; q < kHcMix; ++q) pr[q] = fn[static_cast<std::size_t>(q) * n + c + C + l];
         }
-        if (l < kHcMix) {
+        if (l < kHcMix) {  // the same ascending chain
+            if constexpr (V4) {
+                const float4* f4 = reinterpret_cast<const float4*>(sf);
+                const float4* w4 = reinterpret_cast<const float4*>(srow[l]);
+#pragma unroll 8
+                for (unsigned i = 0; i < C / 4; ++i) {
+                    const float4 f = f4[i], w = w4[i];
+                    acc = __fmaf_rn(f.x, w.x, acc); acc = __fmaf_rn(f.y, w.y, acc);
+                    acc = __fmaf_rn(f.z, w.z, acc); acc = __fmaf_rn(f.w, w.w, acc);
+                }
+            } else {
 #pragma unroll 16
-            for (unsigned i = 0; i < C; ++i) acc = __fmaf_rn(sf[i], srow[l][i], acc);
+                for (unsigned i = 0; i < C; ++i) acc = __fmaf_rn(sf[i], srow[l][i], acc);
+            }
         }
         __syncthreads();
     }
@@ -197,14 +211,14 @@ __global__ void router(const float* x,const U16* w,const float* bias,U32* ids,fl
     float den=0;for(unsigned j=0;j<8;++j)den+=sg[pick[j]];den+=1.e-20f;
     for(unsigned j=0;j<8;++j){ids[std::size_t(r)*8+j]=pick[j];rates[std::size_t(r)*8+j]=sg[pick[j]]/den*2.5f;}
 }
-// router for one row, same values: 9 CTAs of 32 experts; each expert's ascending __fmaf_rn chain over
+// router, same values per row (blockIdx.y; rows <= 4): 9 CTAs of 32 experts; each expert's ascending __fmaf_rn chain over
 // 4096 inputs reads 128-column chunks staged in shared memory (the next chunk in registers), then
 // router_select picks the same top 8 as router's greedy scan + index sort (the eight largest keys,
 // ties to the lower index, ascending) and normalizes them in the same order.
 __global__ __launch_bounds__(128) void router_scores(const float* x,const U16* w,const float* bias,float* sg,U32* keys,unsigned* flag){
     constexpr unsigned C=128,E=32,W=C/2+1; // row stride W words: lane e reads its row conflict-free
     __shared__ U32 sw[E*W];__shared__ float sx[C];
-    const unsigned t=threadIdx.x,e0=blockIdx.x*E;
+    const unsigned t=threadIdx.x,e0=blockIdx.x*E,r=blockIdx.y;x+=std::size_t(r)*4096;sg+=std::size_t(r)*288;keys+=std::size_t(r)*288;
     const U32* rows=reinterpret_cast<const U32*>(w+std::size_t(e0)*4096);
     U32 pw[16];float px=x[t];
     #pragma unroll
@@ -217,16 +231,16 @@ __global__ __launch_bounds__(128) void router_scores(const float* x,const U16* w
         if(c+C<4096){px=x[c+C+t];
             #pragma unroll
             for(unsigned q=0;q<16;++q){unsigned j=t+128*q;pw[q]=rows[std::size_t(j/64)*2048+(c+C)/2+j%64];}}
-        if(t<E){const U16* r=reinterpret_cast<const U16*>(sw+t*W);
+        if(t<E){const U16* wr=reinterpret_cast<const U16*>(sw+t*W);
             #pragma unroll 16
-            for(unsigned k=0;k<C;++k)v=__fmaf_rn(sx[k],hf(r[k]),v);}
+            for(unsigned k=0;k<C;++k)v=__fmaf_rn(sx[k],hf(wr[k]),v);}
         __syncthreads();
     }
     if(t<E){const unsigned e=e0+t;flag_if(flag,v);const float g=sigmoid(v);sg[e]=g;keys[e]=ordered(g+bias[e]);}
 }
 __global__ __launch_bounds__(288) void router_select(const float* sg,const U32* keys,U32* ids,float* rates){
     __shared__ U32 k[288];__shared__ unsigned chosen[288];__shared__ unsigned pick[8];
-    const unsigned e=threadIdx.x;k[e]=keys[e];__syncthreads();
+    const unsigned e=threadIdx.x,r=blockIdx.x;sg+=std::size_t(r)*288;keys+=std::size_t(r)*288;ids+=std::size_t(r)*8;rates+=std::size_t(r)*8;k[e]=keys[e];__syncthreads();
     unsigned rank=0;for(unsigned j=0;j<288;++j)rank+=k[j]>k[e]||(k[j]==k[e]&&j<e);
     chosen[e]=rank<8;__syncthreads();
     if(chosen[e]){unsigned pos=0;for(unsigned j=0;j<e;++j)pos+=chosen[j];pick[pos]=e;}
@@ -623,7 +637,8 @@ struct Runtime::Impl {
     std::string session_key(unsigned P)const{return in_session?":s"+std::to_string(kda_block_start(P))+"/"+std::to_string(kda_open_rows(P)):"";}
     void zero_state(){for(Buffer* b:{&state,&conv,&latent,&key,&gate,&pooled})ck(cudaMemsetAsync(b->p,0,b->bytes,compute.s));}
     void pre(const Hc& hc,const U16* weight,const float* x,float* normalized_out,unsigned n){
-        if(n==1&&dopt.row_hc)hc_pre_staged<<<1,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
+        if(n==1&&dopt.row_hc&&!dopt.row_r2)hc_pre_staged<false><<<1,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
+        else if(n<=4&&dopt.row_hc)hc_pre_staged<true><<<n,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
         else hc_pre_kernel<<<n,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
         norm<<<n,256,0,compute.s>>>(collapsed.as<float>(),weight,normalized_out,n);
     }
@@ -770,7 +785,22 @@ struct Runtime::Impl {
     Json failed_slots;    // the slot census after the last failed decode token (always; best effort)
     void failed_census()noexcept{try{if(ts_tier&&tier.get()==ts_tier)failed_slots=ts_tier->census(compute.s);}catch(...){cudaGetLastError();}}
     bool decode_mode=false;SessionFrontier sess;std::unique_ptr<ExpertCatalog> catalog;std::unique_ptr<UnitBinding> unit_binding;std::unique_ptr<ExpertTier> tier;
-    Buffer kda_s,kda_c,ck_s,ck_c,tail,dlat,dkey,dgate,dpool,head_dec,head_suh,head_svh,head_ws,logits,argres,rx,rx2,hrow,emb,route,mtp_out,host_small,route_sg,route_keys;
+    Buffer kda_s,kda_c,ck_s,ck_c,tail,dlat,dkey,dgate,dpool,head_dec,head_suh,head_svh,head_ws,logits,argres,rx,rx2,hrow,emb,route,mtp_out,host_small,route_sg,route_keys,dlogits;
+    bool have_draft=false;U32 draft_host=0; // mtp_self_spec: the device draft (argres + 16) is valid
+    // Adaptive self-speculation (mtp_self_spec 1; "always" drafts every step): which path emits tokens faster is
+    // measured, as ms per emitted token (EMA), for verify cycles and for plain steps. A session starts with 8
+    // verify cycles and 4 plain steps; then a run of 32 steps on the faster path is followed by a probe of 4 on the
+    // other. Both paths emit the plain greedy tokens, so the choice changes speed only.
+    struct SpecControl {bool plain=false;unsigned left=8;double ms[2]{0,0};bool known[2]{false,false};bool probe=false;};
+    SpecControl spec_ctl;
+    void spec_observe(bool plain,double ms_per_token){auto& m=spec_ctl.ms[plain];m=spec_ctl.known[plain]?0.75*m+0.25*ms_per_token:ms_per_token;spec_ctl.known[plain]=true;}
+    void spec_next(){if(--spec_ctl.left)return;auto& c=spec_ctl;
+        const bool best_plain=c.known[0]&&c.known[1]&&c.ms[1]<c.ms[0];
+        if(c.probe||!c.known[!c.plain]){if(c.probe){c.probe=false;c.plain=best_plain;c.left=32;}else{c.probe=true;c.plain=!c.plain;c.left=4;}}
+        else{c.probe=true;c.plain=!best_plain;c.left=4;}}
+    // Routed ids exported per gated layer and step: rows x top-k (2 rows under mtp_self_spec).
+    static constexpr unsigned spec_drafts=3; // drafts per verify (rows <= 4: the row MoE path, one 16-row MMA tile)
+    unsigned tier_ids()const{return dopt.mtp_spec?(spec_drafts+1)*routed_topk:routed_topk;}
     std::vector<std::vector<std::byte>> snapshot;std::vector<std::uint32_t> snapshot_tokens;
     static void check_device(){
         int count=0;ck(cudaGetDeviceCount(&count));need(count==1,"one visible device required");cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,0));
@@ -820,7 +850,7 @@ struct Runtime::Impl {
         if(d.reference_compare)in.pinned.push_back({compare_part,8*hstride+288*sizeof(Expert)});
         in.pageable={{process_part,process_private}};if(d.reference_compare)in.pageable.push_back({compare_part,hstride});
         add_host_growth_parts(in.pageable,kv); // the bench snapshot (= session state + replay) and driver growth
-        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;in.tier.disk_readers=disk_bounce_readers(d);
+        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.max_ids=d.mtp_spec?4*routed_topk:routed_topk;in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;in.tier.disk_readers=disk_bounce_readers(d);
         if(d.tier_ram_gib>=0)in.ram_expert_bytes=gib_bytes(d.tier_ram_gib);
         if(d.tier_vram_gib>=0){TierBudgetIn t=in.tier;const auto req=gib_bytes(d.tier_vram_gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;
             in.arena_units=tier_budget(t).resident;} // the explicit arena, planned (and checked) before any load
@@ -921,11 +951,12 @@ struct Runtime::Impl {
         const std::size_t c=capacity;Charge kv_charge(kv_part);
         kda_s.allocate(kda_layer_count*kda_state_bytes);kda_c.allocate(kda_layer_count*kda_conv_bytes);ck_s.allocate(kda_layer_count*kda_state_bytes);ck_c.allocate(kda_layer_count*kda_conv_bytes);tail.allocate(kda_layer_count*kda_block*kda_row_bytes);
         dlat.allocate(dsa_layer_count*c*1024);dkey.allocate(dsa_layer_count*c*256);dgate.allocate(dsa_layer_count*c*256);dpool.allocate(dsa_layer_count*(c/4)*512);
-        rx.allocate(65536);rx2.allocate(65536);hrow.allocate(16384);emb.allocate(16384);mtp_out.allocate(16384);route.allocate(256);route_sg.allocate(288*4);route_keys.allocate(288*4);argres.allocate(256);host_small.allocate(65536,true);
+        const std::size_t sr=dopt.mtp_spec?spec_drafts+1:1; // rows of a decode step (up to spec_drafts+1: the verify)
+        rx.allocate(65536*sr);rx2.allocate(65536*sr);hrow.allocate(16384*sr);emb.allocate(16384*sr);mtp_out.allocate(16384*sr);route.allocate(256);route_sg.allocate(4*288*4);route_keys.allocate(4*288*4);argres.allocate(256);host_small.allocate(65536,true); // router scratch: up to 4 rows (verify)
         // Head: stream head.bin to the device once, decode K6 -> FP16, keep scales, free the compressed blob.
         auto& hb=*blobs.at("head.bin");{Charge h(head_blob_part);load_blob_device(hb,staging);}
         auto hm=matrix("lm_head",head_hidden,head_vocab);need(hm.bits==6,"lm_head must be K6");
-        Charge head_charge(head_part);head_dec.allocate(head_decoded_bytes());head_suh.allocate(8192);head_svh.allocate(309760);head_ws.allocate(head_workspace_bytes(1));logits.allocate(std::size_t(vocab_size)*4);
+        Charge head_charge(head_part);head_dec.allocate(head_decoded_bytes());head_suh.allocate(8192);head_svh.allocate(309760);head_ws.allocate(head_workspace_bytes(dopt.mtp_spec?spec_drafts+1:1));logits.allocate(std::size_t(vocab_size)*4*(dopt.mtp_spec?spec_drafts+1:1));if(dopt.mtp_spec)dlogits.allocate(std::size_t(vocab_size)*4);
         ck(decode_head(hm,head_dec.as<U16>(),h2d.s));ck(cudaMemcpyAsync(head_suh.p,hm.suh,8192,cudaMemcpyDeviceToDevice,h2d.s));ck(cudaMemcpyAsync(head_svh.p,hm.svh,309760,cudaMemcpyDeviceToDevice,h2d.s));
         ck(cudaStreamSynchronize(h2d.s));ck(cudaGetLastError());hb.device.reset();
         // One mutually exclusive selection. Tierstream ALWAYS authenticates its
@@ -955,7 +986,7 @@ struct Runtime::Impl {
         auto [physical,commit]=host_free();const std::uint64_t host_avail=host_budget(physical,commit,floor_gib);
         std::uint64_t avail=0,dev=0,host=host_avail;TierBudget b;Json open_plan;
         // Arena-only requests (--tier-vram-gib / --tier-ram-gib) are granted exactly or refused with the numbers.
-        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;t.disk_readers=disk_bounce_readers(dopt);
+        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.max_ids=tier_ids();t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;t.disk_readers=disk_bounce_readers(dopt);
             const auto req=gib_bytes(gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;return tier_budget(t).resident;};
         if(whole_device){
             // Re-plan from what is allocated now (measured device use; process
@@ -977,10 +1008,10 @@ struct Runtime::Impl {
             if(dopt.tier_ram_gib>=0){host=gib_bytes(dopt.tier_ram_gib);
                 need(host<=host_avail,("requested tierstream RAM tier "+gib_text(host)+" exceeds the "+gib_text(host_avail)+" host memory available above the floor at cache open").c_str());}
             TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=dev>(256ULL<<20)?dev-(256ULL<<20):0;in.host_bytes=host>(256ULL<<20)?host-(256ULL<<20):0;
-            in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;in.disk_readers=disk_bounce_readers(dopt);b=tier_budget(in);
+            in.max_ids=tier_ids();in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;in.disk_readers=disk_bounce_readers(dopt);b=tier_budget(in);
         }
         need(b.refuse.empty(),b.refuse.empty()?"":b.refuse.c_str());
-        TierOpenConfig cfg;// The cache opens the canonical held path, never the operator's (possibly aliased) name.
+        TierOpenConfig cfg;cfg.max_ids=tier_ids();// The cache opens the canonical held path, never the operator's (possibly aliased) name.
         const auto order=placement_order();cfg.tiers=tier_assignment(b,keys,order);cfg.seed=order;cfg.policy=policy_code(dopt.tier_policy);cfg.budget=b;cfg.unit_bytes=stride;cfg.disk_prefetch=dopt.disk_prefetch;cfg.flush_ready=dopt.tier_flush_ready;cfg.ledger=ledger.l.get();
         cfg.weight_dirs=dopt.weight_dirs;cfg.drive_readers=dopt.drive_readers;cfg.disk_queue=dopt.tier_disk_queue;cfg.clean_evict=dopt.tier_clean_evict;
         // The source path is the bound native path as lossless UTF-8 (tierstream decodes UTF-8);
@@ -1164,22 +1195,35 @@ struct Runtime::Impl {
         // rates, flag: never read by the token's math); the library only prefetches
         // those units. The branch forks after l's export+wait and joins before l+1's
         // export. Layer 44 does not predict 45 (MTP: its router is inside enqueue_mtp).
-        bool predict=false,join_pending=false;Buffer pred_in,pred_ids,pred_rates,pred_flag;Stream side;Event fork,join;
-        void enable_predict(){Charge c(table_part);pred_in.allocate(4096*4);pred_ids.allocate(routed_topk*4);pred_rates.allocate(routed_topk*4);pred_flag.allocate(4);api->set_predict_ids(routed_topk,gated_ordinal(routed_last_layer-1));predict=true;}
-        void predict_next(unsigned l,const float* x,cudaStream_t st){
+        // Rows <= 4 (a self-speculation verify predicts every row): the promise is set per step (8 ids per row).
+        bool predict=false,join_pending=false;Buffer pred_in,pred_ids,pred_rates,pred_flag,pred_sg,pred_keys;Stream side;Event fork,join;unsigned pred_rows=1;
+        void enable_predict(){Charge c(table_part);pred_in.allocate(4*4096*4);pred_ids.allocate(4*routed_topk*4);pred_rates.allocate(4*routed_topk*4);pred_flag.allocate(4);
+            pred_sg.allocate(4*288*4);pred_keys.allocate(4*288*4);api->set_predict_ids(routed_topk,gated_ordinal(routed_last_layer-1));predict=true;}
+        // Between steps (host): the promise of the coming step's exports. Quiet cache: after 16 tokens without a
+        // demand miss the step promises (and predicts) nothing, so prefetches stop evicting a warm cache; the
+        // next miss turns prediction back on. Outputs never depend on it.
+        bool pred_live=true,promised_live=true;unsigned pred_quiet=0;
+        void observe_misses(std::uint64_t misses){if(misses){pred_quiet=0;pred_live=true;}else if(++pred_quiet>=16)pred_live=false;}
+        void predict_rows(unsigned rows){if(predict&&(rows!=pred_rows||pred_live!=promised_live)){
+            api->set_predict_ids(pred_live?routed_topk*rows:0,gated_ordinal(routed_last_layer-1));pred_rows=rows;promised_live=pred_live;}}
+        void predict_next(unsigned l,const float* x,cudaStream_t st,unsigned rows=1){
             // Never for a layer the step skips or holds: its export promised nothing (StepPlan).
-            if(!predict||l+1>=routed_last_layer||!api->step_exports(gated_ordinal(l+1)))return;auto& w=*r.layers[l+1];
+            if(!predict||!promised_live||l+1>=routed_last_layer||!api->step_exports(gated_ordinal(l+1)))return;auto& w=*r.layers[l+1];
             // The branch reads its OWN copy of the input: the next layer overwrites `x`
             // (normalized) before the join. The copy is ordered on the main stream.
-            ck(cudaMemcpyAsync(pred_in.p,x,4096*4,cudaMemcpyDeviceToDevice,st));
+            need(rows==pred_rows,"prediction rows differ from the step's promise");
+            ck(cudaMemcpyAsync(pred_in.p,x,std::size_t(rows)*4096*4,cudaMemcpyDeviceToDevice,st));
             ck(cudaEventRecord(fork.e,st));ck(cudaStreamWaitEvent(side.s,fork.e,0));
-            router<<<1,320,0,side.s>>>(pred_in.as<float>(),w.router,w.bias,pred_ids.as<U32>(),pred_rates.as<float>(),pred_flag.as<unsigned>());ck(cudaGetLastError());
-            api->enqueue_predict(gated_ordinal(l),reinterpret_cast<const std::int32_t*>(pred_ids.p),routed_topk,side.s);
+            if(r.dopt.row_router){router_scores<<<dim3(9,rows),128,0,side.s>>>(pred_in.as<float>(),w.router,w.bias,pred_sg.as<float>(),pred_keys.as<U32>(),pred_flag.as<unsigned>());
+                router_select<<<rows,288,0,side.s>>>(pred_sg.as<float>(),pred_keys.as<U32>(),pred_ids.as<U32>(),pred_rates.as<float>());}
+            else router<<<rows,320,0,side.s>>>(pred_in.as<float>(),w.router,w.bias,pred_ids.as<U32>(),pred_rates.as<float>(),pred_flag.as<unsigned>());
+            ck(cudaGetLastError());
+            api->enqueue_predict(gated_ordinal(l),reinterpret_cast<const std::int32_t*>(pred_ids.p),routed_topk*rows,side.s);
             ck(cudaEventRecord(join.e,side.s));join_pending=true;}
         // Slot census (diagnostics): per-layer decode misses (counted before each export) and the
         // table's homes per layer; with --decode-profile per token, at a failure, and at open.
         Buffer miss_dev,census_dev;bool census_on=false;
-        unsigned persistent_slots()const{auto v=api->view();return v.guard_slot>=2*routed_topk?v.guard_slot-2*routed_topk:0;}
+        unsigned persistent_slots()const{auto v=api->view();const unsigned b=2*r.tier_ids();return v.guard_slot>=b?v.guard_slot-b:0;}
         void enable_census(){if(!miss_dev.p){Charge c(table_part);miss_dev.allocate(routed_gated*4);census_dev.allocate(routed_gated*3*4);}census_on=true;}
         void census_begin(cudaStream_t s){if(census_on)ck(cudaMemsetAsync(miss_dev.p,0xFF,miss_dev.bytes,s));}
         // After the stream synchronized (best effort for a failed token's caller).
@@ -1304,58 +1348,68 @@ struct Runtime::Impl {
         // Same drain/ring reset as a failed prefill before any reuse.
         try{run(input,"glm-pf-rtx-native-v1",StateSink{});}catch(...){in_session=false;session_failed();
             for(auto& r:ring){r.layer=-1;if(r.read.valid())try{r.read.get();}catch(...){}cudaEventRecord(r.retired.e,compute.s);}cudaStreamSynchronize(compute.s);throw;}
-        in_session=false;sess.begin(input);routes_header("session-"+std::to_string(++route_sessions),input.size());auto j=Json::object();j.set("frontier",int(sess.frontier()));j.set("prefill_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("prefill_timings",last_timings);j.set("row_tile",int(tile));j.set("row_tile_choice",tile_choice);
+        in_session=false;sess.begin(input);have_draft=false;spec_ctl=SpecControl{};routes_header("session-"+std::to_string(++route_sessions),input.size());auto j=Json::object();j.set("frontier",int(sess.frontier()));j.set("prefill_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());j.set("prefill_timings",last_timings);j.set("row_tile",int(tile));j.set("row_tile_choice",tile_choice);
         // The prefill's own expert cache traffic (counter delta since the last read: reset_open or the last token), so
         // file units read during prefill are visible per request and the first decode token counts only its own traffic.
         if(prefill_via_cache&&ts_tier&&tier.get()==ts_tier){try{j.set("prefill_expert_cache",ts_tier->collect_stats());}catch(const std::exception& e){j.set("prefill_expert_cache_error",std::string(e.what()));}}
         return j;
     }
     static void predecoded(Call& v,Layer& w){if(w.fp16_g.p){v.fp16_gate=w.fp16_g.as<U16>();v.fp16_up=w.fp16_u.as<U16>();v.fp16_down=w.fp16_d.as<U16>();}}
-    void moe(unsigned l,Layer& w,const float* x,float* y){
-        if(dopt.row_router){router_scores<<<9,128,0,compute.s>>>(x,w.router,w.bias,route_sg.as<float>(),route_keys.as<U32>(),flag.as<unsigned>());router_select<<<1,288,0,compute.s>>>(route_sg.as<float>(),route_keys.as<U32>(),ids.as<U32>(),rates.as<float>());}
-        else router<<<1,320,0,compute.s>>>(x,w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());
+    void moe(unsigned l,Layer& w,const float* x,float* y,unsigned rows=1){
+        if(rows<=4&&dopt.row_router){router_scores<<<dim3(9,rows),128,0,compute.s>>>(x,w.router,w.bias,route_sg.as<float>(),route_keys.as<U32>(),flag.as<unsigned>());router_select<<<rows,288,0,compute.s>>>(route_sg.as<float>(),route_keys.as<U32>(),ids.as<U32>(),rates.as<float>());}
+        else router<<<rows,320,0,compute.s>>>(x,w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());
         timeline.mark(int(l),DecodePhase::router,compute.s);
-        tier->acquire(l,ids.as<U32>(),8,compute.s);timeline.mark(int(l),DecodePhase::export_wait,compute.s);
-        if(ts_tier&&tier.get()==ts_tier&&ts_tier->predict){ts_tier->predict_next(l,x,compute.s);timeline.mark(int(l),DecodePhase::predict,compute.s);}
+        tier->acquire(l,ids.as<U32>(),8*rows,compute.s);timeline.mark(int(l),DecodePhase::export_wait,compute.s);
+        if(ts_tier&&tier.get()==ts_tier&&ts_tier->predict){ts_tier->predict_next(l,x,compute.s,rows);timeline.mark(int(l),DecodePhase::predict,compute.s);}
         auto* d=static_cast<const Expert*>(tier->bind_selected_descriptors(l,compute.s));
-        Call v{1,288,4096,2048,x,ids.as<U32>(),rates.as<float>(),d,routed.as<float>()};v.compact_groups=dopt.skip_empty_expert_groups;v.row_gemv=dopt.row_moe;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::routed_moe,compute.s);
-        Call sh{1,1,4096,2048,x,nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);sh.row_gemv=dopt.row_moe;ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::shared_expert,compute.s);
-        add<<<16,256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),y,4096,flag.as<unsigned>());tier->release(l,compute.s);timeline.mark(int(l),DecodePhase::combine,compute.s);
+        Call v{rows,288,4096,2048,x,ids.as<U32>(),rates.as<float>(),d,routed.as<float>()};v.compact_groups=dopt.skip_empty_expert_groups;v.row_gemv=dopt.row_moe;v.row_r2=dopt.row_r2;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::routed_moe,compute.s);
+        Call sh{rows,1,4096,2048,x,nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);sh.row_gemv=dopt.row_moe;sh.row_r2=dopt.row_r2;ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::shared_expert,compute.s);
+        add<<<16*rows,256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),y,std::size_t(4096)*rows,flag.as<unsigned>());tier->release(l,compute.s);timeline.mark(int(l),DecodePhase::combine,compute.s);
     }
     // Session working KDA state (export/replay target); the prefill writes it through kst/kcv.
     float* kst2(unsigned l){return kda_s.as<float>()+std::size_t(kda_slot(l))*(kda_state_bytes/4);}
     float* kcv2(unsigned l){return kda_c.as<float>()+std::size_t(kda_slot(l))*(kda_conv_bytes/4);}
+    // The trunk over `rows` consecutive tokens at positions P.. (already in `tokens`): embed, 45 layers, the
+    // final norm, the head over every row and one argmax per row (argres + 4*j). rows = 1 is the plain step
+    // (KDA promotes its checkpoint inline); rows > 1 is a verify: KDA replays the open block plus every row,
+    // and the promotion is the caller's, after acceptance. Begins the tier token.
+    void trunk(unsigned P,unsigned rows){
+        embed<<<64*rows,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P,rx.as<float>(),rows,4);timeline.mark(-1,DecodePhase::embed,compute.s);
+        if(ts_tier&&tier.get()==ts_tier){ts_tier->census_begin(compute.s);ts_tier->predict_rows(rows);}
+        tier->begin_token(P);const unsigned n=kda_replay_rows(P)+rows-1;
+        for(unsigned l=0;l<45;++l){auto& w=*layers[l];const float* yrow=part.as<float>();
+            pre(w.attn,w.input,rx.as<float>(),normalized.as<float>(),rows);timeline.mark(int(l),DecodePhase::hc_pre_attn,compute.s);
+            if(is_kda_layer(l)){
+                ck(cudaMemcpyAsync(tl(l)+std::size_t(n-rows)*4096,normalized.p,rows*kda_row_bytes,cudaMemcpyDeviceToDevice,compute.s));
+                ck(cudaMemcpyAsync(kst2(l),cks(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(kcv2(l),ckc(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));
+                KdaCall v{n,w.k,tl(l),part.as<float>(),kst2(l),kcv2(l)};v.row_kernels=dopt.row_kda;v.row_r2=dopt.row_r2;ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s));yrow=part.as<float>()+std::size_t(n-rows)*4096;
+                if(rows==1&&kda_promotes(P))promote_kda(l);
+                timeline.mark(int(l),DecodePhase::kda,compute.s);
+            }else{DsaCall v{};v.rows=rows;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;v.row_kernels=dopt.row_dsa;v.row_r2=dopt.row_r2;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));timeline.mark(int(l),DecodePhase::dsa,compute.s);}
+            post(rx.as<float>(),yrow,rx2.as<float>(),rows);timeline.mark(int(l),DecodePhase::hc_post_attn,compute.s);
+            pre(w.ffn,w.post,rx2.as<float>(),normalized.as<float>(),rows);timeline.mark(int(l),DecodePhase::hc_pre_ffn,compute.s);
+            if(l<3){Call v{rows,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);v.row_gemv=dopt.row_moe;v.row_r2=dopt.row_r2;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::dense_ffn,compute.s);}
+            else moe(l,w,normalized.as<float>(),part.as<float>(),rows);
+            post(rx2.as<float>(),part.as<float>(),rx.as<float>(),rows);timeline.mark(int(l),DecodePhase::hc_post_ffn,compute.s);
+        }
+        hc_final_kernel<<<dim3(16,rows),256,0,compute.s>>>(rx.as<float>(),part.as<float>());norm<<<rows,256,0,compute.s>>>(part.as<float>(),u16("model.language_model.norm.weight"),hrow.as<float>(),rows);
+        ck(enqueue_head(head(),hrow.as<float>(),logits.as<float>(),rows,head_ws.p,head_ws.bytes,compute.s));
+        for(unsigned j=0;j<rows;++j)ck(enqueue_argmax(logits.as<float>()+std::size_t(j)*vocab_size,vocab_size,argres.as<U32>()+4*j,compute.s));
+    }
+    void promote_kda(unsigned l){ck(cudaMemcpyAsync(cks(l),kst2(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(ckc(l),kcv2(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));}
     // One generation step. Same layer helpers, kernels and order as prefill:
     // KDA replays the open B32 block from its checkpoint; DSA appends rows=1 at
     // the absolute position; MTP pairs (hidden[P],y) on its own state.
-    Json decode_one(bool qualification){
+    Json decode_one(bool qualification,bool draft=false){
         Json restored;if(restore_pending&&decode_mode&&sess.open())restored=run_pending_restore();
-        auto out=decode_step(qualification);if(restored.is_object())out.set("deferred_restore",restored);return out;}
-    Json decode_step(bool qualification){
+        auto out=decode_step(qualification,draft);if(restored.is_object())out.set("deferred_restore",restored);observe(out);return out;}
+    void observe(const Json& out){if(!ts_tier||tier.get()!=ts_tier)return;auto* e=out.find("experts");auto* m=e?e->find("misses"):nullptr;if(m)ts_tier->observe_misses(std::uint64_t(m->as_int()));}
+    Json decode_step(bool qualification,bool draft){
         need(decode_mode,"decode not enabled");const unsigned P=sess.position();const U32 pending=sess.pending();
         try{
             auto begin=std::chrono::steady_clock::now();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
             auto* hs=host_small.as<U32>();hs[0]=pending;ck(cudaMemcpyAsync(tokens.as<U32>()+P,hs,4,cudaMemcpyHostToDevice,compute.s));
-            embed<<<64,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P,rx.as<float>(),1,4);timeline.mark(-1,DecodePhase::embed,compute.s);
-            if(ts_tier&&tier.get()==ts_tier)ts_tier->census_begin(compute.s);
-            tier->begin_token(P);const unsigned n=kda_replay_rows(P);
-            for(unsigned l=0;l<45;++l){auto& w=*layers[l];const float* yrow=part.as<float>();
-                pre(w.attn,w.input,rx.as<float>(),normalized.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_pre_attn,compute.s);
-                if(is_kda_layer(l)){
-                    ck(cudaMemcpyAsync(tl(l)+std::size_t(n-1)*4096,normalized.p,kda_row_bytes,cudaMemcpyDeviceToDevice,compute.s));
-                    ck(cudaMemcpyAsync(kst2(l),cks(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(kcv2(l),ckc(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));
-                    KdaCall v{n,w.k,tl(l),part.as<float>(),kst2(l),kcv2(l)};v.row_kernels=dopt.row_kda;ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s));yrow=part.as<float>()+std::size_t(n-1)*4096;
-                    if(kda_promotes(P)){ck(cudaMemcpyAsync(cks(l),kst2(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(ckc(l),kcv2(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));}
-                    timeline.mark(int(l),DecodePhase::kda,compute.s);
-                }else{DsaCall v{};v.rows=1;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;v.row_kernels=dopt.row_dsa;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));timeline.mark(int(l),DecodePhase::dsa,compute.s);}
-                post(rx.as<float>(),yrow,rx2.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_post_attn,compute.s);
-                pre(w.ffn,w.post,rx2.as<float>(),normalized.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_pre_ffn,compute.s);
-                if(l<3){Call v{1,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);v.row_gemv=dopt.row_moe;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::dense_ffn,compute.s);}
-                else moe(l,w,normalized.as<float>(),part.as<float>());
-                post(rx2.as<float>(),part.as<float>(),rx.as<float>(),1);timeline.mark(int(l),DecodePhase::hc_post_ffn,compute.s);
-            }
-            hc_final_kernel<<<dim3(16,1),256,0,compute.s>>>(rx.as<float>(),part.as<float>());norm<<<1,256,0,compute.s>>>(part.as<float>(),u16("model.language_model.norm.weight"),hrow.as<float>(),1);
-            ck(enqueue_head(head(),hrow.as<float>(),logits.as<float>(),1,head_ws.p,head_ws.bytes,compute.s));ck(enqueue_argmax(logits.as<float>(),vocab_size,argres.as<U32>(),compute.s));
+            trunk(P,1);
             ck(cudaMemcpyAsync(hs,argres.p,12,cudaMemcpyDeviceToHost,compute.s));ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::head,compute.s);ck(cudaStreamSynchronize(compute.s));
             HeadChoice choice{hs[0],hs[1],0};std::memcpy(&choice.logit,hs+2,4);need(!hs[4],"nonfinite trunk activation; session invalidated");const U32 y=accept_choice(choice);
             auto record=Json::object();
@@ -1370,9 +1424,10 @@ struct Runtime::Impl {
             hs[8]=y;ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,hs+8,4,cudaMemcpyHostToDevice,compute.s));
             embed<<<16,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P+1,emb.as<float>(),1,1);
             auto& w=*layers[45];
-            MtpCall m1{1,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
+            MtpCall m1{1,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;m1.row_r2=dopt.row_r2;ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
             tier->acquire(45,route.as<U32>(),8,compute.s);auto m2=m1;m2.phase=2;m2.route_ids=nullptr;m2.w.experts=static_cast<const Expert*>(tier->bind_selected_descriptors(45,compute.s));ck(enqueue_mtp(m2,workspace.p,ws_bytes,compute.s,exec));
-            tier->release(45,compute.s);ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::mtp,compute.s);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[4],"nonfinite MTP activation; session invalidated");
+            tier->release(45,compute.s);if(draft)enqueue_draft(0,hs+12);ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::mtp,compute.s);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[4],"nonfinite MTP activation; session invalidated");
+            if(draft)take_draft(hs+12);else have_draft=false;
             tier->end_token();sess.commit(y);
             std::string routes;
             if(ts_tier&&tier.get()==ts_tier&&ts_tier->route_log.p){std::vector<U32> h(std::size_t(routed_gated)*routed_topk);ck(cudaMemcpy(h.data(),ts_tier->route_log.p,h.size()*4,cudaMemcpyDeviceToHost));routes=routes_line(h.data());
@@ -1382,6 +1437,81 @@ struct Runtime::Impl {
             return record;
         }catch(const std::exception& e){tier->fail_token(e.what());session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
         catch(...){tier->fail_token("non-standard exception");session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
+    }
+    // MTP self-speculation (mtp_self_spec, K = 1). The draft for the next position is the shared head's argmax
+    // over the MTP output of the last committed row (dlogits; the trunk's logits stay the digest source); it
+    // stays on the device (argres + 16) and is read back with the cycle's last synchronization.
+    void enqueue_draft(unsigned row,U32* host){
+        ck(enqueue_head(head(),mtp_out.as<float>()+std::size_t(row)*4096,dlogits.as<float>(),1,head_ws.p,head_ws.bytes,compute.s));
+        ck(enqueue_argmax(dlogits.as<float>(),vocab_size,argres.as<U32>()+16,compute.s));ck(cudaMemcpyAsync(host,argres.as<U32>()+16,12,cudaMemcpyDeviceToHost,compute.s));
+    }
+    void take_draft(const U32* h){have_draft=h[0]<vocab_size&&h[1]==0;draft_host=h[0];}
+    // One cycle: verify [pending, d1..dK] at P..P+K with the plain step's per-row ops (trunk rows = K+1 <= 4),
+    // accept greedily (the longest prefix of drafts equal to the targets, then the target after it), commit
+    // m+1 tokens, MTP over the committed rows, next MTP draft. Drafts: the prompt lookup (spec_lookup, up to
+    // spec_drafts tokens) when the session's suffix occurred before, else the MTP draft (one token). The rows stay
+    // inside one KDA block. A plain step instead when no draft exists or one token is wanted. Rejected rows need no
+    // undo: the KDA working state and the tail are rebuilt from the block checkpoint every step (promotion only
+    // when the last committed row ends the block), and their DSA rows (and pools) are rewritten by later steps.
+    // A non-finite verify flag falls back to the plain step at P (the flag cannot tell the rows apart).
+    Json decode_spec(bool qualification,unsigned max_tokens){
+        need(decode_mode&&dopt.mtp_spec,"decode_spec needs the service opened with mtp_self_spec");
+        Json restored;if(restore_pending&&sess.open())restored=run_pending_restore();
+        const bool plain=!dopt.spec_always&&spec_ctl.plain;const auto begin=std::chrono::steady_clock::now();Json out;
+        if(plain){out=decode_step(qualification,spec_ctl.left==1); // the last plain step drafts for the next cycle
+            auto t=Json::array();t.push(out.find("token")->as_int());out.set("tokens",t);
+            if(qualification){auto g=Json::array();g.push(out.find("logits_sha256")->as_string());out.set("logits",g);}out.set("drafted",0);out.set("accepted",0);}
+        else out=decode_spec_step(qualification,max_tokens);
+        const auto n=out.find("tokens")->as_array().size();
+        if(!dopt.spec_always){if(!(plain&&spec_ctl.left==1))spec_observe(plain,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count()/double(n));
+            out.set("spec_path",plain?"plain":"verify");spec_next();}
+        if(restored.is_object())out.set("deferred_restore",restored);observe(out);return out;}
+    Json decode_spec_step(bool qualification,unsigned max_tokens){
+        const unsigned P=sess.position();
+        std::vector<U32> drafts;bool from_mtp=false;
+        if(dopt.spec_lookup)drafts=lookup_draft(sess.tokens(),spec_drafts);
+        if(drafts.empty()&&have_draft){drafts.assign(1,draft_host);from_mtp=true;}
+        const unsigned R=std::min({unsigned(drafts.size())+1,kda_block-P%kda_block,max_tokens,capacity-1-P});
+        if(R<2){auto r=decode_step(qualification,true);
+            auto t=Json::array();t.push(r.find("token")->as_int());r.set("tokens",t);
+            if(qualification){auto g=Json::array();g.push(r.find("logits_sha256")->as_string());r.set("logits",g);}r.set("drafted",0);r.set("accepted",0);return r;}
+        drafts.resize(R-1);
+        try{
+            auto begin=std::chrono::steady_clock::now();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
+            // host_small: argres rows 0..15, flag 24, verify tokens 32.., MTP tokens 40.., draft 48..50
+            auto* hs=host_small.as<U32>();hs[32]=sess.pending();for(unsigned j=1;j<R;++j)hs[32+j]=drafts[j-1];
+            if(from_mtp){ck(cudaMemcpyAsync(tokens.as<U32>()+P,hs+32,4,cudaMemcpyHostToDevice,compute.s));ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,argres.as<U32>()+16,4,cudaMemcpyDeviceToDevice,compute.s));}
+            else ck(cudaMemcpyAsync(tokens.as<U32>()+P,hs+32,4*R,cudaMemcpyHostToDevice,compute.s));
+            trunk(P,R);
+            ck(cudaMemcpyAsync(hs,argres.p,16*R,cudaMemcpyDeviceToHost,compute.s));ck(cudaMemcpyAsync(hs+24,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::head,compute.s);ck(cudaStreamSynchronize(compute.s));
+            if(hs[24]){tier->end_token();have_draft=false;return decode_spec_step(qualification,1);}
+            auto choice=[&](unsigned j){HeadChoice c{hs[4*j],hs[4*j+1],0};std::memcpy(&c.logit,hs+4*j+2,4);return c;};
+            std::vector<U32> out;unsigned m=0;U32 t=accept_choice(choice(0));
+            while(m+1<R&&drafts[m]==t){out.push_back(drafts[m]);++m;t=accept_choice(choice(m));}
+            out.push_back(t);const unsigned c=m+1; // committed rows P..P+m, emitted d1..dm then t
+            auto record=Json::object();auto tok=Json::array(),dig=Json::array();for(auto y:out)tok.push(std::uint64_t(y));
+            double digest_ms=0;
+            if(qualification){auto digest_begin=std::chrono::steady_clock::now();std::vector<float> host(vocab_size);
+                for(unsigned j=0;j<c;++j){ck(cudaMemcpy(host.data(),logits.as<float>()+std::size_t(j)*vocab_size,host.size()*4,cudaMemcpyDeviceToHost));auto again=head_argmax(host);
+                    need(again.token==choice(j).token&&again.nonfinite==0,"device/host argmax disagree");dig.push(hex_sha(host.data(),host.size()*4));}
+                record.set("logits",dig);digest_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-digest_begin).count();record.set("digest_ms",digest_ms);}
+            auto trunk_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+            timeline.mark(-1,DecodePhase::host_gap,compute.s);
+            if(c==R&&kda_promotes(P+c-1))for(unsigned l=0;l<45;++l)if(is_kda_layer(l))promote_kda(l);
+            // MTP over the committed rows: pairs (hidden[P+j], token P+1+j).
+            for(unsigned j=0;j<c;++j)hs[40+j]=out[j];ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,hs+40,4*c,cudaMemcpyHostToDevice,compute.s));
+            embed<<<16*c,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P+1,emb.as<float>(),c,1);
+            auto& w=*layers[45];
+            MtpCall m1{c,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;m1.row_r2=dopt.row_r2;ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
+            tier->acquire(45,route.as<U32>(),8*c,compute.s);auto m2=m1;m2.phase=2;m2.route_ids=nullptr;m2.w.experts=static_cast<const Expert*>(tier->bind_selected_descriptors(45,compute.s));ck(enqueue_mtp(m2,workspace.p,ws_bytes,compute.s,exec));
+            tier->release(45,compute.s);enqueue_draft(c-1,hs+48);ck(cudaMemcpyAsync(hs+24,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::mtp,compute.s);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[24],"nonfinite MTP activation; session invalidated");
+            take_draft(hs+48);tier->end_token();for(auto y:out)sess.commit(y);
+            record.set("position",int(P));record.set("tokens",tok);record.set("token",std::uint64_t(out[0]));record.set("drafted",int(R-1));record.set("accepted",int(m));record.set("draft_source",from_mtp?"mtp":"lookup");
+            record.set("trunk_ms",trunk_ms);record.set("step_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());record.set("experts",tier->collect_stats());
+            if(timeline.on){record.set("timeline",timeline.collect());if(ts_tier&&tier.get()==ts_tier)record.set("slot_census",ts_tier->census(compute.s));}
+            return record;
+        }catch(const std::exception& e){have_draft=false;tier->fail_token(e.what());session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
+        catch(...){have_draft=false;tier->fail_token("non-standard exception");session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
     }
     void export_session(const StateSink& sink){
         need(decode_mode&&sess.open(),"no open session to export");const unsigned P=sess.frontier();ck(cudaStreamSynchronize(compute.s));
@@ -1396,7 +1526,7 @@ struct Runtime::Impl {
     std::vector<Buffer*> session_buffers(){return {&kda_s,&kda_c,&ck_s,&ck_c,&tail,&dlat,&dkey,&dgate,&dpool};}
     void snapshot_session(){need(decode_mode&&sess.open(),"no open session");ck(cudaStreamSynchronize(compute.s));snapshot.clear();
         for(auto* b:session_buffers()){snapshot.emplace_back(b->bytes);ck(cudaMemcpy(snapshot.back().data(),b->p,b->bytes,cudaMemcpyDeviceToHost));}snapshot_tokens=sess.tokens();}
-    void restore_session(){need(decode_mode&&!snapshot.empty(),"no session snapshot");ck(cudaStreamSynchronize(compute.s));std::size_t j=0;
+    void restore_session(){need(decode_mode&&!snapshot.empty(),"no session snapshot");have_draft=false;ck(cudaStreamSynchronize(compute.s));std::size_t j=0;
         for(auto* b:session_buffers())ck(cudaMemcpy(b->p,snapshot[j++].data(),b->bytes,cudaMemcpyHostToDevice));sess.reset();sess.begin(snapshot_tokens);}
 };
 Runtime::Runtime(const std::string& path,unsigned cap,unsigned rows,bool source,bool graphs,unsigned floor_gib,bool legacy,bool serial,const VerifiedManifest* verified,unsigned max_device,unsigned max_pinned,bool require_file,bool decode,const DecodeOptions& dopts):p_(std::make_unique<Impl>(path,cap,rows,source,graphs,floor_gib,verified,max_device,max_pinned,require_file,decode,dopts)){
@@ -1470,6 +1600,9 @@ std::string Runtime::health()const{auto j=Json::object();j.set("status","ready")
 bool Runtime::decode_capable()const{return p_->decode_mode;}
 std::string Runtime::begin_session(std::span<const U32> t){return p_->begin_session(t).dump();}
 std::string Runtime::decode_one(bool q){return p_->decode_one(q).dump();}
+std::string Runtime::decode_spec(bool q,unsigned max_tokens){return p_->decode_spec(q,max_tokens).dump();}
+void Runtime::profiler(bool on){ck(cudaStreamSynchronize(p_->compute.s));ck(on?cudaProfilerStart():cudaProfilerStop());}
+void Runtime::set_spec_lookup(bool on){need(!on||p_->dopt.mtp_spec,"lookup drafts need the service opened with mtp_self_spec");p_->dopt.spec_lookup=on;}
 void Runtime::export_session(const StateSink& sink){p_->export_session(sink);}
 std::string Runtime::replay_digest(){return p_->replay_digest();}
 std::vector<std::uint32_t> Runtime::session_tokens()const{return p_->sess.tokens();}
@@ -1488,11 +1621,16 @@ std::string Runtime::generate(std::span<const U32> prompt,unsigned max_new,std::
     auto start=std::chrono::steady_clock::now();auto prefill=p_->begin_session(prompt);receipt.set("prefill",prefill);
     auto loop=std::chrono::steady_clock::now();auto steps=Json::array(),generated=Json::array();std::string reason="max_new_tokens";double first_ms=0;
     std::uint64_t logical=0,h2d=0,file=0,sel[3]{},lookups=0,misses=0,file_reads=0,pinned_hits=0,device_hits=0;
-    for(unsigned i=0;i<max_new;++i){auto r=p_->decode_one(qualification);auto y=std::uint32_t(r.find("token")->as_int());generated.push(std::uint64_t(y));
+    // mtp_self_spec: each step is one verify cycle emitting 1..4 tokens (the plain greedy tokens); tokens after a stop
+    // token are not emitted (the session frontier may lie past it).
+    const bool spec=p_->dopt.mtp_spec;bool stopped=false;
+    for(unsigned i=0;i<max_new&&!stopped;){auto r=spec?p_->decode_spec(qualification,max_new-i):p_->decode_one(qualification);
         if(i==0)first_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         const auto& e=*r.find("experts");auto num=[&](const char* k){auto* v=e.find(k);return v?std::uint64_t(v->as_int()):0ULL;};
-        logical+=num("logical_bytes");h2d+=num("h2d_bytes");file+=num("file_bytes");sel[0]+=num("device_selections");sel[1]+=num("pinned_selections");sel[2]+=num("file_selections");lookups+=num("lookups");misses+=num("misses");file_reads+=num("file_reads");pinned_hits+=num("pinned_hits");device_hits+=num("device_hits");steps.push(r);
-        if(std::find(stop.begin(),stop.end(),y)!=stop.end()){reason="stop_token";break;}}
+        logical+=num("logical_bytes");h2d+=num("h2d_bytes");file+=num("file_bytes");sel[0]+=num("device_selections");sel[1]+=num("pinned_selections");sel[2]+=num("file_selections");lookups+=num("lookups");misses+=num("misses");file_reads+=num("file_reads");pinned_hits+=num("pinned_hits");device_hits+=num("device_hits");
+        std::vector<std::uint32_t> ys;if(spec)for(const auto& t:r.find("tokens")->as_array())ys.push_back(std::uint32_t(t.as_int()));else ys.push_back(std::uint32_t(r.find("token")->as_int()));
+        steps.push(r);
+        for(auto y:ys){generated.push(std::uint64_t(y));++i;if(std::find(stop.begin(),stop.end(),y)!=stop.end()){reason="stop_token";stopped=true;break;}}}
     auto end=std::chrono::steady_clock::now();double loop_s=std::chrono::duration<double>(end-loop).count();auto n=generated.as_array().size();
     receipt.set("generated_token_ids",generated);receipt.set("stop_reason",reason);receipt.set("emitted_tokens",std::uint64_t(n));
     receipt.set("first_token_ms",first_ms);receipt.set("generation_loop_s",loop_s);receipt.set("tokens_per_s",loop_s>0?double(n)/loop_s:0.0);receipt.set("total_ms",std::chrono::duration<double,std::milli>(end-start).count());

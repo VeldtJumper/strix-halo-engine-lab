@@ -5,6 +5,7 @@
 // both frontiers equal P=N-1. A step consumes the pending token at absolute
 // position P, chooses y, advances MTP with (hidden[P],y), appends y as pending.
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -45,6 +46,18 @@ inline bool dsa_completes_pool(unsigned first){return (first+1)%4==0;}
 inline unsigned dsa_scored_pools(unsigned first){return (first+1)/4;}
 inline constexpr unsigned dsa_attended_bound=2051;
 inline unsigned dsa_attended_tokens(unsigned first){auto pools=dsa_scored_pools(first);return pools<=512?first+1:2048+(first+1)%4;}
+// Prompt-lookup drafts (local stand-in for the shared n-gram component): the longest suffix of `tokens`
+// (max_match down to min_match tokens) that occurred earlier, most recent occurrence first; returns up to k
+// tokens that followed it (empty: no match). Drafts only propose; the greedy verify decides every token.
+inline std::vector<std::uint32_t> lookup_draft(std::span<const std::uint32_t> tokens,unsigned k,unsigned min_match=3,unsigned max_match=8){
+    const std::size_t L=tokens.size();
+    for(std::size_t n=std::min<std::size_t>(max_match,L>0?L-1:0);n>=min_match&&n>0;--n)
+        for(std::size_t i=L-n;i-->0;){
+            bool same=true;for(std::size_t j=0;j<n&&same;++j)same=tokens[i+j]==tokens[L-n+j];
+            if(same)return std::vector<std::uint32_t>(tokens.begin()+std::ptrdiff_t(i+n),tokens.begin()+std::ptrdiff_t(std::min(i+n+k,L)));
+        }
+    return {};
+}
 class SessionFrontier {
     unsigned capacity_=0;std::vector<std::uint32_t> tokens_;bool open_=false,failed_=false;
 public:

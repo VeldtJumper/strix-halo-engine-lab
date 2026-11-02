@@ -154,12 +154,13 @@ cudaError_t enqueue_kda(const KdaCall& v,void* workspace,std::size_t bytes,cudaS
     auto s=stream;cudaError_t e;
     const bool rq=v.row_kernels&&!ref&&row_project_fits(w.qkv,r),ro=v.row_kernels&&!ref&&row_project_fits(w.out,r);
     if(!rq)layer_decode<<<w.qkv.input/16*(w.qkv.output/16),256,0,s>>>(w.qkv,a.decoded);
-    if((e=project(w.qkv,v.x,a.qkv,r,a,s,ref,false,rq))!=cudaSuccess)return e;
-    if((e=ordinary(v.x,w.fa,a.lo,r,w.hidden,D,a,s,ref))!=cudaSuccess)return e;
-    if((e=ordinary(v.x,w.ga,a.hi,r,w.hidden,D,a,s,ref))!=cudaSuccess)return e;
-    if((e=ordinary(a.lo,w.fb,a.f,r,D,c,a,s,ref))!=cudaSuccess)return e;
-    if((e=ordinary(a.hi,w.gb,a.g,r,D,c,a,s,ref))!=cudaSuccess)return e;
-    if((e=ordinary(v.x,w.b,a.beta,r,w.hidden,w.heads,a,s,ref))!=cudaSuccess)return e;
+    const bool r2=v.row_r2;
+    if((e=project(w.qkv,v.x,a.qkv,r,a,s,ref,false,rq,r2))!=cudaSuccess)return e;
+    if((e=ordinary(v.x,w.fa,a.lo,r,w.hidden,D,a,s,ref,false,ro&&r2))!=cudaSuccess)return e;
+    if((e=ordinary(v.x,w.ga,a.hi,r,w.hidden,D,a,s,ref,false,ro&&r2))!=cudaSuccess)return e;
+    if((e=ordinary(a.lo,w.fb,a.f,r,D,c,a,s,ref,false,ro&&r2))!=cudaSuccess)return e;
+    if((e=ordinary(a.hi,w.gb,a.g,r,D,c,a,s,ref,false,ro&&r2))!=cudaSuccess)return e;
+    if((e=ordinary(v.x,w.b,a.beta,r,w.hidden,w.heads,a,s,ref,false,ro&&r2))!=cudaSuccess)return e;
     prepare<<<dim3(w.heads,r),D,0,s>>>(w,a.qkv,a.f,a.beta,v.conv,a.prep);
     if(cp)snapshot_conv<<<(3*c+255)/256,256,0,s>>>(a.qkv,v.conv,cp->conv,cp->row,3*c);
     commit_conv<<<(3*c+255)/256,256,0,s>>>(a.qkv,v.conv,r,3*c);
@@ -175,6 +176,6 @@ cudaError_t enqueue_kda(const KdaCall& v,void* workspace,std::size_t bytes,cudaS
     }
     output_gate<<<dim3(w.heads,r),D,0,s>>>(w,a.o,a.g,a.z);
     if(!ro)layer_decode<<<w.out.input/16*(w.out.output/16),256,0,s>>>(w.out,a.decoded);
-    return project(w.out,a.z,v.y,r,a,s,ref,false,ro);
+    return project(w.out,a.z,v.y,r,a,s,ref,false,ro,r2);
 }
 }

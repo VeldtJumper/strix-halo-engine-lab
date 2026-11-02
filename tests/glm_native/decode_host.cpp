@@ -786,9 +786,9 @@ void profile_tests(){
     auto* pp=def.find("predicted_prefetch");
     check(pp&&pp->status==rp::Status::pending&&pp->value=="0"&&pp->wanted=="1","predicted prefetch pending in default: its builtin (off) runs");
     check(!def.find("prefill_tile_large")&&!def.find("dsa_index_mma"),"default leaves the fast-only rows alone");
-    check(def.pending()==std::vector<std::string>{"predicted_prefetch","skip_empty_expert_groups","persistent_dense_fp16"},"default pending list");
+    check(def.pending()==std::vector<std::string>{"predicted_prefetch","skip_empty_expert_groups","persistent_dense_fp16","mtp_self_spec","lookup_drafts"},"default pending list");
     const auto fast=run({"--profile","fast"});
-    check(fast.pending()==std::vector<std::string>{"predicted_prefetch","skip_empty_expert_groups","persistent_dense_fp16","prefill_tile_large","dsa_index_mma"},"fast: every fast-only row pending (none qualified)");
+    check(fast.pending()==std::vector<std::string>{"predicted_prefetch","skip_empty_expert_groups","persistent_dense_fp16","mtp_self_spec","lookup_drafts","prefill_tile_large","dsa_index_mma"},"fast: every fast-only row pending (none qualified)");
     check(fast.find("prefill_tile_large")->value=="off"&&fast.find("dsa_index_mma")->value=="fp32"&&fast.find("dsa_index_mma")->lever->kind==rp::Kind::bit_changing,
           "fast pending rows run their builtin form");
     const auto quality=run({"--profile","quality"});
@@ -805,7 +805,7 @@ void profile_tests(){
     check(run({"--tier-predict","1"}).find("predicted_prefetch")->status==rp::Status::explicit_cli,"explicit --tier-predict is an expert override, not pending");
     // the exact decode levers: pending everywhere (builtin 0 runs), explicit by CLI or environment, run by --allow-pending
     {const auto allowed=run({"--allow-pending"});
-     for(const char* l:{"skip_empty_expert_groups","persistent_dense_fp16"}){auto* e=def.find(l);
+     for(const char* l:{"skip_empty_expert_groups","persistent_dense_fp16","mtp_self_spec","lookup_drafts"}){auto* e=def.find(l);
         check(e&&e->status==rp::Status::pending&&e->value=="0"&&e->wanted=="1"&&e->lever->kind==rp::Kind::exact,(std::string("pending exact lever: ")+l).c_str());
         check(allowed.find(l)->status==rp::Status::unqualified&&allowed.find(l)->value=="1",(std::string("--allow-pending runs ")+l).c_str());}}
     {const auto c=run({"--skip-empty-expert-groups","1"});check(c.find("skip_empty_expert_groups")->status==rp::Status::explicit_cli,"--skip-empty-expert-groups explicit");
@@ -813,13 +813,23 @@ void profile_tests(){
            quality.find("prefill_overlap")->value=="1","prefill_overlap on in every profile");
      const auto o=run({"--prefill-overlap","0"});check(o.find("prefill_overlap")->status==rp::Status::explicit_cli&&o.find("prefill_overlap")->value=="0","--prefill-overlap 0 turns it off");
      const auto e=run({},{{"STRIX_GLM_RTX_PERSISTENT_DENSE_FP16","1"}});check(e.find("persistent_dense_fp16")->status==rp::Status::explicit_env&&e.find("persistent_dense_fp16")->value=="1","STRIX_GLM_RTX_PERSISTENT_DENSE_FP16=1 explicit");}
+    // prompt-lookup drafts: longest earlier suffix match (most recent first), up to k following tokens
+    {const std::vector<std::uint32_t> s{5,1,2,3,9,9,1,2,3,7,4,1,2,3};
+     check(lookup_draft(s,3)==std::vector<std::uint32_t>{7,4,1},"lookup: most recent match of the longest suffix");
+     check(lookup_draft(s,8,3,3)==std::vector<std::uint32_t>{7,4,1,2,3},"lookup: drafts stop at the end of the history");
+     check(lookup_draft(std::vector<std::uint32_t>{1,2,3,4,5},3).empty(),"lookup: no repeated suffix, no draft");
+     check(lookup_draft(std::vector<std::uint32_t>{8,8,8,8,8},2)==std::vector<std::uint32_t>{8},"lookup: overlapping match");}
     // decode_row_kernels: on in every profile; 0, 1 or a '+' subset; the runtime switches follow the value
     check(def.find("decode_row_kernels")->value=="1"&&fast.find("decode_row_kernels")->value=="1","decode_row_kernels on by default");
+    check(run({"--mtp-self-spec","0"}).find("mtp_self_spec")->status==rp::Status::explicit_cli&&run({"--mtp-self-spec","0"}).find("mtp_self_spec")->value=="0","--mtp-self-spec 0 turns it off");
     check(run({},{{"STRIX_GLM_RTX_ROW_KERNELS","0"}}).find("decode_row_kernels")->value=="off","STRIX_GLM_RTX_ROW_KERNELS=0 turns it off");
     {const auto c=run({"--decode-row-kernels","moe+router"});check(c.find("decode_row_kernels")->status==rp::Status::explicit_cli&&c.find("decode_row_kernels")->value=="moe+router","--decode-row-kernels explicit");
      DecodeOptions d;set_row_kernels_value(d,"moe+router");check(d.row_moe&&!d.row_hc&&d.row_router&&row_kernels_name(d)=="moe+router","row kernel subset");
      set_row_kernels_value(d,"1");check(d.row_moe&&d.row_hc&&d.row_router&&row_kernels_name(d)=="1","row kernels all");
      set_row_kernels_value(d,"0");check(!d.row_moe&&!d.row_hc&&!d.row_router&&row_kernels_name(d)=="0","row kernels none");
+     set_row_kernels_value(d,"1");check(!d.row_r2,"row kernels 1 = round one");
+     set_row_kernels_value(d,"2");check(d.row_moe&&d.row_dsa&&d.row_r2&&row_kernels_name(d)=="2","row kernels 2 = round two");
+     set_row_kernels_value(d,"moe+r2");check(d.row_moe&&!d.row_kda&&d.row_r2&&row_kernels_name(d)=="moe+r2","row kernel subset with r2");
      bool threw=false;try{set_row_kernels_value(d,"moe+gemm");}catch(const std::exception&){threw=true;}check(threw,"unknown row kernel refused");}
     // restore_decode_residency: placement only, on in every profile; CLI / environment override
     check(def.find("restore_decode_residency")->value=="on"&&fast.find("restore_decode_residency")->value=="on"&&def.find("restore_decode_residency")->status==rp::Status::profile,"restore_decode_residency on");
@@ -840,11 +850,11 @@ void profile_tests(){
     check(bench.find("prefill_tile_large")->status==rp::Status::unqualified&&bench.find("prefill_tile_large")->value=="8192"&&
           bench.find("predicted_prefetch")->status==rp::Status::unqualified&&bench.find("dsa_index_mma")->status==rp::Status::pending,
           "--allow-pending runs pending rows that are in this build only (dsa_index_mma stays pending)");
-    check(bench.qualification()=="unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,prefill_tile_large","the receipt is stamped unqualified");
+    check(bench.qualification()=="unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,mtp_self_spec,lookup_drafts,prefill_tile_large","the receipt is stamped unqualified");
     check(run({},{{"STRIX_GLM_RTX_PROFILE_ALLOW_PENDING","1"}}).allow_pending,"STRIX_GLM_RTX_PROFILE_ALLOW_PENDING=1");
     // stderr notices: one line per pending row, one for an unqualified run
-    auto n=fast.notices();check(n.size()==5&&n[0].rfind("profile fast: predicted_prefetch pending, not used (",0)==0,"pending stderr lines");
-    check(bench.notices().back()=="profile fast: unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,prefill_tile_large (--allow-pending: benchmarks only)","unqualified stderr line");
+    auto n=fast.notices();check(n.size()==7&&n[0].rfind("profile fast: predicted_prefetch pending, not used (",0)==0,"pending stderr lines");
+    check(bench.notices().back()=="profile fast: unqualified: predicted_prefetch,skip_empty_expert_groups,persistent_dense_fp16,mtp_self_spec,lookup_drafts,prefill_tile_large (--allow-pending: benchmarks only)","unqualified stderr line");
     // the JSON (--print-effective-config / the first receipt event's "profile")
     auto j=strix::serve::parse_json(fast.json([](std::string_view l){return l=="row_tile"?std::string("auto (planner rule)"):std::string();}));
     check(j.find("profile")->as_string()=="fast"&&j.find("app")->as_string()=="decode-service"&&j.find("qualification")->as_string()=="qualified"&&!j.find("allow_pending")->as_bool(),
@@ -853,7 +863,7 @@ void profile_tests(){
     auto* row=levers->find("row_tile");check(row->find("effective")->as_string()=="auto (planner rule)"&&row->find("switch")->as_string()=="--row-tile"&&
           row->find("kind")->as_string()=="exact"&&row->find("status")->as_string()=="profile","JSON row fields");
     check(levers->find("dsa_index_mma")->find("wanted")->as_string()=="mma"&&levers->find("dsa_index_mma")->find("kind")->as_string()=="bit-changing","JSON pending row");
-    check(j.find("pending")->as_array().size()==5&&j.find("unqualified")->as_array().empty(),"JSON pending / unqualified lists");
+    check(j.find("pending")->as_array().size()==7&&j.find("unqualified")->as_array().empty(),"JSON pending / unqualified lists");
     check(strix::serve::parse_json(quality.json()).find("note")!=nullptr,"quality JSON states quality = default");
     std::cout<<"INFO profile default: "<<def.json().size()<<" B JSON, pending "<<def.pending().size()<<"; fast pending "<<fast.pending().size()<<"\n";
 }
