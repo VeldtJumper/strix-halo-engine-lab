@@ -173,11 +173,12 @@ struct Coordinator::Slot {
     std::array<std::uint64_t,8> admitted{};
     double minimum_gain = 0;
     ConfidenceConfig confidence; // resolved per session (env, drafter config or builtin); disabled when not capable
+    std::vector<float> last_hidden; // final hidden row of the last committed position (drafters that read it)
 };
 Coordinator::Coordinator(Backend& backend, DraftFactory drafts, std::shared_ptr<CostModel> costs)
     : backend_(backend), drafts_(std::move(drafts)), costs_(costs ? std::move(costs) : std::make_shared<CostModel>()) {}
 Coordinator::~Coordinator() = default;
-std::size_t Coordinator::submit(Request r) {
+std::size_t Coordinator::submit(Request r, std::shared_ptr<const PrefixSnapshot> prefix) {
     const auto setup_start = Clock::now();
     const auto& c = backend_.config();
     r.sampling.validate();
@@ -194,10 +195,17 @@ std::size_t Coordinator::submit(Request r) {
     // Return a completed/cancelled lease before acquiring the replacement.
     // Receipts retain their values; no live transaction crosses this boundary.
     if (slot < slots_.size()) slots_[slot]->draft.reset();
-    s->state = backend_.create_stream(std::uint32_t(s->request.prompt.size()+s->request.max_tokens));
+    const auto admitted = std::uint32_t(s->request.prompt.size()+s->request.max_tokens);
+    const auto& prompt = s->request.prompt;
+    if (prefix && (prefix->tokens.empty() || prefix->tokens.size()+1 > prompt.size() ||
+            !std::equal(prefix->tokens.begin(),prefix->tokens.end(),prompt.begin()) || !prefix->state ||
+            prefix->state->frontier() != prefix->tokens.size()))
+        prefix.reset();
+    if (prefix) s->state = prefix->state->fork(admitted);
+    if (!s->state) { prefix.reset(); s->state = backend_.create_stream(admitted); }
     s->generation = ++generation_;
-    require(bool(s->state) && s->state->frontier() == 0, "backend must provide a fresh stream");
-    s->out.digest = s->state->digest();
+    require(bool(s->state) && s->state->frontier() == (prefix ? prefix->tokens.size() : 0), "backend must provide a fresh stream");
+    if (!prefix) s->out.digest = s->state->digest();
     s->workload = measurement_key(backend_,s->request);
     s->out.rng_draws = s->request.sampling.draws;
     s->dflash_enabled = dflash::enabled_from_environment();
@@ -207,9 +215,44 @@ std::size_t Coordinator::submit(Request r) {
     if (s->draft && confidence_.enabled()) s->confidence = s->draft->resolve_confidence(confidence_);
     if (s->request.dflash == DraftMode::on && s->dflash_enabled && s->request.sampling.temperature == 0)
         require(bool(s->draft), "DFlash on requires a drafter");
+    if (prefix) {
+        const auto F = prefix->tokens.size();
+        // The drafter must hold exactly the context of the restored rows; one that cannot be seeded gets a fresh stream.
+        if (s->draft && (s->draft->wants_hidden() != !prefix->hidden.empty() ||
+                !s->draft->seed({prompt.data(),F+1},prefix->hidden))) {
+            s->draft.reset();
+            s->state = backend_.create_stream(admitted);
+            if (s->dflash_enabled && s->request.dflash != DraftMode::off && drafts_ && s->request.sampling.temperature == 0)
+                s->draft = drafts_();
+            if (s->draft) s->draft->attach(*s->state);
+            if (s->draft && confidence_.enabled()) s->confidence = s->draft->resolve_confidence(confidence_);
+            s->out.digest = s->state->digest();
+        } else {
+            s->prompt_processed = F;
+            s->out.cached_tokens = F;
+            s->out.prefill_frontier = prefix->prefill_written ? F : 0;
+            s->out.frontier = F;
+            s->last_hidden = prefix->hidden;
+        }
+    }
     s->out.setup_ms = elapsed(setup_start);
     if (slot == slots_.size()) slots_.push_back(std::move(s)); else slots_[slot] = std::move(s);
     return slot;
+}
+std::shared_ptr<PrefixSnapshot> Coordinator::snapshot(std::size_t slot) const {
+    const auto& s = *slots_.at(slot);
+    const auto F = s.state->frontier();
+    if (!F || s.out.status == Status::failed) return nullptr;
+    auto state = s.state->fork(std::uint32_t(F));
+    if (!state) return nullptr;
+    auto out = std::make_shared<PrefixSnapshot>();
+    const auto& prompt = s.request.prompt;
+    out->tokens.assign(prompt.begin(),prompt.begin()+std::ptrdiff_t(std::min<std::uint64_t>(F,prompt.size())));
+    for (std::size_t i = 0; out->tokens.size() < F; ++i) out->tokens.push_back(s.out.ids.at(i));
+    out->state = std::move(state);
+    out->prefill_written = s.out.prefill_frontier == F;
+    if (s.draft && s.draft->wants_hidden()) out->hidden = s.last_hidden;
+    return out;
 }
 void Coordinator::cancel(std::size_t slot) {
     auto& s = *slots_.at(slot);
@@ -271,7 +314,9 @@ bool Coordinator::step() {
         if (const auto chunk = backend_.prefill_chunk_rows()) {
             // With a prefill limit, at most that many streams prefill a chunk this step, round-robin from the
             // cursor; the others sit this step out (scheduling only: rows and their order per stream are unchanged).
-            std::size_t chunks = 0, cursor = prefill_cursor_;
+            std::size_t chunks = 0, cursor = prefill_cursor_, decoding = 0;
+            for (const auto& p : slots_)
+                if (p->out.status == Status::running && p->prompt_processed+1 >= p->request.prompt.size()) ++decoding;
             for (std::size_t j = 0; j < slots_.size(); ++j) {
                 const auto i = (prefill_cursor_+j)%slots_.size();
                 auto& s = *slots_[i];
@@ -282,7 +327,11 @@ bool Coordinator::step() {
                 const auto begin = Clock::now();
                 auto tx = s.state->begin();
                 const auto position = tx->frontier();
-                const auto n = std::min<std::size_t>(s.request.prompt.size()-1-s.prompt_processed, chunk-position%chunk);
+                auto n = std::min<std::size_t>(s.request.prompt.size()-1-s.prompt_processed, chunk-position%chunk);
+                // While other streams decode, a shorter chunk bounds their wait. Only when prefill rows equal decode
+                // rows: otherwise where a chunk ends decides which prompt rows a decode pass writes (a short tail goes
+                // through forward_rows), so chunk ends stay those of the stream alone.
+                if (prefill_budget_ && decoding && backend_.prefill_matches_decode()) n = std::min(n,prefill_budget_);
                 const bool hidden = s.draft && s.draft->wants_hidden(), taps = s.draft && s.draft->wants_taps();
                 const auto call = Clock::now();
                 const auto rows = backend_.prefill_rows(*tx,{s.request.prompt.data()+s.prompt_processed,n},hidden,taps);
@@ -321,10 +370,12 @@ bool Coordinator::step() {
                     const auto t = Clock::now();
                     s.draft->publish();
                     while (staged < n) { stage(); s.draft->publish(); }
+                    if (hidden) s.last_hidden.assign(hidden_rows.end()-std::ptrdiff_t(width),hidden_rows.end());
                     context_ms += elapsed(t);
                 }
                 s.out.context_ms += context_ms;
                 ++s.out.target_calls; s.out.target_rows += n;
+                if (s.out.prefill_frontier == position) s.out.prefill_frontier = s.state->frontier();
                 s.out.frontier = s.state->frontier();
                 s.prompt_processed += n;
                 s.out.prefill_ms += elapsed(begin);
@@ -440,6 +491,7 @@ bool Coordinator::step() {
                 const std::span<const float> hidden = s.draft->wants_hidden() ?
                     std::span<const float>(out.hidden.data()+w.start*width,processed*width) : std::span<const float>{};
                 s.draft->stage_rows({out.taps.data()+w.start*out.tap_width,processed*out.tap_width},hidden,next,positions);
+                if (!hidden.empty()) s.last_hidden.assign(hidden.end()-std::ptrdiff_t(width),hidden.end());
                 w.context_ms += elapsed(begin);
             }
             const auto commit_start = Clock::now();
@@ -548,6 +600,7 @@ Json Coordinator::receipt(std::size_t slot) const {
         j.set("prefill_levers",levers);
     }
     if (!r.prefill_taps.empty()) j.set("prefill_taps",r.prefill_taps);
+    if (r.cached_tokens) j.set("cached_tokens",r.cached_tokens);
     timings.set("prefill_ms",r.prefill_ms); timings.set("decode_ms",r.decode_ms); timings.set("draft_ms",r.draft_ms); timings.set("context_ms",r.context_ms);
     timings.set("verify_ms",r.verify_ms); timings.set("commit_ms",r.commit_ms);
     if (r.prefill_calls) timings.set("prefill_host_ms",r.prefill_host_ms);

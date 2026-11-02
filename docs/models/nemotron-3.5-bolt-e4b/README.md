@@ -121,6 +121,22 @@ use `v3`.
 The decode step with eight requests matches the engine's own C8 step. With long prompts in the mix, exact prompt
 processing (about 435 tok/s) still pauses the other requests while a prompt chunk runs.
 
+While other requests decode, a prompt is processed in chunks of at most 64 rows (`STRIX_G4_SERVE_PREFILL_ROWS`,
+`0` = whole 512-row chunks), so a long prompt pauses them for shorter stretches: with the mixed prompts above the
+longest gap between two tokens of a request went from 1.05-1.12 s to 0.41-0.42 s and the 99th percentile from
+0.44 / 1.08 s to 0.17 / 0.20 s (4 / 8 clients); throughput and token ids are unchanged. With `fast`
+(int8-activation decode beside the exact prompt processing) prompt chunks keep their full size, since where a chunk
+ends decides which prompt rows a decode pass writes.
+
+The server also keeps the committed state at the end of each prompt and of each finished request and reuses it
+when a later prompt starts with exactly those tokens, typically the next turn of a conversation, which re-sends the
+conversation so far: only the new rows are processed. Turn-2 time to first token (`default`, six conversations in
+parallel): 4K-token document **0.20 s** vs 12.59 s without the cache, 1K-token document **0.19 s** vs 3.48 s, chat
+0.39-0.51 s vs 1.31-1.66 s; both turns' token ids equal the cache off. Up to 16 states within 4 GB
+(`STRIX_G4_SERVE_PREFIX_MB`); `STRIX_G4_SERVE_PREFIX=0` turns it off. With `fast`, whose int8-activation decode differs from the exact prompt
+processing, only states at a 512-row prompt boundary written by prompt processing are reused, never an answer. Two different conversations that share a long
+document but diverge after it do not share it yet.
+
 **MTP drafter** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). A small assistant model (Google's
 Gemma-4-E4B-it MTP assistant, 78.8M parameters) proposes the next few tokens and the main model verifies them, so the
 output is identical to decoding without it; only the speed changes. The speed-up comes from the MTP assistant

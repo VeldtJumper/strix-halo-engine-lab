@@ -72,6 +72,8 @@ public:
 #endif
     void stage_rows(std::span<const float> taps, std::span<const float> hidden, std::span<const std::uint32_t> next_tokens,
                     std::span<const std::uint64_t> positions) STRIX_G4_MTP_ROWS;
+    // The session state keeps only the last committed row's final hidden, its position and the token after it.
+    bool seed(std::span<const std::uint32_t> tokens, std::span<const float> hidden) override;
 #if defined(STRIX_G4_DRAFT_KV_API)
     void attach(engine::StreamState& state) override;
 #endif

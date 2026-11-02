@@ -34,6 +34,7 @@ public:
     LinearView resident_embedding(LinearView source) const override { return backend_->resident_embedding(source); }
     LinearView resident_head(LinearView source) const override { return backend_->resident_head(source); }
     std::size_t prefill_chunk_rows() const override { return backend_->prefill_chunk_rows(); }
+    bool prefill_matches_decode() const override { return backend_->prefill_matches_decode(); }
     PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
         return backend_->prefill_rows(transaction,tokens,hidden,taps);
     }

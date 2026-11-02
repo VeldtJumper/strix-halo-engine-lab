@@ -8,6 +8,10 @@
 
 namespace strix::gemma4::gpu {
 namespace {
+void fork_checked(hipError_t e) {
+    if (e != hipSuccess)
+        throw std::runtime_error(std::string("gemma4 stream fork: ") + hipGetErrorString(e));
+}
 __device__ void publish_rows(float* k, float* v, std::uint64_t* tags, const float* ok, const float* ov,
                              std::uint64_t start, unsigned rows, unsigned slots, unsigned width, bool global) {
     // One block per producer: rows published in position order even if a prompt spans a ring.
@@ -171,6 +175,26 @@ KvView DeviceStream::kv_view(std::uint32_t layer, const KvTxn* transaction) cons
         v.overlay_k = r.overlay_k; v.overlay_v = r.overlay_v; v.frontier = r.frontier; v.candidate_rows = r.candidate_rows;
     }
     return v;
+}
+std::unique_ptr<DeviceStream> DeviceStream::fork(std::uint32_t admitted) const {
+    if (impl_->busy || impl_->poisoned || admitted < impl_->frontier)
+        throw std::runtime_error("device stream cannot be forked");
+    auto out = std::make_unique<DeviceStream>(impl_->config, admitted);
+    // Publication runs on the target queue; the copy starts after all of it.
+    fork_checked(hipDeviceSynchronize());
+    for (std::size_t l = 0; l < impl_->cache.size(); ++l) {
+        const auto& from = impl_->cache[l];
+        auto& to = out->impl_->cache[l];
+        if (!from.width)
+            continue;
+        const auto slots = from.global ? impl_->frontier : std::uint64_t(from.slots);
+        const auto bytes = slots * from.width * sizeof(float);
+        fork_checked(hipMemcpy(to.k.data(), from.k.data(), bytes, hipMemcpyDeviceToDevice));
+        fork_checked(hipMemcpy(to.v.data(), from.v.data(), bytes, hipMemcpyDeviceToDevice));
+        fork_checked(hipMemcpy(to.tags.data(), from.tags.data(), slots * sizeof(std::uint64_t), hipMemcpyDeviceToDevice));
+    }
+    out->impl_->frontier = impl_->frontier;
+    return out;
 }
 std::string DeviceStream::digest() const {
     if (impl_->poisoned)

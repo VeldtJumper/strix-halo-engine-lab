@@ -31,6 +31,9 @@ public:
     virtual bool kv_view(std::uint32_t layer, const KvTxn* transaction, KvView& out) const {
         (void)layer; (void)transaction; (void)out; return false;
     }
+    // Optional: a new stream admitting `admitted` positions whose committed state equals this one byte for byte
+    // (same digest; the same passes give the same outputs). nullptr = unsupported.
+    [[nodiscard]] virtual std::unique_ptr<StreamState> fork(std::uint32_t admitted) const { (void)admitted; return nullptr; }
 };
 // Rows of one exact many-row prefill call (no logits): taps per row and, when
 // requested, the final-norm hidden rows that RowPlan::export_hidden returns.
@@ -53,6 +56,11 @@ public:
     // hidden rows equal forward_rows passes over the same rows. 0 = unsupported.
     // taps=false: the caller consumes no taps, which the backend may then omit.
     [[nodiscard]] virtual std::size_t prefill_chunk_rows() const { return 0; }
+    // true when prefill_rows writes the same KV, taps and hidden bytes as forward_rows passes over the same rows
+    // under this backend's decode identity; then where prompt chunks end cannot change outputs. false (default)
+    // for a prefill whose arithmetic differs from decode (an int8-activation decode beside an FP32 prefill, a WMMA
+    // prefill identity): the coordinator keeps prompt chunk boundaries independent of scheduling.
+    [[nodiscard]] virtual bool prefill_matches_decode() const { return false; }
     virtual PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) {
         (void)transaction; (void)tokens; (void)hidden; (void)taps;
         throw std::logic_error("backend has no many-row prefill");
@@ -99,6 +107,12 @@ public:
     // or measured by the multi-stream auto policy; it still admits them only on their measured cost. Default
     // false keeps DFlash (fixed block cost) C1-only exactly as before.
     [[nodiscard]] virtual bool multi_stream_candidate() const { return false; }
+    // Optional: start from a committed prefix restored without staging its rows. tokens = the committed tokens
+    // [0, F) followed by the token after them; hidden = the final hidden row of position F-1 (empty when
+    // wants_hidden() is false). Must leave the session as staging and publishing those rows would. false = unsupported.
+    virtual bool seed(std::span<const std::uint32_t> tokens, std::span<const float> hidden) {
+        (void)tokens; (void)hidden; return false;
+    }
     // Drafter-confidence-gated window (ConfidenceConfig): the session drafts in chunks up to kmax depths, stopping
     // once the cumulative top-1 probability falls below tau, and returns the window to verify (<= drafted <= kmax)
     // plus the depths it drafted. Only confidence_capable() sessions are asked; the default keeps propose_window.
@@ -166,6 +180,14 @@ struct Request {
 // than pooling unrelated languages; the key is never published in receipts.
 [[nodiscard]] std::string measurement_key(const Backend& backend, const Request& request);
 enum class Status { running, stopped, length, cancelled, failed };
+// A committed target state kept for reuse: its tokens [0, F), a fork of the state at F and the final hidden row of
+// position F-1 (for drafters that read it; empty otherwise). prefill_written: every row was written by prefill_rows.
+struct PrefixSnapshot {
+    std::vector<std::uint32_t> tokens;
+    std::shared_ptr<const StreamState> state;
+    std::vector<float> hidden;
+    bool prefill_written = false;
+};
 struct Result {
     Status status = Status::running;
     std::vector<std::uint32_t> ids;
@@ -179,6 +201,8 @@ struct Result {
     std::uint64_t probes = 0;
     std::uint64_t multistream_auto_cycles = 0, multistream_auto_proposals = 0;
     std::uint32_t multistream_auto_max_window = 0; // largest auto window drafted while >1 stream was live
+    std::uint64_t cached_tokens = 0; // prompt rows restored from a prefix snapshot instead of prefilled
+    std::uint64_t prefill_frontier = 0; // rows [0, prefill_frontier) were all written by prefill_rows
     // Drafter-confidence-gated C1 cycles (STRIX_G4_MTP_CONF): cycles, depths drafted, drafted depths not verified.
     std::uint64_t confidence_cycles = 0, confidence_drafted = 0, confidence_unverified = 0;
     // Prompt prefill chunks per engaged prefill lever (receipt "prefill_levers", only when any ran).
@@ -209,14 +233,21 @@ class Coordinator {
 public:
     explicit Coordinator(Backend& backend, DraftFactory drafts = {}, std::shared_ptr<CostModel> costs = {});
     ~Coordinator();
-    // A completed slot may be replaced; generation IDs never repeat after reuse.
-    std::size_t submit(Request request);
+    // A completed slot may be replaced; generation IDs never repeat after reuse. With `prefix` (its tokens a prefix
+    // of the prompt's first prompt.size()-1 tokens) the stream starts from a fork of that state and prefills only
+    // the rest; Result::cached_tokens says how many rows it skipped (0 when the backend or drafter cannot reuse it).
+    std::size_t submit(Request request, std::shared_ptr<const PrefixSnapshot> prefix = {});
+    // The slot's committed state as a snapshot (nullptr when the backend cannot fork). Between steps only.
+    [[nodiscard]] std::shared_ptr<PrefixSnapshot> snapshot(std::size_t slot) const;
     void cancel(std::size_t slot);
     // At most one forward_rows call, with <=8 total causal/independent rows.
     bool step();
     // At most `streams` many-row prefill chunks per step, round-robin across slots (0 = every eligible stream,
     // the default). Decoding streams still step every call; outputs are unchanged.
     void set_prefill_limit(std::size_t streams) { prefill_limit_ = streams; }
+    // At most `rows` prompt rows per many-row prefill chunk while another stream is decoding (0 = whole chunks, the
+    // default), when the backend's prefill rows equal its decode rows (otherwise whole chunks). Outputs are unchanged.
+    void set_prefill_budget(std::size_t rows) { prefill_budget_ = rows; }
     void run();
     [[nodiscard]] const Result& result(std::size_t slot) const;
     [[nodiscard]] strix::serve::Json receipt(std::size_t slot) const;
@@ -229,7 +260,7 @@ private:
     ConfidenceConfig confidence_ = ConfidenceConfig::from_environment();
     std::vector<std::unique_ptr<Slot>> slots_;
     std::uint64_t generation_ = 0, steps_ = 0;
-    std::size_t prefill_limit_ = 0, prefill_cursor_ = 0;
+    std::size_t prefill_limit_ = 0, prefill_cursor_ = 0, prefill_budget_ = 0;
 };
 
 } // namespace strix::gemma4::engine

@@ -3,6 +3,7 @@
 #include "gemma4/dflash/device.hpp"
 #include "gemma4/prefill/device.hpp"
 #include "gemma4/exl3/device.hpp"
+#include "gemma4/kernels/a8.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -16,7 +17,11 @@ bool enabled(const char* name) {
 }
 class DeviceState final : public StreamState {
 public:
-    DeviceState(const ModelConfig& config, std::uint32_t admitted) : state_(config,admitted) {}
+    DeviceState(const ModelConfig& config, std::uint32_t admitted) : owned_(std::make_unique<gpu::DeviceStream>(config,admitted)), state_(*owned_) {}
+    explicit DeviceState(std::unique_ptr<gpu::DeviceStream> stream) : owned_(std::move(stream)), state_(*owned_) {}
+    std::unique_ptr<StreamState> fork(std::uint32_t admitted) const override {
+        return std::make_unique<DeviceState>(state_.fork(admitted));
+    }
     std::unique_ptr<KvTxn> begin() override { return state_.begin(); }
     std::uint64_t frontier() const override { return state_.frontier(); }
     std::string digest() const override { return state_.digest(); }
@@ -25,7 +30,8 @@ public:
         try { out = state_.kv_view(layer,transaction); return true; } catch (const std::runtime_error&) { return false; }
     }
 private:
-    gpu::DeviceStream state_;
+    std::unique_ptr<gpu::DeviceStream> owned_;
+    gpu::DeviceStream& state_;
 };
 class DeviceBackend final : public Backend {
 public:
@@ -60,20 +66,29 @@ public:
         const bool exl3_wmma = many_row && exl3_route && std::string(exl3_route) == "wmma" &&
                                bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1;
         metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : many_row ? "many-row" : "rows8");
+        // The prefill linears decide whether prefill rows equal decode rows: any WMMA route never does.
+        const auto linears = exl3_wmma ? prefill::Linears::wmma : prefill::Linears::exact;
         // Read-only inspection must never initialize HIP or upload weights.
         if (!inspect) {
             target_ = std::make_unique<gpu::DeviceTarget>(bind_host_weights(model),tables);
             if (many_row)
                 prefill_ = std::make_unique<prefill::DevicePrefill>(target_->borrow_device_weights(),tables,
-                    prefill::Residency::device,false,prefill::AttentionMode::canonical,
-                    exl3_wmma ? prefill::Linears::wmma : prefill::Linears::exact);
+                    prefill::Residency::device,false,prefill::AttentionMode::canonical,linears);
         }
         // Report the identity the device resolved (STRIX_G4_IDENTITY may select g4-a8-v1), not the static model one.
         if (target_) metadata_.set("identity",target_->stats().identity);
         else if (const auto* selected = std::getenv("STRIX_G4_IDENTITY"); selected && *selected)
             metadata_.set("identity",std::string(selected));
+        const auto* resolved = metadata_.find("identity");
+        prefill_matches_decode_ = linears == prefill::Linears::exact && !(resolved && resolved->as_string() == a8::arithmetic_id);
+        if (prefill_ && (prefill_->stats().linears == prefill::Linears::exact) != (linears == prefill::Linears::exact))
+            throw std::logic_error("prefill linears differ from the declared prefill_matches_decode");
+        metadata_.set("prefill_matches_decode",prefill_matches_decode_);
     }
     std::size_t prefill_chunk_rows() const override { return prefill_ ? prefill::chunk_rows : 0; }
+    // The exact many-row prefill (g4-v1 linears, or the EXL3 pack's own core order) equals the decode passes; a
+    // g4-a8-v1 decode (int8 activations) or the WMMA prefill identity does not.
+    bool prefill_matches_decode() const override { return prefill_matches_decode_; }
     PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
         if (!prefill_) throw std::logic_error("many-row prefill is off");
         auto chunk = prefill_->forward(transaction,tokens,false,false,hidden,taps,true);
@@ -140,6 +155,7 @@ private:
     strix::serve::Json metadata_;
     std::unique_ptr<gpu::DeviceTarget> target_;
     std::unique_ptr<prefill::DevicePrefill> prefill_;
+    bool prefill_matches_decode_ = false;
     gpu::Buffer head_input_, head_output_, head_failure_, head_scratch_;
 };
 struct DraftAssets {
