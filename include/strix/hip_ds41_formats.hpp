@@ -29,9 +29,9 @@ struct MoeKernelTuning {
     int slots = 1;
     int slots_y = 0;
     // Routed IQ2_XXS gate/up and Q2_K down with every weight group of a wave loaded at once and held in registers
-    // across the staged-row parts (STRIX_DS41_EXPERT_ROWS=1, default 0 = off; same bits). STRIX_DS41_EXPERT_ROWS_FORM
+    // across the staged-row parts (STRIX_DS41_EXPERT_ROWS, default 1 = on, =0 off; same bits). STRIX_DS41_EXPERT_ROWS_FORM
     // overrides the shape for A/B (hip_ds41_formats.hip, rows_shape).
-    int rows = 0;
+    int rows = 1;
     int rows_form = -1;
     // The expert-TP down (enqueue_routes_product_groups at width 1152) with held groups and its four tail groups spread
     // over the lanes (STRIX_DS41_TP_DOWN, default 1 since P17.2, =0 off; same bits). STRIX_DS41_TP_DOWN_FORM overrides the

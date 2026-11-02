@@ -15,6 +15,7 @@
 #include "strix/ds41_touch_batch.hpp"
 #include "strix/ds41_exact_flags.hpp"
 #include "strix/hip_ds41_attention.hpp"
+#include "strix/hip_ds41_formats.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -1838,7 +1839,8 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
                aba_engtp = a.aba_flags.find("engtp") != std::string::npos, aba_touch = a.aba_flags.find("touch") != std::string::npos,
                aba_rowviews = a.aba_flags.find("rowviews") != std::string::npos, aba_normilp = a.aba_flags.find("normilp") != std::string::npos,
                aba_routes = a.aba_flags.find("routes") != std::string::npos, aba_cfast = a.aba_flags.find("cfast") != std::string::npos,
-               aba_swz = a.aba_flags.find("swz") != std::string::npos;
+               aba_swz = a.aba_flags.find("swz") != std::string::npos, aba_erows = a.aba_flags.find("erows") != std::string::npos;
+    const int erows_start = strix::ds41::moe_kernel_tuning().rows;  // STRIX_DS41_EXPERT_ROWS as started
     const auto slice = strix::ds41::vocab_slice(129280U, single ? 1U : 2U, single ? 0U : rank);
     std::vector<float> slice_host(slice.count);
     for (std::uint32_t arm = 0; arm < arms; ++arm) {
@@ -1858,6 +1860,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         strix::ds41::set_r1fuse_routes(aba_routes ? on : -1);        // STRIX_DS41_R1FUSE_ROUTES
         ah::set_compress_fast(aba_cfast ? on : -1);                  // STRIX_DS41_COMPRESS_FAST
         ah::set_attention_lds_swizzle(aba_swz ? on : -1);            // STRIX_DS41_ATTN_LDS_SWIZZLE
+        strix::ds41::moe_kernel_tuning().rows = aba_erows ? on : erows_start;  // STRIX_DS41_EXPERT_ROWS
         if (arm != 0U) {
             seq = prompt_seq;
             if (!a.state_in.empty()) fwd.import_state(start);
