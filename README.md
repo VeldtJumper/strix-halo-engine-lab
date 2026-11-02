@@ -175,6 +175,20 @@ single-node or pair defaults, and each has its own declared identity and gates.
   and it also runs exact with 24 GiB VRAM + 32 GiB host RAM.
   [Results](docs/models/glm-5.3/README.md#glm-rtx-results) · [guide](src/glm/rtxpf/README.md).
 
+## MiniMax H3 audio + video (opt-in build)
+
+MiniMax H3 generates a video clip with its audio from a text prompt (50-block diffusion transformer, 50-layer
+Qwen3-VL-32B text tower, 36-layer video VAE, audio VAE). It is an opt-in build (`-DSTRIX_FAMILY_H3=ON`); with the
+option off nothing is built. The dense path is the reference and the two-node clip is byte-identical to the one-node
+clip (latents and every frame).
+
+| Clip: 1344x768, 124 frames (5.17 s) + audio, 8 steps | Text encoder | DiT | Video VAE | Total |
+|---|---:|---:|---:|---:|
+| Dense, 1 node | 10 s | 860 s | 87 s | **~16 min** |
+| Dense, 2 nodes over USB4 (byte-identical to 1 node) | 10 s | 435 s (52-55 s/step) | 40.6 s | **~8 min** |
+
+[Model page, packages, build and kernel numbers](docs/models/h3/README.md).
+
 ## Documentation
 
 - **Getting started:** [requirements, build and run](docs/getting-started/README.md) ·

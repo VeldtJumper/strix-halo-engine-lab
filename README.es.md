@@ -180,6 +180,20 @@ los valores predeterminados de un nodo ni del par, y cada una tiene su propia id
   19.7 / 41.7 s con 8K / 32K en la tarjeta completa, y también funciona de forma exacta con 24 GiB de VRAM + 32 GiB de
   RAM del host. [Resultados](docs/models/glm-5.3/README.es.md#glm-rtx-results) · [guía](src/glm/rtxpf/README.md).
 
+## MiniMax H3 audio + vídeo (compilación opt-in)
+
+MiniMax H3 genera un clip de vídeo con su audio a partir de un prompt de texto (transformer de difusión de 50
+bloques, torre de texto Qwen3-VL-32B de 50 capas, VAE de vídeo de 36 capas, VAE de audio). Es una compilación
+opcional (`-DSTRIX_FAMILY_H3=ON`); con la opción desactivada no se compila nada. La ruta densa es la referencia y el
+clip en dos nodos es idéntico byte a byte al clip en un nodo (latentes y todos los fotogramas).
+
+| Clip: 1344x768, 124 fotogramas (5.17 s) + audio, 8 pasos | Codificador de texto | DiT | VAE de vídeo | Total |
+|---|---:|---:|---:|---:|
+| Denso, 1 nodo | 10 s | 860 s | 87 s | **~16 min** |
+| Denso, 2 nodos por USB4 (idéntico byte a byte a 1 nodo) | 10 s | 435 s (52-55 s/paso) | 40.6 s | **~8 min** |
+
+[Página del modelo, paquetes, compilación y cifras de los kernels](docs/models/h3/README.es.md).
+
 ## Documentación
 
 - **Primeros pasos:** [requisitos, compilación y ejecución](docs/getting-started/README.es.md) ·
