@@ -1184,6 +1184,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-ple-staged-gather-tests)
     add_test(NAME strix-ple-staged-gather-tests COMMAND strix-ple-staged-gather-tests)
 
+    add_executable(strix-ple-serve-policy-tests tests/ple_serve_policy_tests.cpp)
+    target_link_libraries(strix-ple-serve-policy-tests PRIVATE strix_core)
+    strix_target_warnings(strix-ple-serve-policy-tests)
+    add_test(NAME strix-ple-serve-policy-tests COMMAND strix-ple-serve-policy-tests)
+
     add_executable(strix-execution-plan-tests tests/execution_plan_tests.cpp)
     target_link_libraries(strix-execution-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-execution-plan-tests)

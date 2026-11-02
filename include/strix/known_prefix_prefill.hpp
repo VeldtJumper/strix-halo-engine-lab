@@ -91,6 +91,10 @@ struct KnownPrefillSegmentHooks {
     // After step i of segment s is enqueued (also for shared steps, once per segment): resolver of the
     // segment's own row r (0..rows_s-1).
     std::function<void(std::size_t,std::size_t,const std::function<ExecutionDispatchContext(std::uint32_t)>&)> after_step;
+    // HTTP prompt groups only: stage the successor before launching the current
+    // segment. One pending stage pairs inline and staged gathers; never verify
+    // or reclaim windows.
+    bool stage_ple = false;
 };
 // The same model through possibly distinct owner objects (manifest layout, access plan, tensor bindings).
 [[nodiscard]] bool same_model(const ExecutionRuntimeResources&,const ExecutionRuntimeResources&);

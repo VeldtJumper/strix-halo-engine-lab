@@ -80,10 +80,9 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     result.state_d1 = add(state.device_total_bytes, add(state.host_total_bytes, add(state.host_total_bytes, state.host_alignment - 1U)));
     result.serial_scratch = compiled.arena.total_bytes;
     result.device_base = add(state.device_total_bytes, result.serial_scratch);
-    // Only automatic native HTTP uses committed target backing. Ordinary mmap
-    // file cache (notably the CPU-read PLE table) is reclaimable, not a pinned
-    // UMA allocation. Registration aliases count once in UMA and also consume
-    // GTT. Use the allocator's exact page/coalescing layout, never tensor sums.
+    // Automatic native HTTP separates registered backing from warmed file cache.
+    // Registration aliases count once in UMA and also consume GTT; the uncovered
+    // PLE pages are reserved separately on the host. Use registration geometry.
     if (options.automatic_prefill && options.http_serve && options.rotary.mode()==RotaryMode::native) {
 #ifdef __linux__
         const auto page=::sysconf(_SC_PAGESIZE);

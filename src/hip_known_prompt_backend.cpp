@@ -343,7 +343,7 @@ void HipKnownPromptBackend::set_all_rows_sink(AllRowsSink sink, std::function<vo
     self.all_rows_drain = std::move(drain);
 }
 std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPromptBackend& group,
-    std::span<const GroupMember> members) {
+    std::span<const GroupMember> members, bool stage_ple) {
     auto& lead = *group.impl_;
     if (members.empty() || !lead.window->supports_tiled_prefill() || current_hip_launch_context())
         throw std::invalid_argument("known prompt group requires members and a tiled prefill group owner");
@@ -391,7 +391,7 @@ std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPro
         for (std::size_t m = 0; m < members.size(); ++m)
             if (impls[m]->handoff) { hand_off_serial_session(impls[m]->session, impls[m]->handoff->first, impls[m]->handoff->second); handed[m] = 1; }
         attempted = true;
-        const auto results = lead.window->execute_prefill_segments(requests);
+        const auto results = lead.window->execute_prefill_segments(requests,stage_ple);
         for (std::size_t m = 0; m < members.size(); ++m)
             if (handed[m]) { hand_off_serial_session(impls[m]->session, impls[m]->handoff->second, impls[m]->handoff->first); handed[m] = 0; }
         for (std::size_t m = 0; m < members.size(); ++m) {

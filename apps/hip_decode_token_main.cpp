@@ -49,6 +49,7 @@
 #include "strix/wave_router_contract.hpp"
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
+#include "strix/ple_serve_policy.hpp"
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -132,19 +133,20 @@ namespace {
 // Another process can evict them, turning those reads into random disk I/O while the GPU waits
 // (and every fault pulls a whole readahead window for a ~100-byte row). Mark them random-access
 // and populate them once, after the model registration. STRIX_PLE_WARM=0 skips it.
-void warm_file_backed_tensors(const strix::MappedModelFile& mapped, const strix::ModelManifest& manifest) {
+std::uint64_t warm_file_backed_tensors(const strix::MappedModelFile& mapped, const strix::ModelManifest& manifest,
+    bool before_listening = false) {
 #if defined(__linux__)
     const char* v = std::getenv("STRIX_PLE_WARM");
-    if (v && v[0] == '0') return;
+    if (v && v[0] == '0') return 0;
     const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
     const auto t0 = std::chrono::steady_clock::now();
-    std::uint64_t bytes = 0;
+    std::uint64_t bytes = 0, reserved = 0;
     // Cold page cache (another model's turn evicted the table): one random-access populate reads 4 KiB per fault,
     // 0.2 GB/s for the 28.8 GB table. First read the table from several threads with normal readahead; the
     // random-access pass below then normally finds the pages resident. Same bytes, same state.
     // STRIX_PLE_WARM_PARALLEL=0 keeps the single random-access pass.
     const char* parallel_env = std::getenv("STRIX_PLE_WARM_PARALLEL");
-    if (!strix::hip_model_copy_all_mode() && !(parallel_env && parallel_env[0] == '0')) {
+    if (!before_listening && !strix::hip_model_copy_all_mode() && !(parallel_env && parallel_env[0] == '0')) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
         for (const auto& tensor : manifest.tensors)
             if (tensor.residency == strix::ResidencyPolicy::file_backed_candidate && tensor.byte_size)
@@ -162,29 +164,54 @@ void warm_file_backed_tensors(const strix::MappedModelFile& mapped, const strix:
         const auto length = static_cast<std::size_t>(end - begin);
         // STRIX_MODEL_COPY_ALL: the arena allocation can push the table out of the page cache; populate it with
         // readahead (sequential) before marking it random-access, instead of one 4 KiB read per fault.
-        if (strix::hip_model_copy_all_mode()) {
+        if (!before_listening && strix::hip_model_copy_all_mode()) {
             (void)madvise(address, length, MADV_SEQUENTIAL);
 #if defined(MADV_POPULATE_READ)
             (void)madvise(address, length, MADV_POPULATE_READ);
 #endif
         }
-        (void)madvise(address, length, MADV_RANDOM);
+        if (!before_listening) (void)madvise(address, length, MADV_RANDOM);
 #if defined(MADV_POPULATE_READ)
         if (madvise(address, length, MADV_POPULATE_READ) != 0)
 #endif
-        {
+        if (!before_listening) {  // never force pages in after the serving allocations
             (void)madvise(address, length, MADV_WILLNEED);
             volatile std::uint8_t sink = 0;
             for (auto at = begin; at < end; at += page) sink = sink + *reinterpret_cast<const volatile std::uint8_t*>(at);
             (void)sink;
         }
         bytes += tensor.byte_size;
+        reserved += ((end + page - 1U) & ~(page - 1U)) - begin;
     }
     if (bytes)
-        std::fprintf(stderr, "warmed %.1f GB of file-backed tensors in %.1f s\n", static_cast<double>(bytes) / 1e9,
+        std::fprintf(stderr, before_listening ? "file-backed tensors: re-warmed %.1f GB in %.1f s before listening\n" :
+            "warmed %.1f GB of file-backed tensors in %.1f s\n", static_cast<double>(bytes) / 1e9,
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return reserved;
+#else
+    (void)mapped; (void)manifest; (void)before_listening;
+    return 0;
+#endif
+}
+// Bytes of the file-backed tensors not resident in the page cache now (mincore); nullopt when unknown.
+std::optional<std::uint64_t> file_backed_missing_bytes(const strix::MappedModelFile& mapped, const strix::ModelManifest& manifest) {
+#if defined(__linux__)
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    std::uint64_t missing = 0;
+    std::vector<unsigned char> resident;
+    for (const auto& tensor : manifest.tensors) {
+        if (tensor.residency != strix::ResidencyPolicy::file_backed_candidate || !tensor.byte_size) continue;
+        if (tensor.absolute_offset > mapped.bytes() || tensor.byte_size > mapped.bytes() - tensor.absolute_offset) continue;
+        const auto begin = (mapped.base_address() + tensor.absolute_offset) & ~(page - 1U);
+        const auto end = mapped.base_address() + tensor.absolute_offset + tensor.byte_size;
+        resident.assign(static_cast<std::size_t>((end - begin + page - 1U) / page), 0);
+        if (mincore(reinterpret_cast<void*>(begin), static_cast<std::size_t>(end - begin), resident.data()) != 0) return std::nullopt;
+        for (const auto r : resident) if (!(r & 1U)) missing += page;
+    }
+    return missing;
 #else
     (void)mapped; (void)manifest;
+    return std::nullopt;
 #endif
 }
 using strix::decode_cli::parse_options;
@@ -2372,7 +2399,8 @@ static int run_decode_entry(
         ? strix::decode_cli::load_mtp_cli_assets(options.mtp, model, mapped_owner, manifest, model_owner, generations)
         : std::shared_ptr<const strix::HipMtpAssets>{};
     // After registration: pinning the model may evict anything populated before it.
-    if (!ple_reclaim_requested) warm_file_backed_tensors(mapped, manifest);
+    std::uint64_t warmed_file_backed_bytes = 0;
+    if (!ple_reclaim_requested) warmed_file_backed_bytes = warm_file_backed_tensors(mapped, manifest);
     if (load_balloon) { (void)hipFree(load_balloon); load_balloon = nullptr; std::cerr << "load balloon: released\n"; }
     // Keep the actual registration/copy owner and its exact map control block
     // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
@@ -2460,7 +2488,7 @@ static int run_decode_entry(
             const auto required=strix::decode_cli::compile_prompt_requirements(options,model,manifest,mapped.bytes(),nullptr,true);
             const auto admitted=strix::decode_cli::resident_prefill_admission(options,required,fresh);
             for(const auto& [name,bytes]:admitted) effective.admission[name]=bytes;
-        }, [&] { warm_file_backed_tensors(mapped, manifest); });
+        }, [&] { warmed_file_backed_bytes = warm_file_backed_tensors(mapped, manifest); });
         if (ple_reclaimer) strix::ple_reclaim::set_active(ple_reclaimer.get());
     }
     if (yarn) {
@@ -3939,11 +3967,23 @@ static int run_decode_entry(
             // Resident unlocked registered model pages count as reclaimable in MemAvailable,
             // but reclaiming them evicts every GPU queue of this process: not available to slots.
             const auto unlocked_registered = model_residency.registered_bytes() - model_residency.registered_locked_bytes();
-            const auto observe = [unlocked_registered] {
+            const auto reserve_env = std::getenv("STRIX_PLE_SERVE_RESERVE");
+            // Opt-in: reserving the table can cost T8192 and slots on a full node.
+            const bool reserve_ple = !strix::hip_model_copy_all_mode() && reserve_env && reserve_env[0] == '1';
+            std::uint64_t reserved_table_bytes = 0;
+            if (reserve_ple && warmed_file_backed_bytes) {
+                strix::HipModelResidencyPolicy policy;
+                policy.coalesce_gap_bytes = options.coalesce_gap_bytes;
+                const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+                reserved_table_bytes = strix::decode_cli::file_backed_unregistered_bytes(manifest,
+                    strix::build_registered_residency_ranges(manifest, policy, mapped.bytes(), page), mapped.bytes(), page);
+            }
+            const auto observe = [unlocked_registered, reserved_table_bytes, reserve_ple] {
                 PrefillCapabilities capabilities;
                 auto observation = observe_prefill_memory(capabilities);
                 if (observation.available)
-                    observation.available = *observation.available - std::min(*observation.available, unlocked_registered);
+                    observation.available = strix::ple_detail::serve_available(*observation.available,
+                        unlocked_registered, reserved_table_bytes, reserve_ple);
                 return observation;
             };
             const auto gtt_free = [](const PrefillMemory& observation) -> std::optional<std::uint64_t> {
@@ -4033,6 +4073,27 @@ static int run_decode_entry(
                 throw std::runtime_error("HTTP sampling requires memory for the batched route");
         }
         std::size_t eager_slots = batch_slots;
+        const auto rewarm_before_listen = [&] {
+            // Slot allocation after the startup warm reclaims part of the table. STRIX_PLE_REWARM=0 skips it.
+            const auto rewarm = std::getenv("STRIX_PLE_REWARM");
+            if(!warmed_file_backed_bytes || ple_reclaimer || strix::hip_model_copy_all_mode() || (rewarm && rewarm[0]=='0')) return;
+            // Repopulating may reclaim other pages: only with every registered model byte locked (a reclaimed
+            // registration evicts the process's GPU queues) and only if the missing pages fit with 4 GiB to spare.
+            const char* skip = nullptr;
+            const auto missing = file_backed_missing_bytes(mapped, manifest);
+            strix::decode_cli::PrefillCapabilities caps;
+            const auto now = strix::decode_cli::observe_prefill_memory(caps);
+            if (model_residency.registered_locked_bytes() != model_residency.registered_bytes()) skip = "registered model pages are not locked";
+            else if (!missing || !now.available) skip = "residency or MemAvailable unknown";
+            else if (*missing == 0) skip = "table resident";
+            else if (*missing > *now.available || *now.available - *missing < (UINT64_C(4) << 30)) skip = "missing pages do not fit MemAvailable with 4 GiB headroom";
+            if (skip) {
+                if (missing && *missing) std::fprintf(stderr, "file-backed tensors: re-warm skipped (%s; %.1f GB not resident)\n", skip,
+                    static_cast<double>(*missing) / 1e9);
+                return;
+            }
+            (void)warm_file_backed_tensors(mapped,manifest,true);
+        };
         if (options.http_serve && batch_slots) {
             const char* eager = std::getenv("STRIX_HTTP_EAGER_SLOTS");
             std::uint32_t count = 4;
@@ -4194,7 +4255,7 @@ static int run_decode_entry(
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                    startup_preflight, release_assets)
+                    startup_preflight, release_assets, {}, rewarm_before_listen)
                 : strix::decode_cli::make_cohort_tiled_run(options, model, std::cout);
         }
         if(strix::decode_cli::mtp_prompt_phase_separation(options)) {
@@ -4215,7 +4276,7 @@ static int run_decode_entry(
         if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
                 std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                parents->tiled.rtx_import, startup_preflight, release_assets);
+                parents->tiled.rtx_import, startup_preflight, release_assets, rewarm_before_listen);
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.

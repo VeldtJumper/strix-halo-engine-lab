@@ -1823,7 +1823,7 @@ private:
         std::vector<std::vector<float>> logits;
         for(const auto& member:members)
             member.slot->prefill->before_writer((lead.group?lead.group_owner:lead.block_owner)->producer_stream());
-        const auto launch=[&]{logits=HipKnownPromptBackend::execute_group(group,group_members);};
+        const auto launch=[&]{logits=HipKnownPromptBackend::execute_group(group,group_members,options_.http_serve);};
         std::vector<Slot*> group_slots;for(const auto& member:members) group_slots.push_back(member.slot);
         if(worker_) execute_prefill(*(lead.group?lead.group_owner:lead.block_owner),launch,nullptr,group_slots);else launch();
         for (std::size_t k = 0; k < members.size(); ++k) {

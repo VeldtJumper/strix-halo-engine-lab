@@ -110,7 +110,7 @@ public:
         std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)> observer;
     };
     [[nodiscard]] static std::vector<std::vector<float>> execute_group(HipKnownPromptBackend& group,
-        std::span<const GroupMember> members);
+        std::span<const GroupMember> members, bool stage_ple = false);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

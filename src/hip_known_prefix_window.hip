@@ -820,6 +820,8 @@ struct HipKnownPrefixWindow::Impl {
                 },
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
                     static_cast<Impl*>(object)->ple_window->launch(rows);
+                },0,false,[](std::span<const ExecutionDispatchContext> rows,void* object) {
+                    static_cast<Impl*>(object)->ple_window->stage_serve(rows);
                 }});
         // STRIX_PREFILL_FULL_QSA=0: keep QSA rows in 8-row tiles.
         static const bool qsa=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_QSA");return !v||v[0]!='0';}();
@@ -2211,7 +2213,7 @@ struct HipKnownPrefixWindow::Impl {
         bool head = false;
         HipKnownPrefixWindow::PrefillStepObserver observer;
     };
-    std::vector<KnownWindowResult> execute_segments(std::span<const PrefillSegment> requests) {
+    std::vector<KnownWindowResult> execute_segments(std::span<const PrefillSegment> requests, bool stage_ple) {
         if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
         if (executing) throw std::logic_error("known-window native owner cannot execute recursively");
         if (!prefill || requests.empty() || prefill->output_policy == KnownWindowOutputPolicy::all_rows)
@@ -2265,6 +2267,8 @@ struct HipKnownPrefixWindow::Impl {
             hooks.preflight_memo = &preflight_memo; hooks.recipe_memo = &recipe_memo; hooks.preflight_slots = &preflight_slots;
             hooks.arena_index = &arena_index;
             KnownPrefillSegmentHooks segment_hooks;
+            const char* stage_env=std::getenv("STRIX_PLE_STAGE_SERVE");
+            segment_hooks.stage_ple = stage_ple && !(stage_env && stage_env[0]=='0');
             segment_hooks.shared = [this](std::size_t i) { return segment_shared_step(i); };
             if (std::any_of(requests.begin(), requests.end(), [](const auto& r) { return static_cast<bool>(r.observer); }))
                 segment_hooks.after_step = [&](std::size_t step, std::size_t s, const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
@@ -2464,7 +2468,8 @@ std::vector<HipMtpTargetWindowExecution> HipKnownPrefixWindow::execute_mtp_cohor
     }
     return out;
 }
-std::vector<KnownWindowResult> HipKnownPrefixWindow::execute_prefill_segments(std::span<const PrefillSegmentRequest> members) {
+std::vector<KnownWindowResult> HipKnownPrefixWindow::execute_prefill_segments(std::span<const PrefillSegmentRequest> members,
+    bool stage_ple) {
     std::vector<Impl::PrefillSegment> owned(members.size());
     for (std::size_t s = 0; s < members.size(); ++s) {
         if (!members[s].own) throw std::invalid_argument("segmented prefill member has no own tiled owner");
@@ -2474,7 +2479,7 @@ std::vector<KnownWindowResult> HipKnownPrefixWindow::execute_prefill_segments(st
         owned[s].head = members[s].head;
         owned[s].observer = members[s].observer;
     }
-    return impl_->execute_segments(owned);
+    return impl_->execute_segments(owned,stage_ple);
 }
 void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
     impl_->attach_greedy_rows(partials,replies);

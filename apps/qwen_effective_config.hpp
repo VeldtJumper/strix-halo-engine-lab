@@ -136,7 +136,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE",
-            "STRIX_SERVE_PREFILL", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
+            "STRIX_SERVE_PREFILL", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
             "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
@@ -167,9 +167,30 @@ inline std::uint64_t prefill_checked_add(std::uint64_t a, std::uint64_t b) {
     if (b > UINT64_MAX - a) throw std::overflow_error("prefill reservation overflow");
     return a + b;
 }
+// Page-rounded file-backed (PLE table) bytes outside the registered ranges: the one calculation
+// shared by automatic admission and runtime slot sizing (STRIX_PLE_SERVE_RESERVE=1).
+template <class Ranges>
+inline std::uint64_t file_backed_unregistered_bytes(const ModelManifest& manifest,const Ranges& ranges,
+    std::uint64_t file_bytes,std::uint64_t page) {
+    std::uint64_t table=0;
+    for (const auto& tensor:manifest.tensors) {
+        if(tensor.residency!=ResidencyPolicy::file_backed_candidate || !tensor.byte_size) continue;
+        if(tensor.absolute_offset>file_bytes || tensor.byte_size>file_bytes-tensor.absolute_offset) continue;
+        const auto begin=tensor.absolute_offset/page*page;
+        const auto end=prefill_checked_add(tensor.absolute_offset,tensor.byte_size);
+        const auto rounded=prefill_checked_add(end,page-1U)/page*page;
+        auto uncovered=rounded-begin;
+        for(const auto range:ranges) {
+            const auto lo=std::max(begin,range.begin),hi=std::min(rounded,range.end);
+            if(hi>lo) uncovered-=hi-lo;
+        }
+        table=prefill_checked_add(table,uncovered);
+    }
+    return table;
+}
 // Automatic native HTTP: use the same page/coalescing geometry as registration.
-// The source mmap's unregistered file cache remains reclaimable. Registered
-// aliases consume UMA once and GTT once; no RSS-plus-GTT sum is meaningful.
+// Registered aliases consume UMA once and GTT once; warmed file cache is a
+// separate host reservation. No RSS-plus-GTT sum is meaningful.
 inline void account_http_registered_target(PrefillRequirements& result,const Options& o,
     const ModelManifest& manifest,std::uint64_t file_bytes,std::uint64_t page) {
     if (o.residency!=HipModelResidencyMode::registered_file_mapping ||
@@ -178,12 +199,14 @@ inline void account_http_registered_target(PrefillRequirements& result,const Opt
     HipModelResidencyPolicy policy;
     policy.coalesce_gap_bytes=o.coalesce_gap_bytes;
     std::uint64_t committed=0;
-    for (const auto range:build_registered_residency_ranges(manifest,policy,file_bytes,page))
+    const auto ranges=build_registered_residency_ranges(manifest,policy,file_bytes,page);
+    for (const auto range:ranges)
         committed=prefill_checked_add(committed,range.end-range.begin);
     result.model_backing=committed;
     result.device_base=prefill_checked_add(result.device_base,committed);
     result.organization["target_mapped_file_bytes"]=file_bytes;
     result.organization["target_registered_backing_bytes"]=committed;
+    result.organization["target_file_backed_unregistered_bytes"]=file_backed_unregistered_bytes(manifest,ranges,file_bytes,page);
 }
 inline std::uint64_t prefill_checked_multiply(std::uint64_t a, std::uint64_t b) {
     if (b && a > UINT64_MAX / b) throw std::overflow_error("prefill reservation overflow");
@@ -1084,7 +1107,17 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             const auto future_device = add(staging,add(serving.shared_device,serving.slot_device));
             const auto growth = add(scratch,add(required.metadata,add(required.runtime_payload,
                 add(future_host,add(candidate.prefix_cache_host_bytes,candidate.known_prefill_host_headroom)))));
-            const auto total = add(required.model_backing,add(required.state_d1,add(required.serial_scratch,add(required.external_host,growth))));
+            auto total = add(required.model_backing,add(required.state_d1,add(required.serial_scratch,add(required.external_host,growth))));
+            // Only registered backing replaced the full-file estimate; reserve its uncovered cache pages.
+            const auto enabled=[&](const char* name) {
+                const auto it=result.environment.find(name);
+                return it==result.environment.end() || it->second.empty() || it->second[0]!='0';
+            };
+            // Opt-in (STRIX_PLE_SERVE_RESERVE=1): on a full node it trades T8192 and slots for a resident table.
+            const auto reserve=result.environment.find("STRIX_PLE_SERVE_RESERVE");
+            if(enabled("STRIX_PLE_WARM") && reserve!=result.environment.end() && !reserve->second.empty() && reserve->second[0]=='1')
+                if(const auto table=required.organization.find("target_file_backed_unregistered_bytes");table!=required.organization.end())
+                    total=add(total,table->second);
             const auto fit = [](const char* resource, std::uint64_t need, std::uint64_t limit) {
                 if (need > limit) throw std::runtime_error(std::string("memory:") + resource +
                     " needs " + std::to_string(need) + " bytes, limit " + std::to_string(limit));

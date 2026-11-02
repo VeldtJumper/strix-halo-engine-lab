@@ -230,8 +230,8 @@ inline bool handle_session_route(bool enabled, const MtpServeRunner& run,
 // rtx_import (--rtx-state-import): the /admin/rtx-import/* routes over these imports; null: no route.
 inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description,
     std::shared_ptr<RtxStateImportRegistry> rtx_import = {},
-    std::optional<StartupPreflight> startup = {}, serve::Json assets = {}) {
-    return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets](const MtpServeRunner& run,bool selection_mtp_available) {
+    std::optional<StartupPreflight> startup = {}, serve::Json assets = {}, std::function<void()> before_listen = {}) {
+    return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets, before_listen](const MtpServeRunner& run,bool selection_mtp_available) {
         if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
@@ -307,6 +307,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         serve::HttpServer server(http, [&api](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
             api.handle(request, response);
         });
+        if(before_listen) before_listen();
         server.listen();
         api.set_state("ready");
         std::cerr << "strix serve: listening on " << options.http_bind << ':' << server.port() << " model " << config.model_id << std::endl;
@@ -341,9 +342,9 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 // and seed.
 inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description,
     std::optional<StartupPreflight> startup = {}, serve::Json assets = {},
-    std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}) {
+    std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}, std::function<void()> before_listen = {}) {
     return [&options, engine_description = std::move(engine_description), startup, assets,
-        supplied_tokenizer = std::move(supplied_tokenizer)](MtpBatchRunner& runner) {
+        supplied_tokenizer = std::move(supplied_tokenizer), before_listen](MtpBatchRunner& runner) {
         if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = supplied_tokenizer ? supplied_tokenizer : serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
@@ -422,6 +423,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         serve::HttpServer server(http, [&api](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
             api.handle(request, response);
         });
+        if(before_listen) before_listen();
         server.listen();
         api.set_state("ready");
         std::cerr << "strix serve: listening on " << options.http_bind << ':' << server.port() << " model " << config.model_id

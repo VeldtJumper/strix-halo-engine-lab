@@ -112,6 +112,8 @@ struct KnownWindowRowsEntry {
     void (*launch)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
     std::uint64_t implementation_identity = 0;
     bool binds_qsa_score_ring = false;
+    // Optional host staging; the callback must snapshot the borrowed contexts.
+    void (*stage)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
 };
 
 struct KnownWindowResult {

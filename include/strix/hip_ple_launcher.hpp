@@ -98,6 +98,9 @@ public:
     HipPleKnownWindow(const HipPleKnownWindow&) = delete;
     HipPleKnownWindow& operator=(const HipPleKnownWindow&) = delete;
     void preflight(std::span<const ExecutionDispatchContext> rows) const;
+    // Stage a successor before its predecessor launches; an occupied stage is
+    // retained until its slot is selected. Never used for reclaim windows.
+    void stage_serve(std::span<const ExecutionDispatchContext> rows);
     void launch(std::span<const ExecutionDispatchContext> rows);
     // Enqueues on `stream` (a hipStream_t); the host history is written immediately.
     void commit(std::uint32_t n_keep, void* stream);
