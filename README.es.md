@@ -260,6 +260,10 @@ dos turnos de GPU por brazo:
 
 `--profile fast` activa la palanca MoE de orden relajado `STRIX_DS41_FAST_MOE=1`: **8.53 / 29.24 / 41.90 s** con los
 mismos prompts. Cambia los logits; su cualificación de calidad está en curso, y `default` no cambia.
+Dentro de `--profile fast`, la proyección down del MoE relajado trabaja ahora por defecto en grupos de 32 filas
+(`STRIX_DS41_FAST_MOE_DOWN_ROWS=64` restablece los grupos anteriores; mismos bits de salida FAST). La forma de 64 filas
+desbordaba registros. Prefill del par dentro de la aplicación, cuatro ejecuciones alternas: 8.4K 7.863 → 7.533 s
+(−4.2 %), 32.5K 27.509 → 27.077 s (−1.6 %); el kernel down por sí solo es un 13-25 % más rápido.
 
 **DeepSeek con la RTX PRO, división del pipeline** (los mismos ficheros de modelo; la RTX ejecuta las capas 0-21 con CUDA, los dos nodos ejecutan
 las capas 22-39 y la cabeza):

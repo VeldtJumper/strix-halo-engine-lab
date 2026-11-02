@@ -1627,6 +1627,22 @@ The exact attention combine already forms the A8 operands of o (int8 codes, delt
 - **Measured gain:** Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, default first): 8.883 / 31.251 s with STRIX_DS41_PREFILL_O_A8_FUSED=0 vs 8.767 / 30.886 s default (-1.3 / -1.2 %); logits and generated ids identical.
 - **Public evidence:** [Prefill attention site](../src/hip_deepseek41_prefill.hip)
 
+<a id="ds-fast-moe-down-rows"></a>
+
+### FAST MoE down row groups
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_FAST_MOE_DOWN_ROWS`. **Default:** 32 (with `STRIX_DS41_FAST_MOE=1`).
+
+The FAST relaxed MoE down kernel takes row groups of up to 32 rows of one expert instead of 64: half the accumulators and staged activations per thread, so it compiles without register spills. Each output's terms keep their order; only the grouping of rows into blocks changes.
+
+- **Preconditions:** STRIX_DS41_FAST_MOE=1 (--profile fast) and route batches of at most 32 rows.
+- **Automatic selection:** On whenever the FAST relaxed down kernel runs on batches of at most 32 rows.
+- **Fallback notice:** None.
+- **Exactness evidence:** The FAST relaxed MoE down outputs are bitwise identical for 32- and 64-row groups: rank-shaped bench (layer 20, 2048 / 4096 / 8192 rows) A8 codes, deltas, sums and raw down vectors; two-node serve logits and generated ids under --profile fast. The FAST identity itself is unchanged.
+- **Off switch:** STRIX_DS41_FAST_MOE_DOWN_ROWS=64
+- **Measured gain:** FAST relaxed down kernel -23 / -16 / -14 % at 2048 / 4096 / 8192 rows (32-row groups compile without the ~69 spilled VGPRs of 64-row groups). Two-node serve TTFT with STRIX_DS41_FAST_MOE=1 at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, four GPU turns in alternating arm order): 7.863 / 27.509 s with STRIX_DS41_FAST_MOE_DOWN_ROWS=64 vs 7.533 / 27.077 s default (-4.2 / -1.6 %).
+- **Public evidence:** [FAST relaxed MoE kernels](../src/hip_ds41_prefill_relaxed.inl)
+
 <a id="ds-fast-moe-order"></a>
 
 ### FAST MoE block order

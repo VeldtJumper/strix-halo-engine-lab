@@ -249,6 +249,10 @@ default profile, mean of two GPU turns per arm:
 
 `--profile fast` turns on the relaxed-order MoE lever `STRIX_DS41_FAST_MOE=1`: **8.53 / 29.24 / 41.90 s** on the same
 prompts. It changes logits; its quality qualification is in progress, and `default` is unchanged.
+Within `--profile fast`, the relaxed MoE down projection now works on 32-row groups by default
+(`STRIX_DS41_FAST_MOE_DOWN_ROWS=64` restores the previous groups; same FAST output bits). The 64-row form spilled
+registers. In-app pair prefill, four alternating runs: 8.4K 7.863 → 7.533 s (−4.2 %), 32.5K 27.509 → 27.077 s
+(−1.6 %); the down kernel alone is 13-25 % faster.
 
 **DeepSeek with the RTX PRO, pipeline split** (same model files; the RTX runs layers 0-21 with CUDA, the two nodes run
 layers 22-39 and the head):

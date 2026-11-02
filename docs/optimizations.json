@@ -1094,6 +1094,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "FAST MoE down row groups",
+    "flag_or_env": "STRIX_DS41_FAST_MOE_DOWN_ROWS",
+    "default": "32 (with STRIX_DS41_FAST_MOE=1)",
+    "exact": "The FAST relaxed MoE down outputs are bitwise identical for 32- and 64-row groups: rank-shaped bench (layer 20, 2048 / 4096 / 8192 rows) A8 codes, deltas, sums and raw down vectors; two-node serve logits and generated ids under --profile fast. The FAST identity itself is unchanged.",
+    "gain": "FAST relaxed down kernel -23 / -16 / -14 % at 2048 / 4096 / 8192 rows (32-row groups compile without the ~69 spilled VGPRs of 64-row groups). Two-node serve TTFT with STRIX_DS41_FAST_MOE=1 at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, four GPU turns in alternating arm order): 7.863 / 27.509 s with STRIX_DS41_FAST_MOE_DOWN_ROWS=64 vs 7.533 / 27.077 s default (-4.2 / -1.6 %).",
+    "preconditions": "STRIX_DS41_FAST_MOE=1 (--profile fast) and route batches of at most 32 rows.",
+    "off_switch": "STRIX_DS41_FAST_MOE_DOWN_ROWS=64",
+    "doc_anchor": "docs/optimizations.md#ds-fast-moe-down-rows"
+  },
+  {
+    "engine": "deepseek",
     "name": "Prefill router scores v2",
     "flag_or_env": "STRIX_DS41_PREFILL_ROUTER_V2",
     "default": "on",
