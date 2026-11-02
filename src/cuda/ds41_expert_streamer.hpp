@@ -13,7 +13,9 @@
 #include "strix/cuda_ds41_moe.hpp"
 #include "strix/cuda_ds41_prefill.hpp"
 #include "strix/ds41_file_reader.hpp"
+#include "strix/ds41_host_promote.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -47,6 +49,10 @@ struct StreamerPlan {
     double host_commit_floor_gib = 0.0;            // > 0: commit-floor policy instead of the tries (see PrefillOptions)
     double host_pin_wait_s = 360.0;                // commit-floor policy: total wait for the whole host tier
     bool host_tier_implicit = false;
+    // lazy host promotion: a file-tier layer read for a run is kept in a new pinned buffer (the host tier's packed
+    // layout) and streams from it in later runs; the least recently used ones go back to the file when the host drops
+    // below the floor at a run start (ds41_host_promote.hpp; never with host_alias)
+    HostPromotePolicy host_promote;
     bool timing = false;                           // copy start / end events per streamed layer
 };
 
@@ -102,12 +108,21 @@ public:
         // bytes_streamed): bytes, host wall time, and the part of it still running after this run began (s).
         std::uint64_t preload_bytes = 0;
         double preload_s = 0.0, preload_after_begin_s = 0.0;
+        // lazy host promotion: layers promoted / given back since the previous run ended (its between-runs preload
+        // included), promoted layers and bytes held now, and the file-tier bytes this run read (in bytes_streamed)
+        std::uint32_t promoted_layers = 0, demoted_layers = 0, promoted_held = 0;
+        std::uint64_t promoted_bytes = 0, file_bytes = 0;
     };
     [[nodiscard]] Stats stats() const;           // after the run's work finished
     [[nodiscard]] cudaEvent_t copy_origin() const;  // timing: the event the copy times are relative to
     [[nodiscard]] std::size_t device_bytes() const noexcept { return device_bytes_; }
     [[nodiscard]] const HostPinStats& host_pin_stats() const { return host_pin_stats_; }
-    [[nodiscard]] std::size_t pinned_bytes() const noexcept { return pinned_bytes_; }
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept { return pinned_bytes_; }  // the promoted layers included
+    struct Promoted {
+        std::uint32_t layers = 0, promoted = 0, demoted = 0;  // held now; promoted / given back since the load
+        std::uint64_t bytes = 0;
+    };
+    [[nodiscard]] Promoted promoted() const;
     [[nodiscard]] std::uint32_t host_pin_failed_layers() const noexcept { return host_pin_failed_; }
     [[nodiscard]] double host_pin_seconds() const noexcept { return host_pin_s_; }
     [[nodiscard]] std::uint32_t host_pin_waits() const noexcept { return host_pin_waits_; }
@@ -139,8 +154,11 @@ private:
     [[nodiscard]] std::size_t use_of(std::uint32_t layer) const;
     void file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst);
     void file_to_host(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst, PinnedBytes& page);
+    void file_to_pinned(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst);
     void copy_piecewise(std::uint8_t* dst, const std::uint8_t* src, std::uint64_t bytes);
-    void load_group(Slot& s, std::uint32_t layer, std::uint32_t g);
+    void load_group(Slot& s, std::uint32_t layer, std::uint32_t g, std::uint8_t* fill);
+    std::unique_ptr<PinnedBytes> promote_buffer(std::uint32_t layer);  // nullptr: no promotion of this load
+    void demote_under_pressure();
     std::uint64_t load_into(Slot& s, std::uint32_t layer);  // returns the bytes enqueued
     void loop();
 
@@ -168,7 +186,8 @@ private:
     std::string error_;
     std::uint64_t bytes_streamed_ = 0;
     double io_seconds_ = 0.0, wait_seconds_ = 0.0;
-    std::size_t device_bytes_ = 0, pinned_bytes_ = 0;
+    std::size_t device_bytes_ = 0;
+    std::atomic<std::size_t> pinned_bytes_{0};  // grows / shrinks with the promoted layers (loader thread)
     HostPinStats host_pin_stats_;
     std::uint32_t host_pin_failed_ = 0;   // host layers demoted to the file tier (pinned allocation failed)
     double host_pin_s_ = 0.0;             // time spent allocating the host tier (incl. retries)
@@ -187,6 +206,15 @@ private:
     // the preload the current run consumed (set when the loader starts the run: the preload, if any, finished before)
     std::uint64_t consumed_bytes_ = 0;
     double consumed_s_ = 0.0, consumed_after_begin_s_ = 0.0;
+    // lazy host promotion: the LRU, its clock and the block flag belong to the loader thread; the counters are read
+    // under mutex_ (cumulative; a run reports the difference to the mark taken when it began, which is the count at
+    // the previous run's end)
+    HostPromoteLru promote_lru_;
+    std::uint64_t promote_clock_ = 0;
+    bool promote_blocked_ = false;  // a run that gave layers back promotes none
+    std::uint32_t promoted_cum_ = 0, demoted_cum_ = 0, promoted_end_ = 0, demoted_end_ = 0, promoted_mark_ = 0, demoted_mark_ = 0;
+    std::uint32_t promoted_held_ = 0;
+    std::uint64_t promoted_bytes_ = 0, file_bytes_ = 0;
 };
 
 }  // namespace strix::ds41::cuda::detail

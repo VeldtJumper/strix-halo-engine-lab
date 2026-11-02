@@ -16,11 +16,14 @@ baseline_exe = os.environ.get("STRIX_DS41_CONFIG_BASELINE_EXE")
 baseline_comparisons = 0
 env = os.environ.copy()
 env["CUDA_VISIBLE_DEVICES"] = "-1"
-for key in ('STRIX_DS41_RTX_BASELINE', 'DG_LOAD_SERIAL', 'STRIX_SESSION_CACHE', 'STRIX_SESSION_DISK', 'STRIX_DS41_CE_PACING', 'STRIX_DS41_WB_STREAM'):
+for key in ('STRIX_DS41_RTX_BASELINE', 'DG_LOAD_SERIAL', 'STRIX_SESSION_CACHE', 'STRIX_SESSION_DISK', 'STRIX_DS41_FILE_TIER',
+            'STRIX_DS41_CE_PACING', 'STRIX_DS41_VRAM_TOTAL_GIB', 'STRIX_DS41_RAM_TOTAL_GIB', 'STRIX_DS41_WB_STREAM',
+            'STRIX_DS41_PROFILE', 'STRIX_DS41_PROFILE_ALLOW_PENDING'):
     env.pop(key, None)
 
 
-def call(args=(), extra=None, base=None, ok=True):
+def call(args=(), extra=None, base=None, ok=True, profile=False, raw=False):
+    """The resolved configuration; its 'profile' receipt is checked on its own (profile=True keeps it)."""
     e = dict(env, **(extra or {}))
     p = subprocess.run([exe, *(base or ['MODEL', '--import-state', 'S', '--ref', 'R', '--draft', 'D']),
                         '--print-config', *args], env=e, capture_output=True, text=True)
@@ -38,7 +41,12 @@ def call(args=(), extra=None, base=None, ok=True):
         baseline_comparisons += 1
     lines = p.stdout.splitlines()
     assert len(lines) == 1, p.stdout
-    return json.loads(lines[0])
+    if raw:
+        return p
+    config = json.loads(lines[0])
+    receipt = config.pop('profile')
+    assert receipt['app'] == 'replica', receipt
+    return dict(config, profile=receipt) if profile else config
 
 
 def diff(a, b):
@@ -97,6 +105,57 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
     assert call(['--wb-stream', '--baseline'])['wb_stream'] is False
     assert call(['--baseline', '--wb-stream'])['wb_stream'] is True
     assert diff(call(['--no-ce-pacing']), call(['--no-ce-pacing', '--no-wb-stream'])) == {'wb_stream'}
+    # Three-tier placement: the file tier (instead of the refusal) is on by default, the RAM tier auto, no clean copies.
+    assert default['file_tier'] is True and default['ram_expert_gib'] == 'auto' and default['ram_inclusive_gib'] == '0'
+    assert default['disk_prefetch'] is False and default['disk_staging'] == 8
+    assert diff(default, call(['--no-file-tier'])) == {'file_tier'}
+    assert call(extra={'STRIX_DS41_FILE_TIER': '0'})['file_tier'] is False
+    assert call(['--file-tier'], extra={'STRIX_DS41_FILE_TIER': '0'})['file_tier'] is True
+    assert call(['--file-tier', '--baseline'])['file_tier'] is False
+    assert call(['--baseline', '--file-tier'])['file_tier'] is True
+    assert diff(default, call(['--ram-expert-gib', '64'])) == {'ram_expert_gib'}
+    assert call(['--ram-expert-gib', '64'])['ram_expert_gib'] == '64'
+    assert call(['--ram-expert-gib', '64', '--ram-expert-gib', 'auto']) == default
+    assert diff(default, call(['--ram-inclusive-gib', '8'])) == {'ram_inclusive_gib'}
+    assert call(['--ram-inclusive-gib', 'auto'])['ram_inclusive_gib'] == 'auto'
+    assert call(['--ram-inclusive-gib', '8', '--baseline'])['ram_inclusive_gib'] == '0'
+    assert diff(default, call(['--disk-prefetch'])) == {'disk_prefetch'}
+    assert call(['--disk-prefetch', '--baseline'])['disk_prefetch'] is False
+    assert diff(default, call(['--disk-staging', '4'])) == {'disk_staging'}
+    # file reads in flight: default 4 (measured), env / flag, --baseline = one at a time
+    assert default['disk_queue'] == 'auto'
+    assert call(extra={'STRIX_DS41_DISK_QUEUE': 'auto'})['disk_queue'] == 'auto'
+    assert call(['--disk-queue', '4'])['disk_queue'] == 4
+    assert diff(default, call(['--disk-queue', '1'])) == {'disk_queue'}
+    assert call(extra={'STRIX_DS41_DISK_QUEUE': '16'})['disk_queue'] == 16
+    assert call(['--disk-queue', '2'], extra={'STRIX_DS41_DISK_QUEUE': '16'})['disk_queue'] == 2
+    assert call(['--baseline'])['disk_queue'] == 1
+    assert call(['--baseline', '--disk-queue', '4'])['disk_queue'] == 4
+    assert call(['--vram-expert-gib', '48']) == call(['--arena-gib', '48'])
+    assert call(['--vram-expert-gib', 'auto']) == call(['--arena-gib', 'auto'])
+    # whole-device budgets: default none (today); flags / env; total caps never touch the arena / RAM settings here (the
+    # plan needs the measured fixed parts at load); --baseline keeps them; bad values refused
+    assert default['vram_total_gib'] == 'none' and default['ram_total_gib'] == 'none' and default['budget_receipt'] is False
+    assert default['vram_margin_gib'] == 1.5 and default['ram_margin_gib'] == 1 and default['budget_sample_ms'] == 100
+    assert default['budget_plan'].startswith('none')
+    capped = call(['--vram-total-gib', '24', '--ram-total-gib', '32'])
+    assert diff(default, capped) == {'vram_total_gib', 'ram_total_gib', 'budget_receipt', 'budget_plan'}
+    assert capped['vram_total_gib'] == '24' and capped['ram_total_gib'] == '32' and capped['budget_receipt'] is True
+    assert capped['budget_plan'].startswith('at load: arena slots = min(--vram-expert-gib, (24 GiB')
+    assert call(extra={'STRIX_DS41_VRAM_TOTAL_GIB': '24', 'STRIX_DS41_RAM_TOTAL_GIB': '32'}) == capped
+    assert call(['--vram-total-gib', '20'], extra={'STRIX_DS41_VRAM_TOTAL_GIB': '24'})['vram_total_gib'] == '20'
+    assert call(['--vram-total-gib', 'none'], extra={'STRIX_DS41_VRAM_TOTAL_GIB': '24'})['vram_total_gib'] == 'none'
+    assert call(['--vram-total-gib', '24', '--ram-total-gib', '32', '--baseline'])['vram_total_gib'] == '24'
+    assert call(['--vram-total-gib', '24', '--vram-expert-gib', '8'])['arena_gib'] == 8
+    assert diff(default, call(['--budget-receipt'])) == {'budget_receipt'}
+    assert diff(default, call(['--vram-margin-gib', '2', '--ram-margin-gib', '0.5'])) == {'vram_margin_gib', 'ram_margin_gib'}
+    assert diff(default, call(['--budget-sample-ms', '0'])) == {'budget_sample_ms'}
+    for bad in (['--vram-total-gib', '-1'], ['--vram-total-gib', 'x'], ['--ram-total-gib', 'auto'], ['--vram-margin-gib', 'auto']):
+        call(bad, ok=False)
+    call(extra={'STRIX_DS41_VRAM_TOTAL_GIB': 'lots'}, ok=False)
+    for bad in (['--ram-expert-gib', '-1'], ['--ram-expert-gib', 'x'], ['--ram-inclusive-gib', 'nan'],
+                ['--disk-staging', '0'], ['--vram-expert-gib', 'big']):
+        call(bad, ok=False)
     assert diff(default, call(['--census'])) == {'census'}
     for policy, hook in [('scored', 'ts_dg_set_policy'), ('auto', 'ts_dg_end_rows')]:
         probe = subprocess.run([exe, 'MODEL', '--print-config', '--evict', policy], env=env, capture_output=True, text=True)
@@ -114,7 +173,8 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                     q8_r1=False, q8_r1_pad=False, draft_keep=0, draft_keep_ids=[], controller_prior='none',
                     controller_costs='none', wb_defer=False, controller_scope='run', host_spares=96,
                     arena_gib=71.5, draft_vocab='full', warmup_graphs='none', residency_seed='none',
-                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru', ce_pacing=False, wb_stream=False)
+                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru', ce_pacing=False, wb_stream=False,
+                    file_tier=False, disk_queue=1)
     for key, value in expected.items():
         assert old[key] == value, (key, old[key], value)
     for key in ('decode_fuse_hc', 'decode_fuse_shared', 'decode_router_v2', 'decode_ob_one',
@@ -211,9 +271,65 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
     sibling.mkdir()
     assert call(extra={'STRIX_DS41_DRAFT_VOCAB': str(root / 'missing')}, base=['MODEL', '--draft', str(root / 'D.gguf')])['draft_vocab'] == 'auto:' + str(sibling)
     assert call(extra={'STRIX_DS41_DRAFT_VOCAB': ''}, base=['MODEL', '--draft', str(root / 'D.gguf')])['draft_vocab'] == 'auto:' + str(sibling)
+    # --profile default|fast|quality: default (and no --profile) = today; quality = default; fast = default + pending rows
+    # listed (not used); per-lever options / variables / --baseline stay explicit overrides above the profile
+    today_levers = {'lean_state', 'q8_r1', 'dsrtxk', 'fuse', 'decode_forms', 'evict_auto', 'controller', 'draft_keep',
+                    'draft_vocab_auto', 'wb_defer', 'ce_pacing', 'wb_stream', 'file_tier', 'residency_auto', 'warmup_graphs',
+                    'engram_cache'}
+    base_raw = call(raw=True).stdout
+    for name in ('default', 'quality'):  # byte for byte; the receipt names the profile asked for
+        same = lambda out: out.replace('"profile":{"profile":"' + name + '"', '"profile":{"profile":"default"', 1)
+        assert same(call(['--profile', name], raw=True).stdout) == base_raw, name
+        assert same(call(extra={'STRIX_DS41_PROFILE': name}, raw=True).stdout) == base_raw, name
+    r = call(profile=True)['profile']
+    assert r['profile'] == 'default' and r['qualification'] == 'qualified' and r['unqualified'] == []
+    assert r['pending'] == ['prompt_layer_major']  # PRO-qualified, wanted in every profile, not in this build
+    assert set(r['levers']) == today_levers | {'prompt_layer_major'}, set(r['levers']) ^ today_levers
+    for k, v in r['levers'].items():
+        if k == 'prompt_layer_major':
+            assert v['status'] == 'pending' and v['value'] == 'off' and v['wanted'] == 'on' and v['effective'] == 'off', v
+            assert 'owner review (layer-major' in v['source'], v
+            continue
+        assert v['value'] == 'on' and v['status'] == 'profile' and v['kind'] == 'exact' and v['source'], (k, v)
+        assert v['effective'] in ('on', 'on (serve only)'), (k, v)
+    assert 'prompt_layer_major pending, not used' in call(raw=True).stderr
+    fast = call(['--profile', 'fast'], profile=True)
+    assert dict(fast, profile=None) == dict(call(), profile=None)  # every qualified fast lever is today's default
+    fr = fast['profile']
+    assert fr['profile'] == 'fast' and fr['pending'] == ['prompt_layer_major'] and fr['qualification'] == 'qualified'
+    lm = fr['levers']['prompt_layer_major']
+    assert lm['status'] == 'pending' and lm['value'] == 'off' and lm['wanted'] == 'on' and lm['source'].startswith('pending:')
+    assert call(extra={'STRIX_DS41_PROFILE': 'fast'}, profile=True)['profile'] == fr
+    assert call(['--profile', 'default'], extra={'STRIX_DS41_PROFILE': 'fast'}, raw=True).stdout == base_raw
+    assert 'prompt_layer_major pending, not used' in call(['--profile', 'fast'], raw=True).stderr  # never silently used
+    # --allow-pending: nothing pending is runnable in this build -> still pending, the receipt says allow_pending
+    fa = call(['--profile', 'fast', '--allow-pending'], profile=True)['profile']
+    assert fa['allow_pending'] is True and fa['pending'] == ['prompt_layer_major'] and fa['qualification'] == 'qualified'
+    assert call(['--allow-pending'], profile=True)['profile']['allow_pending'] is True
+    assert call(extra={'STRIX_DS41_PROFILE_ALLOW_PENDING': '1'}, profile=True)['profile']['allow_pending'] is True
+    # precedence: CLI > env > profile; --baseline in order; STRIX_DS41_RTX_BASELINE=1 over the levers' variables
+    def lv(args=(), extra=None):
+        return call(args, extra=extra, profile=True)['profile']['levers']
+    assert lv(['--profile', 'fast', '--no-wb-stream'])['wb_stream'] == dict(lv()['wb_stream'], value='off', status='explicit-cli', effective='off')
+    assert lv(extra={'STRIX_DS41_WB_STREAM': '0'})['wb_stream']['status'] == 'explicit-env'
+    assert lv(['--wb-stream'], extra={'STRIX_DS41_WB_STREAM': '0'})['wb_stream']['effective'] == 'on'
+    b = lv(['--profile', 'fast', '--baseline'])
+    assert b['prompt_layer_major']['status'] == 'pending'
+    assert all(b[k]['status'] == 'baseline-cli' and b[k]['effective'] in ('off', 'lru') for k in today_levers), b
+    assert lv(['--baseline', '--wb-stream'])['wb_stream']['status'] == 'explicit-cli'
+    be = lv(extra={'STRIX_DS41_RTX_BASELINE': '1'})
+    assert all(be[k]['status'] == 'baseline-env' for k in today_levers) and be['prompt_layer_major']['status'] == 'pending'
+    assert call(['--profile', 'fast', '--baseline']) == old  # --baseline still restores the reference forms
+    assert lv(['--evict', 'lru'])['evict_auto'] == dict(lv()['evict_auto'], value='lru', status='explicit-cli', effective='lru')
+    assert lv(['--controller-prior', 'none'])['controller']['effective'] == 'custom'
+    for bad in (['--profile', 'turbo'], ['--profile']):
+        assert 'profile' in call(bad, ok=False).stderr
+    call(extra={'STRIX_DS41_PROFILE': 'Fast'}, ok=False)
+    assert call([*worker, '--profile', 'fast'], profile=True)['profile']['levers']['warmup_graphs']['effective'] == 'on'
     for label, config in [('i', default), ('ii', production), ('iii', old)]:
         print(label + ': ' + json.dumps(config, sort_keys=True))
-    print('PASS: default == production (all keys); baseline; per-feature switches; ordering; arena; serve; auto fallbacks')
+    print('PASS: default == production (all keys); baseline; per-feature switches; ordering; arena; serve; auto fallbacks; '
+          '--profile default == quality == no profile (byte for byte), fast = default + pending listed, precedence, --allow-pending')
 
 if baseline_exe:
     print(f"PASS: {baseline_comparisons} ordinary config outputs/stderr match the public baseline")

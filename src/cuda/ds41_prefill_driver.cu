@@ -141,6 +141,13 @@ void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("ds41 cuda prefill: ") + what);
 }
 
+// Lazy host promotion keeps at least the service's opportunistic host-tier floor free (--host-gib-auto's default).
+constexpr double kHostPromoteFloorGiB = 20.0;
+// The streamer only, a full prompt per run (pass_rows' bounded host budget does not count it), real weights.
+bool host_promote_effective(const CudaPrefillOptions& o) {
+    return o.host_promote && o.pass_rows == 0U && o.host_alias_layers == 0U && !o.decode_only;
+}
+
 // Pinned host allocation (cudaHostAlloc), owned.
 class PinnedBuffer {
 public:
@@ -358,6 +365,7 @@ public:
         ++run_id_;
         next_use_ = 0;
         bytes_streamed_ = 0;
+        file_bytes_streamed_ = 0;
         io_seconds_ = 0.0;
         wait_seconds_ = 0.0;
         wake_.notify_all();
@@ -466,6 +474,7 @@ public:
     [[nodiscard]] double host_pin_seconds() const { return host_pin_s_; }
 
     [[nodiscard]] std::uint64_t bytes_streamed() const { return bytes_streamed_; }
+    [[nodiscard]] std::uint64_t file_bytes_streamed() const { return file_bytes_streamed_; }
     [[nodiscard]] double io_seconds() const { return io_seconds_; }
     [[nodiscard]] double wait_seconds() const { return wait_seconds_; }
     [[nodiscard]] std::size_t device_bytes() const { return device_bytes_; }
@@ -620,6 +629,7 @@ private:
             at += x.bytes[k];
         }
         bytes_streamed_ += x.total();
+        if (tiers_[layer] == ExpertTier::file) file_bytes_streamed_ += x.total();
         s.layer = static_cast<std::int32_t>(layer);
     }
 
@@ -647,7 +657,7 @@ private:
     std::uint64_t run_id_ = 0;
     std::size_t next_use_ = 0;
     std::string error_;
-    std::atomic<std::uint64_t> bytes_streamed_{0};
+    std::atomic<std::uint64_t> bytes_streamed_{0}, file_bytes_streamed_{0};
     double io_seconds_ = 0.0, wait_seconds_ = 0.0;
     std::size_t device_bytes_ = 0, pinned_bytes_ = 0, resident_bytes_ = 0;
     // decode residency
@@ -1715,6 +1725,9 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
         sp.host_commit_floor_gib = o.host_commit_floor_gib;
         sp.host_pin_wait_s = o.host_pin_wait_s;
         sp.host_tier_implicit = o.host_tier_implicit;
+        sp.host_promote.enabled = host_promote_effective(o);
+        sp.host_promote.floor_bytes = static_cast<std::uint64_t>(std::max(o.host_commit_floor_gib, kHostPromoteFloorGiB) * double(1ULL << 30));
+        sp.host_promote.cap_bytes = static_cast<std::uint64_t>(std::max(0.0, o.host_promote_max_gib) * double(1ULL << 30));
         sp.timing = o.timing;
         if (!o.expert_residency) {
             // whole layers through the streamer: device = all resident, host / file = all streamed, identity order
@@ -2005,6 +2018,14 @@ std::string CudaPrefill::describe() const {
     }
     s << "]";
     s << ",\"residency\":\"" << (m.o.expert_residency ? "expert" : "layer") << "\",\"transport\":\"" << (m.streamer ? "streamer" : "provider") << "\"";
+    {
+        const auto pr = m.streamer ? m.streamer->promoted() : detail::ExpertStreamer::Promoted{};
+        s << ",\"host_promote\":{\"switch\":" << (m.o.host_promote ? "true" : "false")
+          << ",\"enabled\":" << (m.streamer && m.streamer->plan().host_promote.enabled ? "true" : "false")
+          << ",\"floor_gib\":" << std::max(m.o.host_commit_floor_gib, kHostPromoteFloorGiB) << ",\"max_gib\":" << m.o.host_promote_max_gib
+          << ",\"layers\":" << pr.layers << ",\"gb\":" << double(pr.bytes) / 1e9 << ",\"promoted\":" << pr.promoted
+          << ",\"demoted\":" << pr.demoted << "}";
+    }
     if (m.streamer) {
         s << ",\"residency_plan\":\"" << m.residency_plan << "\"";
         s << ",\"slot_gb\":" << double(m.streamer->slot_bytes()) / 1e9 << ",\"group_experts\":" << m.o.xfer_group_experts
@@ -2253,6 +2274,9 @@ CudaPrefillResult CudaPrefill::run_long(std::span<const std::uint32_t> tokens, b
                 result.logits = std::move(r.logits); result.head_logits = std::move(r.head_logits); result.next_token = r.next_token;
                 result.stream_hashes = std::move(r.stream_hashes);
                 result.expert_bytes_streamed = r.expert_bytes_streamed; result.expert_io_seconds = r.expert_io_seconds;
+                result.file_bytes_streamed = r.file_bytes_streamed;
+                result.host_promoted_layers = r.host_promoted_layers; result.host_demoted_layers = r.host_demoted_layers;
+                result.host_promoted_total = r.host_promoted_total; result.host_promoted_bytes = r.host_promoted_bytes;
                 result.expert_copy_busy_s = r.expert_copy_busy_s; result.expert_stall_ms = r.expert_stall_ms;
             }
             {
@@ -3471,6 +3495,11 @@ std::vector<CudaPrefillResult> CudaPrefill::run_contexts(std::span<const CudaBat
         result.preload_bytes = ss.preload_bytes;
         result.preload_s = ss.preload_s;
         result.preload_after_begin_s = ss.preload_after_begin_s;
+        result.host_promoted_layers = ss.promoted_layers;
+        result.host_demoted_layers = ss.demoted_layers;
+        result.host_promoted_total = ss.promoted_held;
+        result.host_promoted_bytes = ss.promoted_bytes;
+        result.file_bytes_streamed = ss.file_bytes;
         for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l) {
             result.layers[l].copy_bytes = ss.copy_bytes[l];
             if (ss.copy_begin_ms[l] >= 0.0F) result.layers[l].copy_ms = ss.copy_end_ms[l] - ss.copy_begin_ms[l];
@@ -3487,6 +3516,7 @@ std::vector<CudaPrefillResult> CudaPrefill::run_contexts(std::span<const CudaBat
     } else if (!m.streamer && (!long_mode || final_pass)) {
         result.expert_io_seconds = m.experts->io_seconds();
         result.expert_bytes_streamed = m.experts->bytes_streamed();
+        result.file_bytes_streamed = m.experts->file_bytes_streamed();
     }
     if (o.timing)
         for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l) {
@@ -3541,6 +3571,11 @@ std::vector<CudaPrefillResult> CudaPrefill::run_contexts(std::span<const CudaBat
         r.engram_seconds = result.engram_seconds;
         r.expert_io_seconds = result.expert_io_seconds;
         r.expert_bytes_streamed = result.expert_bytes_streamed;
+        r.file_bytes_streamed = result.file_bytes_streamed;
+        r.host_promoted_layers = result.host_promoted_layers;
+        r.host_demoted_layers = result.host_demoted_layers;
+        r.host_promoted_total = result.host_promoted_total;
+        r.host_promoted_bytes = result.host_promoted_bytes;
         r.expert_copy_busy_s = result.expert_copy_busy_s;
         r.expert_stall_ms = result.expert_stall_ms;
         r.engram_records = result.engram_records;

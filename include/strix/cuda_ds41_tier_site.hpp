@@ -43,6 +43,9 @@ struct TierWinpf {
     bool revert_unused = true;
 };
 
+// --disk-queue auto: the library's resolved queue (tierstream SS_DG_DISK_QUEUE_AUTO), 4 on a library without it
+inline constexpr std::uint32_t kDiskQueueAuto = 0xFFFFFFFFu;
+
 struct TierSiteOptions {
     WeightReadOptions weight_read;
     std::string model;                     // the GGUF the library reads the experts from
@@ -66,6 +69,15 @@ struct TierSiteOptions {
     std::vector<std::uint8_t> prior;       // tierstream/hint-prior-v1 bytes for window prefetch (empty = none)
     bool wb_defer = false;                 // tierstream dg_wb_defer (deferred write-back scheduling)
     bool ce_pacing = false;                // one-expert background CE debt (the replica turns it on by default)
+    // Three-tier placement (tierstream SS_DG_DISK_TIER; rtx::tier_plan): after the residents, the next `pinned_units`
+    // keys by seed priority (then key order) take the pinned tier and the rest stay in the model file (read on demand,
+    // through the weight_read stripes when given). UINT32_MAX = every non-resident key pinned (the two-tier cache).
+    std::uint32_t pinned_units = 0xFFFFFFFFU;
+    bool disk_prefetch = false;            // predictions may read file-tier experts too (off: demand reads only)
+    std::uint32_t disk_staging = 8;        // pinned staging buffers of the file reads
+    std::uint32_t disk_queue = 0;          // file reads in flight at once (0 = the library default, 1 = one at a time,
+                                           // kDiskQueueAuto = the library resolves it from the read locations; 4 without that)
+    std::uint32_t inclusive_units = 0;     // device experts that may keep their pinned block as a clean copy (0 = exclusive)
     // tierstream dg_wb_stream: deferred write-backs on the library's own D2H stream behind the layer's ready (true; the
     // replica's default) or on the demand stream (false: queued ahead of the next layer's demand copies). Transport
     // only: the same parts, bytes, destinations, pacing and completion events.
@@ -125,6 +137,10 @@ public:
     // Between tokens: checks `count` random units against the file (ts_check_unit); returns mismatches.
     std::uint32_t verify(std::uint32_t count, std::uint64_t seed);
     [[nodiscard]] std::uint32_t device_experts() const noexcept;  // resident at open
+    // Three-tier / inclusive counters since open as a JSON object body ("" when both are off): file reads and their host
+    // time, pinned drops, victim discards, clean copies kept / dropped, file-tier and clean-copy units now.
+    [[nodiscard]] std::string tier3_json() const;
+    static bool can_disk_tier() noexcept;  // the linked tierstream has SS_DG_DISK_TIER
     [[nodiscard]] std::uint64_t device_bytes() const noexcept;
     [[nodiscard]] std::uint64_t host_bytes() const noexcept;
 

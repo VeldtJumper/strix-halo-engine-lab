@@ -115,6 +115,14 @@ struct CudaPrefillOptions {
     // shared deadline. Explicit floor 0 retains the legacy allocation path.
     double host_commit_floor_gib = 0.0;
     double host_pin_wait_s = 360.0;
+    // Lazy host promotion (streamer transport; strix/ds41_host_promote.hpp): a file-tier layer read for a run is kept in
+    // a new pinned buffer and streams from host memory in the next runs (the same file bytes), while the host keeps
+    // max(host_commit_floor_gib, 20) GiB free (and the promoted bytes stay under host_promote_max_gib when > 0); below
+    // that floor at a run start, the least recently used promoted layers go back to the file tier. Off here; the
+    // prefill service turns it on (--no-host-promote / STRIX_DS41_HOST_PROMOTE=0 / --baseline). Not with pass_rows,
+    // host_alias_layers or the whole-layer provider.
+    bool host_promote = false;
+    double host_promote_max_gib = 0.0;
     // Engram rows: "file" (the model file's tables), "zero" (no rows read: timing only, NOT the model's bits).
     std::string engram = "file";
     bool engram_direct = true;                      // unbuffered reads of the Engram rows / file-tier experts
@@ -290,6 +298,10 @@ struct CudaPrefillResult {
     // its wall time, and the part of it that ran after this run began (it then delays the first streamed layer)
     std::uint64_t preload_bytes = 0;
     double preload_s = 0.0, preload_after_begin_s = 0.0;
+    // lazy host promotion (host_promote): layers promoted / given back since the previous run (its between-runs preload
+    // included), promoted layers and bytes held now; and the file-tier bytes this run read (part of expert_bytes_streamed)
+    std::uint32_t host_promoted_layers = 0, host_demoted_layers = 0, host_promoted_total = 0;
+    std::uint64_t host_promoted_bytes = 0, file_bytes_streamed = 0;
     bool graphs = false;                         // this run replayed (or captured) the layer segments as graphs
     std::uint32_t graph_captures = 0;            // segments captured during this run
     // run_batch: seconds = until this prompt's logits were on the host; batch_seconds = the whole batch's wall

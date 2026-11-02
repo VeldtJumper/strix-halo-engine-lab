@@ -79,6 +79,13 @@ del modelo. Los costes de preparación, verificación, elegibilidad de lectura y
 [streaming con dos unidades](rtx-two-drives.md). Esto es configuración de almacenamiento,
 no un perfil numérico distinto.
 
+En una tarjeta o un host demasiado pequeños para todos los expertos (por ejemplo 24 GB de VRAM y 32 GB de RAM), la réplica
+mantiene los expertos más rápidos en VRAM, los siguientes en RAM fijada y lee el resto del fichero del modelo (ubicación en
+tres niveles; `--vram-total-gib` / `--ram-total-gib` dimensionan cada nivel a partir de límites de dispositivo completo).
+Las lecturas de fichero van varias a la vez por defecto (`--disk-queue auto`: 4 con una unidad, 6 con dos, 8 con tres o
+más; `--disk-queue 1` o `--baseline` leen de una en una). Medido con 4 a la vez en una RTX PRO 6000 con límites de dispositivo completo `--vram-total-gib 24 --ram-total-gib 32`, los expertos que no caben en ningún nivel se leen de una unidad NVMe, 2 chats x 64 tokens tras un prompt de 96 tokens, en caliente, mismo binario, 6.55 / 6.75 tok/s normal / DSpark frente a 5.45 / 5.37 de una en una (+20 % / +26 %),
+16 a la vez igual que 4, tokens idénticos. Opciones y niveles: [RTX independiente](rtx-standalone.md).
+
 <a id="how-fast"></a>
 
 ## Resultados medidos: el par

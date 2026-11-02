@@ -77,6 +77,14 @@ file. Preparation, verification, read eligibility and startup hashing costs are 
 [two-drive streaming](rtx-two-drives.md). This is storage configuration,
 not a different numerical profile.
 
+On a card or host too small for every expert (for example 24 GB of VRAM and 32 GB of RAM), the replica keeps the
+fastest experts in VRAM, the next ones in pinned RAM and reads the rest from the model file (three-tier placement;
+`--vram-total-gib` / `--ram-total-gib` size every tier from whole-device caps). File reads run several at a time by default
+(`--disk-queue auto`: 4 on one drive, 6 on two, 8 on three or more; `--disk-queue 1` or `--baseline` reads one at a
+time). Measured with 4 at a time on one RTX PRO 6000 with whole-device caps `--vram-total-gib 24 --ram-total-gib 32`, experts that fit neither tier read from one NVMe drive, 2 chats x 64 tokens after a 96-token prompt, warm, one binary,
+6.55 / 6.75 tok/s plain / DSpark vs 5.45 / 5.37 one at a time (+20 % / +26 %), 16 at a time the same as 4, identical
+tokens. Flags and tiers: [standalone RTX](rtx-standalone.md).
+
 <a id="how-fast"></a>
 
 ## Measured results: the pair

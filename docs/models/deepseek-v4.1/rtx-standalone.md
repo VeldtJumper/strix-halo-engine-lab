@@ -26,6 +26,10 @@ for the library side.
 Use an x64 MSVC developer PowerShell with CMake (3.24 or newer), Ninja, and
 a CUDA toolkit supporting architecture 120. Build tierstream's CUDA static
 library first, using a compatible toolchain.
+This replica is built and tested against tierstream `main` at commit
+`4c823b4` (#14); the three-tier placement, whole-device budgets and file-read
+queue use its device-gated file tier and budget planner. The schedule and
+budget CPU tests link its CPU library (`build-cpu`) when that build exists.
 
 From the repository root, with a tierstream checkout at the relative
 placeholder `TIERSTREAM`:
@@ -106,6 +110,160 @@ A request containing only `--quit` stops it. This is a file-queue worker.
 The model can also be read from two NVMe drives at once (a verified partial stripe on the second drive):
 [rtx-two-drives.md](rtx-two-drives.md).
 
+## Expert placement: VRAM, pinned RAM, NVMe
+
+The routed experts (40 layers x 384, 9.95 MB each, 142.4 GiB) live in a
+three-tier cascade: the VRAM arena, then pinned host RAM, then the model file
+on NVMe (one drive, or a multi-drive stripe with `--weight-dirs`). The
+replica sizes the tiers at load and prints the plan as a `tier_plan` JSON
+event (GiB and experts per tier, the spare blocks, the clean-copy share, the
+staging buffers):
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--vram-expert-gib G\|auto` | VRAM arena for resident experts (same as `--arena-gib`; spares on top) | by drafter, see below |
+| `--ram-expert-gib G\|auto` | Pinned RAM tier, spare blocks and staging included; `auto` = what the host can pin now, keeping `--host-margin-gib` free and within `--max-pinned-gib` | `auto` |
+| file tier | Experts that fit neither tier stay in the model file and are read on demand into pinned staging buffers | on when needed; `--no-file-tier` / `STRIX_DS41_FILE_TIER=0` / `--baseline` refuse as before |
+| `--ram-inclusive-gib G\|auto\|0` | Pinned blocks that device experts keep as clean copies after a promotion; evicting such an expert is a drop, not a device-to-host copy. Only RAM left after the pinned homes is used (`auto`: up to 16 GiB) | `0` (exclusive, as before) until measured |
+| `--disk-prefetch` | Predictions may also read file-tier experts (a synchronous read on the library's service thread) | off: demand reads only |
+| `--disk-staging N` | Pinned staging buffers of the file reads | 8 |
+| `--disk-queue auto\|N` | File reads in flight at once (at most `--disk-staging`). `auto` = tierstream's clamp(3 x read locations, 4, 8): one drive 4, two 6, three or more 8. Measured at 24+32 on one drive: 4 in flight +20 % plain / +26 % DSpark vs one at a time, 16 = 4 (one drive saturates), same bytes | auto; `STRIX_DS41_DISK_QUEUE=auto\|N`; `--disk-queue 1` / `--baseline` = one at a time |
+
+Which experts go where: the seed priority (the saved residency, then the
+`--routes` usage order) fills the arena first, then the RAM tier; the least
+used experts stay in the file. At run time a missing expert comes from the
+next tier down, and victims move down one tier: a VRAM victim is written back
+into a free pinned block; when no block is free, the least recently homed
+pinned expert is dropped to its file (no copy, the file holds the same bytes),
+and only with no pinned expert left is the VRAM victim itself dropped. A
+clean copy (inclusive share) makes the VRAM victim's eviction a drop.
+
+When the budgets cover every expert (today's PRO with 128 GB RAM), the plan,
+the library options and every byte are today's: no file tier, no staging
+buffers, the same pinned blocks. The only default behaviour change is that a
+host that cannot pin every non-resident expert loads with a file tier instead
+of refusing (`not enough available host memory for the pinned tier`). All
+placements are exact: every expert byte the GPU reads is the file's byte, so
+tokens and logits equal the two-tier run (the PRO identity scripts compare
+chat hashes across budgets).
+
+Expected throughput by budget. Estimates from a replay of the recorded routes
+(held-out fold) through the three-tier cache model, calibrated on today's
+measured plain decode (9.27 misses/token, 70 tok/s) and on the measured
+random expert read rates (D: alone ~1 GB/s, D:+E: ~3.1 GB/s; three drives not
+measured, assumed equal to two). DSpark is an upper bound (today's
+controller/plain ratio). The measured columns are filled by the PRO runs.
+
+| Budget (VRAM + RAM) | File tier | Misses/token (file reads) | Drives | Plain tok/s est. | DSpark tok/s est. (<=) | 96-token chat prompt s est. | Measured DSpark cold / warm tok/s |
+|---|---|---|---|---|---|---|---|
+| 96 GB PRO + 128 GB RAM (arena 74.8 GiB, today) | 0 | 9.3 (0) | any | 70 | 84 | 1.3 | 72-77 / 90-95 (mdec loads) |
+| 96 GB PRO + 64 GB RAM (arena 74.8, RAM auto ~48) | 20 GiB | 9.3 (1.2) | D: | 38 | 45 | 3.2 | pending |
+| | | | D:+E: | 55 | 66 | 1.9 | pending |
+| 48 GiB VRAM + 64 GiB RAM | 31 GiB | 19.0 (2.4) | D: | 23 | 28 | 6.1 | pending |
+| | | | D:+E: / D:+E:+C: | 38 | 46 | 3.3 | pending |
+| 32 GiB VRAM + 32 GiB RAM | 79 GiB | 32.9 (12.6) | D: | 7 | 8 | 26 | pending |
+| | | | D:+E: / D:+E:+C: | 16 | 19 | 10 | pending |
+| 20 GiB VRAM (24 GB GPU) + 48 GiB RAM | 75 GiB | 54.6 (11.3) | D: | 7 | 8 | 23 | pending |
+| | | | D:+E: / D:+E:+C: | 14 | 17 | 9 | pending |
+
+File reads cost a whole expert per miss (three part reads, about 10 ms on a
+single drive); a second drive roughly triples the random-read rate. Loads with
+a file tier are shorter (fewer bytes read at load). The replica reports the
+file tier's counters in a `tier3` event at the end of each request (file
+reads and their host time, pinned drops, victim drops, clean copies kept and
+dropped).
+
+### Whole-device budgets: `--vram-total-gib` / `--ram-total-gib`
+
+`--vram-expert-gib` / `--ram-expert-gib` size the expert tiers only: the CUDA
+context, the dense trunk, the attention state, the drafter, the workspaces and
+the graphs come on top (a "24 GiB" expert arena used ~46 GB of the card). A
+total cap means the whole device, "as if the user had a 24 GiB GPU":
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--vram-total-gib N\|none` (`STRIX_DS41_VRAM_TOTAL_GIB`) | Everything this process holds on the device: context + trunk + attention state for `--max-positions` + drafter + workspaces + arena + margin | none (today) |
+| `--ram-total-gib M\|none` (`STRIX_DS41_RAM_TOTAL_GIB`) | The process's whole commit, pinned memory included | none (today) |
+| `--vram-margin-gib G` / `--ram-margin-gib G` | Kept for allocations after the plan (graph capture, warmup, per-request buffers) | 1.5 / 1 |
+| `--budget-receipt` | Measure and print the budget events without caps (implied by a cap) | off |
+| `--budget-sample-ms N` | Period of the NVML peak sampler (0: stage samples only) | 100 |
+
+At load the replica creates the context, allocates the trunk, the drafter, the
+decode workspaces, and measures each part (`cudaMemGetInfo`, minus the device's
+use before the process as NVML reports it). Then tierstream's budget planner
+(`ss_budget_plan` in `strix_stream/ss.h`, shared with the other engines) gives the arena
+what is left: `min(--vram-expert-gib, (N - fixed - margin - bank/site/graph
+reserves) / expert)` slots, and the pinned tier `min(--ram-expert-gib or auto,
+(M - process commit - margin - load staging) / expert)` blocks; the rest of
+the experts stay in the model file. A cap only shrinks a tier: caps that cover
+everything give today's placement. When the fixed part does not fit, the load
+is refused before the arena is allocated, with the minimum (e.g. `the minimum
+is --vram-total-gib 20.24 (21 rounded up)`).
+
+The `budget` events: `stage:"plan"` (caps, measured components, the plan),
+`stage:"load"` (measured per component, declared bytes, tiers, peaks),
+`stage:"warmup"`, and `stage:"request"` at every request end (`stage:"run"`
+without `--serve`). Each carries the device peak (stage samples + the NVML
+sampler), the host peak (process commit peak, plus pinned bytes if the commit
+does not show them) and `peak_le_cap` (tierstream's `ss_budget_ledger_observe` /
+`ss_budget_ledger_within_caps`). The `plan` object is `ss_budget_plan_json`'s
+(`resident`, `arena_slots`, `pinned`, `disk`, `host_cap_units`, `device_capped`,
+`host_capped`, `min_vram_total_gib`, ...). Above a cap at load or after warmup the
+worker refuses to serve; at a request end the request fails (rc 1).
+
+Estimate (CPU, from the GGUF header and a
+PRO load at 2304 positions): trunk on the device 9.41 GiB (8.79 GiB of Q2/Q8
+file tensors), context + untracked ~2.8 GiB, attention state 17 MiB, drafter
+keep-64 4.12 GiB: ~16.5 GiB fixed, so the minimum is ~20.2 GiB and a 24 GiB
+card keeps ~5 GiB of arena (~440 resident experts besides the 96 spares).
+
+## Profiles: `--profile default|fast|quality`
+
+One switch selects every lever (`--profile NAME` or `STRIX_DS41_PROFILE=NAME`; the option wins). The per-lever options
+below stay as expert overrides. Precedence: an explicit option (the last of the lever's own options and `--baseline`) >
+an explicit environment variable (`STRIX_DS41_RTX_BASELINE=1` over the lever's own variable) > the profile > the builtin.
+
+| Profile | What runs |
+|---|---|
+| `default` (also no `--profile`) | Today's replica: every exact lever of the table below ON. `--print-config` is byte for byte the configuration without the switch. The layer-major exact prompt path is wanted here too but is pending (not in this build). |
+| `fast` | `default` plus every further exact lever and every bit-changing lever that has passed its quality qualification. None has yet, so `fast` runs the `default` levers and lists the fast-only rows as pending. |
+| `quality` | = `default`. DeepSeek on the RTX has no higher-precision expert pack, so there is nothing to trade for quality. |
+
+| Lever | Kind | default | fast | quality | Status | Override |
+|---|---|---|---|---|---|---|
+| Lean decode state | exact | ON | ON | ON | ready | `--no-lean-state` |
+| Q8 R1 GEMVs | exact | ON | ON | ON | ready | `--q8-r1-off`, `--q8-r1-pad` |
+| dsrtxk decode kernels | exact | ON | ON | ON | ready | `--dsrtxk-off` |
+| Fusions (hc, shared expert) | exact | ON | ON | ON | ready | `--fuse-off` |
+| Decode forms (deferred records, router form 2, qa_kv S=1) | exact | ON | ON | ON | ready | `--records-inline`, `--router-pf0`, `--qakv-auto` |
+| Auto eviction | exact | ON | ON | ON | ready | `--evict lru` |
+| Controller window (built-in prior, seeded costs, chat scope) | exact | ON | ON | ON | ready | `--window`, `--controller-prior`, `--controller-costs`, `--controller-scope` |
+| Drafter keep-64 | exact | ON | ON | ON | ready | `--draft-keep 0` |
+| Drafter vocabulary auto | exact | ON | ON | ON | ready | `--draft-vocab full` |
+| Deferred write-backs | exact | ON | ON | ON | ready | `--no-wb-defer` |
+| CE pacing | exact | ON | ON | ON | ready | `--no-ce-pacing`, `STRIX_DS41_CE_PACING=0` |
+| Write-back stream | exact | ON | ON | ON | ready | `--no-wb-stream`, `STRIX_DS41_WB_STREAM=0` |
+| File tier fallback | exact | ON | ON | ON | ready | `--no-file-tier`, `STRIX_DS41_FILE_TIER=0` |
+| Residency auto seed / save | exact | ON | ON | ON | ready | `--residency-seed none`, `--residency-save none` |
+| Warmup graphs (serve) | exact | ON | ON | ON | ready | `--warmup-graphs none` |
+| Engram RAM cache | exact | ON | ON | ON | ready | `--engram-cache-mb 0` |
+| Layer-major exact prompt path | exact | pending | pending | pending | PRO-qualified exact (about -5 %); pending owner review, not in this build | - |
+| Prefill service closed batches (batch-long) | exact | - | pending | - | pending: decision on the first member's TTFT | prefill service `--batch-max` |
+| DS FP16 dense prefill | bit-changing | - | pending | - | pending: quality qualification | prefill service |
+
+A pending row is never silently used. The builtin form runs, the row is listed under `pending` in the `profile` object
+of `--print-config` and in the run's first `profile` event, and stderr names it. `--allow-pending` (or
+`STRIX_DS41_PROFILE_ALLOW_PENDING=1`) runs a pending row whose implementation is in this build, for benchmarks only,
+and stamps the receipt `"qualification": "unqualified: <rows>"`. No replica row is runnable that way today. The
+`profile` object gives each lever's value, status (`profile`, `explicit-cli`, `explicit-env`, `baseline-cli`,
+`baseline-env`, `pending` or `unqualified`), effective form, kind, switches and source commit. `--baseline` still
+restores every reference form, and `--profile` is a load-time option that a worker request cannot change.
+
+The prefill service (`strix-cuda-ds41-prefill-service`) does not take `--profile` yet. Its default already runs the
+fast dense / fast MoE arm (`--exact` for the reference bits), so a `default` profile there would change today's service
+behaviour. Its rows (batch-long, FP16 dense) are in the resolver's table (`strix/ds41_rtx_profile.hpp`) for the
+service to use once that decision is made.
+
 ## Optimizations (default ON) and off switches
 
 These options change scheduling, placement or draft proposals. Committed
@@ -132,6 +290,8 @@ this defaults change is checked on CPU and does not establish new GPU results.
 | Eviction | Public tierstream scored victims after verify windows; plain steps keep LRU | Auto | DSpark misses/token −14 %, median +6.4 % tok/s (7 chats); plain decode neutral | Bitwise (only residency changes) | `--evict lru` |
 | CE pacing | Cap background write-back debt on the single copy engine at about one expert (demand and speculation stay first) | ON | 4 alternating loads: DSpark +2.7 % / plain -0.5 % / wall -1.1 % adjacent, neutral bracketed | Bitwise (only copy timing changes) | `--no-ce-pacing` / `STRIX_DS41_CE_PACING=0` |
 | Write-back stream | Deferred write-backs go out on their own D2H stream (tierstream `dg_wb_stream`) so they overlap the next layer's demand H2D | ON | 4 alternating loads: DSpark plain -2.0 %, controller -6.4 % per commit; copy bench duplex 43.3 to 44.8 GB/s | Bitwise (same copies, order and destinations; only the stream changes) | `--no-wb-stream` / `STRIX_DS41_WB_STREAM=0` |
+| File tier | Load with VRAM + pinned RAM + NVMe tiers when the host cannot pin every non-resident expert, instead of refusing | ON (only when needed) | Pending PRO runs (estimates above) | Bitwise (placement only) | `--no-file-tier` / `STRIX_DS41_FILE_TIER=0` |
+| Clean copies | Inclusive share of the pinned tier (`--ram-inclusive-gib`) | Off | Pending PRO runs | Bitwise (placement only) | `--ram-inclusive-gib 0` |
 
 `--baseline` restores all reference forms at that argument; later explicit
 flags override their own settings. `STRIX_DS41_RTX_BASELINE=1` applies the
@@ -141,6 +301,8 @@ and serial loading unless the caller already set `DG_LOAD_SERIAL`. It also
 restores phase-inferred row capacity and 4 pressure spares.
 `--dsrtxk`, `--fuse`, `--records-deferred`, `--router-pf`, `--qakv-s1`, and
 `--q8-r1` can re-enable those features after baseline.
+
+Baseline also turns the file tier off (the old refusal) and the clean-copy share to 0.
 
 Normal defaults use 48 host spares, 8 pressure spares and 6 maximum rows.
 An explicit `--arena-gib` wins over the drafter-dependent arena rule.

@@ -62,6 +62,8 @@ struct ReplicaCensus {
         CENSUS_TRAFFIC(wb_boundary_flushed_bytes); CENSUS_TRAFFIC(wb_outstanding_start_bytes); CENSUS_TRAFFIC(wb_outstanding_bytes);
         CENSUS_TRAFFIC(wb_deferred); CENSUS_TRAFFIC(wb_cancelled); CENSUS_TRAFFIC(wb_forced); CENSUS_TRAFFIC(wb_boundary_flushed);
         CENSUS_TRAFFIC(wb_forced_wait_ns); CENSUS_TRAFFIC(device_timeouts);
+        CENSUS_TRAFFIC(disk_reads); CENSUS_TRAFFIC(disk_read_bytes); CENSUS_TRAFFIC(disk_wait_ns); CENSUS_TRAFFIC(disk_stage_waits);
+        CENSUS_TRAFFIC(disk_drops); CENSUS_TRAFFIC(disk_carried);
         CENSUS_TRAFFIC(boundary_sync_us); CENSUS_TRAFFIC(boundary_select_us); CENSUS_TRAFFIC(boundary_upload_us); CENSUS_TRAFFIC(boundary_issue_us);
 #undef CENSUS_TRAFFIC
         os << ",\"target_device_ms\":" << target_device_ms << ",\"draft_device_ms\":" << draft_device_ms
@@ -121,6 +123,8 @@ struct ReplicaCensusTotals {
         ADD_CENSUS(traffic.wb_forced); ADD_CENSUS(traffic.wb_boundary_flushed); ADD_CENSUS(traffic.wb_forced_wait_ns);
         ADD_CENSUS(traffic.device_timeouts); ADD_CENSUS(traffic.boundary_sync_us); ADD_CENSUS(traffic.boundary_select_us);
         ADD_CENSUS(traffic.boundary_upload_us); ADD_CENSUS(traffic.boundary_issue_us);
+        ADD_CENSUS(traffic.disk_reads); ADD_CENSUS(traffic.disk_read_bytes); ADD_CENSUS(traffic.disk_wait_ns);
+        ADD_CENSUS(traffic.disk_stage_waits); ADD_CENSUS(traffic.disk_drops); ADD_CENSUS(traffic.disk_carried);
 #undef ADD_CENSUS
         for (std::size_t l = 0; l < 40; ++l) {
             auto& a = sum.layers[l]; const auto& b = c.layers[l];
