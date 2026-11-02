@@ -663,8 +663,9 @@ public:
         plan_identity_=sha256_bytes(frame);
     }
     void observe_serial_unit(const KnownPromptChunkUnit& unit) {serial_executed_.push_back(unit);}
-    void certificate_decline(const char* reason) {
-        request_->refusal=reason;++request_->certificate_declines[reason];
+    void certificate_decline(PrefixCertificateDecline reason) {
+        const auto name=prefix_certificate_decline_names[static_cast<std::size_t>(reason)];
+        request_->refusal=name; ++request_->certificate_declines[std::string(name)];
         if(store_) store_->record_certificate_decline(reason);
     }
     [[nodiscard]] const std::optional<QwenPlanCursor>& continuation() const {return continuation_;}
@@ -705,7 +706,7 @@ public:
             throw std::invalid_argument("prefix state cache restores only into a fresh ready session");
         imported_ = false;
         if (policy_selection_) {
-            if (store_ || rtx_registry_) request_->refusal = "policy-selection-cache-unqualified";
+            if (store_ || rtx_registry_) certificate_decline(PrefixCertificateDecline::policy_selection_cache_unqualified);
             return 0;
         }
         if (before_restore_hook_) before_restore_hook_();
@@ -715,41 +716,48 @@ public:
         // STRIX_PREFIX_CACHE_LOOKUP=0: capture only (diagnostic; every request prefills from position 0).
         static const bool lookup = [] { const char* v = std::getenv("STRIX_PREFIX_CACHE_LOOKUP"); return !v || v[0] != '0'; }();
         if(serial_path_ && (!plan_enabled_ || block_rows_!=plan_.rows)) {
-            certificate_decline("serial-plan-unsupported");return 0;
+            certificate_decline(PrefixCertificateDecline::serial_plan_unsupported);return 0;
         }
         if (prompt.size() < 2U || !lookup) {
-            if(serial_path_) certificate_decline("serial-lookup-disabled-or-short");
+            certificate_decline(serial_path_?PrefixCertificateDecline::serial_lookup_disabled_or_short:PrefixCertificateDecline::prefix_lookup_disabled_or_short);
             return 0;
         }
         const auto start = std::chrono::steady_clock::now();
         std::function<bool(const PrefixCacheCheckpoint&)> eligible;
         if(certified_path_) eligible=[&](const PrefixCacheCheckpoint& c) {
-            if(!allow_restore_ || (plan_route_==2 &&
-                !qwen_suffix_solo_class(plan_,plan_n_,c.position,batch_config_,nesting_possible_))) return false;
-            if(serial_path_ && (!plan_enabled_ || block_rows_!=plan_.rows)) {certificate_decline("serial-plan-unsupported");return false;}
+            if(!allow_restore_) {certificate_decline(PrefixCertificateDecline::prefix_restore_disabled);return false;}
+            if(plan_route_==2 &&
+                !qwen_suffix_solo_class(plan_,plan_n_,c.position,batch_config_,nesting_possible_)) {
+                certificate_decline(PrefixCertificateDecline::batch_suffix_not_solo);return false;
+            }
+            if(serial_path_ && (!plan_enabled_ || block_rows_!=plan_.rows)) {certificate_decline(PrefixCertificateDecline::serial_plan_unsupported);return false;}
             if(!plan_enabled_ || c.identity!=active_identity() || c.block_rows!=block_rows_ || c.position>=prompt.size() ||
                 c.producer_certificate.empty()) {
-                if(serial_path_) certificate_decline("serial-certificate-missing-or-incompatible");
+                certificate_decline(serial_path_?PrefixCertificateDecline::serial_certificate_missing_or_incompatible:PrefixCertificateDecline::prefix_certificate_missing_or_incompatible);
                 return false;
             }
             const auto proof=execution_certificate(c.position);
             if(proof.empty() || proof!=c.producer_certificate) {
-                if(serial_path_) certificate_decline("serial-producer-plan-mismatch");
+                certificate_decline(serial_path_?PrefixCertificateDecline::serial_producer_plan_mismatch:PrefixCertificateDecline::prefix_producer_plan_mismatch);
                 return false;
             }
             if(serial_path_ && (!serial_can_resume_ || !serial_can_resume_(c.position))) {
-                certificate_decline("serial-cursor-continuation-unsupported");return false;
+                certificate_decline(PrefixCertificateDecline::serial_cursor_continuation_unsupported);return false;
             }
             try { (void)preflight_checkpoint(session,c); }
-            catch(const std::runtime_error&) {if(serial_path_) certificate_decline("serial-checkpoint-preflight");return false;}
+            catch(const std::runtime_error&) {
+                certificate_decline(serial_path_?PrefixCertificateDecline::serial_checkpoint_preflight:PrefixCertificateDecline::prefix_checkpoint_preflight);return false;
+            }
             if(serial_path_) return true;
             continuation_=qwen_full_t_continuation(plan_,plan_n_,c.position);
+            if(!continuation_) certificate_decline(PrefixCertificateDecline::prefix_continuation_unsupported);
             return continuation_.has_value();
         };
         const auto checkpoint = store_->find_longest(active_identity(), prompt, block_rows_, prompt.size() - 1U, retain_, conversation_,eligible);
         request_->lookup_ms = ms(start);
         if (!checkpoint) {
-            if(serial_path_ && request_->certificate_declines.empty()) certificate_decline("serial-no-certified-checkpoint");
+            if(request_->certificate_declines.empty())
+                certificate_decline(serial_path_?PrefixCertificateDecline::serial_no_certified_checkpoint:PrefixCertificateDecline::prefix_no_compatible_checkpoint);
             return 0;
         }
         if(serial_path_) for(const auto& u:serial_cold_) {
@@ -841,7 +849,7 @@ private:
         std::shared_ptr<const void> target_owner,std::shared_ptr<const void> predictor_owner,const void* owner_tag,
         bool split_target) {
         PrefixAsyncCapture::reap();
-        if(serial_path_) {certificate_decline("serial-async-capture-unsupported");return {};}
+        if(serial_path_) {certificate_decline(PrefixCertificateDecline::serial_async_capture_unsupported);return {};}
         const auto p=session.next_position;
         if(policy_selection_ || !store_ || store_->policy().legacy || !certified_path_ || !plan_enabled_ || imported_ ||
             !p || p>=prompt.size() || p%block_rows_ || session.committed_tokens!=p ||
@@ -965,25 +973,25 @@ public:
         covered = std::min<std::uint64_t>(covered, prompt.size());
         if(serial_path_ && (!position || position>=prompt.size() || position%block_rows_ ||
             session.committed_tokens!=position || session.health!=SerialSessionHealth::ready)) {
-            certificate_decline("serial-capture-boundary-unsupported");return;
+            certificate_decline(PrefixCertificateDecline::serial_capture_boundary_unsupported);return;
         }
         if (!position || position % block_rows_ || position > prompt.size() || session.health != SerialSessionHealth::ready ||
             session.arithmetic_lineage.tainted || session.committed_tokens != position) {
-            if(serial_path_) certificate_decline("serial-capture-metadata-mismatch");
+            if(serial_path_) certificate_decline(PrefixCertificateDecline::serial_capture_metadata_mismatch);
             return;
         }
         if(serial_path_) {
-            if(!plan_enabled_ || block_rows_!=plan_.rows) {certificate_decline("serial-plan-unsupported");return;}
+            if(!plan_enabled_ || block_rows_!=plan_.rows) {certificate_decline(PrefixCertificateDecline::serial_plan_unsupported);return;}
             if(!known_prompt_full_t_prefix(serial_executed_,position,plan_.rows) ||
                 qwen_serial_certificate(plan_,serial_executed_,plan_n_,position)!=
                 qwen_serial_certificate(plan_,serial_cold_,plan_n_,position)) {
-                certificate_decline("serial-capture-unit-unsupported");return;
+                certificate_decline(PrefixCertificateDecline::serial_capture_unit_unsupported);return;
             }
         }
         if(certified_path_ && (!plan_enabled_ || (!serial_path_ && !qwen_full_t_continuation(plan_,plan_n_,position)) ||
             !qwen_capture_boundary(position,prompt.size(),block_rows_,
                 certified_metadata(session.state,session.arithmetic_lineage,position),false,true))) {
-            if(serial_path_) certificate_decline("serial-capture-metadata-mismatch");
+            if(serial_path_) certificate_decline(PrefixCertificateDecline::serial_capture_metadata_mismatch);
             return;
         }
         if (!prefix_capture_boundary_selected(position,covered,block_rows_,every_)) return;

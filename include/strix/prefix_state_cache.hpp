@@ -179,7 +179,30 @@ public:
     }
 };
 
-inline constexpr std::array<std::string_view,11> prefix_certificate_decline_names{
+enum class PrefixCertificateDecline : std::size_t {
+    serial_async_capture_unsupported,
+    serial_lookup_disabled_or_short,
+    serial_certificate_missing_or_incompatible,
+    serial_plan_unsupported,
+    serial_no_certified_checkpoint,
+    serial_producer_plan_mismatch,
+    serial_cursor_continuation_unsupported,
+    serial_checkpoint_preflight,
+    serial_capture_unit_unsupported,
+    serial_capture_boundary_unsupported,
+    serial_capture_metadata_mismatch,
+    policy_selection_cache_unqualified,
+    prefix_lookup_disabled_or_short,
+    prefix_restore_disabled,
+    batch_suffix_not_solo,
+    prefix_certificate_missing_or_incompatible,
+    prefix_producer_plan_mismatch,
+    prefix_checkpoint_preflight,
+    prefix_continuation_unsupported,
+    prefix_no_compatible_checkpoint,
+};
+
+inline constexpr std::array<std::string_view,20> prefix_certificate_decline_names{
     "serial-async-capture-unsupported",
     "serial-lookup-disabled-or-short",
     "serial-certificate-missing-or-incompatible",
@@ -191,6 +214,15 @@ inline constexpr std::array<std::string_view,11> prefix_certificate_decline_name
     "serial-capture-unit-unsupported",
     "serial-capture-boundary-unsupported",
     "serial-capture-metadata-mismatch",
+    "policy-selection-cache-unqualified",
+    "prefix-lookup-disabled-or-short",
+    "prefix-restore-disabled",
+    "batch-suffix-not-solo",
+    "prefix-certificate-missing-or-incompatible",
+    "prefix-producer-plan-mismatch",
+    "prefix-checkpoint-preflight",
+    "prefix-continuation-unsupported",
+    "prefix-no-compatible-checkpoint",
 };
 struct PrefixStateCacheStats {
     std::uint64_t lookups = 0, plan_misses = 0, host_hits = 0, disk_hits = 0, misses = 0;
@@ -287,7 +319,7 @@ public:
     void record_staging(std::uint64_t cap, std::uint64_t bytes, bool active);
     void record_staging_skip(bool cap);
     void record_cross_stream_skip();
-    void record_certificate_decline(const std::string& reason);
+    void record_certificate_decline(PrefixCertificateDecline reason) noexcept;
     void record_tripwire_skip();
     void record_batch_config_skip();
     void record_row_prefetch();
@@ -358,6 +390,10 @@ private:
     std::list<ModelContentIdentity> lru_;  // front: least recently used
     std::map<ModelContentIdentity, std::weak_ptr<const PrefixCacheSegment>, DigestLess> segments_;
     PrefixStateCacheStats stats_;
+    // Refusals run outside lookup locks; no allocation or additional store lock.
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    std::array<std::atomic<std::uint64_t>,prefix_certificate_decline_names.size()> certificate_declines_{};
+    friend struct PrefixStateCacheTestAccess;
     // Disk writer.
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_, idle_cv_;

@@ -998,6 +998,8 @@ void PrefixStateCache::record_no_store_skip() {
 PrefixStateCacheStats PrefixStateCache::counters() {
     std::lock_guard lock(mutex_);
     auto out = stats_;
+    for(std::size_t i=0;i<certificate_declines_.size();++i)
+        out.certificate_declines[i]=certificate_declines_[i].load(std::memory_order_relaxed);
     if (policy_.legacy) {
         out.host_bytes = host_bytes_locked(); out.host_segments = segments_.size();
     } else {
@@ -1014,6 +1016,8 @@ PrefixStateCacheStats PrefixStateCache::stats() {
     if (!policy_.legacy) return counters();
     std::lock_guard lock(mutex_);
     auto out = stats_;
+    for(std::size_t i=0;i<certificate_declines_.size();++i)
+        out.certificate_declines[i]=certificate_declines_[i].load(std::memory_order_relaxed);
     out.host_bytes = host_bytes_locked();
     out.host_checkpoints = entries_.size();
     out.host_segments = segments_.size();
@@ -1119,10 +1123,8 @@ void PrefixStateCache::record_staging_skip(bool cap) {
 
 namespace strix {
 void PrefixStateCache::record_row_prefetch() {std::lock_guard lock(mutex_); ++stats_.row_prefetches;}
-void PrefixStateCache::record_certificate_decline(const std::string& reason) {
-    std::lock_guard lock(mutex_);
-    for(std::size_t i=0;i<prefix_certificate_decline_names.size();++i)
-        if(prefix_certificate_decline_names[i]==reason) {++stats_.certificate_declines[i];return;}
+void PrefixStateCache::record_certificate_decline(PrefixCertificateDecline reason) noexcept {
+    certificate_declines_[static_cast<std::size_t>(reason)].fetch_add(1,std::memory_order_relaxed);
 }
 void PrefixStateCache::record_snapshot_preparation() {std::lock_guard lock(mutex_); ++stats_.snapshot_preparations;}
 void PrefixStateCache::record_tripwire_skip() {std::lock_guard lock(mutex_); ++stats_.capture_skips_tripwire;}
