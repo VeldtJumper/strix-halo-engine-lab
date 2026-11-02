@@ -235,7 +235,7 @@ build `7b2453fe`; the row's other cells are from the build above.
 | 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
 
 These are exactness checks against serial YaRN, not native rotary; they do not establish general model
-fidelity at these lengths. See the [README long-context section](../README.md#qwen-long-context).
+fidelity at these lengths. See the [Qwen long-context section](models/qwen3.8/README.md#qwen-long-context).
 
 ### Two replicas (one complete model per node, behind the router)
 

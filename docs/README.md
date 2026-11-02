@@ -7,10 +7,16 @@ work as it stood on their date; documents marked **Superseded** name their repla
 
 ## Getting started
 
+- [Getting started: requirements, build and run](getting-started/README.md) ([Español](getting-started/README.es.md)): Requirements per engine, the complete build, where each engine's launch command lives.
 - [Engine reference](getting-started/engine-reference.md): Decode configuration, build options, full CLI, prefill, draft vocab, env switches, repo layout, docs map.
 
 ## Models
 
+- [Qwen3.8-Flash-Next](models/qwen3.8/README.md) ([Español](models/qwen3.8/README.es.md)): Results, launch commands, profiles, long context, GSQ, bit-changing prefill options and tuning switches on one node.
+- [DeepSeek V4.1 Flash](models/deepseek-v4.1/README.md) ([Español](models/deepseek-v4.1/README.es.md)): Results, launch commands and profiles for the USB4 pair, the RTX pipeline split and the standalone RTX.
+- [MiniMax M3.1 Flash](models/minimax-m3.1/README.md) ([Español](models/minimax-m3.1/README.es.md)): Results, quality gate and launch command on the USB4 pair.
+- [GLM-5.3 Flash](models/glm-5.3/README.md) ([Español](models/glm-5.3/README.es.md)): Results and launch commands for the USB4 pair and for one RTX PRO 6000.
+- [Nemotron 3.5 Bolt E4B](models/nemotron-3.5-bolt-e4b/README.md) ([Español](models/nemotron-3.5-bolt-e4b/README.es.md)): Profiles, assets, build and run, results and off switches on one node.
 - [Model families](models/model-families.md): Model-family registry in the core and how to add a family; deepseek41 as worked example.
 - [deepseek41 decode attention (CSA2)](models/deepseek-v4.1/attention.md): deepseek41 CSA2 decode attention on gfx1151: shapes, indexer, RoPE, declared arithmetic, host references.
 - [Sixteen-row BatchForward steps](models/deepseek-v4.1/batch-rows16.md): STRIX_DS41_BATCH_ROWS16: up to sixteen rows per BatchForward step.
@@ -41,12 +47,14 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [Qwen attention, draft and recurrent dispatch experiments](models/qwen3.8/persistence-kernels.md): STRIX_QPERSIST_* attention, draft and recurrent persistent dispatch experiments for Qwen.
 - [Shared down R8 organization (draft)](models/qwen3.8/shared-down-r8.md): Draft STRIX_QWEN_SHARED_DOWN_NARROW shared-expert down projection organization for R8 windows.
 
-MiniMax M3.1 and GLM have no dedicated pages yet; their status is in the top-level README
-and [performance.md](performance.md).
 
 ## Performance
 
 - [Measured performance](performance.md): All measured speed numbers with date, config and exactness check, per model and for the USB4 link.
+- [Methodology](methodology.md) ([Español](methodology.es.md)): How the tables are read, exactness per engine, model fidelity, defaults and off switches, design decisions.
+- [Measured gains](measured-gains.md) ([Español](measured-gains.es.md)): Changelog of every shipped default with its measured gain, exactness evidence and off switch.
+- [Two nodes over USB4](pair.md) ([Español](pair.es.md)): The pair, what it needs, how DeepSeek, MiniMax and GLM run on it, links to the transport internals.
+- [Serving over HTTP](serving.md) ([Español](serving.es.md)): Which server each engine has, serving features, exposing the servers safely.
 
 ## Architecture (normative)
 
