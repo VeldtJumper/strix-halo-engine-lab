@@ -44,6 +44,37 @@ void Sampling::validate() const {
     require(std::isfinite(temperature) && temperature >= 0 && std::isfinite(top_p) && top_p > 0 && top_p <= 1,
             "invalid temperature/top_p");
 }
+std::vector<std::uint32_t> candidate_order(std::span<const float> logits, std::uint32_t top_k) {
+    // One 64-bit key per id, ascending in better() order: the logit's order-preserving bits inverted (descending
+    // logit, -0 == +0), then the id (low id first on ties). Keys are distinct, so any correct sort gives this order.
+    const auto n = logits.size();
+    std::vector<std::uint64_t> keys(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        auto bits = bit_cast<std::uint32_t>(logits[i]);
+        if ((bits & 0x7fffffffU) == 0) bits = 0;
+        const auto ascending = bits & 0x80000000U ? ~bits : bits | 0x80000000U;
+        keys[i] = std::uint64_t(~ascending) << 32U | i;
+    }
+    if (top_k && top_k < n) {
+        std::nth_element(keys.begin(),keys.begin()+top_k,keys.end());
+        keys.resize(top_k);
+        std::sort(keys.begin(),keys.end());
+    } else {
+        // LSD radix sort, four 16-bit digits.
+        std::vector<std::uint64_t> other(n);
+        std::vector<std::size_t> count(65537);
+        for (unsigned shift = 0; shift < 64; shift += 16) {
+            std::fill(count.begin(),count.end(),0);
+            for (const auto k : keys) ++count[(k >> shift & 0xffffU)+1];
+            for (std::size_t d = 1; d < count.size(); ++d) count[d] += count[d-1];
+            for (const auto k : keys) other[count[k >> shift & 0xffffU]++] = k;
+            keys.swap(other);
+        }
+    }
+    std::vector<std::uint32_t> order(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) order[i] = std::uint32_t(keys[i]);
+    return order;
+}
 std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws) {
     sampling.validate();
     require(!logits.empty() && logits.size() <= UINT32_MAX, "empty/oversized logits");
@@ -51,10 +82,17 @@ std::uint32_t select_token(std::span<const float> logits, const Sampling& sampli
     std::uint32_t best = 0;
     for (std::uint32_t i = 1; i < logits.size(); ++i) if (better(logits[i],i,logits[best],best)) best = i;
     if (sampling.temperature == 0) return best;
-    std::vector<std::uint32_t> order(logits.size());
-    std::iota(order.begin(),order.end(),0U);
-    std::sort(order.begin(),order.end(),[&](auto a, auto b) { return better(logits[a],a,logits[b],b); });
-    if (sampling.top_k && order.size() > sampling.top_k) order.resize(sampling.top_k);
+    // STRIX_G4_SAMPLE_ORDER=legacy restores the comparator sort; both give the same order.
+    const auto* order_env = std::getenv("STRIX_G4_SAMPLE_ORDER");
+    std::vector<std::uint32_t> order;
+    if (order_env && std::string(order_env) == "legacy") {
+        order.resize(logits.size());
+        std::iota(order.begin(),order.end(),0U);
+        std::sort(order.begin(),order.end(),[&](auto a, auto b) { return better(logits[a],a,logits[b],b); });
+        if (sampling.top_k && order.size() > sampling.top_k) order.resize(sampling.top_k);
+    } else {
+        order = candidate_order(logits,sampling.top_k);
+    }
     std::vector<double> weights;
     double sum = 0;
     for (const auto id : order) {
