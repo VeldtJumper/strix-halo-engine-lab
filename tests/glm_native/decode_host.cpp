@@ -391,6 +391,14 @@ void tier_budget_tests(){
     check(three.refuse.empty()&&three.three_tier&&three.staging==8&&three.disk>0&&three.resident+three.pinned+three.disk==keys,"three-tier when RAM is short");
     check((three.pinned+three.host_spares+three.staging)*unit<=in.host_bytes&&(three.pinned+three.host_spares+three.staging+1)*unit>in.host_bytes,"pinned tier fills the RAM budget");
     auto lib=library_budget(three,unit,keys,8);check(lib.ring_slots==17&&lib.device_bytes>=(three.slots+17)*unit&&lib.host_bytes>=three.host_bytes(unit),"library budget covers arena/ring and pinned blocks");
+    // Defaults: no new option changes today's behaviour (queue 1 = no extra bounce buffers, no stripes, no clean evict).
+    {const DecodeOptions d{};check(disk_bounce_readers(d)==0&&d.weight_dirs.empty()&&d.drive_readers==0&&d.tier_disk_queue==1&&!d.tier_clean_evict&&!d.routes_prefill&&TierBudgetIn{}.disk_readers==0,"new options default off");
+     auto q=d;q.tier_disk_queue=8;check(disk_bounce_readers(q)==8,"queue 8: eight reader bounce buffers");
+     bool bad=false;for(const char* v:{"",";","D:/s;;C:/s","D:/s;d:\\S\\"," ;D:/s"}){try{check_weight_dirs(v);}catch(...){continue;}bad=true;}
+     check(!bad,"--weight-dirs: empty entries and duplicates refused");try{check_weight_dirs("D:/a;C:/b");}catch(...){check(false,"--weight-dirs: two distinct directories accepted");}}
+    // dg_disk_queue > 1: one bounce buffer per disk reader, billed in the plan, host bytes and library budget.
+    {auto q=three;q.disk_readers=8;const auto lq=library_budget(q,unit,keys,8);const auto stride=(unit+4095)/4096*4096;
+     check(q.host_bytes(unit)==three.host_bytes(unit)+8*unit&&lq.host_bytes==lib.host_bytes+8*stride&&lq.device_bytes==lib.device_bytes,"disk-reader bounce buffers are billed to pinned host memory");}
     in.device_bytes=10*unit;check(!tier_budget(in).refuse.empty(),"VRAM below ring + spares refused");
     in.device_bytes=40ULL<<30;in.host_bytes=10*unit;check(!tier_budget(in).refuse.empty(),"host below spares + staging refused");
     in.host_bytes=48ULL<<30;in.file_tier=false;check(!tier_budget(in).refuse.empty(),"no file tier and short RAM refused");
@@ -674,6 +682,19 @@ void placement_tests(){
     std::vector<std::uint64_t> counts;auto tokens=count_routes("# seq a rows 5\n"+line+"\n"+line+"\n# seq b rows 2\n3:9\n",counts);
     check(tokens==3&&counts[0*288+0]==2&&counts[0*288+9]==1&&counts[42*288+ids[42*8]]==2,"routes census counts by key");
     bool bad=false;try{count_routes("2:1\n",counts);}catch(...){bad=true;}check(bad,"routes: dense layer refused");
+    // Prefill census rows: the unset MTP layer (45) is left out, never counted as expert 0.
+    {auto pre=ids;for(unsigned k=0;k<8;++k)pre[42*8+k]=~0u;const auto pl=routes_line_present(pre.data());
+     check(pl==line.substr(0,line.find(" 45:")),"prefill census line: layers 3..44 only");
+     std::vector<std::uint64_t> pc;check(count_routes(pl+"\n",pc)==1&&pc[42*288+ids[42*8]]==0&&pc[0*288+0]==1,"prefill census: no MTP-layer counts");}
+    // A layer the census never saw (the MTP layer of a prefill census) gets the observed mean per unit,
+    // so it interleaves with the observed layers instead of sorting last with no device slot.
+    {std::vector<std::uint64_t> u(43*288);for(unsigned g=0;g<42;++g)for(unsigned e=0;e<288;++e)u[g*288+e]=(e%4==0)?8:0; // mean 2
+     check(fill_unobserved_layers(u)==1&&u[42*288+0]==2&&u[42*288+287]==2&&u[0]==8&&u[1]==0,"unobserved layer filled at the mean per-unit rate");
+     const auto order=seed_order({},u);std::size_t first42=order.size();for(std::size_t i=0;i<order.size();++i)if(order[i]/288==42){first42=i;break;}
+     check(first42<42*72+288,"unobserved layer interleaves with the observed ones");
+     std::vector<std::uint64_t> none(43*288),all(43*288,1);check(fill_unobserved_layers(none)==0&&fill_unobserved_layers(all)==0,"no census or a full census: unchanged");
+     // barely sampled (a few decode tokens vs thousands of prefill rows) counts as unobserved too
+     auto t=u;for(unsigned e=0;e<288;++e)t[42*288+e]=(e<8)?1:0;check(fill_unobserved_layers(t)==1&&t[42*288+100]==2,"under-sampled layer filled at the mean");}
     // Priority: residency first, then most routed (ties: round-robin order), then the rest.
     std::vector<std::uint64_t> c(43*288);c[5*288+3]=9;c[0*288+200]=4;c[7]=4;
     auto o=seed_order({100,5*288+3},c);check(o.size()==43ULL*288&&o[0]==100&&o[1]==5*288+3&&o[2]==7&&o[3]==200&&o[4]==0&&o[5]==288,"seed order: residency, counts (ties round-robin), then round-robin");

@@ -649,7 +649,7 @@ struct Runtime::Impl {
     DsaIndex index(const std::string& id){if(id=="glm-pf-rtx-native-v1"||id==dsa_identity)return DsaIndex::fp32;for(auto v:{DsaIndex::mma,DsaIndex::mma_proj_fp32_score,DsaIndex::fp32_proj_mma_score,DsaIndex::tf32x3})if(id==dsa_index_identity(v))return v;throw std::runtime_error("unsupported producer identity");}
     void run(std::span<const U32> input,const std::string& identity,const StateSink& sink){
         choose_tile(input.size());
-        try{run_prefill(input,identity,sink);record_tile();record_prefill_cache();}
+        try{run_prefill(input,identity,sink);record_tile();record_prefill_cache();write_census_rows();}
         catch(const std::exception& e){if(prefill_via_cache&&ts_tier)ts_tier->abort_prefill(e.what());throw;}
         catch(...){if(prefill_via_cache&&ts_tier)ts_tier->abort_prefill("prefill: non-standard exception");throw;}
     }
@@ -661,6 +661,7 @@ struct Runtime::Impl {
         for(auto& r:ring){if(r.read.valid())r.read.get();r.layer=-1;}
         std::fill(std::begin(staged),std::end(staged),false);
         need(input.size()>=2&&input.size()<=capacity,"prompt exceeds resident capacity");for(auto t:input)need(t<154880,"token outside vocabulary");unsigned P=unsigned(input.size()-1);auto mode=index(identity);
+        census_rows.clear();if(dopt.routes_prefill&&routes_file.is_open())census_rows.assign(std::size_t(P)*routed_gated*routed_topk,~U32(0));
         ck(cudaMemsetAsync(flag.p,0,4,compute.s));ck(cudaMemcpyAsync(tokens.p,input.data(),input.size_bytes(),cudaMemcpyHostToDevice,h2d.s));ck(cudaStreamSynchronize(h2d.s));
         embed<<<unsigned((std::size_t(P)*4*4096+255)/256),256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>(),X.as<float>(),P,4);
         // Entire prefix for each layer. No state from a later layer becomes
@@ -689,6 +690,8 @@ struct Runtime::Impl {
                 };
                 auto binding=prefill_binding(first,n,identity,legacy_index,session_key(P));
                 if(graphs){auto& g=graph[l][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
+                // Census: this tile's router ids, in stream order before the next tile's router overwrites them.
+                if(!census_rows.empty()&&l>=3)ck(cudaMemcpy2DAsync(census_rows.data()+std::size_t(first)*routed_gated*routed_topk+std::size_t(l-3)*routed_topk,routed_gated*routed_topk*4,ids.p,routed_topk*4,routed_topk*4,n,cudaMemcpyDeviceToHost,compute.s));
             }
             if(prefill_via_cache&&l>=3)prefill_end(l); // close the layer's step, release its units
             // H2D for N+1 runs while N's queued kernels execute. Acquisition
@@ -812,7 +815,7 @@ struct Runtime::Impl {
         if(d.reference_compare)in.pinned.push_back({compare_part,8*hstride+288*sizeof(Expert)});
         in.pageable={{process_part,process_private}};if(d.reference_compare)in.pageable.push_back({compare_part,hstride});
         add_host_growth_parts(in.pageable,kv); // the bench snapshot (= session state + replay) and driver growth
-        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;
+        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;in.tier.disk_readers=disk_bounce_readers(d);
         if(d.tier_ram_gib>=0)in.ram_expert_bytes=gib_bytes(d.tier_ram_gib);
         if(d.tier_vram_gib>=0){TierBudgetIn t=in.tier;const auto req=gib_bytes(d.tier_vram_gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;
             in.arena_units=tier_budget(t).resident;} // the explicit arena, planned (and checked) before any load
@@ -947,7 +950,7 @@ struct Runtime::Impl {
         auto [physical,commit]=host_free();const std::uint64_t host_avail=host_budget(physical,commit,floor_gib);
         std::uint64_t avail=0,dev=0,host=host_avail;TierBudget b;Json open_plan;
         // Arena-only requests (--tier-vram-gib / --tier-ram-gib) are granted exactly or refused with the numbers.
-        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;
+        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;t.disk_readers=disk_bounce_readers(dopt);
             const auto req=gib_bytes(gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;return tier_budget(t).resident;};
         if(whole_device){
             // Re-plan from what is allocated now (measured device use; process
@@ -969,11 +972,12 @@ struct Runtime::Impl {
             if(dopt.tier_ram_gib>=0){host=gib_bytes(dopt.tier_ram_gib);
                 need(host<=host_avail,("requested tierstream RAM tier "+gib_text(host)+" exceeds the "+gib_text(host_avail)+" host memory available above the floor at cache open").c_str());}
             TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=dev>(256ULL<<20)?dev-(256ULL<<20):0;in.host_bytes=host>(256ULL<<20)?host-(256ULL<<20):0;
-            in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;b=tier_budget(in);
+            in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;in.disk_readers=disk_bounce_readers(dopt);b=tier_budget(in);
         }
         need(b.refuse.empty(),b.refuse.empty()?"":b.refuse.c_str());
         TierOpenConfig cfg;// The cache opens the canonical held path, never the operator's (possibly aliased) name.
         const auto order=placement_order();cfg.tiers=tier_assignment(b,keys,order);cfg.seed=order;cfg.policy=policy_code(dopt.tier_policy);cfg.budget=b;cfg.unit_bytes=stride;cfg.disk_prefetch=dopt.disk_prefetch;cfg.flush_ready=dopt.tier_flush_ready;cfg.ledger=ledger.l.get();
+        cfg.weight_dirs=dopt.weight_dirs;cfg.drive_readers=dopt.drive_readers;cfg.disk_queue=dopt.tier_disk_queue;cfg.clean_evict=dopt.tier_clean_evict;
         // The source path is the bound native path as lossless UTF-8 (tierstream decodes UTF-8);
         // the library opens it through held ancestor handles and requires the authenticated identity.
         BoundCache<UnitBinding> owned(std::move(unit_binding),[&](UnitBinding& u){cfg.descriptor_json=tierstream_descriptor(c,u.bound->utf8(),model_hash).dump();
@@ -990,8 +994,11 @@ struct Runtime::Impl {
             placement.set("resident_per_layer_min",lo);placement.set("resident_per_layer_max",hi);placement.set("policy",dopt.tier_policy);}
         if(dopt.tier_predict)ts_tier->enable_predict();
         if(!dopt.routes_out.empty()){ts_tier->enable_routes();routes_file.open(dopt.routes_out,std::ios::binary|std::ios::app);need(routes_file.is_open(),("open --routes-out "+dopt.routes_out).c_str());}
+        need(!dopt.routes_prefill||routes_file.is_open(),"--routes-prefill needs --routes-out on the tierstream expert tier");
         tier_plan=Json::object();tier_plan.set("placement",placement);tier_plan.set("skip_empty_expert_groups",dopt.skip_empty_expert_groups?"on: routed MoE launches only the expert groups holding routed rows (device compaction)":"off");tier_plan.set("persistent_dense_fp16",dopt.persistent_dense_fp16?"on: shared experts and dense FFNs decoded once at startup":persist_note.empty()?std::string("off"):persist_note);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
-        tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
+        tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);
+        tier_plan.set("weight_dirs",dopt.weight_dirs.empty()?std::string("none: the primary only"):dopt.weight_dirs);if(dopt.weight_dirs.empty())tier_plan.set("drive_readers",std::string("n/a: no --weight-dirs"));else tier_plan.set("drive_readers",std::uint64_t(dopt.drive_readers?dopt.drive_readers:4));
+        tier_plan.set("disk_queue",std::uint64_t(b.three_tier?dopt.tier_disk_queue:0));tier_plan.set("disk_bounce_units",std::uint64_t(b.disk_readers));tier_plan.set("clean_evict",b.three_tier&&dopt.tier_clean_evict?"on: device victims with no free pinned block go to their file (no D2H)":"off");tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
         {auto c=ts_tier->census(compute.s);for(const auto& l:c.find("layers")->as_array())ts_tier->open_persistent.push_back(std::uint32_t(l.find("persistent")->as_int()));
          tier_plan.set("slot_census_at_open",c);} // homes per gated layer as the cache opened
         if(auto diag=ts_tier->api->diagnostics();diag.find("cuda_module_loading"))tier_plan.set("tierstream_cuda_module_loading",diag.find("cuda_module_loading")->as_string());
@@ -1012,6 +1019,13 @@ struct Runtime::Impl {
     // ---- Placement, the DS way (expert_tier.hpp seed_order) ----
     Json placement=Json::object();std::filesystem::path residency_path;std::ofstream routes_file;std::uint64_t route_sessions=0;
     // DS routes census header per decode session ("# seq NAME rows N"; rows = prompt tokens).
+    std::vector<U32> census_rows;std::uint64_t census_prompts=0; // --routes-prefill: [row][gated layer][k] of the current prefill
+    void write_census_rows(){
+        if(census_rows.empty())return;ck(cudaStreamSynchronize(compute.s));const std::size_t per=std::size_t(routed_gated)*routed_topk,rows=census_rows.size()/per;
+        routes_file<<"# seq prefill-"<<++census_prompts<<" rows "<<rows<<'\n';
+        // Only the layers the prefill trunk routed (3..44); the MTP layer's slots stay unset and are skipped.
+        for(std::size_t r=0;r<rows;++r)routes_file<<routes_line_present(census_rows.data()+r*per)<<'\n';
+        routes_file.flush();need(bool(routes_file),"write --routes-out (prefill census)");census_rows.clear();}
     void routes_header(const std::string& name,std::size_t rows){if(routes_file.is_open()){routes_file<<"# seq "<<name<<" rows "<<rows<<'\n';routes_file.flush();}}
     static int policy_code(const std::string& p){if(p=="lru")return 0;if(p=="scored")return 1;need(p=="auto","--tier-policy must be lru, scored or auto");return 2;}
     static std::string read_small(const std::filesystem::path& f){std::error_code ec;const auto n=std::filesystem::file_size(f,ec);need(!ec&&n<=(64ULL<<20),("placement input missing or over 64 MiB: "+f.string()).c_str());
@@ -1024,8 +1038,9 @@ struct Runtime::Impl {
         for(std::size_t pos=0;!dopt.expert_routes.empty();){const auto next=dopt.expert_routes.find(',',pos);
             const auto one=dopt.expert_routes.substr(pos,next==std::string::npos?std::string::npos:next-pos);if(!one.empty())tokens+=count_routes(read_small(one),counts);
             if(next==std::string::npos)break;pos=next+1;}
+        const unsigned uniform_layers=tokens?fill_unobserved_layers(counts):0u; // e.g. the MTP layer of a prefill census
         auto order=seed_order(res,counts);
-        placement.set("residency_file",residency_path.string());placement.set("residency_keys",std::uint64_t(res.size()));placement.set("routes_files",dopt.expert_routes);placement.set("routes_tokens",tokens);
+        placement.set("residency_file",residency_path.string());placement.set("residency_keys",std::uint64_t(res.size()));placement.set("routes_files",dopt.expert_routes);placement.set("routes_tokens",tokens);placement.set("routes_uniform_layers",std::uint64_t(uniform_layers));
         placement.set("order",std::string(res.empty()?"":"residency of the previous run, then ")+(tokens?"route counts, then ":"")+"expert-major round-robin across all routed layers");
         return order;}
     std::string save_residency(){

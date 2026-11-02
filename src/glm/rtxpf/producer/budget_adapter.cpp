@@ -1,7 +1,7 @@
 // THE budget adapter: the only GLM file that calls a budget planner / ledger
 // API. GLM component sizes in (expert_tier.hpp: TierBudgetIn, WholeDeviceIn,
 // BudgetPart), {resident, slots, pinned, disk, staging, min caps, refusal} out,
-// plus the allocation ledger. Implemented against tierstream 602702b
+// plus the allocation ledger. Implemented against tierstream d7277a9
 // (ss_budget_plan / ss_budget_ledger, include/strix_stream/ss.h SS_BUDGET).
 // Switching to another shared planner replaces this file only; GLM keeps no
 // budget arithmetic of its own (the device-gated spare-slot rules below are
@@ -20,7 +20,7 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
     const auto& t=w.tier;expert_need(t.unit_bytes>0&&t.keys>0&&t.max_ids>=1,"tier budget inputs");
     const std::uint64_t ring=2ULL*t.max_ids+1,unit=t.unit_bytes;WholeDevicePlan r;
     r.device=w.device;r.pinned=w.pinned;r.device.push_back({"tierstream ring/guard slots",ring*unit});
-    if(library_parts){r.device.push_back({"tierstream unit table + controls",t.keys*4+(64ULL<<20)});r.pinned.push_back({"tierstream bounce + load ring",5*align_up(unit,4096)+(80ULL<<20)});}
+    if(library_parts){r.device.push_back({"tierstream unit table + controls",t.keys*4+(64ULL<<20)});r.pinned.push_back({"tierstream bounce + load ring",(5ULL+t.disk_readers)*align_up(unit,4096)+(80ULL<<20)});}
     auto comps=[](const std::vector<BudgetPart>& v){std::vector<ts_budget_component> c;c.reserve(v.size());for(auto& x:v)c.push_back({x.name.c_str(),x.bytes});return c;};
     auto d=comps(r.device),p=comps(r.pinned),g=comps(w.pageable);
     ts_budget_in in;ts_budget_in_defaults(&in);in.file_tier=t.file_tier?1u:0u;in.vram_total_bytes=w.vram_total;in.ram_total_bytes=caps?w.ram_total:0;in.device_context_bytes=w.context;
@@ -32,7 +32,7 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
     r.device_fixed=out.device_fixed_bytes;r.device_planned=out.device_planned_bytes;r.host_fixed=out.host_fixed_bytes;r.host_planned=out.host_planned_bytes;
     r.min_vram_total=out.min_vram_total_bytes;r.min_ram_total=out.min_ram_total_bytes;if(out.refused)r.refuse=out.refuse;
     auto& b=r.tier;b.ring=ring;b.resident=out.resident;b.spare_slots=out.arena_spares;b.slots=out.resident+out.arena_spares;b.pinned=out.pinned;b.disk=out.disk;
-    b.staging=out.staging;b.host_spares=t.host_spares;b.three_tier=out.three_tier!=0;
+    b.staging=out.staging;b.host_spares=t.host_spares;b.disk_readers=t.disk_readers;b.three_tier=out.three_tier!=0;
     // Device-gated library rules (not budget arithmetic): at least one global
     // spare slot, never more spares than non-resident units; no file tier means
     // every non-resident unit plus the spare blocks must be pinned.

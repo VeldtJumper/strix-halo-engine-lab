@@ -11,6 +11,7 @@
 #include "expert_source.hpp"
 #include "head_select.hpp"
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <sstream>
 #include <vector>
@@ -145,13 +146,16 @@ struct TierBudgetIn {
     // Spares as a share of the arena (resident + spares): the planner is asked again with
     // max(spare_slots, ceil(permille * arena / 1000)) spares; 0 = spare_slots exactly.
     std::uint32_t spare_permille=0;
+    // The library's per-reader bounce buffers beyond its own one: with dg_disk_queue > 1 each
+    // disk reader holds one (up to a unit's covering read), billed to pinned host memory.
+    std::uint32_t disk_readers=0;
     bool file_tier=true;
 };
 struct TierBudget {
-    std::uint64_t slots=0,resident=0,pinned=0,disk=0,spare_slots=0,host_spares=0,staging=0,ring=0;
+    std::uint64_t slots=0,resident=0,pinned=0,disk=0,spare_slots=0,host_spares=0,staging=0,ring=0,disk_readers=0;
     bool three_tier=false;std::string refuse;
     std::uint64_t device_bytes(std::uint64_t unit)const{return slots*unit;}
-    std::uint64_t host_bytes(std::uint64_t unit)const{return (pinned+host_spares+staging)*unit;}
+    std::uint64_t host_bytes(std::uint64_t unit)const{return (pinned+host_spares+staging+disk_readers)*unit;}
 };
 // Arena-only budgets (--tier-vram-gib / --tier-ram-gib, and the default sizing
 // from free memory): ss_budget_plan with the arena budget as its device cap (the
@@ -301,6 +305,23 @@ inline std::vector<std::uint32_t> parse_residency(const std::string& text,const 
 inline std::string routes_line(const std::uint32_t* ids,unsigned gated=routed_gated,unsigned topk=routed_topk){
     std::string s;for(unsigned g=0;g<gated;++g){if(g)s+=' ';s+=std::to_string(g+routed_first_layer)+':';for(unsigned k=0;k<topk;++k){if(k)s+=',';s+=std::to_string(ids[g*topk+k]);}}return s;
 }
+// A routes line of only the layers that were recorded: a layer whose first id is
+// ~0 (unset, e.g. the MTP layer in a prefill census) is left out.
+inline std::string routes_line_present(const std::uint32_t* ids,unsigned gated=routed_gated,unsigned topk=routed_topk){
+    std::string s;for(unsigned g=0;g<gated;++g){if(ids[g*topk]==~std::uint32_t(0))continue;if(!s.empty())s+=' ';s+=std::to_string(g+routed_first_layer)+':';
+        for(unsigned k=0;k<topk;++k){if(k)s+=',';s+=std::to_string(ids[g*topk+k]);}}return s;
+}
+// --weight-dirs: ';'-separated stripe directories. No empty entry and no directory twice (compared
+// case- and separator-insensitively, trailing separators ignored). tierstream itself binds each
+// stripe manifest to the primary's SHA-256 and ignores the primary's own directory.
+inline void check_weight_dirs(const std::string& v){
+    expert_need(!v.empty(),"--weight-dirs: ';'-separated stripe directories");std::vector<std::string> seen;std::size_t pos=0;
+    for(;;){const auto end=v.find(';',pos);auto d=v.substr(pos,end==std::string::npos?std::string::npos:end-pos);
+        std::string k;for(char ch:d)k+=ch=='\\'?'/':char(std::tolower(static_cast<unsigned char>(ch)));while(k.size()>1&&k.back()=='/')k.pop_back();
+        expert_need(!k.empty()&&k.find_first_not_of(' ')!=std::string::npos,"--weight-dirs: empty directory entry");
+        for(auto& s:seen)expert_need(s!=k,"--weight-dirs: directory listed twice");seen.push_back(k);
+        if(end==std::string::npos)break;pos=end+1;}
+}
 // Adds every routed (layer, expert) of the census to counts[key]; returns tokens counted.
 inline std::uint64_t count_routes(const std::string& text,std::vector<std::uint64_t>& counts,unsigned gated=routed_gated,unsigned units=routed_experts){
     counts.resize(std::size_t(gated)*units);std::istringstream in(text);std::string line;std::uint64_t tokens=0;
@@ -310,6 +331,22 @@ inline std::uint64_t count_routes(const std::string& text,std::vector<std::uint6
             while(std::getline(ids,id,',')){const unsigned long e=std::stoul(id);expert_need(e<units,"routes: expert id");++counts[(layer-routed_first_layer)*units+e];any=true;}}
         tokens+=any;}
     return tokens;
+}
+// A routed layer the census barely saw (the MTP layer of a prefill census: only the first
+// decode token of each prompt routes it) would sort after every observed key and get no
+// device slot. A layer sampled less than 1/16 as often as the best-sampled one gets the
+// observed layers' mean per-unit count instead (as if uniform), so it interleaves with them.
+// Returns the number of layers filled. Placement only.
+inline unsigned fill_unobserved_layers(std::vector<std::uint64_t>& counts,unsigned gated=routed_gated,unsigned units=routed_experts){
+    if(counts.size()!=std::size_t(gated)*units)return 0;
+    std::vector<std::uint64_t> sum(gated,0);std::uint64_t most=0;
+    for(unsigned g=0;g<gated;++g){for(unsigned u=0;u<units;++u)sum[g]+=counts[std::size_t(g)*units+u];most=std::max(most,sum[g]);}
+    if(!most)return 0;
+    std::uint64_t total=0;unsigned seen=0;for(unsigned g=0;g<gated;++g)if(sum[g]*16>=most){total+=sum[g];++seen;}
+    if(seen==gated)return 0;
+    const std::uint64_t mean=std::max<std::uint64_t>(1,(total+std::uint64_t(seen)*units/2)/(std::uint64_t(seen)*units));unsigned filled=0;
+    for(unsigned g=0;g<gated;++g)if(sum[g]*16<most){for(unsigned u=0;u<units;++u)counts[std::size_t(g)*units+u]=mean;++filled;}
+    return filled;
 }
 // Priority list: residency keys first, then by count (most routed first; ties
 // keep round-robin order), then the rest in round-robin order. Every key once.
@@ -331,7 +368,7 @@ GLM_HOST_DEVICE inline std::uint64_t unit_address(std::uint64_t base,std::int32_
 // (covered), or by a demand copy (fetched); prefetched are speculative copies.
 // Every copy has one source: a pinned RAM block or a file staging buffer filled
 // by exactly one file read (disk_reads), so RAM copies = copies - file reads.
-struct CacheCounters {std::uint64_t lookups=0,misses=0,fetched=0,prefetched=0,resurrected=0,covered=0,bank_serves=0,file_reads=0,file_bytes=0,file_ns=0,evicted=0,drops=0,writebacks=0,stalled=0,timeouts=0,free_slots=0;};
+struct CacheCounters {std::uint64_t lookups=0,misses=0,fetched=0,prefetched=0,resurrected=0,covered=0,bank_serves=0,file_reads=0,file_bytes=0,file_ns=0,evicted=0,drops=0,writebacks=0,stalled=0,timeouts=0,free_slots=0,file_wait_ns=0,clean_drops=0,clean_drop_bytes=0;};
 inline Json cache_delta(const CacheCounters& a,const CacheCounters& b,std::uint64_t unit_bytes){
     auto d=[](std::uint64_t x,std::uint64_t y){expert_need(y>=x,"cache counters went backwards");return y-x;};
     const auto look=d(a.lookups,b.lookups),miss=d(a.misses,b.misses),fetch=d(a.fetched,b.fetched),pre=d(a.prefetched,b.prefetched),file=d(a.file_reads,b.file_reads);
@@ -339,7 +376,9 @@ inline Json cache_delta(const CacheCounters& a,const CacheCounters& b,std::uint6
     auto j=Json::object();j.set("backend","tierstream");j.set("lookups",look);j.set("misses",miss);j.set("device_hits",look-miss);
     j.set("resurrected",d(a.resurrected,b.resurrected));j.set("covered",d(a.covered,b.covered));j.set("fetched",fetch);j.set("prefetched",pre);j.set("bank_serves",d(a.bank_serves,b.bank_serves));
     j.set("ram_copies",fetch+pre-file);j.set("file_reads",file);j.set("file_bytes",d(a.file_bytes,b.file_bytes));j.set("file_read_ns",d(a.file_ns,b.file_ns));j.set("h2d_bytes",(fetch+pre)*unit_bytes);
-    j.set("evicted",d(a.evicted,b.evicted));j.set("disk_drops",d(a.drops,b.drops));j.set("writebacks",d(a.writebacks,b.writebacks));j.set("stalled",d(a.stalled,b.stalled));j.set("free_slots",b.free_slots);return j;
+    j.set("evicted",d(a.evicted,b.evicted));j.set("disk_drops",d(a.drops,b.drops));j.set("writebacks",d(a.writebacks,b.writebacks));j.set("stalled",d(a.stalled,b.stalled));j.set("free_slots",b.free_slots);
+    // The service's wall time waiting on file reads (< file_read_ns once reads overlap) and clean drops (no D2H).
+    j.set("file_wait_ns",d(a.file_wait_ns,b.file_wait_ns));j.set("clean_drops",d(a.clean_drops,b.clean_drops));j.set("clean_drop_bytes",d(a.clean_drop_bytes,b.clean_drop_bytes));return j;
 }
 // Cache token ownership. A failure after begin leaves the library token without
 // its end kernel, so the cache is never reused: every later begin reports the

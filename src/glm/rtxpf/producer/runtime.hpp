@@ -13,6 +13,15 @@ namespace strix::glm::rtxpf::producer {
 struct DecodeOptions {
     std::string expert_tier="tierstream"; // the product cache (default); "reference": uncached backend, only inside the untimed compare
     std::string unit_file;               // tierstream disk tier: the GLM unit file (manifest beside it)
+    // Multi-disk reads (ss_options.weight_dirs): ';'-separated directories holding ts-stripe copies of
+    // the unit file (glm_unit_file plan --stripe); file-tier misses and make_resident read the chunks
+    // from every drive. Empty: the primary only. drive_readers: per volume, 1..32 (0 = library default 4).
+    std::string weight_dirs;unsigned drive_readers=0;
+    // Three-tier file reads in flight (ss_options.dg_disk_queue: 1 = one at a time, as before; 2..64,
+    // at most tier_staging since each read holds a staging buffer) and clean eviction (dg_clean_evict:
+    // a device victim with no free pinned block goes to its file with no D2H copy and displaces no
+    // pinned unit). Placement / IO only: same bytes. Defaults keep today's behaviour until measured.
+    unsigned tier_disk_queue=1;bool tier_clean_evict=false;
     double vram_total_gib=-1,ram_total_gib=-1; // whole-device caps (< 0: none = the device room / host above the floor)
     double tier_vram_gib=-1,tier_ram_gib=-1; // < 0: everything left after prefill residency / the host floor
     unsigned tier_spare_slots=16,tier_host_spares=8,tier_staging=8;
@@ -24,6 +33,10 @@ struct DecodeOptions {
     // routes census files (DS routes format; comma-separated), the round-robin fallback.
     std::string expert_residency,expert_routes;
     std::string routes_out;              // record each decoded token's routes (DS routes format; receipts carry them too)
+    // Census runs: also record every prefill row's routes into routes_out (one line per prompt row,
+    // all routed layers), so a placement census can come from prompts other than the benchmark's.
+    // One D2H copy per tile after its kernels (untimed census use; off by default).
+    bool routes_prefill=false;
     std::string tier_policy="auto";      // boundary victims: lru | scored | auto (SCORED_AUTO, the DS default)
     bool tier_predict=false;             // overlapped next-layer prefetch (ss_dg_enqueue_predict), off by default
     // dg_flush_ready: the library flushes its demand stream after each layer's ready
@@ -62,6 +75,8 @@ inline std::string row_kernels_name(const DecodeOptions& d){
     std::string s;unsigned n=0;for(unsigned j=0;j<5;++j)if(f[j]){s+=(s.empty()?"":"+")+std::string(k[j]);++n;}
     return n==5?"1":n==0?"0":s;
 }
+// The library's disk readers that each hold a bounce buffer beyond its own one (none at queue 1).
+inline unsigned disk_bounce_readers(const DecodeOptions& d){return d.tier_disk_queue>1?d.tier_disk_queue:0;}
 using StateSink=std::function<void(unsigned rank,unsigned layer,unsigned component,std::span<const std::byte>)>;
 // Constructor is the first device work. The service validates the UUID and all
 // host arguments before constructing it. No CPU emulation hides a CUDA failure.

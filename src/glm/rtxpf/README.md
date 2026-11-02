@@ -20,15 +20,15 @@ or routes.
 - Windows 10/11, Visual Studio 2022 (MSVC, x64), CUDA 13.0, CMake >= 3.24,
   Ninja, Python 3.11+ and PowerShell 7 (`pwsh`).
 - [tierstream](https://github.com/hyukudan/tierstream) at commit
-  [`602702b4e5138df5fffc9dbb22091737e84e374f`](https://github.com/hyukudan/tierstream/commit/602702b4e5138df5fffc9dbb22091737e84e374f).
+  [`d7277a94253ef99c954561e58d67d12e3d348a87`](https://github.com/hyukudan/tierstream/commit/d7277a94253ef99c954561e58d67d12e3d348a87).
   The build takes it as a plain source export with a `STAMP` file naming that
   commit (configuration refuses any other commit):
 
   ```powershell
   git clone https://github.com/hyukudan/tierstream.git tierstream-src
   mkdir TIERSTREAM_DIR
-  git -C tierstream-src archive --format=tar 602702b4e5138df5fffc9dbb22091737e84e374f | tar -x -C TIERSTREAM_DIR
-  Set-Content TIERSTREAM_DIR/STAMP 602702b4e5138df5fffc9dbb22091737e84e374f
+  git -C tierstream-src archive --format=tar d7277a94253ef99c954561e58d67d12e3d348a87 | tar -x -C TIERSTREAM_DIR
+  Set-Content TIERSTREAM_DIR/STAMP d7277a94253ef99c954561e58d67d12e3d348a87
   ```
 
 - CUTLASS 4.2.1 headers. CMake downloads the pinned release and checks its
@@ -63,8 +63,12 @@ BUILD_DIR/glm_unit_file.exe verify  --model MODEL_DIR --out OUT_DIR/glm-units.bi
 
 - `dry-run` reads only the shard headers and writes nothing. It prints the exact
   output size (`PRIMARY_BYTES`: 12,384 units x the unit stride), the output
-  paths and the free space. Add `--stripe STRIPE_DIR:64` to plan a second-drive
-  stripe; the printed command creates it with tierstream's own tool.
+  paths and the free space. Add `--stripe STRIPE_DIR:K` (odd K-chunk runs) or
+  `--stripe STRIPE_DIR:even:K` to plan stripe copies on other drives; the printed
+  commands create them with tierstream's own tool (`ts-stripe make`). Pass the
+  stripe directories at run time with `--weight-dirs` (see below): file-tier
+  reads then use every drive. Each chunk is checked against the stripe manifest,
+  and any bad chunk is read from the primary instead.
 - `copy` authenticates the source shards and refuses unless `--confirm-bytes`
   equals the planned size. It writes the units, a manifest with per-unit and
   whole-file SHA-256, and the tierstream descriptor. It verifies everything and
@@ -96,6 +100,12 @@ Main options:
 | `--row-tile N` | Prefill row tile (a multiple of 32). By default the planner picks the largest tile up to 8192 whose extra activation memory stays within 5% of the expert arena. |
 | `--tile-sweep 2048,4096,8192` | Full card: one start per tile, with a cross-tile check that the digests are bitwise equal. |
 | `--tier-predict 1` | Prefetches the next layer's experts while the current layer runs (pending). |
+| `--weight-dirs "DIR;DIR"`, `--drive-readers N` | Multi-disk reads: stripe copies of the unit file on other drives (see Unit file); `N` reader threads per drive (1..32, default 4). Off by default (the primary only). Same bytes. |
+| `--tier-disk-queue N`, `--tier-staging N` | File reads in flight in three-tier opens (1..64, at most the staging buffer count; default 1 = one at a time). Each reader's bounce buffer is billed to pinned host memory. Same bytes. |
+| `--tier-clean-evict 1` | Three-tier opens: a device victim with no free pinned block goes back to the unit file with no device-to-host copy and displaces no pinned unit. Off by default. Same bytes. |
+| `--disk-prefetch 1` | With `--tier-predict 1`: predicted experts homed on the unit file are read ahead too (pending). |
+| `--routes-out FILE --routes-prefill 1`, `--expert-routes FILE` | Placement census: record every prefill row's expert routes from your own prompts, then seed the cache's placement with them on the next start (placement only). |
+| `--ab-arm`, `--census KINDS`, `--compare-arms DIR_A DIR_B` | Harness modes: one arm of a main-vs-build comparison (TTFT + decode, no exactness gate, every digest listed); a prefill-only routes census on chat prompts outside the decode bench; a CPU check that two arms' tokens, logits and states are bitwise equal, with speed ratios. |
 | `--plan-budget` | Prints the planned memory split from shard headers only (no CUDA, no unit-file read). |
 
 ## Measured (draft, one RTX PRO 6000, full card)

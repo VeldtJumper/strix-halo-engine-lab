@@ -22,7 +22,11 @@ void configure(const TierOpenConfig& c,Handles& h,ts_budget& b,ts_options& o){
     ts_ok(ts_plan_from_tiers(h.desc,&b,c.tiers.data(),c.tiers.size(),&h.plan),"plan");
     ts_options_defaults(&o);o.backend=c.cuda?TS_BACKEND_CUDA:TS_BACKEND_CPU;o.device=0;o.forward_mode=TS_FORWARD_DEVICE_GATED;o.pin_planned=0;o.verify_hash=0;
     expert_need(p.spare_slots>=1,"the global spare count must be positive");o.dg_max_ids=c.max_ids;o.dg_spare_slots=std::uint32_t(p.spare_slots);
-    if(p.three_tier){o.dg_disk_tier=1;o.dg_disk_prefetch=c.disk_prefetch?1u:0u;o.dg_disk_staging=std::uint32_t(p.staging);}
+    expert_need(c.disk_queue>=1&&c.disk_queue<=64,"disk queue must be 1..64");
+    if(p.three_tier){o.dg_disk_tier=1;o.dg_disk_prefetch=c.disk_prefetch?1u:0u;o.dg_disk_staging=std::uint32_t(p.staging);
+        // Each read in flight holds one staging buffer.
+        expert_need(c.disk_queue<=std::max<std::uint64_t>(p.staging,1),"disk queue exceeds the staging buffers (raise --tier-staging)");
+        o.dg_disk_queue=c.disk_queue;o.dg_clean_evict=c.clean_evict?1u:0u;}
     if(c.source_size){h.source.volume=c.source_volume;h.source.index=c.source_index;h.source.size=c.source_size;o.source_identity_n=1;o.source_identities=&h.source;}
     // The device-gated context charges its own arena, tables, pinned blocks and
     // staging to GLM's ledger by name (no whole-device sample at open).
@@ -33,11 +37,15 @@ void configure(const TierOpenConfig& c,Handles& h,ts_budget& b,ts_options& o){
         for(std::size_t i=0;i<c.seed.size()&&i<p.resident;++i)expert_need(c.tiers[c.seed[i]]==TS_TIER_RESIDENT,"seed head != resident tier keys");
         o.dg_seed=h.seed.data();o.dg_seed_n=std::uint32_t(h.seed.size());}
     o.dg_flush_ready=c.flush_ready?1u:0u; // as DS TierSite: flush the demand stream after each ready signal (WDDM)
+    // Multi-disk: the library copies the directory list at open (c outlives ts_open).
+    expert_need(c.drive_readers<=32,"drive readers must be 1..32");
+    if(!c.weight_dirs.empty()){o.weight_dirs=c.weight_dirs.c_str();if(c.drive_readers)o.drive_readers=c.drive_readers;}
 }
 class Binding final:public TierCacheApi {
     Handles h_;TierView view_{};CacheCounters before_{};std::uint64_t unit_=0;unsigned pred_=0,pred_through_=0;bool flush_ready_=false;std::string last_error_;StepPlan plan_;
     CacheCounters read(){ts_dg_stats s{};ts_ok(ts_stats_dg(h_.ctx,&s),"stats");CacheCounters c;c.lookups=s.lookups;c.misses=s.misses;c.fetched=s.fetched;c.prefetched=s.prefetched;c.resurrected=s.resurrected;c.covered=s.covered;c.bank_serves=s.bank_serves;c.file_reads=s.disk_reads;c.file_bytes=s.disk_read_bytes;c.file_ns=s.disk_read_ns;
-        c.evicted=s.evicted;c.drops=s.disk_drops;c.writebacks=s.writebacks_done;c.stalled=s.stalled;c.timeouts=s.device_timeouts;c.free_slots=s.free_slots;return c;}
+        c.evicted=s.evicted;c.drops=s.disk_drops;c.writebacks=s.writebacks_done;c.stalled=s.stalled;c.timeouts=s.device_timeouts;c.free_slots=s.free_slots;
+        c.file_wait_ns=s.disk_wait_ns;c.clean_drops=s.clean_drops;c.clean_drop_bytes=s.clean_drop_bytes;return c;}
 public:
     explicit Binding(const TierOpenConfig& c){
         ts_budget b;ts_options o;configure(c,h_,b,o);ts_ok(ts_open(h_.desc,&b,h_.plan,&o,&h_.ctx),"open");flush_ready_=o.dg_flush_ready!=0;
@@ -89,7 +97,10 @@ public:
         ts_ok(ts_begin(h_.ctx,rows.data(),int(rows.size())),"begin single-layer step");plan_.begin_layer(g);}
     Json counters()override{ts_dg_stats s{};ts_ok(ts_stats_dg(h_.ctx,&s),"stats");auto j=Json::object();
         j.set("evicted",s.evicted);j.set("writebacks",s.writebacks_done);j.set("fetched",s.fetched);j.set("file_reads",s.disk_reads);j.set("file_bytes",s.disk_read_bytes);
-        j.set("resident_units",s.resident_units);j.set("resident_evicted",s.resident_evicted);j.set("resident_bytes",s.resident_bytes);j.set("resident_ns",s.resident_ns);return j;}
+        j.set("resident_units",s.resident_units);j.set("resident_evicted",s.resident_evicted);j.set("resident_bytes",s.resident_bytes);j.set("resident_ns",s.resident_ns);
+        // make_resident's own transfers (tierstream #10), clean drops and the service's file-read wait.
+        j.set("mkres_file_reads",s.mkres_file_reads);j.set("mkres_file_bytes",s.mkres_file_bytes);j.set("mkres_read_ns",s.mkres_read_ns);j.set("mkres_h2d_bytes",s.mkres_h2d_bytes);j.set("mkres_wb_bytes",s.mkres_wb_bytes);
+        j.set("clean_drops",s.clean_drops);j.set("clean_drop_bytes",s.clean_drop_bytes);j.set("file_wait_ns",s.disk_wait_ns);return j;}
     // Deltas since the previous collect (cache_delta in expert_tier.hpp).
     Json stats()override{auto now=read();auto j=cache_delta(before_,now,unit_);before_=now;
         // Prefill residency (make_resident) totals since open: counted only here, nowhere else.
