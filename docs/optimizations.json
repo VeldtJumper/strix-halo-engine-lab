@@ -1655,6 +1655,72 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill router, tiled scores",
+    "flag_or_env": "STRIX_MM_PF_ROUTER_ROWS",
+    "default": "32",
+    "exact": "Exact: routes and weights byte-identical to the fused and 4/8-row forms for every input kind on the tested boundary and tail row counts; prefill state, final rows and tokens identical on both ranks.",
+    "gain": "post-exchange + router per 4096-row piece 5.40 -> 4.82 ms; TTFT 1K -0.9 %, 8K -0.8 %",
+    "preconditions": "Batch router on and prefill pieces of 1024 to 4096 rows (other piece sizes keep the 8-row form).",
+    "off_switch": "STRIX_MM_PF_ROUTER_ROWS=8 (previous default) or =4",
+    "doc_anchor": "docs/optimizations.md#mm-pf-router-v2"
+  },
+  {
+    "engine": "minimax",
+    "name": "Prefill MSA scratch for whole pieces",
+    "flag_or_env": "STRIX_MM_PF_MSA_SCRATCH_MB",
+    "default": "1152",
+    "exact": "Exact: independent windows, only the launch count changes; prefill state, final rows and tokens identical on both ranks.",
+    "gain": "part of the prefill shipping set: 8K -2.4 %, 32K -3.0 %",
+    "preconditions": "At least 4 GiB of device headroom after the request, else 512 MiB with one notice.",
+    "off_switch": "STRIX_MM_PF_MSA_SCRATCH_MB=512",
+    "doc_anchor": "docs/optimizations.md#mm-pf-msa-scratch"
+  },
+  {
+    "engine": "minimax",
+    "name": "Prefill o projection on the v4 core",
+    "flag_or_env": "STRIX_MM_PF_DENSE_O",
+    "default": "1",
+    "exact": "Exact: o outputs byte-identical to the library GEMM on the tested row counts (9 to 4096); prefill state, final rows and tokens identical on both ranks.",
+    "gain": "o projection per 4096-row piece 7.89 -> 7.59 ms; part of the prefill shipping set",
+    "preconditions": "Exactly 4096-row pieces; EXL3 weights of 3, 4, 5, 6 or 8 bits.",
+    "off_switch": "STRIX_MM_PF_DENSE_O=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-dense-o"
+  },
+  {
+    "engine": "minimax",
+    "name": "Prefill MoE table ring",
+    "flag_or_env": "STRIX_MM_PF_TABLE_RING",
+    "default": "1 in strix-minimax-rank; 0 in strix-minimax-serve",
+    "exact": "Exact: identical table bytes; prefill state, final rows and tokens identical on both ranks at 1K and 8K.",
+    "gain": "1K TTFT -0.5 %; 8K not slower",
+    "preconditions": "One engine per process on a single host thread; rank app only (serve not qualified).",
+    "off_switch": "STRIX_MM_PF_TABLE_RING=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-table-ring"
+  },
+  {
+    "engine": "minimax",
+    "name": "MSA prefill mode 6",
+    "flag_or_env": "STRIX_MM_PF_MSA_REWORK",
+    "default": "6",
+    "exact": "Exact: every partial, score, index and output byte of every rework mode in the fused MSA suite (over 10,000 cases); state and final rows identical on both ranks in an in-process 5-vs-6 gate.",
+    "gain": "8K TTFT vs mode 5 in-process -1.6 / 0.0 / 0.0 % (not slower)",
+    "preconditions": "Supported MSA prefill shapes.",
+    "off_switch": "STRIX_MM_PF_MSA_REWORK=5 (previous default), =3, =0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-msa-mode6"
+  },
+  {
+    "engine": "minimax",
+    "name": "GPU-gated prefill exchange in the rank app",
+    "flag_or_env": "STRIX_MM_PFX",
+    "default": "on",
+    "exact": "Exact: prefill state, final rows and tokens identical on both ranks in-process and across fresh processes in any order.",
+    "gain": "TTFT 1K -3.5 %, 8K -1.5 % (strix-minimax-rank)",
+    "preconditions": "Host-path USB4 transport only (elsewhere constructed but off); rank app only (serve would lose nested serving).",
+    "off_switch": "STRIX_MM_PFX=load (previous default) or =off",
+    "doc_anchor": "docs/optimizations.md#mm-rank-pfx"
+  },
+  {
+    "engine": "minimax",
     "name": "Decode MoE gate/up interleave",
     "flag_or_env": "STRIX_MMX_MOE_GU_INTERLEAVE",
     "default": "1",

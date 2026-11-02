@@ -3,7 +3,7 @@
 [English](README.md) · [Español](README.es.md) · [Main README](../../../README.md)
 
 MiniMax M3.1 Flash, EXL3 trellis weights at 3.06 bpw, on two Strix Halo nodes (TP2 over USB4): exact prefill and
-decode, DSpark serving with automatic admission, MSA prefill mode 5, deadline-based and nested serving. Production;
+decode, DSpark serving with automatic admission, MSA prefill mode 6, deadline-based and nested serving. Production;
 the eight-text quality gate passed. This page keeps every published measurement with its build and conditions and the
 launch command. How the tables are read and what "exact" covers: [methodology](../../methodology.md). Build
 instructions (trellis library included): [getting started](../../getting-started/README.md); the pair itself:
@@ -20,7 +20,7 @@ Run once per node with `R` set to 0 or 1 and matching EXL3 assets:
 ```
 
 The [resolver](../../../src/minimax/engine/mm_defaults.cpp) enables the production decode/prefill/exchange set,
-including MSA prefill mode 5. `strix-minimax-serve` uses structural DSpark auto admission with compatible
+including MSA prefill mode 6. `strix-minimax-serve` uses structural DSpark auto admission with compatible
 local assets; eligible uncontended requests may draft, while competing/grouped or unsupported requests
 stay plain. See [admission and qualification](../../engine/serving/dspark-auto-qualification.md).
 A named session request that does not fit the context returns HTTP 400 `context_length_exceeded` (the

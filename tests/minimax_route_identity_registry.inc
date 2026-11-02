@@ -37,11 +37,15 @@
 // src/minimax/moe/mmx_prefill.hip: enqueue_prefill_dense; src/minimax/engine/engine.hip: dense_qkv
 {"prefill-dense-qkv", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense == strix_gemm bitwise (q/k/v/o, q+k+v, T 9..4096); bits 3/4/5/6/8 only, else the library call; mm_defaults.cpp pf_dense_qkv", ""},
 // src/minimax/engine/engine.hip: enqueue_post (STRIX_MM_PF_ROUTER_ROWS=32 -> enqueue_router_tiled)
-{"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; opt-in only (default 8)", ""},
+{"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; mm_defaults.cpp pf_router_rows (default 32 = tiled v2)", ""},
+// src/minimax/engine/engine.hip: dense_o (STRIX_MM_PF_DENSE_O) - o_proj through enqueue_prefill_dense on full pieces
+{"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
+// src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
+{"prefill-msa-scratch", 'a', "independent MSA windows; batch size only", "msa_fused_tests.hip every-batch bytes (scratch=1/125 and full); mm_defaults.cpp pf_msa_scratch_mb", ""},
 // src/minimax/moe/mmx_prefill.hip:647
 {"prefill-fuse", 'a', "single-split WMMA+epilogue contract", "prefill gufuse intermediate/producer debug gate in hip-mmx-moe-bench; default OFF; combinations outside gate remain unqualified", ""},
 // src/minimax/moe/mmx_prefill.hip:416
-{"prefill-table", 'a', "identical item table bytes", "prefill table ring event ownership; default OFF; A/B pftab gate in rank app", ""},
+{"prefill-table", 'a', "identical item table bytes", "prefill table ring event ownership; A/B pftab gate in rank app (1K/8K state identical); default ON in strix-minimax-rank only (serve off)", ""},
 // src/minimax/attn/msa_fused.hip:1714
 {"msa-attend", 'a', "MSA block128/chunk/FP32 combine contract", "msa_fused_tests.hip:run_case versions/head counts/graph replay", ""},
 // src/minimax/engine/engine.hip: route::attend_n2_sparse; src/minimax/attn/msa_fused.hip: launch_attend

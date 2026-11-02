@@ -230,13 +230,13 @@ __global__ __launch_bounds__(kNormThreads) void router_batch_kernel(
     }
 }
 
-// Prefill router, tiled (enqueue_router_tiled): CTA = kRtRows rows x kRtExperts experts, so the router weights are read
-// once per 32 rows (router_batch_kernel: once per 4 / 8 rows). Per (row, expert) lane L still runs
-// a = fmaf(y[j], w[e][j], a) over j = L, L + 32, ... ascending from 0.0F (kRtChunk % 32 == 0), then the same xor
-// butterfly, sigmoid and bias: the same bits. blockIdx.x = expert group (fastest), so the groups of one row tile run
-// together and share its y rows in cache. Scores go to scratch [rows][2][kExperts]; router_select_kernel runs the
-// selection of router_batch_kernel unchanged.
-constexpr unsigned kRtRows = 32, kRtExperts = 32, kRtChunk = 256, kRtPerWave = kRtExperts / kWaves;
+// Prefill router, tiled (enqueue_router_tiled): CTA = kRtRows rows x kRtExperts experts. Per (row, expert) lane L still
+// runs a = fmaf(y[j], w[e][j], a) over j = L, L + 32, ... ascending from 0.0F (kRtChunk % 32 == 0), then the same xor
+// butterfly, sigmoid and bias: the same bits. The j loop is outside the expert loop, so each staged y element is read
+// from LDS once per row for the wave's kRtPerWave experts. blockIdx.x = expert group (fastest), so the groups of one row
+// tile run together and share its y rows in cache. Scores go to scratch [2][kExperts][rows] (rows adjacent: coalesced
+// selection reads); router_select_kernel runs the selection of router_batch_kernel unchanged.
+constexpr unsigned kRtRows = 16, kRtExperts = 32, kRtChunk = 256, kRtPerWave = kRtExperts / kWaves;
 static_assert(kRtExperts % kWaves == 0 && kExperts % kRtExperts == 0 && kHidden % kRtChunk == 0 && kRtChunk % kRouterLanes == 0);
 
 __global__ __launch_bounds__(kNormThreads) void router_tiled_kernel(std::uint32_t rows, const float* y, const float* router_w,
@@ -251,6 +251,9 @@ __global__ __launch_bounds__(kNormThreads) void router_tiled_kernel(std::uint32_
     for (unsigned q = 0; q < kRtPerWave; ++q)
 #pragma unroll
         for (unsigned row = 0; row < kRtRows; ++row) a[q][row] = 0.0F;
+    const float* w[kRtPerWave];
+#pragma unroll
+    for (unsigned q = 0; q < kRtPerWave; ++q) w[q] = router_w + static_cast<std::size_t>(e0 + wave + q * kWaves) * kHidden;
     for (unsigned c0 = 0; c0 < kHidden; c0 += kRtChunk) {
         __syncthreads();
         for (unsigned i = t; i < kRtRows * kRtChunk; i += kNormThreads) {
@@ -258,13 +261,15 @@ __global__ __launch_bounds__(kNormThreads) void router_tiled_kernel(std::uint32_
             ys[row][j] = row < valid ? y[static_cast<std::size_t>(first + row) * kHidden + c0 + j] : 0.0F;
         }
         __syncthreads();
+        for (unsigned j = lane; j < kRtChunk; j += kRouterLanes) {
+            float wj[kRtPerWave];
 #pragma unroll
-        for (unsigned q = 0; q < kRtPerWave; ++q) {
-            const float* w = router_w + static_cast<std::size_t>(e0 + wave + q * kWaves) * kHidden + c0;
-            for (unsigned j = lane; j < kRtChunk; j += kRouterLanes) {
-                const float wj = w[j];
+            for (unsigned q = 0; q < kRtPerWave; ++q) wj[q] = w[q][c0 + j];
 #pragma unroll
-                for (unsigned row = 0; row < kRtRows; ++row) a[q][row] = __builtin_fmaf(ys[row][j], wj, a[q][row]);
+            for (unsigned row = 0; row < kRtRows; ++row) {
+                const float yv = ys[row][j];
+#pragma unroll
+                for (unsigned q = 0; q < kRtPerWave; ++q) a[q][row] = __builtin_fmaf(yv, wj[q], a[q][row]);
             }
         }
     }
@@ -277,20 +282,26 @@ __global__ __launch_bounds__(kNormThreads) void router_tiled_kernel(std::uint32_
             for (unsigned d = 16; d >= 1; d >>= 1U) x = x + __shfl_xor(x, static_cast<int>(d), 32);
             if (lane == 0 && row < valid) {
                 const float sv = 1.0F / (1.0F + msa::exp_f(-x));
-                float* out = scores + static_cast<std::size_t>(first + row) * 2 * kExperts;
-                out[e] = sv;
-                out[kExperts + e] = sv + bias[e];
+                scores[static_cast<std::size_t>(e) * rows + first + row] = sv;
+                scores[(static_cast<std::size_t>(kExperts) + e) * rows + first + row] = sv + bias[e];
             }
         }
     }
 }
 
+// Strided views of one row's scores in the [2][kExperts][rows] scratch.
+struct RowScores {
+    const float* base;
+    std::uint32_t stride;
+    __device__ float operator[](std::uint32_t e) const { return base[static_cast<std::size_t>(e) * stride]; }
+};
+
 __global__ __launch_bounds__(256) void router_select_kernel(std::uint32_t rows, const float* scores, std::uint32_t* ids,
                                                             float* weights) {
     const unsigned r = blockIdx.x * 256U + threadIdx.x;
     if (r >= rows) return;
-    const float* sc = scores + static_cast<std::size_t>(r) * 2 * kExperts;
-    const float* ch = sc + kExperts;
+    const RowScores sc{scores + r, rows};
+    const RowScores ch{scores + static_cast<std::size_t>(kExperts) * rows + r, rows};
     std::uint32_t best[kTopE];
     for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
         std::uint32_t pick = kExperts;

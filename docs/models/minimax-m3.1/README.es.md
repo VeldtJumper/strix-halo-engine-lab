@@ -3,7 +3,7 @@
 [English](README.md) · [Español](README.es.md) · [README principal](../../../README.es.md)
 
 MiniMax M3.1 Flash, pesos trellis EXL3 a 3.06 bpw, en dos nodos Strix Halo (TP2 sobre USB4): prefill y decode
-exactos, servicio DSpark con admisión automática, modo 5 de prefill MSA, servicio con plazos y anidado. Production; la
+exactos, servicio DSpark con admisión automática, modo 6 de prefill MSA, servicio con plazos y anidado. Production; la
 puerta de calidad de ocho textos superada. Esta página conserva todas las mediciones publicadas con su compilación y sus
 condiciones y el comando de lanzamiento. Cómo se leen las tablas y qué cubre "exacto":
 [metodología](../../methodology.es.md). Instrucciones de compilación (biblioteca trellis incluida):
@@ -20,7 +20,7 @@ Ejecute una vez por nodo con `R` establecido en 0 o 1 y assets EXL3 coincidentes
 ```
 
 El [resolutor](../../../src/minimax/engine/mm_defaults.cpp) activa el conjunto de producción de decode/prefill/intercambio,
-incluido el modo de prefill MSA 5. `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
+incluido el modo de prefill MSA 6. `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
 locales compatibles; las peticiones elegibles sin contención pueden usar draft, mientras que las peticiones en competencia/agrupadas o no admitidas
 se quedan en simple. Véase [admisión y cualificación](../../engine/serving/dspark-auto-qualification.md).
 Una petición de sesión con nombre que no cabe en el contexto devuelve HTTP 400 `context_length_exceeded` (la
