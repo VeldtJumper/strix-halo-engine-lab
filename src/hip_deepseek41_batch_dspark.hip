@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,11 @@ void check(hipError_t e, const char* what) {
 }
 
 constexpr std::uint32_t stage_rows = 128;  // kept rows staged per slot before they go to its drafting context
+// prompt lookup (the Nemotron selector's constants): shortest match, decay of the evidence, candidates a bucket needs,
+// pending candidates per request, prompt tokens indexed per plan
+constexpr std::uint32_t lookup_min_match = 2, lookup_evidence = 4, lookup_pending = 16, lookup_chunk = 1024;
+constexpr double lookup_decay = 0.98;
+std::uint32_t lookup_bucket(std::uint32_t length) { return length < 4U ? 1U : length < 8U ? 2U : length < 16U ? 3U : 4U; }  // 2-3, 4-7, 8-15, 16+
 
 // world 2: the draft round, rank 0 -> rank 1, and rank 1's drafts back (one 512-byte exchange each)
 struct DraftRound {
@@ -111,6 +117,19 @@ BatchSpeculator::BatchSpeculator(BatchForward& target, ds::DeviceDrafter& drafte
     auto& S = *slots_;
     S.count = slots;
     S.staged.assign(slots, 0U);
+    lookup_on_ = options_.lookup && options_.rank == 0U;
+    if (const char* v = std::getenv("STRIX_DS41_LOOKUP"); v != nullptr && v[0] == '0') lookup_on_ = false;
+    if (lookup_on_ && options_.world == 2U && slots > 32U) {  // the step command carries lookup windows as a 32-slot mask
+        lookup_on_ = false;
+        std::fprintf(stderr, "dspark: prompt lookup off (%u slots; at most 32 with two ranks)\n", slots);
+    }
+    if (lookup_on_) {
+        lookup_slots_.resize(slots);
+        if (const char* v = std::getenv("STRIX_DS41_LOOKUP_MARGIN"); v != nullptr && *v) lookup_margin_ = std::clamp(std::atof(v), 1.0, 2.0);
+        if (const char* v = std::getenv("STRIX_DS41_LOOKUP_LOG"); v != nullptr && v[0] == '1') lookup_log_ = true;
+        if (const char* v = std::getenv("STRIX_DS41_LOOKUP_TOKENS"); v != nullptr && *v)
+            lookup_capacity_ = static_cast<std::uint32_t>(std::clamp(std::atof(v), 64.0, 4194304.0));
+    }
     S.context.resize(slots);
     check(hipMalloc(reinterpret_cast<void**>(&S.staging), std::size_t{slots} * stage_rows * ds::main_width * sizeof(float)), "staging");
 }
@@ -152,6 +171,68 @@ void BatchSpeculator::stage_from(std::uint32_t slot, std::array<const float*, 3>
     S.staged[slot] += count;
 }
 
+void BatchSpeculator::Moments::add(double tokens, double window_rows) {
+    n = n * lookup_decay + 1.0;
+    sum = sum * lookup_decay + tokens;
+    rows = rows * lookup_decay + window_rows;
+}
+
+
+// a new request in `slot`: its prompt (the last capacity tokens: the index forgets older ones) is indexed a chunk per
+// plan, so a long prompt does not hold the loop
+void BatchSpeculator::lookup_reset(std::uint32_t slot, std::span<const std::uint32_t> prompt) {
+    if (!lookup_on_) return;
+    const auto t0 = clock_type::now();
+    auto& L = lookup_slots_[slot];
+    L = LookupSlot{};
+    strix::lookup::IndexConfig config;
+    config.capacity = lookup_capacity_;
+    L.index = strix::lookup::make_ngram_index(config);
+    const std::size_t keep = std::min<std::size_t>(prompt.size(), lookup_capacity_);
+    L.backlog.assign(prompt.end() - static_cast<std::ptrdiff_t>(keep), prompt.end());
+    L.next_position = prompt.size();
+    stats_.lookup_seconds += since(t0);
+}
+
+void BatchSpeculator::lookup_catch_up(std::uint32_t slot) {
+    auto& L = lookup_slots_[slot];
+    const std::size_t end = std::min(L.backlog.size(), L.backlog_at + lookup_chunk);
+    for (; L.backlog_at < end; ++L.backlog_at) L.index->append(L.backlog[L.backlog_at]);
+    if (L.backlog_at == L.backlog.size()) L.backlog.clear(), L.backlog_at = 0;
+}
+
+// the token `slot` committed at stream `position`: scores the pending candidates waiting for this position, then joins
+// the index (or its backlog). A position out of sequence (the state changed outside the planner) ends lookup for the
+// request.
+void BatchSpeculator::lookup_commit(std::uint32_t slot, std::uint32_t token, std::uint64_t position) {
+    if (!lookup_on_) return;
+    auto& L = lookup_slots_[slot];
+    if (!L.index) return;
+    const auto t0 = clock_type::now();
+    if (position != L.next_position) {
+        L = LookupSlot{};
+        stats_.lookup_seconds += since(t0);
+        return;
+    }
+    ++L.next_position;
+    for (auto it = L.pending.begin(); it != L.pending.end();) {
+        auto& c = *it;
+        if (c.first + c.done != position) {
+            ++it;
+            continue;
+        }
+        L.eligible[c.bucket][c.done] += 1.0;
+        const bool hit = c.token[c.done] == token;
+        if (hit) L.accepted[c.bucket][c.done] += 1.0;
+        ++c.done;
+        if (!hit || c.done == c.count) it = L.pending.erase(it);
+        else ++it;
+    }
+    if (!L.backlog.empty()) L.backlog.push_back(token);
+    else L.index->append(token);
+    stats_.lookup_seconds += since(t0);
+}
+
 void BatchSpeculator::start(std::uint32_t slot, std::span<const std::uint32_t> prompt) {
     auto& S = *slots_;
     if (slot >= S.count) throw std::invalid_argument("deepseek41 batch dspark: no such slot");
@@ -165,6 +246,7 @@ void BatchSpeculator::start(std::uint32_t slot, std::span<const std::uint32_t> p
     last_finish_ok_ = false;  // its prefill / import ran in the loop since the last step: that gap is no per-step cost
     prompts_[slot].assign(prompt.begin(), prompt.end());
     positions_[slot] = 0;
+    lookup_reset(slot, prompt);
     owners_[slot] = options_.world == 2U && options_.split_started ? slot % 2U : 0U;
     in_step_[slot] = false;  // rank 1 may not see a prompt read in rows: imported() requests only
 }
@@ -179,6 +261,7 @@ void BatchSpeculator::imported(std::uint32_t slot, std::span<const std::uint32_t
     auto& ctx = slots_->context[slot];
     ctx.assign(prompt.begin(), prompt.end());
     ctx.push_back(first);
+    lookup_commit(slot, first, position);
     positions_[slot] = position;
     owners_[slot] = options_.world == 2U ? slot % 2U : 0U;
     in_step_[slot] = coop_;  // both ranks import it with the same seed rows
@@ -221,7 +304,8 @@ void BatchSpeculator::follow_stage(std::span<const BatchRow> last_rows, std::spa
         while (r0 + count < last_rows.size() && last_rows[r0 + count].slot == slot) ++count;
         const std::uint32_t k = std::min(count, kept_.at(slot));
         const bool prompt = positions_[slot] < prompts_[slot].size();
-        if (count > 1U && !coop_pending_[slot]) in_step_[slot] = false;  // rows not from a cooperative draft (as finish())
+        const bool lookup_window = slot < 32U && ((lookup_mask_follow_ >> slot) & 1U) != 0U;
+        if (count > 1U && !coop_pending_[slot] && !lookup_window) in_step_[slot] = false;  // as finish()
         coop_pending_[slot] = false;
         if (keeps(slot)) {
             stage(slot, r0, k);
@@ -238,6 +322,7 @@ void BatchSpeculator::follow_stage(std::span<const BatchRow> last_rows, std::spa
         r0 += count;
     }
     kept_.fill(0xFFFFFFFFU);
+    lookup_mask_follow_ = 0U;
 }
 
 bool BatchSpeculator::follow_packet(std::span<const std::byte> packet, std::span<const BatchRow> last_rows, std::span<const std::uint32_t> last_tokens,
@@ -300,7 +385,9 @@ struct BatchSpeculator::ParkedPlan {
     PlannedStep plan;
     std::vector<ds::Draft> drafts;
     std::vector<std::uint32_t> window_rows;
-    std::vector<bool> drafted;
+    std::vector<bool> drafted, lookup;
+    std::vector<std::uint32_t> lookup_cap;
+    std::uint32_t lookup_mask = 0;
     std::uint32_t planned_drafting = 0, planned_decoders = 0, planned_total = 0;
     bool planned_prompt_rows = false;
     double plan_seconds = 0.0;
@@ -322,6 +409,9 @@ std::shared_ptr<BatchSpeculator::ParkedPlan> BatchSpeculator::park() {
     p->drafts = std::move(drafts_);
     p->window_rows = std::move(window_rows_);
     p->drafted = std::move(drafted_);
+    p->lookup = std::move(lookup_);
+    p->lookup_cap = std::move(lookup_cap_);
+    p->lookup_mask = lookup_mask_;
     p->planned_drafting = planned_drafting_;
     p->planned_decoders = planned_decoders_;
     p->planned_total = planned_total_;
@@ -332,6 +422,8 @@ std::shared_ptr<BatchSpeculator::ParkedPlan> BatchSpeculator::park() {
     drafts_.clear();
     window_rows_.clear();
     drafted_.clear();
+    lookup_.clear();
+    lookup_cap_.clear();
     return p;
 }
 
@@ -341,6 +433,9 @@ void BatchSpeculator::resume(const std::shared_ptr<ParkedPlan>& p) {
     drafts_ = p->drafts;
     window_rows_ = p->window_rows;
     drafted_ = p->drafted;
+    lookup_ = p->lookup;
+    lookup_cap_ = p->lookup_cap;
+    lookup_mask_ = p->lookup_mask;
     planned_drafting_ = p->planned_drafting;
     planned_decoders_ = p->planned_decoders;
     planned_total_ = p->planned_total;
@@ -359,6 +454,10 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
     drafts_.assign(n, ds::Draft{});
     window_rows_.assign(n, 0U);
     drafted_.assign(n, false);
+    lookup_.assign(n, false);
+    lookup_cap_.assign(n, 0U);
+    lookup_mask_ = 0U;
+    if (lookup_log_) lookup_trace_.assign(n, LookupTrace{});
     // decoding requests: one row each at least
     std::vector<std::uint32_t> dec;
     for (std::uint32_t i = 0; i < n; ++i)
@@ -398,14 +497,113 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
         c.coop = all && coop_n_ != 0U ? static_cast<float>(coop_mean_) : 0.0F;
         controller_.set_costs(c);
     }
+    // prompt lookup first: per decoding request the window of the best estimated rate (tokens per priced step time;
+    // rows only, no draft) where it beats the mean rate of the request's alternative (its measured DSpark windows
+    // while DSpark may draft, else a plain row) by the margin; stage 1 then plans DSpark for the others in the rows left
+    std::vector<std::vector<double>> given;
+    std::vector<ds::Draft> looked;
+    std::uint32_t nlookup = 0, lookup_rows = 0;
+    std::vector<std::uint32_t> limit1 = limit;
+    if (lookup_on_ && nd != 0U) {
+        const auto t_lookup = clock_type::now();
+        const auto& c = controller_.costs();
+        const double base = controller_.plain_cost(nd), row = c.row;
+        given.assign(nd, {});
+        looked.assign(nd, ds::Draft{});
+        for (std::uint32_t k = 0; k < nd; ++k) {
+            const auto slot = slots[k];
+            auto& L = lookup_slots_[slot];
+            if (!L.index) continue;
+            if (!L.backlog.empty()) lookup_catch_up(slot);
+            const auto& s = *seqs[dec[k]];
+            if (!L.backlog.empty() || L.next_position != std::uint64_t{s.position} + 1U) continue;  // not current
+            const auto m = L.index->longest({}, lookup_min_match, ds::block_size);
+            if (m.length < lookup_min_match || m.available == 0U) continue;
+            const auto b = lookup_bucket(m.length);
+            if (lookup_log_) {
+                auto& tr = lookup_trace_[dec[k]];
+                tr.candidate = true, tr.length = m.length, tr.bucket = b, tr.available = std::min<std::uint32_t>(m.available, ds::block_size);
+                for (std::uint32_t j = 0; j < tr.available; ++j) tr.token[j] = m.next[j];
+            }
+            // the evidence (decayed) that this bucket's candidates survive, scored on what this request commits
+            for (auto& x : L.eligible[b]) x *= lookup_decay;
+            for (auto& x : L.accepted[b]) x *= lookup_decay;
+            const bool enough = L.evidence[b] >= lookup_evidence && base > 0.0 && row > 0.0;
+            L.evidence[b] = L.evidence[b] * lookup_decay + 1.0;
+            if (L.pending.size() < lookup_pending) {
+                LookupSlot::Pending p;
+                p.first = std::uint64_t{s.position} + 1U;
+                p.count = std::min<std::uint32_t>(m.available, ds::block_size);
+                p.bucket = b;
+                for (std::uint32_t j = 0; j < p.count; ++j) p.token[j] = m.next[j];
+                L.pending.push_back(p);
+            }
+            if (!enough || budget <= nd + lookup_rows) continue;
+            const bool dspark_may = allow_drafts_ && limit[k] > 1U;
+            if (dspark_may && L.dspark.n < 3.0) continue;  // the alternative is measured first
+            // the alternative at today's prices: its tokens (upper bound) over a step with its mean rows and the cheaper
+            // of a draft and a cooperative draft (when the request could draft cooperatively)
+            double dspark_rate = 0.0;
+            if (dspark_may) {
+                // its draft at the price of the route it would take: alone, a cooperative draft while it is in step, else a
+                // plain one; beside other decoders (drafts on each rank, cooperative only if it ends up the sole drafter)
+                // the cheaper of the two, the conservative bound. A possible route unmeasured (0) is unknown: no lookup.
+                // (this request's own eligibility and the cooperative measurement itself, not the controller's price,
+                // which is zero as soon as any decoder is out of step)
+                const bool coop_route = coop_ && in_step_[slot];
+                const double coop_price = coop_n_ != 0U ? coop_mean_ : 0.0, plain_price = c.draft;
+                double draft = 0.0;
+                if (nd == 1U) {
+                    draft = coop_route ? coop_price : plain_price;
+                } else if (coop_route) {  // plain beside other drafters, cooperative if it ends up the sole drafter
+                    draft = coop_price > 0.0 && plain_price > 0.0 ? std::min(coop_price, plain_price) : 0.0;
+                } else {
+                    draft = plain_price;
+                }
+                if (!(draft > 0.0)) continue;
+                dspark_rate = L.dspark.mean_tokens() / (base + row * (L.dspark.rows / L.dspark.n) + draft);
+            }
+            const double alternative = std::max(1.0 / base, dspark_rate) * lookup_margin_;
+            std::uint32_t depth = std::min<std::uint32_t>({m.available, ds::block_size, limit[k] - 1U, budget - nd - lookup_rows});
+            if (options_.fixed_rows != 0U) depth = std::min(depth, options_.fixed_rows - 1U);
+            double best = alternative, survival = 1.0, yield = 1.0;
+            std::uint32_t cap = 0;
+            std::vector<double> p;
+            for (std::uint32_t j = 0; j < depth; ++j) {
+                // the Beta(1,2) posterior mean per depth, compared with the alternative's mean rate (both point estimates:
+                // a lower bound against an upper one ate the whole draft saving where DSpark accepts ~95 %; the native
+                // ABBA qualifies 'never slower')
+                const double q = (L.accepted[b][j] + 1.0) / (L.eligible[b][j] + 3.0);
+                p.push_back(q);
+                survival *= q;
+                yield += survival;
+                const double rate = yield / (base + row * (j + 1U));
+                if (rate > best) best = rate, cap = j + 1U;
+            }
+            if (lookup_log_) lookup_trace_[dec[k]].rate = best, lookup_trace_[dec[k]].alternative = alternative, lookup_trace_[dec[k]].cap = cap;
+            if (cap == 0U) continue;
+            p.resize(cap);
+            given[k] = std::move(p);
+            lookup_cap_[dec[k]] = cap;
+            auto& d = looked[k];
+            d.tokens[0] = s.generated.back();
+            for (std::uint32_t j = 0; j < cap; ++j) d.tokens[j + 1U] = m.next[j];
+            limit1[k] = 1U;  // no DSpark draft for it
+            lookup_rows += cap;
+            ++nlookup;
+        }
+        if (nlookup == 0U) given.clear();
+        stats_.lookup_seconds += since(t_lookup);
+    }
     // stage 1: who drafts (the first decode step of every request count is plain: its cost is measured first)
     std::vector<bool> drafting(nd, false);
-    if (nd != 0U && budget > nd && allow_drafts_) {
+    const std::uint32_t budget1 = budget - lookup_rows;
+    if (nd != 0U && budget1 > nd && allow_drafts_) {
         if (options_.fixed_rows != 0U) {
-            for (std::uint32_t k = 0; k < nd; ++k) drafting[k] = limit[k] > 1U;
+            for (std::uint32_t k = 0; k < nd; ++k) drafting[k] = limit1[k] > 1U;
         } else if ((calib_ ? measured_n_.at(nd) : plain_n_[nd] != 0U) || !chunks.empty()) {
             // (a step with prompt rows may draft before a measured decode step of nd: those steps are never cost samples)
-            drafting = controller_.plan_drafts(slots, limit, budget);
+            drafting = controller_.plan_drafts(slots, limit1, budget1);
         }
     }
     std::vector<ds::Draft> drafts(nd);
@@ -496,15 +694,23 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
             accumulate(round_mean_, round_n_, since(t_round) - draft_mean_ * ((ndraft + 1U) / 2U));
         seen_round_ = true;  // calib: the first round (rank 1's first drafter call) is first use
     }
+    for (std::uint32_t k = 0; k < nd && nlookup != 0U; ++k)
+        if (!given[k].empty()) {
+            drafts[k] = looked[k];
+            drafts_[dec[k]] = drafts[k];
+            drafted_[dec[k]] = true;
+            lookup_[dec[k]] = true;
+            if (slots[k] < 32U) lookup_mask_ |= 1U << slots[k];
+        }
     const double draft_span = since(t_round);  // the drafts and the draft round (not per-step overhead)
     // stage 2: rows per request
     std::vector<std::uint32_t> rows(nd, 1U);
-    if (ndraft != 0U) {
+    if (ndraft + nlookup != 0U) {
         if (options_.fixed_rows != 0U) {
-            for (std::uint32_t k = 0; k < nd; ++k) rows[k] = drafting[k] ? std::min(options_.fixed_rows, limit[k]) : 1U;
+            for (std::uint32_t k = 0; k < nd; ++k) rows[k] = drafting[k] ? std::min(options_.fixed_rows, limit1[k]) : 1U;
             std::uint32_t total = 0;
             for (const auto r : rows) total += r;
-            while (total > budget) {  // the last of the largest windows gives a row back
+            while (total > budget1) {  // the last of the largest windows gives a row back (lookup rows are reserved)
                 std::uint32_t big = 0;
                 for (std::uint32_t k = 0; k < nd; ++k)
                     if (rows[k] >= rows[big]) big = k;
@@ -512,7 +718,7 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
                 --total;
             }
         } else {
-            rows = controller_.choose_rows(slots, limit, budget, drafting, drafts);
+            rows = controller_.choose_rows(slots, limit1, budget - lookup_rows, drafting, drafts);
             if (calib_ && probe_due_ && chunks.empty()) {  // a step with prompt rows is no cost sample: keep it due
                 std::uint32_t total = 0;
                 bool wide = false;
@@ -527,6 +733,8 @@ const PlannedStep& BatchSpeculator::plan(std::span<BatchSequence* const> seqs, s
             }
         }
     }
+    for (std::uint32_t k = 0; k < nd && nlookup != 0U; ++k)
+        if (!given[k].empty()) rows[k] = lookup_cap_[dec[k]] + 1U;  // as chosen (its rows were reserved before stage 1)
     // the rows: every decoding request's window, then the prompt chunks
     std::uint32_t total = 0;
     for (std::uint32_t k = 0; k < nd; ++k) {
@@ -576,7 +784,9 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
         while (r0 + count < plan_.rows.size() && plan_.owner[r0 + count] == i) ++count;
         auto& s = *seqs[i];
         const auto slot = s.slot;
-        if (count > 1U && !coop_pending_[slot]) in_step_[slot] = false;  // rows not from a cooperative draft (as follow_stage)
+        const bool coop_window = coop_pending_[slot];
+        // rows not from a cooperative draft or a lookup window (as follow_stage): a one-rank draft flushed on one rank
+        if (count > 1U && !coop_window && !lookup_[i]) in_step_[slot] = false;
         coop_pending_[slot] = false;
         if (window_rows_[i] != 0U) {  // a window: row j + 1 is kept when draft j + 1 equalled row j's greedy token
             std::uint32_t accepted = 0;
@@ -590,6 +800,7 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
             if (keeps(slot)) stage(slot, r0, kept);
             for (std::uint32_t j = 0; j < kept; ++j) {
                 s.generated.push_back(tokens[r0 + j]);
+                lookup_commit(slot, tokens[r0 + j], std::uint64_t{s.position} + 1U + j);
                 if (keeps(slot)) S.context[slot].push_back(tokens[r0 + j]);
             }
             s.position += kept;
@@ -597,7 +808,24 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
             ++stats_.window_rows[count];
             if (count == 1U) ++stats_.plain_rows;
             else ++stats_.windows;
-            if (drafted_[i]) {  // with one row the step's own token still checks draft 1
+            if (lookup_log_ && i < lookup_trace_.size() && lookup_trace_[i].candidate) {
+                const auto& tr = lookup_trace_[i];
+                std::uint32_t agree = 0;  // the lookup candidate's prefix equal to the DSpark draft that ran
+                if (drafted_[i] && !lookup_[i])
+                    while (agree < tr.available && agree < ds::block_size && drafts_[i].tokens[agree + 1U] == tr.token[agree]) ++agree;
+                std::uint32_t truth = 0;  // the candidate's prefix equal to the tokens committed this step
+                while (truth < tr.available && truth < kept && tokens[r0 + truth] == tr.token[truth]) ++truth;
+                std::fprintf(stderr, "dspark lookup: slot %u pos %u len %u bucket %u avail %u cap %u rate %.2f alt %.2f ran %s rows %u accepted %u agree %u truth %u kept %u\n",
+                             slot, s.position, tr.length, tr.bucket, tr.available, tr.cap, tr.rate * 1e-3, tr.alternative * 1e-3,
+                             lookup_[i] ? "lookup" : drafted_[i] ? "dspark" : "plain", count, accepted, agree, truth, kept);
+            }
+            if (lookup_[i]) {  // a prompt-lookup window: its own counts (the DSpark controller observes DSpark drafts only)
+                if (count > 1U) {
+                    ++stats_.lookup_windows;
+                    stats_.lookup_verified += count - 1U;
+                    stats_.lookup_accepted += accepted;
+                }
+            } else if (drafted_[i]) {  // with one row the step's own token still checks draft 1
                 const std::uint32_t verified = std::max(count - 1U, 1U);
                 const std::uint32_t acc = count > 1U ? accepted : (drafts_[i].tokens[1] == tokens[r0] ? 1U : 0U);
                 if (cost_log_) {  // diagnostic: the controller's per-depth acceptance before this observation vs the outcome
@@ -611,6 +839,7 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
                     std::fprintf(stderr, "%s\n", line);
                 }
                 controller_.observe(slot, drafts_[i], verified, acc);
+                if (lookup_on_) lookup_slots_[slot].dspark.add(kept, count - 1U);  // the alternative a lookup window must beat
                 stats_.drafts_verified += count - 1U;
                 stats_.drafts_accepted += accepted;
                 for (std::uint32_t j = 0; j + 1U < count && j <= accepted && j < ds::block_size; ++j) {
@@ -626,6 +855,7 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> BatchSpeculator::finish(std
             if (!s.reading_prompt()) {
                 if (mine) S.context[slot].insert(S.context[slot].end(), s.prompt.begin(), s.prompt.end());
                 s.generated.push_back(tokens[r0 + count - 1U]);
+                lookup_commit(slot, tokens[r0 + count - 1U], s.position);
                 if (mine) S.context[slot].push_back(tokens[r0 + count - 1U]);
             }
         }

@@ -306,7 +306,7 @@ struct Control {
     std::uint32_t pbudget = 0;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill_unit budget
     std::uint64_t pkey = 0;
     std::uint32_t prefill_mode = 0, prefill_rows = 0, prefix_block = 0;
-    std::uint32_t pend = 0;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill_unit end row
+    std::uint32_t pend = 0;  // STRIX_DS41_SERVE_SCHED=interleave: the prefill_unit end row; step: prompt-lookup window slots
     std::uint64_t prefix_bytes = 0;
     // disk tier and session snapshots (hello: configuration; step/prefill/heartbeat: snaps = slots whose state at a
     // block boundary rank 0 inserted after the last step, inserted by rank 1 before anything else)
@@ -1447,6 +1447,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* 
         std::copy_n(c.row, std::min(c.rows, BatchForward::max_rows), step_rows.begin());
         if (c.rows > BatchForward::max_rows) std::copy_n(c.extra_rows, c.rows - BatchForward::max_rows, step_rows.begin() + BatchForward::max_rows);
         const auto rows = std::span<const BatchRow>(step_rows.data(), c.rows);
+        if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
         const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
         last_rows.assign(rows.begin(), rows.end());
         spec_rows = last_rows;
@@ -2132,11 +2133,13 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 const auto& st = sp->stats();
                 const auto& c = sp->controller().costs();
                 std::fprintf(stderr, "; dspark: %llu drafted steps, draft %.1f s total, plan %.1f s, finish %.1f s, windows %llu, plain rows %llu,"
-                             " drafts %llu accepted of %llu (cooperative %llu); costs ms plain[1..4] %.1f %.1f %.1f %.1f row %.2f draft %.2f round %.2f coop %.2f",
+                             " drafts %llu accepted of %llu (cooperative %llu), lookup windows %llu (%llu accepted of %llu, host %.1f ms); costs ms plain[1..4] %.1f %.1f %.1f %.1f"
+                             " row %.2f draft %.2f round %.2f coop %.2f",
                              static_cast<unsigned long long>(st.drafted_steps), st.draft_seconds, st.plan_seconds, st.finish_seconds,
                              static_cast<unsigned long long>(st.windows), static_cast<unsigned long long>(st.plain_rows),
                              static_cast<unsigned long long>(st.drafts_accepted), static_cast<unsigned long long>(st.drafts_verified),
-                             static_cast<unsigned long long>(st.coop_drafts), c.plain[1] * 1e3, c.plain[2] * 1e3, c.plain[3] * 1e3, c.plain[4] * 1e3,
+                             static_cast<unsigned long long>(st.coop_drafts), static_cast<unsigned long long>(st.lookup_windows), static_cast<unsigned long long>(st.lookup_accepted),
+                             static_cast<unsigned long long>(st.lookup_verified), st.lookup_seconds * 1e3, c.plain[1] * 1e3, c.plain[2] * 1e3, c.plain[3] * 1e3, c.plain[4] * 1e3,
                              c.row * 1e3, c.draft * 1e3, c.round * 1e3, c.coop * 1e3);
             }
             std::fprintf(stderr, "; steps by rows %s, by running %s, drafts allowed %llu; %s\n", hist(by_rows).c_str(), hist(by_running).c_str(),
@@ -2609,6 +2612,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         Control c;
         c.command = static_cast<std::uint32_t>(Command::step);
         c.rows = static_cast<std::uint32_t>(plan.rows.size());
+        c.pend = spec ? spec->lookup_window_slots() : 0U;  // step: the slots whose window came from prompt lookup
         c.resets = pending_resets;
         c.snaps = pending_snaps;
         pending_snaps = 0;

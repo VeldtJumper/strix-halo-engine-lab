@@ -4,6 +4,7 @@
 #include "strix/deepseek41_batch_schedule.hpp"
 #include "strix/ds41_dspark_driver.hpp"
 #include "strix/hip_ds41_dspark.hpp"
+#include "strix/lookup/index.hpp"
 
 #include <array>
 #include <chrono>
@@ -55,6 +56,11 @@ struct BatchSpecOptions {
     // world 2: a request drafting alone in a step is drafted by both ranks (DeviceDrafter::set_rank); both ranks must
     // agree (the server compares it in its hello; STRIX_DS41_DSPARK_COOP=0 turns it off)
     bool coop = true;
+    // Prompt lookup (rank 0, the planner): a request may draft its window from an earlier occurrence of its context
+    // (prompt + committed tokens, strix/lookup/index.hpp) instead of DSpark, or when DSpark does not draft; chosen per
+    // request from measured survival (no draft time). Exact: verification decides every token. STRIX_DS41_LOOKUP=0
+    // turns it off; rank 1 needs no setting (the rows carry the tokens).
+    bool lookup = true;
     // The wall time of the last target step for the cost model (empty: target.last_stats().seconds). A split decode
     // (ds41_hetero_stage.hpp) passes the step it waited for: the FRONT's boundaries, the forward and the TAIL step.
     std::function<double()> step_seconds;
@@ -68,6 +74,8 @@ struct BatchSpecStats {
     std::uint64_t decode_steps = 0, decode_tokens = 0;  // steps without prompt rows and the tokens they emitted
     std::uint64_t probe_rows = 0;  // calib: extra rows verified as price-independent probes (every 32nd drafted plan, at most one)
     std::uint64_t coop_drafts = 0;  // drafts both ranks ran together (one head half each)
+    std::uint64_t lookup_windows = 0, lookup_verified = 0, lookup_accepted = 0;  // windows drafted by prompt lookup
+    double lookup_seconds = 0.0;  // host time of the lookup indexes, queries and scoring
     double draft_seconds = 0.0, step_seconds = 0.0, finish_seconds = 0.0, plan_seconds = 0.0;
     double decode_seconds = 0.0;  // wall of the decode-only steps (plan + drafts + step + finish)
     std::array<std::uint64_t, ds41::dspark::block_size + 2U> window_rows{};  // windows by rows (1 = plain row)
@@ -128,7 +136,15 @@ public:
     void release(std::uint32_t slot) { owners_.at(slot) = 0U, in_step_.at(slot) = false; }
     // both ranks: `slot`'s target state was replaced from outside (an imported state): its drafting contexts no longer
     // follow the same rows on both ranks, no cooperative draft until a new imported() request
-    void forget(std::uint32_t slot) { in_step_.at(slot) = false, coop_pending_.at(slot) = false; }
+    // world 2, rank 0: the slots whose window in the current plan came from prompt lookup (bit s); the server sends it
+    // with the step. Rank 1: that mask for the step about to run, so follow_stage keeps those requests' cooperative
+    // state (a lookup window flushes no drafter on either rank: the contexts stay identical).
+    [[nodiscard]] std::uint32_t lookup_window_slots() const noexcept { return lookup_mask_; }
+    void follow_lookup_windows(std::uint32_t mask) noexcept { lookup_mask_follow_ = mask; }
+    void forget(std::uint32_t slot) {
+        in_step_.at(slot) = false, coop_pending_.at(slot) = false;
+        if (slot < lookup_slots_.size()) lookup_slots_[slot] = LookupSlot{};  // no lookup until a new request
+    }
     static constexpr std::uint32_t round_magic = 0x44524631U;
     static constexpr std::size_t round_bytes = 512;
     [[nodiscard]] std::uint32_t owner(std::uint32_t slot) const noexcept { return owners_[slot]; }
@@ -234,6 +250,53 @@ private:
     std::array<std::uint32_t, ds41::dspark::BatchWindowController::max_requests> kept_{};  // rank 1: last step's commits (all ones: none)
     std::uint64_t staged_step_ = ~std::uint64_t{0};
     BatchSpecStats stats_;
+
+    // prompt lookup (rank 0, options_.lookup), per request (slot) as the Nemotron selector: an index over its prompt
+    // (indexed a chunk per plan) and committed tokens; every plan's candidate is shadow-scored token by token against
+    // what the request commits (per match-length bucket and depth, decayed); a window drafts from lookup only where its
+    // estimated rate (posterior-mean survival; tokens per priced step time, rows only) beats the mean rate of the request's alternative
+    // (its DSpark windows, once measured, or a plain row) by STRIX_DS41_LOOKUP_MARGIN
+    static constexpr std::uint32_t lookup_buckets = 5;
+    struct Moments {  // decayed tokens and rows per window (priced at the current costs when compared)
+        double n = 0.0, sum = 0.0, rows = 0.0;
+        void add(double tokens, double window_rows);
+        [[nodiscard]] double mean_tokens() const { return n > 0.0 ? sum / n : 0.0; }
+    };
+    struct LookupSlot {
+        std::unique_ptr<strix::lookup::Index> index;  // null: no lookup for this request
+        std::vector<std::uint32_t> backlog;           // tokens to index before it is current (the prompt, then commits)
+        std::size_t backlog_at = 0;
+        std::uint64_t next_position = 0;              // stream position of the next committed token
+        struct Pending {
+            std::uint64_t first = 0;
+            std::array<std::uint32_t, ds41::dspark::block_size> token{};
+            std::uint32_t count = 0, done = 0, bucket = 0;
+        };
+        std::vector<Pending> pending;
+        std::array<std::array<double, ds41::dspark::block_size>, lookup_buckets> eligible{}, accepted{};
+        std::array<double, lookup_buckets> evidence{};
+        Moments dspark;  // the request's DSpark windows
+    };
+    bool lookup_on_ = false;
+    double lookup_margin_ = 1.0;
+    std::uint32_t lookup_capacity_ = 1U << 16;
+    std::vector<LookupSlot> lookup_slots_;
+    std::vector<bool> lookup_;  // per owner (index into seqs): its window came from prompt lookup
+    std::vector<std::uint32_t> lookup_cap_;  // per owner: the drafts of its lookup window (executed as chosen)
+    std::uint32_t lookup_mask_ = 0, lookup_mask_follow_ = 0;  // see lookup_window_slots()
+    // STRIX_DS41_LOOKUP_LOG=1 (diagnostic, rank 0): per decoding request and step, the lookup candidate, its predicted
+    // rate against the alternative and what ran (stderr "dspark lookup:" lines), for calibration and agreement studies
+    struct LookupTrace {
+        bool candidate = false;
+        std::uint32_t length = 0, bucket = 0, available = 0, cap = 0;
+        double rate = 0.0, alternative = 0.0;
+        std::array<std::uint32_t, ds41::dspark::block_size> token{};
+    };
+    bool lookup_log_ = false;
+    std::vector<LookupTrace> lookup_trace_;  // per owner
+    void lookup_reset(std::uint32_t slot, std::span<const std::uint32_t> prompt);
+    void lookup_commit(std::uint32_t slot, std::uint32_t token, std::uint64_t position);
+    void lookup_catch_up(std::uint32_t slot);
 };
 
 }  // namespace strix::deepseek41
