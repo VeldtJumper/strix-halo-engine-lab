@@ -124,6 +124,8 @@
 // src/minimax/session/session_cache.cpp; include/strix/file_snapshot.hpp
 {"session-restore", 'b', "loader-fd asset identities+executable+runtime+schema+frontier+rank-group digest", "minimax_session_cache_tests.cpp envelope/transaction/retarget negatives; session_cache_gate.sh fresh restore and never-saved control; UNCOVERED GPU state equality", ""},
 // src/minimax/moe/mmx_moe.hip: moe_grid_slots / launch_experts4_grid
+// src/minimax/moe/mmx_moe.hip: moe_pipe4_kernel / launch_experts4_grid (calls of 2-4 rows)
+{"decode-moe-pipe", 'a', "routed gate/up + down one launch; down waits per-block gate/up readiness (epoch) instead of the boundary; same partials, counters, finish, combine", "rank --xb-check cfg f vs -: decode logits bitwise N1/N2/N4 + verify window; --ab moepipe matched replay; hip_mmx_moe_bench --test (incl. epoch wrap) and --diverse --test; mm_defaults.cpp moe_pipe", ""},
 {"decode-moe-tight-grid", 'a', "v4 routed grid.y = min(32, 4N)+1; map_slot rejects y > count before work/counters", "rank --xb-check cfg g vs -: decode logits bitwise N1/N4/N8 + verify window; mm_defaults.cpp moe_tight_grid", ""},
 // src/minimax/engine/engine.hip: xb_warm_o
 {"decode-warm-o", 'a', "cache state only (side-stream reads, sink store); no consumer of its data", "rank --xb-check cfg o vs -: decode logits bitwise N1/N4/N8 + verify window; --ab xbwarmo matched replay; mm_defaults.cpp xb_warm_o", ""},

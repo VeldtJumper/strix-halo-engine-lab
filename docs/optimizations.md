@@ -2308,6 +2308,24 @@ rows returned before any work, so at N = 1 about 10,000 empty CTAs per launch ar
 - **Measured gain:** C1 8K two-node decode 45.12-45.18 -> 44.60-44.68 ms/token (-1.2 %).
 - **Implementation / evidence:** [MoE launches](../src/minimax/moe/mmx_moe.hip), [rank gates](../apps/minimax_rank_main.cpp) (`--ab moegrid`, `--xb-check` cfg `g`)
 
+<a id="mm-moe-pipe"></a>
+
+### Decode MoE routed gate/up and down in one launch
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_MOE_PIPE`. **Default:** 2 via the engine resolver; raw-library unset is 0.
+
+After the router + shared-expert launch, the routed gate/up and down run as one launch. CTAs take arrival tickets, so
+each waits only on lower tickets that are already running; a down CTA starts as soon as the three gate/up blocks of its
+input split are finished (per-block ready word carrying the route's epoch) instead of after the whole gate/up launch.
+Form 2 runs the shared expert's down first (its inputs come from the previous launch); 1 runs it last.
+
+- **Preconditions:** v4 decode MoE overlap form, calls of 2-4 rows (DSpark verify windows, C2-C4 steps).
+- **Automatic selection:** Resolver supplies 2 only when unset; read per call. It replaces the four-row down split. N1 keeps two launches (measured 0.1 ms/token faster); 5-8 rows keep them too (the merged 8-row kernel needs ~150 VGPRs vs 85 apart and loses 15-19 %).
+- **Exactness evidence:** Decode logits bitwise on both ranks vs off at N1/N2/N4 and a 4-row verify window; in-process matched replay identical; MoE bench --test (incl. a seeded epoch wrap with stale ready words) and --diverse --test bitwise.
+- **Off switch:** STRIX_MMX_MOE_PIPE=0
+- **Measured gain:** Two-node decode, in-process blocks: N2 58.9-59.3 -> 57.3-57.7 ms/step (-2.7 %), N4 81.8-82.6 -> 80.6-80.8 ms/step (-1.6 %).
+- **Implementation / evidence:** [MoE launches](../src/minimax/moe/mmx_moe.hip), [rank gates](../apps/minimax_rank_main.cpp) (`--ab moepipe`, `--xb-check` cfg `f`)
+
 <a id="mm-serve-lookup"></a>
 
 ### Serve prompt lookup

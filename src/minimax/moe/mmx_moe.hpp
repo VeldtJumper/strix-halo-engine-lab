@@ -85,6 +85,9 @@ struct MoeWorkspace {  // one device allocation of moe_workspace_bytes(), zeroed
     void* base = nullptr;
 };
 std::size_t moe_workspace_bytes();
+// Start of the routed pipeline's sequencing words (route epoch, ticket, ready epochs) inside the workspace: they change
+// on every routed call by design, so workspace reuse checks compare the bytes before it and check the ticket separately.
+std::size_t moe_pipe_offset();
 // Bench diagnostic: print HIP VGPR/scratch/LDS for all Single=true instances; throw on scratch or query failure.
 void check_moe_single_resources();
 
