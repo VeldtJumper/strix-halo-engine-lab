@@ -1,0 +1,1626 @@
+#!/usr/bin/env python3
+"""ds41-pair: set up, run and verify the DeepSeek V4.1 Flash pair on two Strix Halo nodes.
+
+Run the same commands on both nodes; each node has its own small config file (rank, peer, model directory, profile).
+Every step is idempotent and can be re-run. Nothing here runs as root: steps that need root are printed for you to
+run, or run one by one (each shown first) only with an explicit --yes-root.
+
+  ds41-pair init --rank 0 --peer user@node-b --model-dir /path/to/models    write this node's config
+  ds41-pair check                     read-only preflight of this node (and the peer over SSH)
+  ds41-pair driver [--yes-root]       build the USB4 driver modules for the running kernel, then the root steps
+  ds41-pair driver-verify [--link-test]   both cables, link speed, the four streams (and a live exchange)
+  ds41-pair build                     build the trellis library and the engine with the production options
+  ds41-pair fetch [--dry-run] [--from-peer] [--verify]   pinned weights, every SHA-256 checked, resumable
+  ds41-pair prepare [--dry-run]       optional one-time expert preparation (faster model loads)
+  ds41-pair run [--both] | stop [--both] | status | logs | unit [--install]
+  ds41-pair smoke                     exact token check against the published reference and one speed line
+
+Full guide: docs/pair-setup.md.
+"""
+import argparse
+import datetime
+import fnmatch
+import glob
+import hashlib
+import http.client
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[1]
+sys.path.insert(0, str(REPO / 'scripts' / 'bench' / 'lib'))
+import fetch_models  # noqa: E402  (the pinned mirror revisions and the DeepSeek file recipe live there)
+
+# Test hook: a directory that stands in for / when reading /sys, /proc, /dev, /boot and /run (hardware-free tests).
+ROOT = os.environ.get('DS41_PAIR_TEST_ROOT', '')
+
+# ---------------------------------------------------------------------------------------------------------------- pins
+TRELLIS_GIT = 'https://github.com/hyukudan/strix-trellis.git'
+TRELLIS_COMMIT = 'a34516bf91b9c66166bf6d3678d10fc68d6c122c'
+DRIVER_GIT = 'https://github.com/hyukudan/strix-halo-usb4-driver.git'
+DRIVER_COMMIT = '4668b95451cddd613c1268a0c85eedf0c7ae2898'
+LINUX_COMMIT = '72d3fcf802c45d00b300f25b848a93c3a2bd7c7e'  # the upstream tree the driver series applies to (7.3-rc5)
+LINUX_GIT = 'https://github.com/torvalds/linux.git'
+TTM_PAGES_LIMIT = 30720000  # 117 GiB GTT (driver NODE-SETUP section 4)
+MODEL = 'DeepSeek-V4.1-Flash-1017-Q2.gguf'
+# Published sizes of the production files (bytes), used for the disk check before anything is downloaded.
+SIZES = {MODEL: 365713686528, 'DeepSeek-V4.1-Flash-1017-DSpark-MXFP4.gguf': 7966294016,
+         'c-u6.gguf': 7588516384, 'ours-K4/': 3581409171, 'ours-K5/': 4474173923, 'aux/': 2506854}
+PREPARED_BYTES = 77 << 30  # one rank's TP pack (72 GiB of experts plus headroom)
+BINARIES = ['strix-deepseek41-serve', 'strix-deepseek41-rank', 'strix-tokenize', 'strix-ds41-prepare-load',
+            'strix-dist-host-exchange-bench']
+PROFILES = ('default', 'fast', 'quality')
+SMOKE_REFERENCE = HERE / 'ds41-smoke-reference.json'
+
+COLOR = sys.stdout.isatty() and os.environ.get('NO_COLOR') is None
+FAILS = []
+
+
+def sysp(path):
+    return Path(ROOT + path) if ROOT else Path(path)
+
+
+def say(level, topic, text):
+    tag = {'PASS': '\033[32mPASS\033[0m', 'WARN': '\033[33mWARN\033[0m', 'FAIL': '\033[31mFAIL\033[0m',
+           'INFO': 'INFO'}[level] if COLOR else level
+    print(f'{tag}  {topic:<10} {text}', flush=True)
+    if level == 'FAIL':
+        FAILS.append(topic)
+
+
+def die(text, code=1):
+    print('ds41-pair: ' + text, file=sys.stderr)
+    sys.exit(code)
+
+
+def read(path, default=None):
+    try:
+        return Path(path).read_text(encoding='utf-8', errors='replace').strip()
+    except OSError:
+        return default
+
+
+def run(argv, check=True, cwd=None, env=None, capture=False, show=True):
+    if show:
+        print('+ ' + shlex.join(map(str, argv)), flush=True)
+    r = subprocess.run(list(map(str, argv)), cwd=cwd, env=env, text=True,
+                       stdout=subprocess.PIPE if capture else None, stderr=subprocess.STDOUT if capture else None)
+    if check and r.returncode != 0:
+        if capture and r.stdout:
+            print(r.stdout[-4000:], end='')
+        die(f'command failed ({r.returncode}): {shlex.join(map(str, argv))}')
+    return r
+
+
+def out(argv, timeout=30):
+    try:
+        r = subprocess.run(argv, text=True, capture_output=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def human(n):
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(n) < 1000 or unit == 'TB':
+            return f'{n:.1f} {unit}' if unit != 'B' else f'{n} B'
+        n /= 1000.0
+    return str(n)
+
+
+def sha256(path, label=None):
+    h = hashlib.sha256()
+    size = path.stat().st_size
+    done, last = 0, time.time()
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(16 << 20), b''):
+            h.update(block)
+            done += len(block)
+            if size > (4 << 30) and time.time() - last > 15:
+                print(f'      hashing {label or path.name}: {100 * done // size} %', flush=True)
+                last = time.time()
+    return h.hexdigest()
+
+
+# -------------------------------------------------------------------------------------------------------------- config
+def config_path(args):
+    if getattr(args, 'config', None):
+        return Path(args.config)
+    if os.environ.get('STRIX_PAIR_CONFIG'):
+        return Path(os.environ['STRIX_PAIR_CONFIG'])
+    base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return base / 'strix-pair' / 'ds41.conf'
+
+
+def data_dir():
+    base = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share')
+    return base / 'strix-pair'
+
+
+def state_dir():
+    base = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state')
+    return base / 'strix-pair'
+
+
+DEFAULTS = {'RANK': '', 'PEER': '', 'PEER_REPO': '', 'PEER_MODEL_DIR': '', 'PEER_CONFIG': '', 'MODEL_DIR': '', 'PROFILE': 'default',
+            'BUILD_DIR': '', 'DEPS_DIR': '', 'ROCM_PATH': '', 'HTTP_BIND': '127.0.0.1', 'HTTP_PORT': '8080',
+            'API_KEY_FILE': '', 'CONTEXT': '', 'EXTRA_ARGS': ''}
+CONFIG_DOC = {
+    'RANK': 'this node\'s rank: 0 serves HTTP, 1 is the other half',
+    'PEER': 'SSH destination of the other node (checks, copies, run --both); BatchMode keys',
+    'PEER_REPO': 'this repository on the peer (empty: the same path as here)',
+    'PEER_MODEL_DIR': 'model directory on the peer (empty: the same as MODEL_DIR)',
+    'PEER_CONFIG': 'config file on the peer (empty: its default location)',
+    'MODEL_DIR': 'directory with the production files (layout in docs/pair-setup.md)',
+    'PROFILE': 'default (exact production) | fast | quality; the same on both ranks',
+    'BUILD_DIR': 'engine build directory',
+    'DEPS_DIR': 'trellis library, driver and kernel sources, built modules',
+    'ROCM_PATH': 'ROCm root (empty: hipconfig -R, else /opt/rocm)',
+    'HTTP_BIND': 'rank 0 HTTP address (127.0.0.1 = this machine only)',
+    'HTTP_PORT': 'rank 0 HTTP port',
+    'API_KEY_FILE': 'file with the HTTP API key (required by the server when HTTP_BIND is not loopback)',
+    'CONTEXT': 'context length (empty: the server default)',
+    'EXTRA_ARGS': 'extra strix-deepseek41-serve options, the same on both ranks',
+}
+
+
+def load_config(args, required=True):
+    path = config_path(args)
+    cfg = dict(DEFAULTS)
+    if path.is_file():
+        for n, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            key, sep, value = line.partition('=')
+            if not sep or not re.fullmatch(r'[A-Z_]+', key):
+                die(f'{path}:{n}: expected KEY=VALUE')
+            parts = shlex.split(value, comments=True)
+            cfg[key] = ' '.join(parts)
+            if key not in ('EXTRA_ARGS',):
+                cfg[key] = os.path.expanduser(os.path.expandvars(cfg[key]))
+    elif required:
+        die(f'no config at {path}; run: ds41-pair init --rank 0|1 --peer USER@OTHER-NODE --model-dir DIR')
+    cfg['BUILD_DIR'] = cfg['BUILD_DIR'] or str(REPO / 'build-ds41')
+    cfg['DEPS_DIR'] = cfg['DEPS_DIR'] or str(data_dir())
+    cfg['PEER_REPO'] = cfg['PEER_REPO'] or str(REPO)
+    cfg['PEER_MODEL_DIR'] = cfg['PEER_MODEL_DIR'] or cfg['MODEL_DIR']
+    cfg['_path'] = str(path)
+    if required:
+        if cfg['RANK'] not in ('0', '1'):
+            die(f'{path}: RANK must be 0 or 1')
+        if not cfg['MODEL_DIR']:
+            die(f'{path}: MODEL_DIR is empty')
+        if cfg['PROFILE'] not in PROFILES:
+            die(f'{path}: PROFILE must be one of {", ".join(PROFILES)}')
+    return cfg
+
+
+def write_config(path, cfg):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ['# ds41-pair config of this node (shell syntax; read by ds41-pair and ds41-pair-launch).',
+             '# The other node has its own file with the other RANK; everything else should match.']
+    for key in DEFAULTS:
+        lines.append(f'# {CONFIG_DOC[key]}')
+        lines.append(f'{key}={shlex.quote(cfg.get(key, ""))}')
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def raw_config(path):
+    """The keys as written in the file, without the derived defaults."""
+    cfg = dict(DEFAULTS)
+    for line in path.read_text(encoding='utf-8').splitlines():
+        key, sep, value = line.strip().partition('=')
+        if sep and re.fullmatch(r'[A-Z_]+', key) and not line.strip().startswith('#'):
+            cfg[key] = ' '.join(shlex.split(value, comments=True))
+    return cfg
+
+
+def cmd_init(args):
+    path = config_path(args)
+    cfg = raw_config(path) if path.is_file() else dict(DEFAULTS)
+    if path.is_file() and not args.force:
+        print(f'updating {path} (only the options you gave change)')
+    for key, value in (('RANK', args.rank), ('PEER', args.peer), ('MODEL_DIR', args.model_dir),
+                       ('PROFILE', args.profile), ('BUILD_DIR', args.build_dir), ('HTTP_PORT', args.http_port),
+                       ('HTTP_BIND', args.http_bind), ('PEER_REPO', args.peer_repo),
+                       ('PEER_MODEL_DIR', args.peer_model_dir), ('PEER_CONFIG', args.peer_config),
+                       ('API_KEY_FILE', args.api_key_file),
+                       ('CONTEXT', args.context), ('ROCM_PATH', args.rocm), ('DEPS_DIR', args.deps_dir)):
+        if value is not None:
+            cfg[key] = (str(Path(value).expanduser().absolute()) if key in ('MODEL_DIR', 'BUILD_DIR', 'DEPS_DIR')
+                        else str(value))
+    if cfg.get('RANK') not in ('0', '1'):
+        die('--rank 0 or --rank 1 is required')
+    if not cfg.get('MODEL_DIR'):
+        die('--model-dir is required')
+    if cfg.get('PROFILE', 'default') not in PROFILES:
+        die('--profile must be one of ' + ', '.join(PROFILES))
+    for key in ('_path',):
+        cfg.pop(key, None)
+    # Keep derived defaults implicit so that the file stays portable between the two nodes.
+    for key in ('BUILD_DIR', 'DEPS_DIR', 'PEER_REPO', 'PEER_MODEL_DIR'):
+        if cfg.get(key) in (str(REPO / 'build-ds41'), str(data_dir()), str(REPO)):
+            cfg[key] = ''
+    if cfg.get('PEER_MODEL_DIR') == cfg.get('MODEL_DIR'):
+        cfg['PEER_MODEL_DIR'] = ''
+    write_config(path, cfg)
+    print(f'wrote {path}: rank {cfg["RANK"]}, peer {cfg.get("PEER") or "(none)"}, model dir {cfg["MODEL_DIR"]}, '
+          f'profile {cfg.get("PROFILE") or "default"}')
+    other = '1' if cfg['RANK'] == '0' else '0'
+    print(f'On the other node run the same with --rank {other} (and --peer pointing back here).')
+    print('Next: ds41-pair check')
+
+
+def cmd_config(args):
+    cfg = load_config(args)
+    print(f'# {cfg["_path"]}')
+    for key in DEFAULTS:
+        print(f'{key}={shlex.quote(cfg[key])}')
+
+
+# --------------------------------------------------------------------------------------------------------- sysfs probes
+def gpu_targets():
+    found = []
+    for props in sorted(glob.glob(str(sysp('/sys/class/kfd/kfd/topology/nodes')) + '/*/properties')):
+        m = re.search(r'^gfx_target_version (\d+)$', read(props, ''), re.M)
+        if m and int(m[1]):
+            v = int(m[1])
+            found.append(f'gfx{v // 10000}{(v // 100) % 100}{v % 100:x}')
+    return found
+
+
+def meminfo():
+    info = {}
+    for line in (read(sysp('/proc/meminfo'), '') or '').splitlines():
+        key, _, rest = line.partition(':')
+        try:
+            info[key] = int(rest.split()[0]) * 1024
+        except (IndexError, ValueError):
+            pass
+    return info
+
+
+def gb_per_lane(text):
+    m = re.match(r'\s*([0-9.]+)\s*Gb/s', text or '')
+    return float(m[1]) if m else None
+
+
+def usb4_links():
+    """Every XDomain / device link the Thunderbolt bus reports, with per-direction speed (Gb/s per lane) and lanes."""
+    links = []
+    for d in sorted(glob.glob(str(sysp('/sys/bus/thunderbolt/devices')) + '/*')):
+        name = os.path.basename(d)
+        if not re.fullmatch(r'\d+-[0-9a-f]+', name) or name.endswith('-0'):
+            continue  # host routers (N-0) and services (N-R.S) are not links
+        rx, tx = gb_per_lane(read(d + '/rx_speed')), gb_per_lane(read(d + '/tx_speed'))
+        if rx is None and tx is None:
+            continue
+        links.append({'name': name, 'peer': read(d + '/device_name', '?'), 'rx': rx, 'tx': tx,
+                      'rx_lanes': int(read(d + '/rx_lanes', '0') or 0), 'tx_lanes': int(read(d + '/tx_lanes', '0') or 0)})
+    return links
+
+
+def link_verdict(link):
+    """(level, text) for one link: Gen3 x2 = 20 Gb/s per lane on 2 lanes in both directions."""
+    def g(v):
+        return '?' if v is None else f'{v:g}'
+    desc = (f'{link["name"]} to {link["peer"]}: rx {g(link["rx"])} Gb/s x{link["rx_lanes"]}, '
+            f'tx {g(link["tx"])} Gb/s x{link["tx_lanes"]}')
+    speeds = [s for s in (link['rx'], link['tx']) if s is not None]
+    lanes = (link['rx_lanes'], link['tx_lanes'])
+    if speeds and min(speeds) >= 20 and min(lanes) >= 2:
+        return 'PASS', desc + ' (Gen3 x2, 40 Gb/s per direction)'
+    if speeds and min(speeds) < 20:
+        return 'WARN', desc + ' - trained at Gen2: re-seat that cable with both nodes on'
+    return 'WARN', desc + ' - single lane: re-seat that cable with both nodes on'
+
+
+def stream_devices():
+    return sorted(glob.glob(str(sysp('/dev')) + '/tbstream*'))
+
+
+def module_loaded(name):
+    return sysp(f'/sys/module/{name}').is_dir()
+
+
+def nhi_devices():
+    """PCI USB4 host interfaces (class 0x0c0340) with their IOMMU group type and driver."""
+    found = []
+    for d in sorted(glob.glob(str(sysp('/sys/bus/pci/devices')) + '/*')):
+        if read(d + '/class', '') != '0x0c0340':
+            continue
+        group = os.path.realpath(d + '/iommu_group') if os.path.exists(d + '/iommu_group') else None
+        found.append({'pci': os.path.basename(d), 'type': read(group + '/type', '?') if group else None,
+                      'driver': os.path.basename(os.path.realpath(d + '/driver')) if os.path.exists(d + '/driver') else None})
+    return found
+
+
+def kernel_config():
+    """The running kernel's configuration text (from /boot or /proc/config.gz), or None."""
+    release = platform.release()
+    text = read(sysp(f'/boot/config-{release}'))
+    if text:
+        return text, str(sysp(f'/boot/config-{release}'))
+    gz = sysp('/proc/config.gz')
+    if gz.is_file():
+        import gzip
+        try:
+            return gzip.decompress(gz.read_bytes()).decode('utf-8', 'replace'), str(gz)
+        except OSError:
+            pass
+    return None, None
+
+
+def rocm_root(cfg):
+    if cfg.get('ROCM_PATH'):
+        return Path(cfg['ROCM_PATH'])
+    r = out(['hipconfig', '-R'])
+    if r and Path(r.splitlines()[0]).is_dir():
+        return Path(r.splitlines()[0])
+    return Path(os.environ.get('ROCM_PATH', '/opt/rocm'))
+
+
+def hip_compiler(rocm):
+    for rel in ('lib/llvm/bin/clang++', 'llvm/bin/clang++', 'bin/amdclang++'):
+        if (rocm / rel).is_file():
+            return rocm / rel
+    return None
+
+
+def version_tuple(text):
+    return tuple(int(x) for x in re.findall(r'\d+', text or '')[:3])
+
+
+def ssh_argv(cfg, command):
+    return ['ssh', '-n', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', cfg['PEER'], command]
+
+
+def peer_cli(cfg, sub):
+    """The ds41-pair command line to run SUB on the peer (its own config)."""
+    conf = f' --config {shlex.quote(cfg["PEER_CONFIG"])}' if cfg.get('PEER_CONFIG') else ''
+    return f'{shlex.quote(cfg["PEER_REPO"] + "/scripts/pair/ds41-pair")}{conf} {sub}'
+
+
+# --------------------------------------------------------------------------------------------------------------- check
+def model_files_status(cfg):
+    md = Path(cfg['MODEL_DIR'])
+    need, present = 0, []
+    for name, size in SIZES.items():
+        p = md / name.rstrip('/')
+        if name.endswith('/'):
+            have = sum(f.stat().st_size for f in p.rglob('*') if f.is_file()) if p.is_dir() else 0
+        else:
+            have = p.stat().st_size if p.is_file() else 0
+        if have >= size:
+            present.append(name.rstrip('/'))
+        need += max(0, size - have)
+    return need, present
+
+
+def free_bytes(path):
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return shutil.disk_usage(p).free
+
+
+def cmd_check(args):
+    cfg = load_config(args)
+    print(f'ds41-pair check: rank {cfg["RANK"]}, config {cfg["_path"]}')
+    # Hardware
+    cpu = re.search(r'^model name\s*:\s*(.+)$', read(sysp('/proc/cpuinfo'), '') or '', re.M)
+    cpu = cpu[1].strip() if cpu else '?'
+    say('PASS' if re.search(r'Ryzen AI MAX', cpu, re.I) else 'WARN', 'cpu',
+        cpu + ('' if re.search(r'Ryzen AI MAX', cpu, re.I) else ' (not a Strix Halo Ryzen AI Max: untested)'))
+    gpus = gpu_targets()
+    if 'gfx1151' in gpus:
+        say('PASS', 'gpu', 'gfx1151 (Radeon 8060S) visible through /dev/kfd')
+    else:
+        say('FAIL', 'gpu', f'no gfx1151 GPU in the KFD topology ({", ".join(gpus) or "none"}): install amdgpu/ROCm')
+    kfd = sysp('/dev/kfd')
+    if kfd.exists():
+        say('PASS' if os.access(kfd, os.R_OK | os.W_OK) else 'FAIL', 'kfd',
+            '/dev/kfd read/write' if os.access(kfd, os.R_OK | os.W_OK)
+            else '/dev/kfd not writable: add your user to the render and video groups, log in again')
+    mem = meminfo()
+    total = mem.get('MemTotal', 0)
+    vram = sum(int(read(p, '0') or 0) for p in glob.glob(str(sysp('/sys/class/drm')) + '/card*/device/mem_info_vram_total'))
+    if total + vram >= 120 << 30:
+        say('PASS', 'memory', f'{total / 2**30:.0f} GiB system + {vram / 2**30:.1f} GiB GPU carve-out (128 GB class)')
+    else:
+        say('FAIL', 'memory', f'{(total + vram) / 2**30:.0f} GiB in total; the pair needs a 128 GB node')
+    if vram > 8 << 30:
+        say('WARN', 'memory', f'{vram / 2**30:.0f} GiB reserved as VRAM in firmware; the engine allocates from system '
+            'memory (GTT): a small UMA carve-out leaves more for the model')
+    gtt = sum(int(read(p, '0') or 0) for p in glob.glob(str(sysp('/sys/class/drm')) + '/card*/device/mem_info_gtt_total'))
+    if gtt >= 100 << 30:
+        say('PASS', 'memory', f'GPU can map {gtt / 2**30:.0f} GiB of system memory (GTT)')
+    elif gtt:
+        say('FAIL', 'memory', f'GTT limit {gtt / 2**30:.0f} GiB: the pair needs about 117 GiB '
+            f'(options ttm pages_limit={TTM_PAGES_LIMIT}; ds41-pair driver prints the step)')
+    if 'kho=off' not in (read(sysp('/proc/cmdline'), '') or '').split():
+        say('WARN', 'memory', 'kho=off missing from the kernel command line: Kexec HandOver keeps a scratch area '
+            'reserved (ds41-pair driver prints the step)')
+    kfd_procs = glob.glob(str(sysp('/sys/class/kfd/kfd/proc')) + '/*')
+    if kfd_procs:
+        say('WARN', 'gpu', f'{len(kfd_procs)} process(es) hold the GPU now; stop them before run')
+    # Kernel, IOMMU, USB4
+    release = platform.release()
+    say('INFO', 'kernel', release + (' (the driver series targets Linux 7.3-rc5)' if not release.startswith('7.3') else ''))
+    cmdline = read(sysp('/proc/cmdline'), '') or ''
+    if re.search(r'(^|\s)(amd_iommu=off|iommu=off)(\s|$)', cmdline):
+        say('FAIL', 'iommu', 'disabled on the kernel command line: the USB4 driver needs the IOMMU; remove that option')
+    elif re.search(r'(^|\s)iommu=pt(\s|$)', cmdline):
+        say('WARN', 'iommu', 'iommu=pt puts every device in passthrough: keep the USB4 controllers translated '
+            '(per-group passthrough only, see the driver README)')
+    elif list(glob.glob(str(sysp('/sys/class/iommu')) + '/*')):
+        say('PASS', 'iommu', 'on')
+    else:
+        say('WARN', 'iommu', 'no IOMMU found: enable it in the firmware (never disable it for speed)')
+    for nhi in nhi_devices():
+        if nhi['type'] in ('DMA', 'DMA-FQ'):
+            say('PASS', 'iommu', f'USB4 controller {nhi["pci"]} translated ({nhi["type"]})')
+        elif nhi['type']:
+            say('WARN', 'iommu', f'USB4 controller {nhi["pci"]} in {nhi["type"]} mode: keep it translated (DMA-FQ)')
+    for dom in sorted(glob.glob(str(sysp('/sys/bus/thunderbolt/devices')) + '/domain*')):
+        prot = read(dom + '/iommu_dma_protection')
+        if prot is not None:
+            say('PASS' if prot == '1' else 'WARN', 'iommu', f'{os.path.basename(dom)} DMA protection '
+                + ('on' if prot == '1' else 'off: keep the USB4 controllers behind the IOMMU'))
+    perfopt = read(sysp('/sys/module/amdgpu/parameters/iommu_perfopt'))
+    if perfopt is not None:
+        say('INFO', 'iommu', f'amdgpu.iommu_perfopt={perfopt} (record it with any timing)')
+    if module_loaded('thunderbolt_stream'):
+        say('PASS', 'usb4', 'thunderbolt_stream loaded (srcversion '
+            f'{read(sysp("/sys/module/thunderbolt_stream/srcversion"), "?")})')
+    else:
+        say('FAIL', 'usb4', 'thunderbolt_stream is not loaded: run ds41-pair driver')
+    if module_loaded('thunderbolt_net'):
+        say('WARN', 'usb4', 'thunderbolt_net is loaded: it takes one ring pair per controller; unload/blacklist it')
+    links = usb4_links()
+    for link in links:
+        say(link_verdict(link)[0], "link", link_verdict(link)[1])
+    if not links:
+        say('FAIL', 'usb4', 'no USB4 link up: connect the two cables between the nodes with both nodes on')
+    elif len(links) == 1:
+        say('WARN', 'usb4', 'one cable up: the pair runs, with about half the link bandwidth; two cables are expected')
+    else:
+        say('PASS', 'usb4', f'{len(links)} cables up')
+    devs = stream_devices()
+    usable = [d for d in devs if os.access(d, os.R_OK | os.W_OK)]
+    if len(usable) >= 4:
+        say('PASS', 'streams', f'{len(usable)} stream devices read/write')
+    elif devs:
+        say('WARN', 'streams', f'{len(devs)} stream devices, {len(usable)} read/write for you: install the udev rule '
+            'printed by ds41-pair driver')
+    else:
+        say('WARN' if module_loaded('thunderbolt_stream') else 'INFO', 'streams',
+            'no /dev/tbstream*: the stream service is not set up (ds41-pair driver prints the steps)')
+    if not sysp('/run/usb4stream-layout.json').is_file() and module_loaded('thunderbolt_stream'):
+        say('WARN', 'streams', '/run/usb4stream-layout.json missing: the usb4stream service has not run')
+    # Storage
+    need, present = model_files_status(cfg)
+    free = free_bytes(cfg['MODEL_DIR'])
+    if need == 0:
+        say('PASS', 'models', f'all production files present in {cfg["MODEL_DIR"]} (sizes; fetch --verify hashes them)')
+    elif free > need + (5 << 30):
+        say('PASS', 'disk', f'{human(free)} free for {human(need)} still to fetch')
+    else:
+        say('FAIL', 'disk', f'{human(free)} free at {cfg["MODEL_DIR"]}, {human(need)} still to fetch')
+    prep_root = prepared_root()
+    if free_bytes(prep_root) < PREPARED_BYTES and not list(Path(prep_root).glob(f'rank{cfg["RANK"]}-tp-dup-*')):
+        say('INFO', 'disk', f'prepare (optional) needs about {human(PREPARED_BYTES)} free in {prep_root}')
+    # Toolchain
+    rocm = rocm_root(cfg)
+    hipc = hip_compiler(rocm)
+    say('PASS' if hipc else 'FAIL', 'rocm', f'{rocm} (HIP compiler {hipc})' if hipc
+        else f'no HIP compiler under {rocm}: install ROCm or set ROCM_PATH in the config')
+    cm = out(['cmake', '--version'])
+    cmv = version_tuple(cm.splitlines()[0]) if cm else ()
+    say('PASS' if cmv >= (3, 24) else 'FAIL', 'tools', f'cmake {".".join(map(str, cmv))}' if cm else 'cmake missing (>= 3.24)')
+    for tool in ('ninja', 'git', 'make', 'gcc', 'flex', 'bison'):
+        if not shutil.which(tool):
+            say('FAIL' if tool in ('ninja', 'git') else 'WARN', 'tools',
+                f'{tool} missing' + (' (driver build)' if tool in ('make', 'gcc', 'flex', 'bison') else ''))
+    if sys.version_info < (3, 10):
+        say('FAIL', 'tools', f'python {platform.python_version()} (>= 3.10 needed)')
+    if not sysp('/usr/include/openssl/sha.h').is_file():
+        say('WARN', 'tools', 'OpenSSL headers missing (libssl-dev): hashing falls back to the slower portable SHA-256')
+    if not shutil.which('rsync'):
+        say('INFO', 'tools', 'rsync missing: fetch --from-peer needs it')
+    # Build
+    serve = Path(cfg['BUILD_DIR']) / 'strix-deepseek41-serve'
+    local_sha = sha256(serve)[:16] if serve.is_file() else None
+    say('PASS' if local_sha else 'INFO', 'build', f'{serve} sha256 {local_sha}' if local_sha else 'not built yet (ds41-pair build)')
+    # Peer
+    if args.no_peer or not cfg['PEER']:
+        say('INFO', 'peer', 'skipped' if args.no_peer else 'no PEER in the config')
+    else:
+        probe = 'hostname; ' + peer_cli(cfg, 'config') + ' 2>/dev/null | grep -E "^RANK="; ' + peer_cli(cfg, '_serve-sha')
+        r = subprocess.run(ssh_argv(cfg, probe), text=True, capture_output=True, timeout=60)
+        if r.returncode not in (0, 1) or not r.stdout:
+            say('FAIL', 'peer', f'{cfg["PEER"]} not reachable over SSH (BatchMode): set up a key, check the address')
+        else:
+            lines = r.stdout.splitlines()
+            say('PASS', 'peer', f'{cfg["PEER"]} reachable (host {lines[0]})')
+            rank = next((l.split('=', 1)[1].strip("'") for l in lines if l.startswith('RANK=')), None)
+            if rank is None:
+                say('WARN', 'peer', 'no ds41-pair config on the peer yet (run init there)')
+            elif rank == cfg['RANK']:
+                say('FAIL', 'peer', f'the peer is also rank {rank}: one node is 0, the other 1')
+            else:
+                say('PASS', 'peer', f'peer is rank {rank}')
+            peer_sha = next((l.split()[1] for l in lines if l.startswith('serve-sha ')), None)
+            if local_sha and peer_sha:
+                say('PASS' if peer_sha == local_sha else 'WARN', 'peer',
+                    'same engine binary on both nodes' if peer_sha == local_sha
+                    else f'engine binaries differ ({local_sha} here, {peer_sha} there): build the same commit on both')
+            if links and lines[0] not in {l['peer'] for l in links}:
+                say('WARN', 'peer', f'the USB4 links go to {", ".join(sorted({l["peer"] for l in links}))}, '
+                    f'not to {lines[0]}')
+    print('check: ' + ('FAIL (' + ', '.join(sorted(set(FAILS))) + ')' if FAILS else 'OK'))
+    return 1 if FAILS else 0
+
+
+# -------------------------------------------------------------------------------------------------------------- driver
+def git_checkout(url, commit, dest):
+    """Clone URL into DEST (once) and check out COMMIT; no-op when already there."""
+    dest = Path(dest)
+    if not (dest / '.git').is_dir():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        run(['git', 'clone', '--quiet', url, dest])
+    head = out(['git', '-C', str(dest), 'rev-parse', 'HEAD'])
+    if head != commit:
+        if run(['git', '-C', dest, 'cat-file', '-e', commit + '^{commit}'], check=False, show=False).returncode:
+            run(['git', '-C', dest, 'fetch', '--quiet', 'origin', commit])
+        run(['git', '-C', dest, 'checkout', '--quiet', '--detach', commit])
+    return dest
+
+
+def linux_tree(deps):
+    """The pinned upstream tree with the driver series applied (downloaded and verified once)."""
+    tree = deps / f'linux-{LINUX_COMMIT[:12]}'
+    stamp = tree / '.ds41-pair-series'
+    driver = deps / 'strix-halo-usb4-driver'
+    series = [l.split('#')[0].strip() for l in (driver / 'patches' / 'series').read_text().splitlines()]
+    series = [l for l in series if l]
+    want = DRIVER_COMMIT + ' ' + ' '.join(series)
+    if stamp.is_file() and stamp.read_text().strip() == want:
+        return tree
+    if stamp.is_file():
+        print(f'the driver pin changed: preparing {tree.name} again', flush=True)
+        shutil.rmtree(tree)  # our own patched tree of an older pin (it carries our stamp)
+    elif tree.exists():
+        die(f'{tree} exists but was not prepared by ds41-pair; move it away and re-run')
+    # A shallow fetch of the pinned commit (its id pins the content), as in the driver README; once per DEPS_DIR.
+    tmp = deps / f'.linux-{LINUX_COMMIT[:12]}.incomplete'
+    if tmp.exists() and not (tmp / '.git').is_dir():
+        shutil.rmtree(tmp)  # interrupted after the patches were applied: start over
+    if not (tmp / '.git').is_dir():
+        tmp.mkdir(parents=True, exist_ok=True)
+        run(['git', '-C', tmp, 'init', '--quiet'])
+    if out(['git', '-C', str(tmp), 'rev-parse', 'HEAD']) != LINUX_COMMIT:
+        print('fetching the pinned kernel tree (about 250 MB, once)', flush=True)
+        run(['git', '-C', tmp, 'fetch', '--quiet', '--depth', '1', LINUX_GIT, LINUX_COMMIT])
+        run(['git', '-C', tmp, 'checkout', '--quiet', '--detach', 'FETCH_HEAD'])
+    if out(['git', '-C', str(tmp), 'rev-parse', 'HEAD']) != LINUX_COMMIT:
+        die('the fetched kernel tree is not the pinned commit')
+    # an interrupted earlier apply starts clean (also files the patches added)
+    run(['git', '-C', tmp, 'reset', '--quiet', '--hard'], show=False)
+    run(['git', '-C', tmp, 'clean', '-q', '-fdx'], show=False)
+    for p in series:
+        run(['git', 'apply', '--check', driver / 'patches' / p], cwd=tmp, show=False)
+        run(['git', 'apply', driver / 'patches' / p], cwd=tmp, show=False)
+    print(f'applied the {len(series)} driver patches', flush=True)
+    shutil.rmtree(tmp / '.git')  # a Git tree would make the kernel version end in '+' and the modules refuse to load
+    tmp.replace(tree)
+    stamp.write_text(want + '\n')
+    return tree
+
+
+def stream_module_current():
+    """The loaded stream module has the newest configfs attributes of the pinned series (0048 batching budgets)."""
+    return module_loaded('thunderbolt_stream') and bool(
+        glob.glob(str(sysp('/sys/kernel/config/thunderbolt/stream')) + '/*/*/rx_repost_batch'))
+
+
+def system_settings(staged):
+    """Root steps for the memory settings the pair needs (driver NODE-SETUP section 4), only where missing."""
+    steps, notes = [], []
+    limit = read(sysp('/sys/module/ttm/parameters/pages_limit'))
+    if not limit or int(limit or 0) < TTM_PAGES_LIMIT * 9 // 10:
+        (staged / 'ttm.conf').write_text(f'# GTT limit for the DeepSeek pair: {TTM_PAGES_LIMIT} pages x 4 KiB = 117 GiB\n'
+                                         f'options ttm pages_limit={TTM_PAGES_LIMIT}\n')
+        steps.append(['install', '-m', '0644', staged / 'ttm.conf', '/etc/modprobe.d/ttm.conf'])
+        notes.append('ttm.conf takes effect at the next boot; rebuild the initramfs if it loads ttm '
+                     '(update-initramfs -u or dracut -f); if ttm is built in, add ttm.pages_limit= to the command line')
+    if 'kho=off' not in (read(sysp('/proc/cmdline'), '') or '').split():
+        if sysp('/etc/default/grub.d').is_dir():
+            (staged / '50-strix-pair-kho.cfg').write_text(
+                '# keep the Kexec HandOver scratch memory available to the GPU\n'
+                'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT kho=off"\n')
+            steps += [['install', '-m', '0644', staged / '50-strix-pair-kho.cfg', '/etc/default/grub.d/50-strix-pair-kho.cfg'],
+                      ['update-grub']]
+        else:
+            notes.append('add kho=off to the kernel command line with your boot loader')
+    return steps, notes
+
+
+def root_steps(args, steps, notes, then):
+    print('\nRoot steps (run them yourself on THIS node, or re-run with --yes-root to run them one by one):')
+    for s in steps:
+        print('  sudo ' + shlex.join(map(str, s)))
+    for n in notes:
+        print('  note: ' + n)
+    if args.yes_root and not args.dry_run and steps:
+        for s in steps:
+            print('\n+ sudo ' + shlex.join(map(str, s)), flush=True)
+            if subprocess.run(['sudo'] + list(map(str, s))).returncode != 0:
+                die('root step failed; fix it and re-run ds41-pair driver --yes-root (the steps are idempotent)')
+        print('\nroot steps done.')
+    print(then)
+
+
+def configure_tree(tree, driver, config_text, localversion, jobs):
+    (tree / '.config').write_text(config_text)
+    run(['scripts/kconfig/merge_config.sh', '-m', '.config', driver / 'config' / 'usb4-gpu.fragment'], cwd=tree,
+        capture=True)
+    run(['scripts/config', '--file', '.config', '--set-str', 'LOCALVERSION', localversion,
+         '--disable', 'LOCALVERSION_AUTO'], cwd=tree)
+    run(['make', '-j', jobs, 'olddefconfig'], cwd=tree, capture=True)
+    for opt in ('CONFIG_USB4', 'CONFIG_USB4_STREAM'):
+        if not re.search(rf'^{opt}=[my]', (tree / '.config').read_text(), re.M):
+            die(f'{opt} is not enabled after merging the driver fragment (a dependency is missing in your kernel '
+                'configuration, see the driver repository BUILD.md)')
+
+
+def cmd_driver(args):
+    cfg = load_config(args)
+    deps = Path(cfg['DEPS_DIR'])
+    release = platform.release()
+    jobs = str(args.jobs or os.cpu_count() or 8)
+    print(f'ds41-pair driver: USB4 stream driver for this node (running kernel {release})')
+    staged = deps / 'usb4-modules' / release
+    staged.mkdir(parents=True, exist_ok=True)
+    settings, notes = system_settings(staged)
+    if stream_module_current() and not (args.rebuild or args.kernel):
+        say('PASS', 'driver', 'the running kernel already has the series\' stream module (thunderbolt_stream srcversion '
+            f'{read(sysp("/sys/module/thunderbolt_stream/srcversion"), "?")}): nothing to build (--rebuild forces it)')
+        if settings:
+            root_steps(args, settings, notes, 'Then reboot, and run ds41-pair driver-verify on both nodes.')
+        else:
+            print('Next: ds41-pair driver-verify (on both nodes)')
+        return 0
+    for tool in ('git', 'make', 'gcc', 'flex', 'bison', 'bc'):
+        if not shutil.which(tool):
+            die(f'{tool} is missing (kernel builds need: build-essential flex bison bc libelf-dev libssl-dev dwarves)')
+    config_text, config_src = kernel_config()
+    if not config_text:
+        die(f'no configuration of the running kernel (/boot/config-{release} or /proc/config.gz)')
+    driver = git_checkout(DRIVER_GIT, DRIVER_COMMIT, deps / 'strix-halo-usb4-driver')
+    tree = linux_tree(deps)
+    kver = out(['make', '-s', '-C', str(tree), 'kernelversion'], timeout=120)
+    same = bool(kver) and (release == kver or release.startswith(kver + '-') or release.startswith(kver + '+'))
+    builtin = bool(re.search(r'^CONFIG_USB4=y', config_text, re.M))
+    if args.kernel or not same or builtin:
+        return driver_kernel(args, cfg, deps, driver, tree, kver, release, config_text, config_src, jobs,
+                             settings, notes, same, builtin)
+    return driver_modules(args, deps, driver, tree, kver, release, config_text, config_src, jobs, staged,
+                          settings, notes)
+
+
+def driver_modules(args, deps, driver, tree, kver, release, config_text, config_src, jobs, staged, settings, notes):
+    """The running kernel is the series' version: build the three modules against it (no new kernel)."""
+    local = release[len(kver):]
+    symvers = sysp(f'/lib/modules/{release}/build/Module.symvers')
+    whole = args.full or not symvers.is_file()
+    say('PASS', 'driver', f'series {DRIVER_COMMIT[:12]} applies to Linux {kver}, the version of the running kernel')
+    print(f'modules for {release}: .config from {config_src} + the driver fragment, LOCALVERSION={local!r}, '
+          + ('the whole kernel tree once (no Module.symvers from linux-headers; 30-60 min)' if whole
+             else "modules_prepare with the running kernel's Module.symvers")
+          + ', then drivers/thunderbolt and drivers/net/thunderbolt')
+    built = [tree / 'drivers/thunderbolt/thunderbolt.ko', tree / 'drivers/thunderbolt/thunderbolt_stream.ko',
+             tree / 'drivers/net/thunderbolt/thunderbolt_net.ko']
+    if args.dry_run:
+        return 0
+    stamp = tree / '.ds41-pair-built'
+    if args.rebuild or read(stamp) != release or not all(p.is_file() for p in built):
+        configure_tree(tree, driver, config_text, local, jobs)
+        if whole:
+            run(['make', '-j', jobs], cwd=tree, capture=True)
+        else:
+            run(['make', '-j', jobs, 'modules_prepare'], cwd=tree, capture=True)
+            shutil.copyfile(symvers, tree / 'Module.symvers')
+        run(['make', '-j', jobs, 'M=drivers/thunderbolt', 'modules'], cwd=tree, capture=True)
+        run(['make', '-j', jobs, 'M=drivers/net/thunderbolt', 'modules'], cwd=tree, capture=True)
+        stamp.write_text(release + '\n')
+    sums = []
+    for ko in built:
+        magic = (out(['modinfo', '-F', 'vermagic', str(ko)]) or '').split()
+        if not magic or magic[0] != release:
+            die(f'{ko.name} was built for {magic[0] if magic else "?"}, not {release}; re-run with --rebuild')
+        shutil.copyfile(ko, staged / ko.name)
+        sums.append(f'{sha256(staged / ko.name)}  {ko.name}')
+    (staged / 'SHA256SUMS').write_text(''.join(line + chr(10) for line in sums))
+    src = out(['modinfo', '-F', 'srcversion', str(staged / 'thunderbolt_stream.ko')])
+    say('PASS', 'driver', f'modules staged in {staged} (vermagic {release}; thunderbolt_stream srcversion {src}; '
+        'record it: driver-verify compares the loaded module with it)')
+    group = out(['id', '-gn']) or 'render'
+    (staged / '70-strix-tbstream.rules').write_text(
+        '# USB4 stream devices of the DeepSeek pair: read/write for the group that runs the engine\n'
+        f'KERNEL=="tbstream*", MODE="0660", GROUP="{group}"\n')
+    (staged / 'strix-usb4.conf').write_text(
+        '# thunderbolt_net would take one data ring pair per controller away from the USB4 streams\n'
+        'blacklist thunderbolt_net\n')
+    (staged / 'usb4stream-pair.service').write_text(
+        '[Unit]\nDescription=Prepare two USB4STREAM channels per USB4 port (DeepSeek pair)\n'
+        'After=systemd-modules-load.service\n\n[Service]\nType=oneshot\n'
+        'ExecStart=/usr/local/sbin/setup-usb4stream-lab\nRemainAfterExit=yes\nTimeoutStartSec=60\n\n'
+        '[Install]\nWantedBy=multi-user.target\n')
+    secure_boot_note()
+    mods = f'/lib/modules/{release}/updates/strix-usb4'
+    steps = [['install', '-D', '-m', '0644', staged / ko.name, f'{mods}/{ko.name}'] for ko in built]
+    steps += [['depmod', '-a', release]] + lab_file_steps(driver, staged) + settings + [
+        ['install', '-m', '0644', staged / 'usb4stream-pair.service', '/etc/systemd/system/usb4stream-pair.service'],
+        ['systemctl', 'daemon-reload'], ['systemctl', 'enable', 'usb4stream-pair.service']]
+    notes = notes + ['the initramfs must not carry thunderbolt_stream (lsinitramfs); if it does, rebuild it after '
+                     'depmod, or the boot loads the old copy']
+    root_steps(args, steps, notes, 'Then reboot (the new modules load at boot; a running module is never swapped), '
+               'and run ds41-pair driver-verify on both nodes.')
+    return 0
+
+
+def driver_kernel(args, cfg, deps, driver, tree, kver, release, config_text, config_src, jobs, settings, notes,
+                  same, builtin):
+    """Another kernel version (or USB4 built in): build the whole patched kernel as a package next to the current one."""
+    why = ('the running kernel has USB4 built in (CONFIG_USB4=y)' if builtin
+           else f'the running kernel is {release}, the series is for Linux {kver}' if not same else '--kernel given')
+    local = args.localversion or ('-strix-gpu-bosgame-pair' + DRIVER_COMMIT[:8])
+    newrel = kver + local
+    say('INFO' if args.kernel else 'WARN', 'driver', ('' if same and not builtin else f'{why}: modules for it cannot be '
+        'built. ') + f'The route is a new kernel {newrel} from the pinned tree with the driver series, installed next '
+        'to the current one (kept as the fallback boot entry); about 30-60 min of compiling, no root until the install.')
+    if not args.kernel:
+        print('Re-run as ds41-pair driver --kernel to build it (--dry-run shows the plan first), or follow the driver '
+              'repository BUILD.md by hand.')
+        return 1
+    deb = bool(shutil.which('dpkg-deb'))
+    print(f'plan: .config from {config_src} + the driver fragment, LOCALVERSION={local!r}, olddefconfig, the driver\'s '
+          f'check_kconfig.py, then make {"bindeb-pkg (Debian packages)" if deb else "(whole tree)"} in {tree}')
+    if args.dry_run:
+        return 0
+    if sysp(f'/lib/modules/{newrel}').exists():
+        die(f'/lib/modules/{newrel} exists already: pass a new --localversion so an installed kernel is never overwritten')
+    configure_tree(tree, driver, config_text, local, jobs)
+    run([sys.executable, driver / 'tools' / 'check_kconfig.py', tree / '.config', '--kernelrelease', newrel], cwd=tree)
+    run(['make', '-j', jobs, 'bindeb-pkg' if deb else 'all'], cwd=tree, capture=True)
+    staged = deps / 'usb4-modules' / newrel
+    staged.mkdir(parents=True, exist_ok=True)
+    (staged / '70-strix-tbstream.rules').write_text(
+        '# USB4 stream devices of the DeepSeek pair: read/write for the group that runs the engine\n'
+        f'KERNEL=="tbstream*", MODE="0660", GROUP="{out(["id", "-gn"]) or "render"}"\n')
+    src = out(['modinfo', '-F', 'srcversion', str(tree / 'drivers/thunderbolt/thunderbolt_stream.ko')])
+    say('PASS', 'driver', f'kernel {newrel} built (thunderbolt_stream srcversion {src}; record it)')
+    secure_boot_note()
+    if deb:
+        images = sorted(tree.parent.glob(f'linux-image-{newrel}_*.deb'))
+        steps = [['dpkg', '-i', images[-1] if images else tree.parent / f'linux-image-{newrel}_VERSION.deb']]
+    else:
+        steps = [['make', '-C', tree, 'modules_install', 'install']]
+    lab = driver / 'tools' / 'lab'
+    steps += [['install', '-m', '0644', lab / 'usb4stream-dedicated.conf', '/etc/modprobe.d/usb4stream-dedicated.conf'],
+              ['install', '-m', '0644', lab / 'usb4stream-lab.service', '/etc/systemd/system/usb4stream-lab.service']]
+    steps += lab_file_steps(driver, staged) + settings + [['systemctl', 'daemon-reload'],
+                                                          ['systemctl', 'enable', 'usb4stream-lab.service']]
+    notes = notes + [f'boot the new kernel once without making it the default: sudo grub-reboot "<menu entry of {newrel}>", '
+                     'then reboot; run ds41-pair driver-verify on both nodes; only then make it the default '
+                     '(driver repository docs/NODE-SETUP.md, "Testing a new kernel")']
+    root_steps(args, steps, notes, 'Keep the current kernel as the fallback entry. Never disable the IOMMU.')
+    return 0
+
+
+def lab_file_steps(driver, staged):
+    lab = driver / 'tools' / 'lab'
+    return [['install', '-m', '0644', staged / '70-strix-tbstream.rules', '/etc/udev/rules.d/70-strix-tbstream.rules'],
+            ['install', '-m', '0755', lab / 'usb4stream_describe.py', '/usr/local/sbin/usb4stream-describe'],
+            ['install', '-m', '0755', lab / 'setup-usb4stream-lab', '/usr/local/sbin/setup-usb4stream-lab'],
+            ['udevadm', 'control', '--reload']]
+
+
+def secure_boot_note():
+    sb = glob.glob(str(sysp('/sys/firmware/efi/efivars')) + '/SecureBoot-*')
+    if sb and Path(sb[0]).read_bytes()[-1:] == b'\x01':
+        say('WARN', 'driver', 'Secure Boot is on: unsigned modules do not load. Sign them with a key enrolled in MOK '
+            '(your distribution documents sign-file and mokutil) before installing.')
+
+
+def cmd_driver_verify(args):
+    cfg = load_config(args)
+    release = platform.release()
+    staged = Path(cfg['DEPS_DIR']) / 'usb4-modules' / release
+    for mod in ('thunderbolt', 'thunderbolt_stream'):
+        if not module_loaded(mod):
+            say('FAIL', 'module', f'{mod} not loaded (ds41-pair driver prints the steps)')
+            continue
+        src = read(sysp(f'/sys/module/{mod}/srcversion'), '?')
+        ko = staged / f'{mod}.ko'
+        want = out(['modinfo', '-F', 'srcversion', str(ko)]) if ko.is_file() else None
+        if want and want != src:
+            say('WARN', 'module', f'{mod} loaded srcversion {src}, staged build {want}: the loaded module is another '
+                'build (reload it, or ignore when you installed your own kernel)')
+        else:
+            say('PASS', 'module', f'{mod} loaded (srcversion {src})')
+    if module_loaded('thunderbolt_stream'):
+        say('PASS' if stream_module_current() else 'WARN', 'module', "stream module has the pinned series' newest "
+            'stream attributes' if stream_module_current() else 'stream module predates the pinned driver series '
+            '(ds41-pair driver builds the current one)')
+    if module_loaded('thunderbolt_net'):
+        say('WARN', 'module', 'thunderbolt_net loaded: one ring pair per controller is lost to the streams')
+    links = usb4_links()
+    for link in links:
+        say(link_verdict(link)[0], "link", link_verdict(link)[1])
+    say('PASS' if len(links) >= 2 else ('WARN' if links else 'FAIL'), 'cables',
+        f'{len(links)} of 2 cables up' + ('' if links else ': connect the cables with both nodes on'))
+    layout = read(sysp('/run/usb4stream-layout.json'))
+    streams = []
+    if layout:
+        try:
+            doc = json.loads(layout)
+            streams = [(k, v) for k, v in doc.items() if '/' in k and isinstance(v, dict)]
+        except ValueError:
+            say('WARN', 'streams', '/run/usb4stream-layout.json is not valid JSON')
+    else:
+        say('FAIL', 'streams', 'no /run/usb4stream-layout.json: the usb4stream-pair service has not run')
+    ok = 0
+    for key, v in streams:
+        dev = v.get('device', '?')
+        dev_path = sysp(dev) if ROOT else Path(dev)
+        attached = v.get('attached', True)
+        rw = dev_path.exists() and os.access(dev_path, os.R_OK | os.W_OK)
+        cable = v.get('cable')
+        if rw and attached is not False:
+            ok += 1
+            say('PASS', 'streams', f'{key} {dev}' + (f' cable {cable}' if cable else '') + ' ready')
+        else:
+            say('WARN', 'streams', f'{key} {dev}: ' + ('not attached to a peer' if attached is False
+                                                       else 'device missing or not read/write for you'))
+    if streams:
+        say('PASS' if ok >= 4 else 'WARN', 'streams', f'{ok} of 4 streams ready')
+    if args.link_test:
+        link_test(cfg)
+    print('driver-verify: ' + ('FAIL (' + ', '.join(sorted(set(FAILS))) + ')' if FAILS else 'OK'))
+    return 1 if FAILS else 0
+
+
+def link_test(cfg):
+    """Open the four streams from both nodes at once (the engine's own pairing) and exchange checked payloads."""
+    bench = Path(cfg['BUILD_DIR']) / 'strix-dist-host-exchange-bench'
+    if not bench.is_file():
+        say('FAIL', 'link-test', f'{bench} missing: run ds41-pair build first')
+        return
+    if not cfg['PEER']:
+        say('FAIL', 'link-test', 'needs PEER in the config (the other rank is started over SSH)')
+        return
+    peer_rank = '1' if cfg['RANK'] == '0' else '0'
+    common = LINK_TEST_ARGS
+    peer = subprocess.Popen(ssh_argv(cfg, peer_cli(cfg, f'_bench-rank {peer_rank}')), text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    mine = subprocess.run(['timeout', '120', str(bench), *common, '--rank', cfg['RANK']], text=True,
+                          capture_output=True, stdin=subprocess.DEVNULL)
+    try:
+        peer_out, _ = peer.communicate(timeout=180)
+    except subprocess.TimeoutExpired:
+        peer.kill()
+        peer_out, _ = peer.communicate()
+    text = mine.stdout + mine.stderr
+    topo = re.search(r'(\d+) stream\(s\) on (\d+) cable\(s\)', text + peer_out)
+    rows = [l.strip() for l in text.splitlines() if 'median_us' in l]
+    bad = [l for l in rows if not re.search(r'\bbad 0\b', l)]
+    if mine.returncode == 0 and peer.returncode == 0 and rows and not bad:
+        few = topo and int(topo[1]) < 4
+        say('WARN' if few else 'PASS', 'link-test',
+            (f'{topo[1]} streams on {topo[2]} cables paired; ' if topo else 'streams paired; ')
+            + f'{len(rows)} checked exchanges, no bad payload'
+            + ('; fewer than 4 streams: check both cables' if few else '') + '; '
+            + '; '.join(re.sub(r'\s+(p10|p90|mean)\S*\s+\S+', '', l) for l in rows[:3])[:240])
+    elif mine.returncode == 0 and peer.returncode == 0:
+        say('FAIL', 'link-test', 'exchange finished with damaged payloads: ' + (bad[0] if bad else 'no result lines')[:200])
+    else:
+        say('FAIL', 'link-test', f'exchange failed (here {mine.returncode}, peer {peer.returncode}): '
+            + (text.strip().splitlines() or ['?'])[-1][:200])
+
+
+LINK_TEST_ARGS = ['--transport', 'usb4auto', '--sizes', '4096,65536,1048576', '--iters', '100', '--warmup', '10']
+
+
+def cmd_bench_rank(args):
+    """(internal) The peer side of driver-verify --link-test, from this node's own build."""
+    cfg = load_config(args)
+    bench = Path(cfg['BUILD_DIR']) / 'strix-dist-host-exchange-bench'
+    return subprocess.run(['timeout', '120', str(bench), *LINK_TEST_ARGS, '--rank', args.rank],
+                          stdin=subprocess.DEVNULL).returncode
+
+
+def cmd_serve_sha(args):
+    """(internal) Prints this node's engine binary digest for the peer's check."""
+    cfg = load_config(args)
+    serve = Path(cfg['BUILD_DIR']) / 'strix-deepseek41-serve'
+    print('serve-sha ' + (sha256(serve)[:16] if serve.is_file() else 'none'))
+    return 0
+
+
+# --------------------------------------------------------------------------------------------------------------- build
+def cmd_build(args):
+    cfg = load_config(args)
+    deps = Path(cfg['DEPS_DIR'])
+    rocm = rocm_root(cfg)
+    hipc = hip_compiler(rocm)
+    if not hipc:
+        die(f'no HIP compiler under {rocm}; install ROCm or set ROCM_PATH in {cfg["_path"]}')
+    jobs = str(args.jobs or os.cpu_count() or 8)
+    env = dict(os.environ, PATH=f'{rocm}/bin:' + os.environ.get('PATH', ''))
+    # 1. The trellis library (dense_r1 TP plans + grouped GEMV), pinned.
+    trellis = git_checkout(TRELLIS_GIT, TRELLIS_COMMIT, deps / 'strix-trellis')
+    tb = trellis / 'build-hip'
+    lib = tb / 'libstrix_trellis.a'
+    stamp = tb / '.ds41-pair-commit'
+    if args.clean or not lib.is_file() or read(stamp) != TRELLIS_COMMIT:
+        run(['cmake', '-S', trellis, '-B', tb, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+             '-DSTRIX_TRELLIS_ENABLE_HIP=ON', '-DSTRIX_TRELLIS_ENABLE_EXPERIMENTAL_TP=ON',
+             '-DSTRIX_TRELLIS_BUILD_TESTING=OFF', f'-DCMAKE_HIP_COMPILER={hipc}',
+             f'-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm}', f'-DCMAKE_PREFIX_PATH={rocm}',
+             '-DCMAKE_HIP_ARCHITECTURES=gfx1151'], env=env, capture=True)
+        run(['cmake', '--build', tb, '--parallel', jobs, '--target', 'strix_trellis'], env=env, capture=True)
+        stamp.write_text(TRELLIS_COMMIT + '\n')
+    if not lib.is_file():
+        die(f'{lib} was not produced')
+    print(f'PASS  trellis    {lib} ({TRELLIS_COMMIT[:12]})')
+    # 2. The engine with the production DeepSeek options (docs/reproduce.md "Build each engine").
+    bd = Path(cfg['BUILD_DIR'])
+    if args.clean and (bd / 'CMakeCache.txt').is_file():
+        shutil.rmtree(bd)
+    openssl = sysp('/usr/include/openssl/sha.h').is_file()
+    run(['cmake', '-S', REPO, '-B', bd, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+         '-DCMAKE_HIP_ARCHITECTURES=gfx1151', f'-DCMAKE_HIP_COMPILER={hipc}', '-DSTRIX_ENABLE_HIP_RUNTIME=ON',
+         f'-DSTRIX_USE_OPENSSL_SHA256={"ON" if openssl else "OFF"}', '-DSTRIX_FAMILY_DEEPSEEK41=ON',
+         '-DSTRIX_DS41_TRELLIS=ON', '-DSTRIX_DS41_TRELLIS_API=dense_r1', f'-DSTRIX_DS41_TRELLIS_LIBRARY={lib}',
+         f'-DSTRIX_DS41_TRELLIS_INCLUDE_DIR={trellis / "include"}', '-DBUILD_TESTING=OFF'], env=env, capture=True)
+    run(['ninja', '-C', bd, '-j', jobs, *BINARIES], env=env)
+    commit = out(['git', '-C', str(REPO), 'rev-parse', 'HEAD']) or 'unknown'
+    dirty = bool(out(['git', '-C', str(REPO), 'status', '--porcelain', '--untracked-files=no']))
+    receipt = {'engine_commit': commit, 'engine_dirty': dirty, 'trellis_commit': TRELLIS_COMMIT,
+               'trellis_sha256': sha256(lib), 'hip_compiler': str(hipc),
+               'binaries': {b: sha256(bd / b) for b in BINARIES}}
+    (bd / 'ds41-pair-build.json').write_text(json.dumps(receipt, indent=1) + '\n')
+    print(f'PASS  build      {bd}: engine {commit[:12]}{" (modified tree)" if dirty else ""}, '
+          f'strix-deepseek41-serve sha256 {receipt["binaries"]["strix-deepseek41-serve"][:16]}')
+    print('Build the same commit on the other node; ds41-pair check compares the two binaries.')
+    return 0
+
+
+# --------------------------------------------------------------------------------------------------------------- fetch
+def jobs_for_pair():
+    """(repo, revision, subdir, patterns) of the production pair files, from the pinned bench recipe."""
+    return [(repo, fetch_models.REVISION[repo], sub, pats) for repo, sub, pats in fetch_models.recipe('deepseek', 'default')]
+
+
+class _DropAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+    """The mirror redirects downloads to a storage host: the token stays with the mirror."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header('Authorization')
+        return new
+
+
+OPENER = urllib.request.build_opener(_DropAuthOnRedirect)
+
+
+def http_get(url, dest=None, timeout=60):
+    headers = {'User-Agent': 'ds41-pair'}
+    token = os.environ.get('HF_TOKEN')
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    req = urllib.request.Request(url, headers=headers)
+    with OPENER.open(req, timeout=timeout) as r:
+        data = r.read()
+    if dest:
+        Path(dest).write_bytes(data)
+    return data
+
+
+def download(url, part, label):
+    """Resumable download into PART (HTTP Range); re-run continues where it stopped."""
+    print(f'download {label}', flush=True)
+    for attempt in range(1, 11):
+        have = part.stat().st_size if part.is_file() else 0
+        headers = {'User-Agent': 'ds41-pair', 'Range': f'bytes={have}-'}
+        if os.environ.get('HF_TOKEN'):
+            headers['Authorization'] = 'Bearer ' + os.environ['HF_TOKEN']
+        try:
+            with OPENER.open(urllib.request.Request(url, headers=headers), timeout=60) as r:
+                total = have + int(r.headers.get('Content-Length') or 0) if r.status == 206 else int(r.headers.get('Content-Length') or 0)
+                with open(part, 'ab' if r.status == 206 else 'wb') as f:
+                    done, last = (have if r.status == 206 else 0), time.time()
+                    for block in iter(lambda: r.read(8 << 20), b''):
+                        f.write(block)
+                        done += len(block)
+                        if time.time() - last > 30:
+                            print(f'      {label}: {human(done)} of {human(total)}', flush=True)
+                            last = time.time()
+            if not total or done >= total:
+                return
+            print(f'      {label}: connection closed at {human(done)} of {human(total)}, retry {attempt}/10', flush=True)
+            continue
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416:
+                return  # already complete
+            if exc.code in (401, 403, 404):
+                die(f'{label}: HTTP {exc.code} from the mirror (see docs/reproduce.md "Models and provenance")')
+            print(f'      {label}: HTTP {exc.code}, retry {attempt}/10', flush=True)
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            print(f'      {label}: {exc}, retry {attempt}/10', flush=True)
+        time.sleep(min(60, 5 * attempt))
+    die(f'download of {label} keeps failing; re-run ds41-pair fetch later to resume it')
+
+
+def manifest(repo, rev, cache):
+    """{name: sha256} of a mirror's SHA256SUMS at the pinned revision (cached on disk)."""
+    path = cache / f'{repo}@{rev[:12]}.SHA256SUMS'
+    if not path.is_file():
+        cache.mkdir(parents=True, exist_ok=True)
+        try:
+            http_get(f'https://huggingface.co/{fetch_models.PREFIX}{repo}/resolve/{rev}/SHA256SUMS', path)
+        except (urllib.error.URLError, OSError) as exc:
+            die(f'cannot read SHA256SUMS of {repo} at {rev[:12]}: {exc}')
+    entries = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        m = re.fullmatch(r'([0-9a-f]{64})\s+\*?(.+)', line.strip())
+        if not m:
+            continue
+        name = m[2]
+        if name.startswith('/') or '..' in name.split('/') or '\\' in name:
+            die(f'unsafe path in the {repo} manifest: {name}')
+        entries[name] = m[1]
+    return entries
+
+
+def remote_sizes(repo, rev):
+    """{name: bytes} from the hub tree listing (best effort; None offline)."""
+    try:
+        data = json.loads(http_get(f'https://huggingface.co/api/models/{fetch_models.PREFIX}{repo}/tree/{rev}?recursive=1'))
+        return {e['path']: e.get('size') for e in data if e.get('type') == 'file'}
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def selected(entries, patterns):
+    names = [n for n in entries if any(fnmatch.fnmatch(n, p) for p in patterns + ['LICENSE*', 'README*'])]
+    for p in patterns:
+        if not any(fnmatch.fnmatch(n, p) for n in entries):
+            die(f'manifest has no file for {p}')
+    return sorted(names)
+
+
+class VerifyCache:
+    """name -> (size, mtime_ns, sha256) of files already hashed, so re-runs do not re-read 390 GB."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            self.data = {}
+
+    def known(self, rel, path):
+        st = path.stat()
+        v = self.data.get(rel)
+        return v[2] if v and v[0] == st.st_size and v[1] == st.st_mtime_ns else None
+
+    def put(self, rel, path, digest):
+        st = path.stat()
+        self.data[rel] = [st.st_size, st.st_mtime_ns, digest]
+        tmp = self.path.with_name(self.path.name + '.tmp')
+        tmp.write_text(json.dumps(self.data, indent=0))
+        os.replace(tmp, self.path)
+
+
+def cmd_fetch(args):
+    cfg = load_config(args)
+    md = Path(cfg['MODEL_DIR'])
+    cache = Path(cfg['DEPS_DIR']) / 'manifests'
+    vc = VerifyCache(md / '.ds41-pair-verified.json') if not args.dry_run else None
+    plan, missing_bytes, total_bytes = [], 0, 0
+    for repo, rev, sub, patterns in jobs_for_pair():
+        entries = manifest(repo, rev, cache)
+        sizes = remote_sizes(repo, rev) if args.dry_run else None
+        for name in selected(entries, patterns):
+            if args.only and not any(fnmatch.fnmatch(name, g) for g in args.only):
+                continue
+            path = md / sub / name
+            size = (sizes or {}).get(name)
+            status = 'missing'
+            if path.is_file():
+                st = path.stat()
+                status = 'present' if size is None or st.st_size == size else f'size {st.st_size} != {size}'
+            elif path.with_name(path.name + '.part').is_file():
+                status = f'partial {human(path.with_name(path.name + ".part").stat().st_size)}'
+            plan.append((repo, rev, sub, name, entries[name], size, status))
+            total_bytes += size or 0
+            if status != 'present':
+                missing_bytes += (size or 0) - (path.with_name(path.name + '.part').stat().st_size
+                                                if status.startswith('partial') else 0)
+    source = f'peer {cfg["PEER"]}:{cfg["PEER_MODEL_DIR"]}' if args.from_peer else 'the Hugging Face mirrors'
+    if args.dry_run:
+        print(f'fetch plan into {md} from {source}:')
+        for repo, rev, sub, name, digest, size, status in plan:
+            if status != 'present' or args.verbose:
+                print(f'  {status:<22} {human(size) if size else "?":>10}  {repo}@{rev[:8]}  {name}')
+        present = sum(1 for p in plan if p[6] == 'present')
+        print(f'{present} of {len(plan)} files present (by name and size; fetch --verify hashes them), '
+              f'{human(missing_bytes)} to transfer of {human(total_bytes)}; {human(free_bytes(md))} free')
+        if missing_bytes > free_bytes(md):
+            say('FAIL', 'disk', 'not enough free space for the remaining files')
+        print('vocab/ is filled from aux/vocab/*.bin after the overlay is verified')
+        return 1 if FAILS else 0
+    md.mkdir(parents=True, exist_ok=True)
+    if args.from_peer and not cfg['PEER']:
+        die('--from-peer needs PEER in the config')
+    bad = []
+    for repo, rev, sub, name, digest, size, status in plan:
+        path = md / sub / name
+        rel = str(Path(sub) / name)
+        if args.verify_only:
+            if not path.is_file():
+                print(f'missing  {name}')
+                bad.append(name)
+                continue
+            known = None if args.verify else vc.known(rel, path)
+            got = known or sha256(path, name)
+            if got == digest:
+                vc.put(rel, path, got)
+                print(f'ok       {name}' + (' (cached)' if known else ''))
+            else:
+                print(f'MISMATCH {name}')
+                bad.append(name)
+            continue
+        if path.is_file():
+            known = None if args.verify else vc.known(rel, path)
+            got = known or sha256(path, name)
+            if got == digest:
+                vc.put(rel, path, got)
+                print(f'ok       {name}')
+                continue
+            print(f'MISMATCH {name}: removing it and fetching it again')
+            path.unlink()
+        part = path.with_name(path.name + '.part')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if args.from_peer:
+            src = f'{cfg["PEER"]}:{Path(cfg["PEER_MODEL_DIR"]) / sub / name}'
+            run(['rsync', '--protect-args', '--partial', '--append-verify', '--inplace', '-e', 'ssh -o BatchMode=yes',
+                 src, part])
+        else:
+            download(f'https://huggingface.co/{fetch_models.PREFIX}{repo}/resolve/{rev}/{name}', part, name)
+        got = sha256(part, name)
+        if got != digest:
+            part.unlink()
+            die(f'SHA-256 mismatch for {name} (removed); re-run ds41-pair fetch to fetch it again')
+        part.replace(path)
+        vc.put(rel, path, got)
+        print(f'fetched  {name}')
+    if args.verify_only:
+        if bad:
+            say('FAIL', 'fetch', f'{len(bad)} of {len(plan)} files missing or not matching; ds41-pair fetch repairs them')
+            return 1
+        say('PASS', 'fetch', f'{len(plan)} files match their published SHA-256')
+        return 0
+    for repo, rev, sub, patterns in jobs_for_pair():
+        shutil.copyfile(cache / f'{repo}@{rev[:12]}.SHA256SUMS', md / sub / f'SHA256SUMS.{repo}')
+    vocab = md / 'vocab'
+    vocab.mkdir(exist_ok=True)
+    for f in sorted((md / 'aux' / 'vocab').glob('*.bin')):
+        if not (vocab / f.name).is_file() or (vocab / f.name).read_bytes() != f.read_bytes():
+            shutil.copyfile(f, vocab / f.name)
+    print(f'PASS  fetch      every file matches its published SHA-256; layout ready in {md}')
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------------------- prepare
+def prepared_root():
+    if os.environ.get('STRIX_DS41_PREPARED_ROOT'):
+        return Path(os.environ['STRIX_DS41_PREPARED_ROOT'])
+    base = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache')
+    return base / 'strix' / 'ds41-prepared'
+
+
+def production_env(cfg):
+    """The dense identity the serve app resolves for itself (production-defaults.md), for the offline preparation."""
+    md = Path(cfg['MODEL_DIR'])
+    return {'STRIX_DS41_OVERLAY': str(md / 'c-u6.gguf'), 'STRIX_DS41_CB4': '1',
+            'STRIX_DS41_TRELLIS': str(md / 'ours-K4'), 'STRIX_DS41_TRELLIS_MIX': 'head=' + str(md / 'ours-K5'),
+            'STRIX_DS41_TRELLIS_SITES': 'all', 'STRIX_DS41_TRELLIS_DENSE_FULL': '1', 'STRIX_DS41_TRELLIS_HEADOUT': '1'}
+
+
+def cmd_prepare(args):
+    cfg = load_config(args)
+    tool = Path(cfg['BUILD_DIR']) / 'strix-ds41-prepare-load'
+    md = Path(cfg['MODEL_DIR'])
+    root = prepared_root()
+    existing = sorted(root.glob(f'rank{cfg["RANK"]}-tp-dup-*'))
+    env = production_env(cfg)
+    argv = [tool, md / MODEL, '-', cfg['RANK'], 'tp', md / 'c-u6.gguf', '40', 'dup']
+    print('One-time expert preparation of this rank (docs/models/deepseek-v4.1/prepared-load.md): the serve app '
+          'then loads its routed experts from a verified local pack (about 20 s faster per start).')
+    print('  ' + ' '.join(f'{k}={shlex.quote(v)}' for k, v in env.items()) + ' \\\n    ' + shlex.join(map(str, argv)))
+    if existing and not args.force:
+        print(f'INFO  prepare    a pack already exists: {existing[-1]} (the runtime validates it at every start; '
+              'remove it and re-run after changing the model files)')
+        return 0
+    if args.dry_run:
+        print(f'dry run: needs about {human(PREPARED_BYTES)} free in {root} ({human(free_bytes(root))} free)')
+        return 0
+    if not tool.is_file():
+        die(f'{tool} missing: run ds41-pair build')
+    for name in (MODEL, 'c-u6.gguf', 'ours-K4', 'ours-K5'):
+        if not (md / name).exists():
+            die(f'{md / name} missing: run ds41-pair fetch')
+    if free_bytes(root) < PREPARED_BYTES:
+        die(f'about {human(PREPARED_BYTES)} free needed in {root}')
+    root.mkdir(parents=True, exist_ok=True)
+    run(argv, env=dict(os.environ, **env))
+    print('PASS  prepare    done; run the same on the other node')
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------------- run / service
+def launcher():
+    return HERE / 'ds41-pair-launch'
+
+
+def pid_file():
+    return state_dir() / 'rank.pid'
+
+
+def log_file():
+    return state_dir() / 'rank.log'
+
+
+def running_pid():
+    """The pid of the rank started by ds41-pair, if that process is still the engine (never a recycled pid)."""
+    try:
+        pid = int(pid_file().read_text().split()[0])
+        cmdline = Path(f'/proc/{pid}/cmdline').read_bytes()
+    except (OSError, ValueError, IndexError):
+        return None
+    if b'strix-deepseek41-serve' not in cmdline and b'ds41-pair-launch' not in cmdline:
+        return None
+    if Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[-1].split()[0] == 'Z':
+        return None  # exited, not yet reaped
+    return pid
+
+
+def wait_event(log, offset, timeout, proc):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            with open(log, 'rb') as f:
+                f.seek(offset)
+                text = f.read().decode('utf-8', 'replace')
+        except OSError:
+            text = ''
+        if '"event":"READY"' in text:
+            return 'READY', time.time() - t0
+        m = re.search(r'"event":"POISONED"[^\n]*', text)
+        if m:
+            return m[0][:200], time.time() - t0
+        if proc.poll() is not None:
+            return f'exited ({proc.returncode})', time.time() - t0
+        time.sleep(1)
+    return 'timeout', time.time() - t0
+
+
+def cmd_run(args):
+    cfg = load_config(args)
+    for name in (MODEL,):
+        if not (Path(cfg['MODEL_DIR']) / name).is_file():
+            die(f'{Path(cfg["MODEL_DIR"]) / name} missing: run ds41-pair fetch')
+    if not (Path(cfg['BUILD_DIR']) / 'strix-deepseek41-serve').is_file():
+        die('no engine build: run ds41-pair build')
+    if args.foreground:
+        os.execve(str(launcher()), [str(launcher())], dict(os.environ, STRIX_PAIR_CONFIG=cfg['_path']))
+    if running_pid():
+        print(f'rank {cfg["RANK"]} already running (pid {running_pid()}); ds41-pair stop first to restart')
+        return 0
+    if args.both:
+        if not cfg['PEER']:
+            die('--both needs PEER in the config')
+        r = subprocess.run(ssh_argv(cfg, peer_cli(cfg, 'run --no-wait')), text=True)
+        if r.returncode != 0:
+            die('could not start the peer rank')
+    state_dir().mkdir(parents=True, exist_ok=True)
+    log = log_file()
+    offset = log.stat().st_size if log.is_file() else 0
+    with open(log, 'ab') as f:
+        f.write(f'\n=== ds41-pair run {datetime.datetime.now().isoformat(timespec="seconds")}\n'.encode())
+        offset = f.tell()
+        p = subprocess.Popen([str(launcher())], stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True, env=dict(os.environ, STRIX_PAIR_CONFIG=cfg['_path']))
+    pid_file().write_text(f'{p.pid}\n')
+    print(f'rank {cfg["RANK"]} started (pid {p.pid}), log {log}')
+    if args.no_wait:
+        return 0
+    print('waiting for READY (model load and warm-up take one to a few minutes; the other rank must be started too)')
+    event, secs = wait_event(log, offset, args.wait, p)
+    if event == 'READY':
+        where = f'http://{cfg["HTTP_BIND"]}:{cfg["HTTP_PORT"]}' if cfg['RANK'] == '0' else 'rank 1 (no HTTP)'
+        print(f'PASS  run        rank {cfg["RANK"]} READY after {secs:.0f} s: {where}')
+        if cfg['RANK'] == '0':
+            print('Next: ds41-pair smoke')
+        return 0
+    print(f'FAIL  run        rank {cfg["RANK"]}: {event} after {secs:.0f} s; last log lines:')
+    for line in (read(log, '') or '').splitlines()[-8:]:
+        print('    ' + line[:240])
+    return 1
+
+
+def cmd_stop(args):
+    cfg = load_config(args)
+    pid = running_pid()
+    if pid:
+        os.kill(pid, signal.SIGTERM)  # clean stop: finish running requests; rank 0 also stops rank 1
+        for _ in range(90):
+            if not running_pid():
+                break
+            time.sleep(1)
+        print(f'rank {cfg["RANK"]} ' + ('stopped' if not running_pid() else f'still running (pid {pid})'))
+    else:
+        print(f'rank {cfg["RANK"]} not running (started by ds41-pair)')
+    if args.both and cfg['PEER']:
+        subprocess.run(ssh_argv(cfg, peer_cli(cfg, 'stop')))
+    return 0
+
+
+def cmd_status(args):
+    cfg = load_config(args)
+    pid = running_pid()
+    log = log_file()
+    text = read(log, '') or ''
+    last_run = text.rsplit('=== ds41-pair run', 1)[-1]
+    state = 'READY' if '"event":"READY"' in last_run else ('POISONED' if 'POISONED' in last_run else 'starting')
+    print(f'rank {cfg["RANK"]}: ' + (f'running pid {pid}, {state}' if pid else 'not running') + f'; log {log}')
+    if pid and cfg['RANK'] == '0':
+        try:
+            with urllib.request.urlopen(f'http://{http_host(cfg)}:{cfg["HTTP_PORT"]}/health', timeout=5) as r:
+                print(f'HTTP /health {r.status}')
+        except (urllib.error.URLError, OSError) as exc:
+            print(f'HTTP /health not answering ({exc})')
+    return 0
+
+
+def cmd_logs(args):
+    lines = (read(log_file(), '') or '').splitlines()
+    print('\n'.join(lines[-args.lines:]))
+    return 0
+
+
+def unit_quote(path):
+    """A path inside a double-quoted systemd value: % is a specifier, quotes and backslashes are escaped."""
+    return str(path).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+
+
+def cmd_unit(args):
+    cfg = load_config(args)
+    unit_dir = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'systemd' / 'user'
+    unit = unit_dir / 'strix-ds41-pair.service'
+    text = ('[Unit]\nDescription=DeepSeek V4.1 Flash pair, rank %s\nAfter=network-online.target\n\n'
+            '[Service]\nType=simple\nEnvironment="STRIX_PAIR_CONFIG=%s"\nExecStart="%s"\n'
+            'Restart=on-failure\nRestartSec=30\nKillSignal=SIGTERM\nTimeoutStopSec=90\n\n'
+            '[Install]\nWantedBy=default.target\n') % (cfg['RANK'], unit_quote(Path(cfg['_path']).absolute()),
+                                                         unit_quote(launcher()))
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit.write_text(text)
+    print(f'wrote {unit}')
+    steps = [['systemctl', '--user', 'daemon-reload'], ['systemctl', '--user', 'enable', '--now', unit.name]]
+    if args.install:
+        for s in steps:
+            run(s)
+    else:
+        for s in steps:
+            print('  ' + shlex.join(s))
+    print(f'To start it at boot without logging in, once as root: sudo loginctl enable-linger {out(["id", "-un"]) or "$USER"}')
+    print('Logs: journalctl --user -u strix-ds41-pair -f. Use the unit or ds41-pair run, not both.')
+    return 0
+
+
+# --------------------------------------------------------------------------------------------------------------- smoke
+def http_host(cfg):
+    host = '127.0.0.1' if cfg['HTTP_BIND'] in ('0.0.0.0', '::', '') else cfg['HTTP_BIND']
+    return f'[{host}]' if ':' in host else host
+
+
+def completion(base, key, prompt, max_tokens):
+    body = {'model': 'deepseek-v4.1-flash', 'prompt': prompt, 'max_tokens': max_tokens, 'temperature': 0,
+            'stream': True, 'return_token_ids': True}
+    headers = {'Content-Type': 'application/json'}
+    if key:
+        headers['Authorization'] = 'Bearer ' + key
+    req = urllib.request.Request(base + '/v1/completions', data=json.dumps(body).encode(), headers=headers)
+    t0 = time.perf_counter()
+    first = last = None
+    ids, chunks = [], 0
+    with urllib.request.urlopen(req, timeout=600) as r:
+        for raw in r:
+            line = raw.decode('utf-8', 'replace').strip()
+            if not line.startswith('data:'):
+                continue
+            data = line[5:].strip()
+            if data == '[DONE]':
+                break
+            j = json.loads(data)
+            ids += (j.get('strix') or {}).get('token_ids') or []
+            ch = (j.get('choices') or [{}])[0]
+            if ch.get('text'):
+                now = time.perf_counter() - t0
+                first = now if first is None else first
+                last = now
+                chunks += 1
+    return ids, first, last
+
+
+def cmd_smoke(args):
+    cfg = load_config(args)
+    if cfg['RANK'] != '0' and not args.port:
+        if not cfg['PEER']:
+            die('smoke talks to rank 0; run it there (or set PEER)')
+        return subprocess.run(ssh_argv(cfg, peer_cli(cfg, 'smoke'))).returncode
+    ref = json.loads(Path(args.reference or SMOKE_REFERENCE).read_text(encoding='utf-8'))
+    base = f'http://{args.host or http_host(cfg)}:{args.port or cfg["HTTP_PORT"]}'
+    key = Path(cfg['API_KEY_FILE']).read_text().strip() if cfg['API_KEY_FILE'] else None
+    t0 = time.time()
+    while True:
+        try:
+            with urllib.request.urlopen(base + '/health', timeout=5) as r:
+                if r.status == 200:
+                    break
+        except (urllib.error.URLError, OSError):
+            pass
+        if time.time() - t0 > args.wait:
+            die(f'no answer from {base}/health after {args.wait} s: is rank 0 READY? (ds41-pair status)')
+        time.sleep(2)
+    def ask(prompt, tokens):
+        try:
+            return completion(base, key, prompt, tokens)
+        except urllib.error.HTTPError as exc:
+            die(f'{base}/v1/completions answered HTTP {exc.code}' + (' (check API_KEY_FILE)' if exc.code == 401 else ''))
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            say('FAIL', 'smoke', f'the server stopped answering ({exc}); ds41-pair logs shows why (both ranks)')
+            sys.exit(1)
+
+    ids, _, _ = ask(ref['prompt'], ref['max_tokens'])
+    digest = hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]
+    if not ids:
+        say('FAIL', 'smoke', 'the server returned no tokens; ds41-pair logs shows why (both ranks)')
+        return 1
+    if args.record:
+        doc = dict(ref, token_ids=ids, token_ids_sha256_16=digest)
+        Path(args.record).write_text(json.dumps(doc, indent=1) + '\n', encoding='utf-8')
+        print(f'recorded {len(ids)} ids (digest {digest}) to {args.record}')
+    profile = cfg['PROFILE']
+    if not ref.get('token_ids'):
+        say('INFO', 'smoke', f'no published reference in this checkout; ids digest {digest} ({len(ids)} ids)')
+    elif profile not in ref.get('profiles', ['default']):
+        say('INFO', 'smoke', f'profile {profile} has no published reference; ids digest {digest} ({len(ids)} ids)')
+    elif ids == ref['token_ids']:
+        say('PASS', 'smoke', f'{len(ids)} token ids equal the published reference (digest {digest})')
+    else:
+        n = next((i for i, (a, b) in enumerate(zip(ids, ref['token_ids'])) if a != b), min(len(ids), len(ref['token_ids'])))
+        say('FAIL', 'smoke', f'token ids differ from the reference at position {n} (digest {digest}, reference '
+            f'{ref["token_ids_sha256_16"]}): check that both nodes run the same build, profile and verified files')
+    ids, first, last = ask(ref['speed_prompt'], ref['speed_tokens'])
+    if first is not None and last and last > first and len(ids) > 1:
+        print(f'speed: TTFT {first:.2f} s, {len(ids)} tokens, decode {(len(ids) - 1) / (last - first):.1f} tok/s '
+              '(one stream, DSpark on; varies with the text)')
+    return 1 if FAILS else 0
+
+
+# ---------------------------------------------------------------------------------------------------------------- main
+def main(argv=None):
+    p = argparse.ArgumentParser(prog='ds41-pair', description=__doc__.split('\n\n')[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n\n', 1)[1])
+    p.add_argument('--config', help='config file (default: $STRIX_PAIR_CONFIG or ~/.config/strix-pair/ds41.conf)')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('init', help='write or update this node\'s config')
+    s.add_argument('--rank', choices=['0', '1'])
+    s.add_argument('--peer', help='SSH destination of the other node, e.g. user@node-b')
+    s.add_argument('--model-dir')
+    s.add_argument('--profile', choices=PROFILES)
+    s.add_argument('--build-dir')
+    s.add_argument('--http-bind')
+    s.add_argument('--http-port')
+    s.add_argument('--api-key-file')
+    s.add_argument('--context')
+    s.add_argument('--peer-repo')
+    s.add_argument('--peer-model-dir')
+    s.add_argument('--peer-config')
+    s.add_argument('--rocm')
+    s.add_argument('--deps-dir')
+    s.add_argument('--force', action='store_true')
+    sub.add_parser('config', help='print the effective config')
+    s = sub.add_parser('check', help='read-only preflight')
+    s.add_argument('--no-peer', action='store_true')
+    s = sub.add_parser('driver', help='build the USB4 driver modules for the running kernel; print the root steps')
+    s.add_argument('--yes-root', action='store_true', help='run the root steps with sudo, each shown first')
+    s.add_argument('--rebuild', action='store_true')
+    s.add_argument('--full', action='store_true', help='build the whole kernel tree (no linux-headers Module.symvers)')
+    s.add_argument('--dry-run', action='store_true', help='sources, series and version check, plan and root steps; no compile')
+    s.add_argument('--kernel', action='store_true', help='build the whole patched kernel (another kernel version, or USB4 built in)')
+    s.add_argument('--localversion', help='LOCALVERSION of the new kernel (--kernel; must start with -strix-gpu-bosgame-)')
+    s.add_argument('--jobs', type=int)
+    s = sub.add_parser('driver-verify', help='modules, cables, link speed, four streams')
+    s.add_argument('--link-test', action='store_true', help='also pair the streams with the peer and exchange data')
+    s = sub.add_parser('build', help='build the trellis library and the engine')
+    s.add_argument('--jobs', type=int)
+    s.add_argument('--clean', action='store_true')
+    s = sub.add_parser('fetch', help='download / copy and verify the production files')
+    s.add_argument('--dry-run', action='store_true')
+    s.add_argument('--from-peer', action='store_true', help='copy from the peer\'s model directory (rsync over SSH)')
+    s.add_argument('--verify', action='store_true', help='re-hash every file even when its size and time are unchanged')
+    s.add_argument('--verify-only', action='store_true', help='hash the files already present; transfer nothing')
+    s.add_argument('--only', action='append', metavar='GLOB', help='limit to matching files (repeatable)')
+    s.add_argument('--verbose', '-v', action='store_true')
+    s = sub.add_parser('prepare', help='optional one-time expert preparation')
+    s.add_argument('--dry-run', action='store_true')
+    s.add_argument('--force', action='store_true')
+    s = sub.add_parser('run', help='start this node\'s rank')
+    s.add_argument('--both', action='store_true', help='also start the peer\'s rank over SSH')
+    s.add_argument('--foreground', action='store_true')
+    s.add_argument('--no-wait', action='store_true')
+    s.add_argument('--wait', type=int, default=420)
+    s = sub.add_parser('stop', help='stop this node\'s rank')
+    s.add_argument('--both', action='store_true')
+    sub.add_parser('status', help='is the rank running and READY')
+    s = sub.add_parser('logs', help='last lines of the rank log')
+    s.add_argument('-n', '--lines', type=int, default=40)
+    s = sub.add_parser('unit', help='write a systemd user unit for this rank')
+    s.add_argument('--install', action='store_true', help='also enable and start it (systemctl --user)')
+    s = sub.add_parser('smoke', help='exact token check and one speed line')
+    s.add_argument('--host')
+    s.add_argument('--port')
+    s.add_argument('--wait', type=int, default=60)
+    s.add_argument('--record', help=argparse.SUPPRESS)
+    s.add_argument('--reference', help=argparse.SUPPRESS)
+    s = sub.add_parser('_bench-rank')
+    s.add_argument('rank', choices=['0', '1'])
+    sub.add_parser('_serve-sha')
+    a = p.parse_args(argv)
+    handler = {'init': cmd_init, 'config': cmd_config, 'check': cmd_check, 'driver': cmd_driver,
+               'driver-verify': cmd_driver_verify, 'build': cmd_build, 'fetch': cmd_fetch, 'prepare': cmd_prepare,
+               'run': cmd_run, 'stop': cmd_stop, 'status': cmd_status, 'logs': cmd_logs, 'unit': cmd_unit,
+               'smoke': cmd_smoke, '_bench-rank': cmd_bench_rank, '_serve-sha': cmd_serve_sha}[a.cmd]
+    return handler(a) or 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:  # output piped into head or similar
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)

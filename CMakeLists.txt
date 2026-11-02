@@ -1750,6 +1750,8 @@ if(BUILD_TESTING)
                 --emitter $<TARGET_FILE:strix-qwen-yarn-table-tests>)
         add_test(NAME strix-session-gate-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/session_gate_tests.py)
+        add_test(NAME strix-ds41-pair-setup-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/ds41_pair_setup_tests.py)
         add_test(NAME strix-qwen-prefill-public-controls-gate-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/qwen_prefill_public_controls_gate_tests.py)
         add_test(NAME strix-ctest-evidence-tests

@@ -128,6 +128,20 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 Requirements, the complete build for every engine and each engine's launch command:
 [getting started](docs/getting-started/README.md). Optional NVIDIA GPU routes: [using a discrete GPU](#discrete-gpu).
 
+## Quick setup for the DeepSeek pair
+
+Two Strix Halo machines with 128 GB each and two USB4 cables between them: one script checks each node, builds the
+USB4 driver modules and the engine, fetches and verifies the weights, starts both ranks and runs an exact smoke test.
+Run on both nodes (`--rank 1` and the other address on the second one):
+
+```bash
+scripts/pair/ds41-pair init --rank 0 --peer user@node-b --model-dir /path/to/models
+scripts/pair/ds41-pair check && scripts/pair/ds41-pair driver && scripts/pair/ds41-pair build && scripts/pair/ds41-pair fetch
+```
+
+then `scripts/pair/ds41-pair run --both` and `scripts/pair/ds41-pair smoke` on the rank 0 node. Root steps are printed,
+never run silently. Every subcommand: [docs/pair-setup.md](docs/pair-setup.md).
+
 ## Profiles: `default`, `fast`, `quality`
 
 Qwen (CLI, `--http-serve` and the MTP runner), every DeepSeek pair app and Nemotron take `--profile default|fast|quality`;
@@ -190,7 +204,8 @@ Requirements, one build or launch per route, what runs where, when a route does 
   [Nemotron 3.5 Bolt E4B](docs/models/nemotron-3.5-bolt-e4b/README.md) · [model families](docs/models/model-families.md).
 - **[Methodology](docs/methodology.md):** how the tables are read, exactness, model fidelity, defaults and off switches,
   design decisions.
-- **[Two nodes over USB4](docs/pair.md):** the pair, what it needs, how DeepSeek, MiniMax and GLM run on it.
+- **[Two nodes over USB4](docs/pair.md):** the pair, what it needs, how DeepSeek, MiniMax and GLM run on it;
+  [setting up the DeepSeek pair](docs/pair-setup.md) with one script.
 - **[Serving](docs/serving.md):** HTTP servers, request contracts, batching, prefix caches, exposure and security.
 - **[Measured gains](docs/measured-gains.md):** every shipped default with its measured gain, exactness evidence and off
   switch · [optimization catalog](docs/optimizations.md) ([JSON](docs/optimizations.json)) ·

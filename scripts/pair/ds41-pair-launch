@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Start this node's rank of the DeepSeek V4.1 Flash pair from the ds41-pair config, in the foreground.
+# Used by `ds41-pair run` and the systemd user unit; run it by hand on both nodes if you prefer.
+# Extra arguments are passed to strix-deepseek41-serve (for example --print-effective-config).
+set -euo pipefail
+conf=${STRIX_PAIR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/strix-pair/ds41.conf}
+[[ -f $conf ]] || { echo "ds41-pair-launch: no config at $conf (run: ds41-pair init)" >&2; exit 2; }
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+RANK='' MODEL_DIR='' PROFILE=default BUILD_DIR='' HTTP_BIND=127.0.0.1 HTTP_PORT=8080 API_KEY_FILE='' CONTEXT=''
+EXTRA_ARGS=''
+# shellcheck disable=SC1090
+. "$conf"
+BUILD_DIR=${BUILD_DIR:-$repo/build-ds41}
+[[ $RANK == 0 || $RANK == 1 ]] || { echo "ds41-pair-launch: RANK must be 0 or 1 in $conf" >&2; exit 2; }
+serve=$BUILD_DIR/strix-deepseek41-serve
+[[ -x $serve ]] || { echo "ds41-pair-launch: $serve missing (run: ds41-pair build)" >&2; exit 2; }
+args=("$MODEL_DIR/DeepSeek-V4.1-Flash-1017-Q2.gguf" --rank "$RANK" --transport usb4auto --profile "${PROFILE:-default}")
+if [[ $RANK == 0 ]]; then
+    args+=(--http-bind "$HTTP_BIND" --http-port "$HTTP_PORT")
+    [[ -z $API_KEY_FILE ]] || args+=(--http-api-key-file "$API_KEY_FILE")
+fi
+[[ -z $CONTEXT ]] || args+=(--context "$CONTEXT")
+# The resolver finds c-u6.gguf, ours-K4/, ours-K5/, the drafter and vocab/ in the model directory.
+export STRIX_DS41_PACKS=$MODEL_DIR
+# EXTRA_ARGS is split on spaces on purpose (plain options, the same on both ranks).
+# shellcheck disable=SC2086
+exec "$serve" "${args[@]}" $EXTRA_ARGS "$@"
