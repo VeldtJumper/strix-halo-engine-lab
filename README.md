@@ -247,8 +247,9 @@ default profile, mean of two GPU turns per arm:
 | 32,499 tokens (two pieces) | 29.90 s | **28.92 s** | −3.3 % |
 | 44,699 tokens (three pieces) | 43.07 s | **40.51 s** | −5.9 % |
 
-`--profile fast` turns on the relaxed-order MoE lever `STRIX_DS41_FAST_MOE=1`: **8.53 / 29.24 / 41.90 s** on the same
-prompts. It changes logits; its quality qualification is in progress, and `default` is unchanged.
+`--profile fast` turns on the relaxed-order MoE lever `STRIX_DS41_FAST_MOE=1`: **7.56 / 26.33 / 36.77 s** on the same
+prompts, against 8.36 / 29.38 / 41.55 s for `default` in the same run (−9.6 / −10.4 / −11.5 %; build with the deferred
+decoder cone, before the 32-row FAST down below). It changes logits; its quality qualification is in progress, and `default` is unchanged.
 Within `--profile fast`, the relaxed MoE down projection now works on 32-row groups by default
 (`STRIX_DS41_FAST_MOE_DOWN_ROWS=64` restores the previous groups; same FAST output bits). The 64-row form spilled
 registers. In-app pair prefill, four alternating runs: 8.4K 7.863 → 7.533 s (−4.2 %), 32.5K 27.509 → 27.077 s
