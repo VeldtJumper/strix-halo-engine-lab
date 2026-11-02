@@ -3969,7 +3969,10 @@ static int run_decode_entry(
             headroom=add(headroom,staging_reserve);
             const auto before = observe();
             auto retained = estimate;
-            auto capacity = resolve_http_bridge_capacity(estimate, serving, before.available, gtt_free(before), headroom, headroom, options.http_batch_cap);
+            // Observations of the last fit, reused if the route falls back to the single runner.
+            auto fit_host = before.available;
+            auto fit_device = gtt_free(before);
+            auto capacity = resolve_http_bridge_capacity(estimate, serving, fit_host, fit_device, headroom, headroom, options.http_batch_cap);
             if (!capacity.slots) throw std::runtime_error("HTTP first slot does not fit: " + capacity.limiting);
             const bool single_route=!ordinary_http_batch_slots(options);
             if (single_route) capacity.slots=1;
@@ -3983,9 +3986,9 @@ static int run_decode_entry(
                 };
                 const auto measured = std::max({estimate, delta(before.available, after.available), delta(gtt_free(before), gtt_free(after))});
                 retained = measured;
-                capacity = resolve_http_bridge_capacity(measured, serving,
-                    after.available ? before.available : std::nullopt,
-                    gtt_free(after) ? gtt_free(before) : std::nullopt, headroom, headroom, options.http_batch_cap);
+                fit_host = after.available ? before.available : std::nullopt;
+                fit_device = gtt_free(after) ? gtt_free(before) : std::nullopt;
+                capacity = resolve_http_bridge_capacity(measured, serving, fit_host, fit_device, headroom, headroom, options.http_batch_cap);
                 if (capacity.slots >= 2U) batch_stacks.push_back(std::move(probe));
             }
             if (!capacity.slots) throw std::runtime_error("HTTP first slot does not fit after probe: " + capacity.limiting);
@@ -4015,7 +4018,17 @@ static int run_decode_entry(
             options.http_slot_reason = "limited by " + capacity.limiting;
             batch_slots = !single_route && (capacity.slots > 1U || (options.http_batch_explicit && options.http_batch_cap == 1U))
                 ? capacity.slots : 0U;
+            const bool pool_fallback = !single_route && !batch_slots &&
+                qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
             options.http_batch = static_cast<std::uint32_t>(batch_slots);
+            if (pool_fallback) {
+                // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
+                const auto single = resolve_http_bridge_capacity(retained, prompt_memory.serving(options),
+                    fit_host, fit_device, headroom, headroom, 1U);
+                options.qsa_mtp_pool_fallback_unfit = !single.slots;
+                std::cerr << "qsa-mtp-pool single-fallback enabled=" << (single.slots ? 1 : 0) << " reserved_bytes="
+                          << strix::mtp_qsa_pool_plan(options.context_tokens).reserved_bytes << " (" << single.limiting << ")\n";
+            }
             if (!batch_slots && options.http_sampling == "sample")
                 throw std::runtime_error("HTTP sampling requires memory for the batched route");
         }
