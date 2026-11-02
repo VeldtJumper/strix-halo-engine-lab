@@ -1127,6 +1127,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Prefill hyper-connection fusion",
+    "flag_or_env": "STRIX_DS41_PREFILL_HC_FUSE",
+    "default": "on",
+    "exact": "Same kernels' arithmetic: the expanded stream, the ffn site's mixes, the collapsed and normalised rows and their A8 / FP16 copies are bitwise identical to the separate expansion, mix, collapse and RMSNorm passes. Two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens.",
+    "gain": "Removes one read of the 4-copy FP32 stream per layer (the ffn mixes are computed from the values being expanded) and the collapsed-row write + read at both sites. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order): 8.185 / 29.078 s with STRIX_DS41_PREFILL_HC_FUSE=0 vs 8.096 / 28.805 s default (-1.1 / -0.9 %).",
+    "preconditions": "Device prefill path.",
+    "off_switch": "STRIX_DS41_PREFILL_HC_FUSE=0",
+    "doc_anchor": "docs/optimizations.md#ds-prefill-hc-fuse"
+  },
+  {
+    "engine": "deepseek",
     "name": "Exact dense prefill selector",
     "flag_or_env": "STRIX_DS41_DENSE_SELECT",
     "default": "auto",

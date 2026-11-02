@@ -1646,6 +1646,22 @@ The FAST relaxed MoE down kernel takes row groups of up to 32 rows of one expert
 - **Measured gain:** FAST relaxed down kernel -23 / -16 / -14 % at 2048 / 4096 / 8192 rows (32-row groups compile without the ~69 spilled VGPRs of 64-row groups). Two-node serve TTFT with STRIX_DS41_FAST_MOE=1 at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, four GPU turns in alternating arm order): 7.863 / 27.509 s with STRIX_DS41_FAST_MOE_DOWN_ROWS=64 vs 7.533 / 27.077 s default (-4.2 / -1.6 %).
 - **Public evidence:** [FAST relaxed MoE kernels](../src/hip_ds41_prefill_relaxed.inl)
 
+<a id="ds-prefill-hc-fuse"></a>
+
+### Prefill hyper-connection fusion
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_HC_FUSE`. **Default:** on.
+
+Prefill moved the 4-copy FP32 hyper-connection stream through separate passes: the expansion after each sublayer, the next site's mixes, the collapse into a row buffer and the RMSNorm of that buffer. Now the attention's expansion also computes the ffn site's mixes from the values it stores (the hyper-connection site kernel), and each site's RMSNorm reads the collapse straight from the stream. Every value is formed by the same operations in the same order.
+
+- **Preconditions:** Device prefill path.
+- **Automatic selection:** On for every prefill call.
+- **Fallback notice:** None.
+- **Exactness evidence:** Same kernels' arithmetic: the expanded stream, the ffn site's mixes, the collapsed and normalised rows and their A8 / FP16 copies are bitwise identical to the separate expansion, mix, collapse and RMSNorm passes. Two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens.
+- **Off switch:** STRIX_DS41_PREFILL_HC_FUSE=0
+- **Measured gain:** Removes one read of the 4-copy FP32 stream per layer and the collapsed-row write + read at both sites. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order): 8.185 / 29.078 s with STRIX_DS41_PREFILL_HC_FUSE=0 vs 8.096 / 28.805 s default (-1.1 / -0.9 %).
+- **Public evidence:** [Prefill hyper-connection sites](../src/hip_deepseek41_prefill.hip)
+
 <a id="ds-fast-moe-order"></a>
 
 ### FAST MoE block order
