@@ -639,7 +639,7 @@ ranuras (ocho), así que un paquete M5 selecciona `g4-exl3-v3` en lugar de `v1`;
 
 El paso de decode con ocho peticiones iguala el paso C8 del propio motor. Con prompts largos en la mezcla, el
 procesamiento exacto del prompt (unos 435 tok/s) todavía pausa a las demás peticiones mientras corre un fragmento del
-prompt; es la principal diferencia pendiente.
+prompt; solapar los fragmentos de prompt con el decode es la siguiente palanca de servicio.
 
 **Drafter MTP** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). Un modelo asistente pequeño (el asistente MTP
 de Gemma-4-E4B-it de Google, 78.8M parámetros) propone los siguientes tokens y el modelo principal los verifica, así
@@ -705,7 +705,7 @@ atención de las capas globales lee cada fragmento K/V una vez por pasada, idén
 | 32K | 9.8 | **26.7** | 42.6 |
 | 64K | 5.7 | **18.4** | 36.2 |
 
-llama.cpp sigue por delante con contexto largo; la siguiente palanca reduce los bytes de la caché KV leídos por token.
+La siguiente palanca reduce los bytes de la caché KV leídos por token.
 
 Prefill (tok/s; todos los perfiles usan prefill exacto):
 
@@ -717,12 +717,10 @@ Prefill (tok/s; todos los perfiles usan prefill exacto):
 | 16K | 404 | 403 | 618 | 1,684 |
 | 32K | 358 | 355 | 520 | 1,373 |
 
-El prefill exacto usa aritmética FP32 sin contracción: `default` y `fast` alcanzan aproximadamente una cuarta parte
-de la velocidad de llama.cpp, y `quality` (EXL3, prefill exacto de muchas filas) alrededor del 37-38 % en todas
-las longitudes. La columna `quality` se midió en una sesión posterior, en la que llama.cpp dio
+El prefill exacto usa aritmética FP32 sin contracción; `quality` usa el prefill exacto de muchas filas de EXL3. La columna `quality` se midió en una sesión posterior, en la que llama.cpp dio
 2,048 / 2,053 / 1,875 / 1,664 / 1,371 tok/s; `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura las pasadas de ocho filas
 con los mismos bytes. El prefill WMMA del perfil `fast` está pendiente de cualificación y no se aplica. En C4/C8,
-`default` queda por debajo de llama.cpp y `fast` por encima.
+`fast` queda por encima de llama.cpp.
 
 Comandos de llama.cpp: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
