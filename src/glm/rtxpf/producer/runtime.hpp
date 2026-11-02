@@ -57,6 +57,12 @@ struct DecodeOptions {
     // After each prefill through the cache, the open decode placement is made resident again
     // (placement only); without it the last prefilled layers own the arena (profile row).
     bool restore_decode_residency=true;
+    // Prefill overlap: the next routed layer's make_resident runs while this layer's kernels are in flight (held
+    // layers, no token; two layers kept, only when the arena has room: PrefillResidency::two_layers, or after
+    // PrefillSpareTarget lowers the spares). Copies vs kernels reorder only: same bytes. Off in a default-constructed
+    // DecodeOptions (library callers); the service sets it from the profile row prefill_overlap, which is on in every
+    // profile (--prefill-overlap 0 turns it off), as it does for the row kernels.
+    bool prefill_overlap=false;
     bool disk_prefetch=false;
     bool reference_compare=false;        // tierstream: also keep the uncached reference tier for same-window comparison
     std::string unit_manifest_sha256;    // pinned digest of PRIMARY.units.json (trusted manifest)

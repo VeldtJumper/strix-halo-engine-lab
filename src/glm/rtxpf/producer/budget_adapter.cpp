@@ -1,7 +1,7 @@
 // THE budget adapter: the only GLM file that calls a budget planner / ledger
 // API. GLM component sizes in (expert_tier.hpp: TierBudgetIn, WholeDeviceIn,
 // BudgetPart), {resident, slots, pinned, disk, staging, min caps, refusal} out,
-// plus the allocation ledger. Implemented against tierstream d7277a9
+// plus the allocation ledger. Implemented against tierstream 5fc3441
 // (ss_budget_plan / ss_budget_ledger, include/strix_stream/ss.h SS_BUDGET).
 // Switching to another shared planner replaces this file only; GLM keeps no
 // budget arithmetic of its own (the device-gated spare-slot rules below are

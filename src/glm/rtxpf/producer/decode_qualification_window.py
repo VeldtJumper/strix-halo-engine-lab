@@ -163,7 +163,7 @@ def repeat_compare(results):
         try:
             arms = [r for r in results if isinstance(r, dict) and r.get('op') == 'ttft' and r.get('tokens') == n and r.get('verdict') == 'EXACT']
             keys = {evidence_key(r) for r in arms}
-            timing = [{k: r.get(k) for k in ('row_tile', 'prefill_s', 'ttft_s', 'make_resident_ms_total', 'prefill_cache', 'decode_restore')} for r in arms]
+            timing = [{k: r.get(k) for k in ('row_tile', 'prefill_s', 'ttft_s', 'make_resident_ms_total', 'prefill_overlap', 'prefill_overlap_gpu_idle_ms_total', 'prefill_overlap_host_wait_ms_total', 'prefill_cache', 'decode_restore')} for r in arms]
         except Exception as exc:  # noqa: BLE001
             out.append(dict(tokens=n, verdict='NO-REFERENCE', reason=str(exc), internal_error=True))
             continue
@@ -392,6 +392,7 @@ def service_command(a, binary):
                             ('--tier-spare-percent', getattr(a, 'tier_spare_percent', None)),
                             ('--tier-spare-slots', getattr(a, 'tier_spare_slots', None)),
                             ('--restore-decode-residency', getattr(a, 'restore_decode_residency', None)),
+                            ('--prefill-overlap', getattr(a, 'prefill_overlap', None)),
                             ('--tier-policy', getattr(a, 'tier_policy', None)),
                             ('--tier-predict', getattr(a, 'tier_predict', None)),
                             ('--tier-flush-ready', getattr(a, 'tier_flush_ready', None)),
@@ -1316,7 +1317,7 @@ def materialize(a, op, n, item, rec, entry, seg, wall_s, expected_tile, allocate
         ev = evidence_ttft(rec, n, expected_tile, allocated) if v == 'EXACT' else None
         traffic = {k: rec[k] for k in ('prefill_file_reads', 'prefill_file_bytes', 'prefill_file_read_ns', 'prefill_misses',
                                        'prefill_fetched', 'prefill_h2d_bytes', 'prefill_cache', 'make_resident_ms_total',
-                                       'decode_restore') if isinstance(rec, dict) and k in rec}
+                                       'prefill_overlap', 'prefill_overlap_gpu_idle_ms_total', 'prefill_overlap_host_wait_ms_total', 'decode_restore') if isinstance(rec, dict) and k in rec}
         return dict(entry, verdict=v, problems=problems, missing=[], evidence=ev, row_tile=ev and ev['row_tile'],
                     ttft_s=ev and ev['ttft_s'], prefill_s=ev and ev['prefill_s'], token=ev and ev['token'], wall_s=wall_s, **traffic)
     if op == 'compare':
@@ -1413,7 +1414,7 @@ def worker_options(a):
     """Every run option the worker re-parses: caps, tiers, placement, the startup tile,
     the fitted tile sweep (and the note of an arm the parent dropped)."""
     argv = []
-    for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency',
+    for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency', 'prefill_overlap',
                  'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'expert_residency', 'expert_routes', 'routes_out', 'routes_prefill', 'row_tile', 'profile', 'prefill_tile_crossover',
                  'weight_dirs', 'drive_readers', 'tier_staging', 'tier_disk_queue', 'tier_clean_evict', 'disk_prefetch'):
         if getattr(a, name, None) is not None:
@@ -1525,6 +1526,9 @@ def arguments(argv=None):
                    'file units, e.g. 290 = a 5%% share of a ~5,800-slot arena)')
     p.add_argument('--restore-decode-residency', choices=['0', '1'], help='after each prefill make the open decode placement '
                    'resident again (default 1 = profile row; inside the prefill/TTFT time)')
+    p.add_argument('--prefill-overlap', choices=['0', '1'], help='prefill through the cache: make the next routed layer resident while '
+                   'the kernels of the current layer run (two layers held, no token; off when the arena cannot keep two layers; '
+                   'exact; default 1 = profile row; 0 = off)')
     p.add_argument('--tier-policy', choices=['lru', 'scored', 'auto'], help='boundary victims (default auto = SCORED_AUTO)')
     p.add_argument('--tier-predict', choices=['0', '1'], help='overlapped next-layer prefetch (default 0)')
     p.add_argument('--tier-flush-ready', choices=['0', '1'], help='flush the cache demand stream after each ready signal (WDDM submission; default 1 = profile row flush_ready)')

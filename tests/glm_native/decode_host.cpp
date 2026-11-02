@@ -414,10 +414,11 @@ void tier_budget_tests(){
 void prefill_cache_tests(){
     auto s=synthetic();ExpertCatalog c(s.tensors,s.g);const std::uint64_t stride=c.unit_stride();
     struct Mock final:TierCacheApi {
-        std::uint64_t stride;unsigned slots,spares;std::vector<std::byte> arena;std::vector<std::int32_t> slot_of=std::vector<std::int32_t>(2*288,-1);std::uint32_t unit_base[3]{0,288,576};
-        std::vector<int> owner;std::vector<bool> kept=std::vector<bool>(2*288,false);std::uint32_t abort=0,absent=0;bool in_step=false,fail=false;std::vector<unsigned> steps;
+        std::uint64_t stride;unsigned slots,spares,gated;std::vector<std::byte> arena;std::vector<std::int32_t> slot_of;std::vector<std::uint32_t> unit_base;
+        std::vector<int> owner;std::vector<bool> kept;std::uint32_t abort=0,absent=0;bool in_step=false,fail=false;std::vector<unsigned> steps;
         std::function<void(unsigned,unsigned,std::byte*)> fill;
-        Mock(std::uint64_t st,unsigned n,unsigned sp,std::function<void(unsigned,unsigned,std::byte*)> f):stride(st),slots(n),spares(sp),arena(std::size_t(n)*st),owner(n,-1),fill(std::move(f)){}
+        Mock(std::uint64_t st,unsigned n,unsigned sp,std::function<void(unsigned,unsigned,std::byte*)> f,unsigned gl=2):stride(st),slots(n),spares(sp),gated(gl),arena(std::size_t(n)*st),slot_of(std::size_t(gl)*288,-1),unit_base(gl+1),owner(n,-1),kept(std::size_t(gl)*288,false),fill(std::move(f)){
+            for(unsigned g=0;g<=gl;++g)unit_base[g]=g*288;}
         unsigned kept_n()const{return unsigned(std::count(kept.begin(),kept.end(),true));}
         bool supports_make_resident()const override{return true;}
         bool make_resident(unsigned g,const std::int32_t* ids,unsigned n)override{
@@ -432,7 +433,7 @@ void prefill_cache_tests(){
         void begin_layer_step(unsigned g)override{if(in_step)throw std::runtime_error("nested step");in_step=true;steps.push_back(g);}
         void begin()override{in_step=true;}void enqueue_begin(void*)override{}void enqueue_export(unsigned,const std::int32_t*,unsigned,void*)override{}void enqueue_wait(unsigned,void*)override{}void enqueue_end(void*)override{}
         void end()override{in_step=false;}void reset_open()override{}Json stats()override{return Json::object();}
-        TierView view()const override{TierView v;v.slot_of=slot_of.data();v.unit_base=unit_base;v.abort=&abort;v.absent_err=const_cast<std::uint32_t*>(&absent);v.guard_slot=slots;v.n_gated=2;v.units=288;v.base=arena.data();v.stride=stride;return v;}
+        TierView view()const override{TierView v;v.slot_of=slot_of.data();v.unit_base=unit_base.data();v.abort=&abort;v.absent_err=const_cast<std::uint32_t*>(&absent);v.guard_slot=slots;v.n_gated=gated;v.units=288;v.base=arena.data();v.stride=stride;return v;}
     };
     auto fill=[&](unsigned g,unsigned e,std::byte* dst){auto& x=c.at(g+3,e);auto& blob=s.blobs.at(x.blob);for(unsigned m=0;m<3;++m)for(unsigned r=0;r<4;++r)std::memcpy(dst+x.unit.offset[m][r],blob.data()+x.t[m][r].offset,x.t[m][r].bytes);};
     // Runtime init by mode (the decisions the runtime uses at its ring, layer
@@ -469,7 +470,72 @@ void prefill_cache_tests(){
     Mock broken(stride,300,8,fill);broken.fail=true;CacheTokenSite bsite(broken);
     rejects([&]{residency.acquire(bsite,0);},"injected failure");bool original=false;try{bsite.begin();}catch(const std::exception& e){original=std::string(e.what()).find("injected make_resident failure")!=std::string::npos;}
     check(!bsite.unusable().empty()&&original,"a failed residency retires the cache with the original error");
-    std::cout<<"INFO prefill through the cache (mock reader/resident): 2 layers x 288 slot-bound descriptors == source bytes\n";
+    // Opt-in prefill overlap (PrefillOverlap), three gated layers in an arena that keeps exactly two: no token is
+    // opened; layer k+1 is made resident while k's kernels are in flight and bound (enqueued) BEFORE the wait on the
+    // previous layer's event; a layer is released only after its wait; never more than two held, none at the end; a
+    // held layer's units never move, so its descriptors still address the source bytes when it is waited.
+    b.slots=584;b.spare_slots=8;check(PrefillResidency::two_layers(b),"584 persistent slots keep two layers + 8 spares");
+    b.slots=583;check(!PrefillResidency::two_layers(b)&&PrefillResidency::refusal(b).empty(),"583: one layer only (overlap off, the one-layer path runs)");
+    {auto fill3=[&](unsigned g,unsigned e,std::byte* dst){fill(g%2,e,dst);};
+     Mock om(stride,585,8,fill3,3);CacheTokenSite osite(om);PrefillOverlap ov;std::vector<std::string> log;unsigned most=0;std::vector<std::vector<std::int32_t>> slots(3);
+     auto bound=[&](unsigned g){ // the slots a bind of g resolves (ss_dg_slot), their bytes checked against the source
+        const auto v=om.view();const auto base=reinterpret_cast<std::uint64_t>(v.base);std::vector<std::int32_t> slots(288);
+        for(unsigned e=0;e<288;++e){bool absent=false;slots[e]=guarded_slot(v.slot_of,v.unit_base,*v.abort,v.guard_slot,g,e,&absent);check(!absent&&slots[e]>=0&&unsigned(slots[e])<om.slots,"overlap: every expert of a held layer resolves");
+            auto u=unit_offsets(c.at(g%2+3,e));auto& x=c.at(g%2+3,e);auto& blob=s.blobs.at(x.blob);
+            for(unsigned m=0;m<3;++m)for(unsigned r=0;r<3;++r)check(std::memcmp(reinterpret_cast<const void*>(unit_address(base,slots[e],stride,u,m,r)),blob.data()+x.t[m][r].offset,x.t[m][r].bytes)==0,"overlap: descriptor bytes == source tensor bytes");}
+        return slots;};
+     auto acquire=[&](unsigned g){check(!osite.open()&&!om.in_step,"overlap: make_resident never inside a token");residency.acquire(osite,g);most=std::max(most,om.kept_n()/288);log.push_back("acquire "+std::to_string(g));};
+     for(unsigned g=0;g<3;++g){ov.begin(g,acquire);slots[g]=bound(g);log.push_back("bind "+std::to_string(g)); // bind, then the layer's kernels (in flight)
+        ov.end(g,g+1<3?int(g+1):-1,acquire,[&](unsigned h){check(bound(h)==slots[h],"overlap: a held layer never moved before its wait");log.push_back("wait "+std::to_string(h));},
+               [&](unsigned h){osite.release_resident(h);log.push_back("release "+std::to_string(h));});}
+     check(log==std::vector<std::string>{"acquire 0","bind 0","acquire 1","bind 1","wait 0","release 0","acquire 2","bind 2","wait 1","release 1","wait 2","release 2"},
+           "overlap order: the next layer bound before the wait on the previous one, a layer released only after its wait");
+     check(most==2&&om.kept_n()==0&&ov.held().empty()&&om.steps.empty()&&osite.unusable().empty(),"overlap: at most two held, none left, no step, worker usable");
+     osite.begin();osite.end();check(osite.unusable().empty(),"decode tokens continue after an overlapped prefill");
+     PrefillOverlap bad;bad.begin(0,[](unsigned){});rejects([&]{bad.begin(1,[](unsigned){});},"overlap: begin while an earlier layer is held");
+     rejects([&]{bad.end(1,-1,[](unsigned){},[](unsigned){},[](unsigned){});},"overlap: end of a layer that is not held");
+     // An arena that keeps one layer only: the overlapped make_resident is refused (SS_E_CAPACITY) and retires the
+     // worker; the held layer is not released before its wait.
+     Mock one(stride,584,8,fill3,3);CacheTokenSite one_site(one);PrefillOverlap o1;auto one_acquire=[&](unsigned g){residency.acquire(one_site,g);};
+     o1.begin(0,one_acquire);rejects([&]{o1.end(0,1,one_acquire,[](unsigned){},[&](unsigned h){one_site.release_resident(h);});},"overlap without room refused");
+     check(!one_site.unusable().empty()&&one.kept_n()==288,"overlap without room: the worker is retired, nothing released before the wait");
+     // With try_acquire (the runtime's form) the same arena runs serially instead: the next layer is refused (nothing
+     // changed), the current one is waited and released, then the next is acquired alone; the worker stays usable.
+     Mock sm(stride,584,8,fill3,3);CacheTokenSite ssite(sm);PrefillOverlap so;std::vector<std::string> slog;unsigned serial=0;
+     auto sacq=[&](unsigned g){residency.acquire(ssite,g);slog.push_back("acquire "+std::to_string(g));};
+     auto stry=[&](unsigned g){const bool ok=residency.try_acquire(ssite,g);slog.push_back(std::string(ok?"try ":"refused ")+std::to_string(g));return ok;};
+     for(unsigned g=0;g<3;++g){so.begin(g,sacq);
+        if(!so.end(g,g+1<3?int(g+1):-1,stry,sacq,[&](unsigned h){slog.push_back("wait "+std::to_string(h));},[&](unsigned h){ssite.release_resident(h);slog.push_back("release "+std::to_string(h));}))++serial;}
+     check(slog==std::vector<std::string>{"acquire 0","refused 1","wait 0","release 0","acquire 1","refused 2","wait 1","release 1","acquire 2","wait 2","release 2"},
+           "overlap without room, try form: serial steps, a layer released only after its wait");
+     check(serial==2&&ssite.unusable().empty()&&sm.kept_n()==0&&so.held().empty(),"overlap without room, try form: two serial steps, worker usable, nothing held");}
+    // Prefill overlap's spare target (PrefillSpareTarget): lowered only when the spares alone block two held layers,
+    // restored once at the prefill end or abort; a failed lowering keeps overlap off, a failed restore retires.
+    {struct SpareMock final:TierCacheApi {unsigned target=31,open=31;int lowers=0,restores=0;bool fail_lower=false,fail_restore=false;
+        void begin()override{}void enqueue_begin(void*)override{}void enqueue_export(unsigned,const std::int32_t*,unsigned,void*)override{}void enqueue_wait(unsigned,void*)override{}
+        void enqueue_end(void*)override{}void end()override{}TierView view()const override{return TierView{};}void reset_open()override{}Json stats()override{return Json::object();}
+        bool lower_spare_target(unsigned n)override{++lowers;if(fail_lower)throw std::runtime_error("injected lower failure");target=n;return true;}
+        void restore_spare_target()override{++restores;if(fail_restore)throw std::runtime_error("injected restore failure");target=open;}};
+     TierBudget tb;tb.slots=606;tb.spare_slots=31;std::string why;
+     {SpareMock m;CacheTokenSite st(m);PrefillSpareTarget sp;
+      check(sp.lower(m,st,tb,true,why)&&sp.lowered()==30&&m.target==30&&why.empty(),"spare target: 606 slots, 31 spares -> 30 for the prefill");
+      sp.restore(m,st,true);sp.restore(m,st,true);check(m.target==31&&m.restores==1&&sp.lowered()==0&&st.unusable().empty(),"spare target: restored once at the prefill end");}
+     {SpareMock m;CacheTokenSite st(m);PrefillSpareTarget sp;TierBudget roomy=tb,short_arena=tb;roomy.slots=700;short_arena.slots=576;
+      check(!sp.lower(m,st,tb,false,why)&&!sp.lower(m,st,roomy,true,why)&&!sp.lower(m,st,short_arena,true,why)&&m.lowers==0,
+            "spare target untouched: --prefill-overlap 0, two layers fit already, or two layers do not fit even without spares");}
+     {SpareMock m;CacheTokenSite st(m);PrefillSpareTarget sp;check(sp.lower(m,st,tb,true,why),"spare target lowered");
+      try{throw std::runtime_error("mid-prefill failure");}catch(const std::exception&){sp.restore(m,st,false);}
+      check(m.target==31&&st.unusable().empty(),"abort mid-prefill: the open-time target restored");}
+     {SpareMock m;m.fail_lower=true;CacheTokenSite st(m);PrefillSpareTarget sp;
+      check(!sp.lower(m,st,tb,true,why)&&why.find("injected lower failure")!=std::string::npos&&m.restores==1&&m.target==31&&sp.lowered()==0&&st.unusable().empty(),
+            "a failed lowering: overlap off, the open-time target set again, worker usable");}
+     {SpareMock m;CacheTokenSite st(m);PrefillSpareTarget sp;(void)sp.lower(m,st,tb,true,why);m.fail_restore=true;
+      rejects([&]{sp.restore(m,st,true);},"a failed restore at the prefill end fails the request");check(!st.unusable().empty(),"a failed restore retires the worker");}
+     {SpareMock m;CacheTokenSite st(m);PrefillSpareTarget sp;(void)sp.lower(m,st,tb,true,why);m.fail_restore=true;
+      sp.restore(m,st,false);check(!st.unusable().empty(),"abort path: a failed restore retires without a second throw");}
+     {SpareMock m;m.fail_lower=true;m.fail_restore=true;CacheTokenSite st(m);PrefillSpareTarget sp;
+      rejects([&]{(void)sp.lower(m,st,tb,true,why);},"a failed lowering whose reset fails throws");check(!st.unusable().empty(),"and retires the worker");}}
+    std::cout<<"INFO prefill through the cache (mock reader/resident): 2 layers x 288 slot-bound descriptors == source bytes; overlap: 3 layers, two held at most\n";
 }
 void tier_mapping_tests(){
     auto s=synthetic();ExpertCatalog c(s.tensors,s.g);const auto stride=c.unit_stride();
@@ -711,7 +777,7 @@ void profile_tests(){
     auto run=[&](std::vector<std::string> args,std::vector<std::pair<std::string,std::string>> env={}){rp::Inputs in;in.args=std::move(args);in.env=lookup(std::move(env));return rp::resolve(rp::App::decode_service,in);};
     const auto def=run({});
     check(def.name==rp::Name::standard&&def.qualification()=="qualified","no --profile = default, qualified");
-    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","prefill_tile_crossover","cuda_graphs","restore_decode_residency","flush_ready","decode_row_kernels"}){
+    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","prefill_tile_crossover","cuda_graphs","restore_decode_residency","flush_ready","prefill_overlap","decode_row_kernels"}){
         auto* e=def.find(l);check(e&&e->status==rp::Status::profile&&e->lever->kind==rp::Kind::exact,(std::string("default: exact lever on: ")+l).c_str());}
     check(def.find("expert_tier")->value=="tierstream"&&def.find("eviction_policy")->value=="auto"&&def.find("spare_share")->value=="5"&&def.find("row_tile")->value=="auto",
           "default values = today's service defaults");
@@ -743,6 +809,9 @@ void profile_tests(){
         check(e&&e->status==rp::Status::pending&&e->value=="0"&&e->wanted=="1"&&e->lever->kind==rp::Kind::exact,(std::string("pending exact lever: ")+l).c_str());
         check(allowed.find(l)->status==rp::Status::unqualified&&allowed.find(l)->value=="1",(std::string("--allow-pending runs ")+l).c_str());}}
     {const auto c=run({"--skip-empty-expert-groups","1"});check(c.find("skip_empty_expert_groups")->status==rp::Status::explicit_cli,"--skip-empty-expert-groups explicit");
+     check(def.find("prefill_overlap")->status==rp::Status::profile&&def.find("prefill_overlap")->value=="1"&&fast.find("prefill_overlap")->value=="1"&&
+           quality.find("prefill_overlap")->value=="1","prefill_overlap on in every profile");
+     const auto o=run({"--prefill-overlap","0"});check(o.find("prefill_overlap")->status==rp::Status::explicit_cli&&o.find("prefill_overlap")->value=="0","--prefill-overlap 0 turns it off");
      const auto e=run({},{{"STRIX_GLM_RTX_PERSISTENT_DENSE_FP16","1"}});check(e.find("persistent_dense_fp16")->status==rp::Status::explicit_env&&e.find("persistent_dense_fp16")->value=="1","STRIX_GLM_RTX_PERSISTENT_DENSE_FP16=1 explicit");}
     // decode_row_kernels: on in every profile; 0, 1 or a '+' subset; the runtime switches follow the value
     check(def.find("decode_row_kernels")->value=="1"&&fast.find("decode_row_kernels")->value=="1","decode_row_kernels on by default");

@@ -42,6 +42,8 @@ void configure(const TierOpenConfig& c,Handles& h,ts_budget& b,ts_options& o){
     if(!c.weight_dirs.empty()){o.weight_dirs=c.weight_dirs.c_str();if(c.drive_readers)o.drive_readers=c.drive_readers;}
 }
 class Binding final:public TierCacheApi {
+    // ss_dg_set_budgets takes all three: the open-time prefetch budgets and spare target (library defaults resolved).
+    std::uint32_t per_layer_=0,per_token_=0,spare_open_=0;
     Handles h_;TierView view_{};CacheCounters before_{};std::uint64_t unit_=0;unsigned pred_=0,pred_through_=0;bool flush_ready_=false;std::string last_error_;StepPlan plan_;
     CacheCounters read(){ts_dg_stats s{};ts_ok(ts_stats_dg(h_.ctx,&s),"stats");CacheCounters c;c.lookups=s.lookups;c.misses=s.misses;c.fetched=s.fetched;c.prefetched=s.prefetched;c.resurrected=s.resurrected;c.covered=s.covered;c.bank_serves=s.bank_serves;c.file_reads=s.disk_reads;c.file_bytes=s.disk_read_bytes;c.file_ns=s.disk_read_ns;
         c.evicted=s.evicted;c.drops=s.disk_drops;c.writebacks=s.writebacks_done;c.stalled=s.stalled;c.timeouts=s.device_timeouts;c.free_slots=s.free_slots;
@@ -49,6 +51,7 @@ class Binding final:public TierCacheApi {
 public:
     explicit Binding(const TierOpenConfig& c){
         ts_budget b;ts_options o;configure(c,h_,b,o);ts_ok(ts_open(h_.desc,&b,h_.plan,&o,&h_.ctx),"open");flush_ready_=o.dg_flush_ready!=0;
+        per_layer_=o.dg_prefetch_per_layer;per_token_=o.dg_prefetch_per_token;spare_open_=o.dg_spare_target==0xFFFFFFFFu?o.dg_spare_slots:o.dg_spare_target;
         ts_dg_device_view v{};ts_ok(ts_dg_get_device_view(h_.ctx,&v),"device view");
         expert_need(v.struct_size>=sizeof v&&v.absent_err&&v.protocol==SS_DG_PROTOCOL&&v.n_parts==1&&v.n_gated==c.expected_gated,"tierstream view: protocol/parts/gated layers");
         expert_need(v.parts[0].stride==c.unit_bytes&&v.parts[0].bytes==c.unit_bytes,"tierstream view: arena stride != GLM unit stride");
@@ -70,6 +73,8 @@ public:
     std::vector<std::uint32_t> residency()override{std::uint32_t total=0;std::vector<ts_dg_unit> u(std::size_t(view_.n_gated)*view_.units);
         ts_ok(ts_dg_residency(h_.ctx,u.data(),std::uint32_t(u.size()),&total),"residency");std::vector<std::uint32_t> keys;keys.reserve(std::min<std::size_t>(total,u.size()));
         for(std::size_t i=0;i<total&&i<u.size();++i)keys.push_back(std::uint32_t(u[i].gated)*view_.units+std::uint32_t(u[i].unit));return keys;}
+    bool lower_spare_target(unsigned n)override{ts_ok(ts_dg_set_budgets(h_.ctx,n,per_layer_,per_token_),"lower spare target");return true;}
+    void restore_spare_target()override{ts_ok(ts_dg_set_budgets(h_.ctx,spare_open_,per_layer_,per_token_),"restore spare target");}
     void enqueue_wait(unsigned g,void* s)override{ts_ok(ts_dg_enqueue_wait(h_.ctx,int(g),s),"enqueue wait");}
     void enqueue_end(void* s)override{ts_ok(ts_dg_enqueue_end(h_.ctx,s),"enqueue end");}
     void end()override{const auto s=ts_dg_end_rows(h_.ctx,1);if(s!=TS_OK){const char* e=ts_last_error();last_error_=e?e:"";}ts_ok(s,"token not accepted");}

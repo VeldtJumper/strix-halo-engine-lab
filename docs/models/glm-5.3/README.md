@@ -104,8 +104,12 @@ the unit file, so per-token file misses are included; 24-token bench). Tokens, e
 session state are bitwise equal on and off, and the 1K/8K qualification passes with them on. The kernels decode each
 weight tile straight into tensor-core fragments and keep the pinned GEMMs' accumulation order; turn them off with
 `--decode-row-kernels 0` or `STRIX_GLM_RTX_ROW_KERNELS=0`.
+Prefill overlap is on by default: while one layer's kernels run, the next layer's experts are made resident. Prefill
+state, tokens and logits are bitwise equal with it off. In same-window comparisons it cuts TTFT to 0.56× (8K) and 0.66×
+(32K) of the overlap-off time on the full card. Turn it off with `--prefill-overlap 0`.
 With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on disk) it also runs exact: TTFT
-**64.8 s** at 1K and **76.7 s** at 8K; decode **0.67 tok/s** warm (0.63 cold). Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
+**60.3 s** at 1K and **62.4 s** at 8K with the prefill overlap (63.4 / 73.7 s with it off in the same window); decode
+**0.67 tok/s** warm (0.63 cold). Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
 
 ## Every shipped GLM default
 
