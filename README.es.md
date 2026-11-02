@@ -258,8 +258,9 @@ dos turnos de GPU por brazo:
 | 32,499 tokens (dos piezas) | 29.90 s | **28.92 s** | −3.3 % |
 | 44,699 tokens (tres piezas) | 43.07 s | **40.51 s** | −5.9 % |
 
-`--profile fast` activa la palanca MoE de orden relajado `STRIX_DS41_FAST_MOE=1`: **8.53 / 29.24 / 41.90 s** con los
-mismos prompts. Cambia los logits; su cualificación de calidad está en curso, y `default` no cambia.
+`--profile fast` activa la palanca MoE de orden relajado `STRIX_DS41_FAST_MOE=1`: **7.56 / 26.33 / 36.77 s** con los
+mismos prompts, frente a 8.36 / 29.38 / 41.55 s de `default` en la misma ejecución (−9.6 / −10.4 / −11.5 %; compilación
+con el cono del decodificador diferido, anterior al down FAST de 32 filas descrito abajo). Cambia los logits; su cualificación de calidad está en curso, y `default` no cambia.
 Dentro de `--profile fast`, la proyección down del MoE relajado trabaja ahora por defecto en grupos de 32 filas
 (`STRIX_DS41_FAST_MOE_DOWN_ROWS=64` restablece los grupos anteriores; mismos bits de salida FAST). La forma de 64 filas
 desbordaba registros. Prefill del par dentro de la aplicación, cuatro ejecuciones alternas: 8.4K 7.863 → 7.533 s
