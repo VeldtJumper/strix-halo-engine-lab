@@ -397,6 +397,9 @@ struct Runtime::Impl {
         if(requested_tile){tile=requested_tile;tile_choice="request override (row_tile)";}else{tile=select_prefill_tile(P,allocated_tile,tile_crossover);tile_choice=prefill_tile_reason(P,tile_crossover);}}
     void record_prefill_cache(){if(!prefill_via_cache||!ts_tier)return;last_timings.set("prefill_cache",counter_delta(prefill_counters0,cache_counters()));
         auto a=Json::array();double total=0;for(double x:ts_tier->acquire_ms){a.push(x);total+=x;}last_timings.set("make_resident_ms_per_layer",a);last_timings.set("make_resident_ms_total",total);
+        last_timings.set("prefill_overlap",ts_tier->overlap_note);
+        if(ts_tier->overlapping)for(auto [k,v]:{std::pair<const char*,const std::vector<double>*>{"prefill_overlap_gpu_idle_ms",&ts_tier->gpu_idle_ms},{"prefill_overlap_host_wait_ms",&ts_tier->host_wait_ms}}){
+            auto w=Json::array();double wt=0;for(double x:*v){w.push(x);wt+=x;}last_timings.set(std::string(k)+"_per_layer",w);last_timings.set(std::string(k)+"_total",wt);}
         last_timings.set("decode_restore",restore_pending?"deferred to the next decode token":"off");}
     void record_tile(){last_timings.set("row_tile",int(tile));last_timings.set("allocated_row_tile",int(allocated_tile));last_timings.set("row_tile_choice",tile_choice);last_timings.set("prefill_tile_crossover",int(tile_crossover));}
     Stream compute,h2d,decode;CutlassExecution exec{};std::vector<cudaEvent_t> exec_events;
@@ -655,6 +658,7 @@ struct Runtime::Impl {
     }
     void run_prefill(std::span<const U32> input,const std::string& identity,const StateSink& sink){
         prefill_counters0=cache_counters();if(ts_tier)ts_tier->acquire_ms.clear();
+        if(prefill_via_cache&&ts_tier)ts_tier->choose_overlap(dopt.prefill_overlap); // once per prefill: held layers, no token
         request_start=std::chrono::steady_clock::now();releases=Json::array();staging_ms=0;file_read_ms=0;file_bytes=0;file_ring_bytes[0]=file_ring_bytes[1]=0;graph_binding_ms=0;
         // Request-scoped reads: do not silently reuse a previous request's last
         // two host rings, which would leave a forced-file repeat unexercised.
@@ -713,6 +717,7 @@ struct Runtime::Impl {
             auto binding=prefill_binding(first,n,identity,legacy_index,session_key(P));if(graphs){auto& g=graph[45][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
         }
         if(prefill_via_cache)prefill_end(45);
+        if(prefill_via_cache&&ts_tier)ts_tier->restore_spares(true); // the decode spare target again, before the residency restore (a failure fails the request)
         // The decode placement again (the prefill's whole-layer sets displaced it); placement only.
         // The decode residency restore is deferred (restore_pending): it runs before the next decode
         // token (or explicitly, untimed, after a TTFT prefill); a prefill-only request never pays it.
@@ -990,6 +995,7 @@ struct Runtime::Impl {
         {auto t=std::make_unique<TierstreamTier>(*this,std::move(owned));ts_tier=t.get();tier=std::move(t);}product_tier=tier.get();
         ts_tier->planned=planned_residents(cfg.tiers,std::uint8_t(0),routed_gated,routed_experts);ts_tier->restore=dopt.restore_decode_residency;
         if(prefill_via_cache)need(PrefillResidency::refusal(b).empty(),PrefillResidency::refusal(b).c_str());
+        ts_tier->budget=b; // prefill overlap room (PrefillResidency::two_layers), decided per prefill
         {std::uint64_t lo=~0ULL,hi=0;for(unsigned g=0;g<routed_gated;++g){std::uint64_t n=0;for(unsigned u=0;u<routed_experts;++u)n+=cfg.tiers[g*routed_experts+u]==0;lo=std::min(lo,n);hi=std::max(hi,n);}
             placement.set("resident_per_layer_min",lo);placement.set("resident_per_layer_max",hi);placement.set("policy",dopt.tier_policy);}
         if(dopt.tier_predict)ts_tier->enable_predict();
@@ -1195,18 +1201,63 @@ struct Runtime::Impl {
         // Prefill through the cache (reader/resident contract; PrefillResidency).
         PrefillResidency residency;Buffer all_ids;bool prefill_active=false;
         // An exception while a layer is held or its step is open retires the worker (original error).
-        void abort_prefill(const std::string& why){if(prefill_active){site.retire(why);prefill_active=false;}}
+        void abort_prefill(const std::string& why){restore_spares(false);if(prefill_active){site.retire(why);prefill_active=false;}}
+        void upload_ids(){if(!all_ids.p){Charge c(table_part);all_ids.allocate(PrefillResidency::units*4);ck(cudaMemcpy(all_ids.p,residency.ids.data(),all_ids.bytes,cudaMemcpyHostToDevice));}}
+        // Opt-in prefill overlap (PrefillOverlap), decided once per prefill: no token; prefill_active stays set
+        // from the first make_resident to the last release (a failure in between retires the worker as above).
+        PrefillOverlap overlap;bool overlapping=false;TierBudget budget;std::string overlap_note="off: option";
+        std::vector<double> host_wait_ms,gpu_idle_ms; // per layer: host wait on its completion event; GPU gap before its start
+        // Overlap mode only (timing events; the serial path records none): per gated layer at its start (before the
+        // descriptor bind) and after its last kernel. GPU idle of a layer = end of the previous routed layer -> its
+        // start (an upper bound: includes the small inter-layer kernels, e.g. check_finite, zero_layer, the final norm).
+        struct LayerEvents {cudaEvent_t start[routed_gated]{},end[routed_gated]{};bool made=false;
+            void create(){if(made)return;for(unsigned g=0;g<routed_gated;++g){ck(cudaEventCreateWithFlags(&start[g],cudaEventDefault));ck(cudaEventCreateWithFlags(&end[g],cudaEventDefault));}made=true;}
+            ~LayerEvents(){for(unsigned g=0;g<routed_gated;++g){if(start[g])cudaEventDestroy(start[g]);if(end[g])cudaEventDestroy(end[g]);}}
+        } ev;
+        // Two held layers need slots >= 2 x 288 + the spare target; when only the spares stand in the way the prefill
+        // lowers the target (PrefillSpareTarget) and restore_spares() puts it back once the prefill ends or aborts
+        // (placement only; a prefill evicts decode residents there anyway). rethrow: the normal end fails the request.
+        PrefillSpareTarget spares;unsigned serial_steps=0;
+        void restore_spares(bool rethrow){spares.restore(*api,site,rethrow);}
+        void choose_overlap(bool want){overlap.reset();host_wait_ms.clear();gpu_idle_ms.clear();serial_steps=0;restore_spares(true);overlapping=want&&PrefillResidency::two_layers(budget);
+            std::string lower_failed;if(!overlapping&&spares.lower(*api,site,budget,want,lower_failed))overlapping=true;
+            const unsigned spare_lowered=spares.lowered();
+            if(overlapping)ev.create();
+            if(!lower_failed.empty()){overlap_note="off: spare target not lowered ("+lower_failed+")";return;}
+            overlap_note=spare_lowered?"on (spare target "+std::to_string(budget.spare_slots)+" -> "+std::to_string(spare_lowered)+" for the prefill)":overlapping?"on":!want?"off: option":"off: arena "+std::to_string(budget.slots)+" persistent slots < 2 x "+std::to_string(PrefillResidency::units)+" + "+std::to_string(budget.spare_slots)+" spares";}
+        void timed_acquire(unsigned g){const auto a0=std::chrono::steady_clock::now();residency.acquire(site,g);acquire_ms.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-a0).count());}
+        void overlap_begin(unsigned l,Buffer& d,cudaStream_t s){
+            prefill_active=true;const unsigned g=gated_ordinal(l);
+            overlap.begin(g,[&](unsigned h){ck(cudaStreamSynchronize(s));timed_acquire(h);}); // the first routed layer only; later ones were acquired by the previous end
+            ck(cudaEventRecord(ev.start[g],s));upload_ids();ck(cudaMemsetAsync(d.p,0,d.bytes,s));
+            bind_units<<<1,PrefillResidency::units,0,s>>>(api->view(),g,all_ids.as<U32>(),PrefillResidency::units,offsets.as<UnitOffsets>(),d.as<Expert>());ck(cudaGetLastError());}
+        // l's end event is NOT waited here: the previous layer is waited and released, the next made resident (host;
+        // overlaps l's kernels), and the caller enqueues the next layer behind l. After the last layer every set is waited and released.
+        void overlap_end(unsigned l,cudaStream_t s){const unsigned g=gated_ordinal(l);ck(cudaEventRecord(ev.end[g],s));
+            const bool overlapped=overlap.end(g,l<routed_last_layer?int(gated_ordinal(l+1)):-1,
+                [&](unsigned h){const auto a0=std::chrono::steady_clock::now();const bool ok=residency.try_acquire(site,h);
+                    if(ok)acquire_ms.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-a0).count());return ok;},
+                [&](unsigned h){timed_acquire(h);},
+                [&](unsigned h){const auto w0=std::chrono::steady_clock::now();ck(cudaEventSynchronize(ev.end[h]));host_wait_ms.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-w0).count());
+                    // No ss_end reports an absent unit here: read the library's absent flag (read only) after the kernels.
+                    std::uint32_t absent=0;ck(cudaMemcpy(&absent,api->view().absent_err,4,cudaMemcpyDeviceToHost));need(absent==0,"prefill overlap: a held layer's unit was absent from the slot table");},
+                [&](unsigned h){site.release_resident(h);});
+            if(!overlapped)++serial_steps; // the next layer did not fit beside this one (SS_E_CAPACITY): this step ran serially
+            if(!overlap.held().empty())return;
+            if(serial_steps)overlap_note+="; "+std::to_string(serial_steps)+" serial steps (SS_E_CAPACITY)";
+            prefill_active=false;gpu_idle_ms.assign(routed_gated,0.0); // after the last wait: every layer event completed
+            for(unsigned h=1;h<routed_gated;++h){float ms=0;ck(cudaEventElapsedTime(&ms,ev.end[h-1],ev.start[h]));gpu_idle_ms[h]=ms;}}
         void prefill_begin(unsigned l,Buffer& d,cudaStream_t s){
+            if(overlapping){overlap_begin(l,d,s);return;}
             ck(cudaStreamSynchronize(s)); // the previous layer's step ended and nothing reads its units any more
             prefill_active=true;
-            const unsigned g=gated_ordinal(l);const auto a0=std::chrono::steady_clock::now();residency.acquire(site,g);
-            acquire_ms.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-a0).count());
-            if(!all_ids.p){Charge c(table_part);all_ids.allocate(PrefillResidency::units*4);ck(cudaMemcpy(all_ids.p,residency.ids.data(),all_ids.bytes,cudaMemcpyHostToDevice));}
+            const unsigned g=gated_ordinal(l);timed_acquire(g);upload_ids();
             site.begin_layer(g);
             try{api->enqueue_begin(s);ck(cudaMemsetAsync(d.p,0,d.bytes,s));
                 bind_units<<<1,PrefillResidency::units,0,s>>>(api->view(),g,all_ids.as<U32>(),PrefillResidency::units,offsets.as<UnitOffsets>(),d.as<Expert>());ck(cudaGetLastError());}
             catch(const std::exception& e){site.fail(e.what());throw;}catch(...){site.fail("prefill step: non-standard exception");throw;}}
         void prefill_end(unsigned l,cudaStream_t s){
+            if(overlapping){overlap_end(l,s);return;}
             try{api->enqueue_end(s);}catch(const std::exception& e){site.fail(e.what());throw;}catch(...){site.fail("prefill step end: non-standard exception");throw;}
             try{site.end();}catch(const std::exception& e){site.fail(e.what());throw;}catch(...){site.fail("prefill step end: non-standard exception");throw;} // a refused step retires the worker
             site.release_resident(gated_ordinal(l));prefill_active=false;}

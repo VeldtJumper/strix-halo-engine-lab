@@ -20,15 +20,15 @@ or routes.
 - Windows 10/11, Visual Studio 2022 (MSVC, x64), CUDA 13.0, CMake >= 3.24,
   Ninja, Python 3.11+ and PowerShell 7 (`pwsh`).
 - [tierstream](https://github.com/hyukudan/tierstream) at commit
-  [`d7277a94253ef99c954561e58d67d12e3d348a87`](https://github.com/hyukudan/tierstream/commit/d7277a94253ef99c954561e58d67d12e3d348a87).
+  [`5fc3441b600e50e17f9bcdad35f0c12a0d188875`](https://github.com/hyukudan/tierstream/commit/5fc3441b600e50e17f9bcdad35f0c12a0d188875).
   The build takes it as a plain source export with a `STAMP` file naming that
   commit (configuration refuses any other commit):
 
   ```powershell
   git clone https://github.com/hyukudan/tierstream.git tierstream-src
   mkdir TIERSTREAM_DIR
-  git -C tierstream-src archive --format=tar d7277a94253ef99c954561e58d67d12e3d348a87 | tar -x -C TIERSTREAM_DIR
-  Set-Content TIERSTREAM_DIR/STAMP d7277a94253ef99c954561e58d67d12e3d348a87
+  git -C tierstream-src archive --format=tar 5fc3441b600e50e17f9bcdad35f0c12a0d188875 | tar -x -C TIERSTREAM_DIR
+  Set-Content TIERSTREAM_DIR/STAMP 5fc3441b600e50e17f9bcdad35f0c12a0d188875
   ```
 
 - CUTLASS 4.2.1 headers. CMake downloads the pinned release and checks its
@@ -103,6 +103,7 @@ Main options:
 | `--weight-dirs "DIR;DIR"`, `--drive-readers N` | Multi-disk reads: stripe copies of the unit file on other drives (see Unit file); `N` reader threads per drive (1..32, default 4). Off by default (the primary only). Same bytes. |
 | `--tier-disk-queue N`, `--tier-staging N` | File reads in flight in three-tier opens (1..64, at most the staging buffer count; default 1 = one at a time). Each reader's bounce buffer is billed to pinned host memory. Same bytes. |
 | `--tier-clean-evict 1` | Three-tier opens: a device victim with no free pinned block goes back to the unit file with no device-to-host copy and displaces no pinned unit. Off by default. Same bytes. |
+| `--prefill-overlap 0` | Turns off the prefill overlap, which is on by default: during a prefill through the cache, the next layer's experts are made resident while the current layer's kernels run (two layers held at once; when only the spare slots are in the way the prefill lowers the spare target and restores it before decode; off when the expert arena cannot keep two layers). Same bytes. |
 | `--disk-prefetch 1` | With `--tier-predict 1`: predicted experts homed on the unit file are read ahead too (pending). |
 | `--routes-out FILE --routes-prefill 1`, `--expert-routes FILE` | Placement census: record every prefill row's expert routes from your own prompts, then seed the cache's placement with them on the next start (placement only). |
 | `--ab-arm`, `--census KINDS`, `--compare-arms DIR_A DIR_B` | Harness modes: one arm of a main-vs-build comparison (TTFT + decode, no exactness gate, every digest listed); a prefill-only routes census on chat prompts outside the decode bench; a CPU check that two arms' tokens, logits and states are bitwise equal, with speed ratios. |
@@ -124,5 +125,9 @@ Main options:
   12 ms, KDA from 53 to 21 ms, the hyper-connection mixes from 56 to 11 ms and the
   router from 21 to 1 ms. Turn them off with `--decode-row-kernels 0` or
   `STRIX_GLM_RTX_ROW_KERNELS=0`.
-- Smaller memory configurations, such as 24 GiB VRAM + 32 GiB RAM with most
-  experts read from the unit file, do not work yet.
+- Smaller memory budgets run exact too. With 24 GiB VRAM + 32 GiB RAM
+  (`--vram-total-gib 24 --ram-total-gib 32`; most experts are read from the unit
+  file): TTFT 60.3 s at 1K and 62.4 s at 8K with the prefill overlap (63.4 /
+  73.7 s with `--prefill-overlap 0`), decode 0.67 tokens/s warm.
+- Tested on an RTX PRO 6000 Blackwell Workstation Edition, driver 617.14,
+  CUDA 13.0 (Windows 11).

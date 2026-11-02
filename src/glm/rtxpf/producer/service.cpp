@@ -119,7 +119,7 @@ Json ttft(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned 
     rec.set("row_tile",int(runtime.prefill_row_tile()));rec.set("allocated_row_tile",int(runtime.allocated_prefill_row_tile()));rec.set("row_tile_requested",int(row_tile));
     rec.set("prefill_tile_crossover",int(runtime.prefill_tile_crossover()));if(auto* c=prefill.find("row_tile_choice"))rec.set("row_tile_choice",*c);
     rec.set("decode_restore",decode_restore);
-    if(auto* t=prefill.find("prefill_timings")){for(const char* k:{"prefill_cache","make_resident_ms_total","make_resident_ms_per_layer"})if(auto* v=t->find(k))rec.set(k,*v);}
+    if(auto* t=prefill.find("prefill_timings")){for(const char* k:{"prefill_cache","make_resident_ms_total","make_resident_ms_per_layer","prefill_overlap","prefill_overlap_gpu_idle_ms_total","prefill_overlap_gpu_idle_ms_per_layer","prefill_overlap_host_wait_ms_total","prefill_overlap_host_wait_ms_per_layer"})if(auto* v=t->find(k))rec.set(k,*v);}
     // the prefill's own expert cache traffic (file units read during this prefill; cheap: a counter delta)
     if(auto* c=prefill.find("prefill_expert_cache"))for(const char* k:{"file_reads","file_bytes","file_read_ns","misses","fetched","h2d_bytes"})if(auto* v=c->find(k))rec.set(std::string("prefill_")+k,*v);
     const double prefill_s=std::chrono::duration<double>(prefilled-begin).count(),first_s=std::chrono::duration<double>(done-first_begin).count();
@@ -194,6 +194,7 @@ int main(int argc,char** argv){try{
         else if(a=="--persistent-dense-fp16"){w::require(value=="0"||value=="1","--persistent-dense-fp16 0|1");dopts.persistent_dense_fp16=value=="1";}
         else if(a=="--decode-row-kernels")p::set_row_kernels_value(dopts,value);
         else if(a=="--restore-decode-residency"){w::require(value=="0"||value=="1","--restore-decode-residency 0|1");dopts.restore_decode_residency=value=="1";}
+        else if(a=="--prefill-overlap"){w::require(value=="0"||value=="1","--prefill-overlap 0|1");dopts.prefill_overlap=value=="1";}
         else if(a=="--tier-flush-ready"){w::require(value=="0"||value=="1","--tier-flush-ready 0|1");dopts.tier_flush_ready=value=="1";}
         else if(a=="--tier-host-spares")dopts.tier_host_spares=unsigned(std::stoul(value));else if(a=="--tier-staging"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)>=1&&std::stoul(value)<=64,"--tier-staging 1..64");dopts.tier_staging=unsigned(std::stoul(value));}
         else if(a=="--prefill-tile-crossover"){w::require(value=="off"||(!value.empty()&&value.find_first_not_of("0123456789")==std::string::npos&&value.size()<=6&&std::stoul(value)<=131072),"--prefill-tile-crossover: rows 0..131072 or off");}
@@ -219,9 +220,9 @@ int main(int argc,char** argv){try{
     unsigned tile_crossover=p::default_prefill_tile_crossover;
     if(auto* e=prof.find("prefill_tile_crossover"))tile_crossover=e->value=="off"||e->value.empty()?0u:unsigned(std::stoul(e->value));
     // flush_ready: the profile value, or STRIX_GLM_RTX_FLUSH_READY=0|1 (explicit env); --tier-flush-ready was applied above.
-    // The exact decode levers: pending (their builtin, off) until qualified; --allow-pending runs them;
-    // the environment (STRIX_GLM_RTX_SKIP_EMPTY_GROUPS / _PERSISTENT_DENSE_FP16) sets them explicitly.
-    for(auto [lever,flag]:{std::pair<const char*,bool*>{"skip_empty_expert_groups",&dopts.skip_empty_expert_groups},{"persistent_dense_fp16",&dopts.persistent_dense_fp16}})
+    // The exact decode levers: pending (their builtin, off) until qualified; --allow-pending runs them; the environment
+    // (STRIX_GLM_RTX_SKIP_EMPTY_GROUPS / _PERSISTENT_DENSE_FP16) sets them explicitly. prefill_overlap: on in every profile.
+    for(auto [lever,flag]:{std::pair<const char*,bool*>{"skip_empty_expert_groups",&dopts.skip_empty_expert_groups},{"persistent_dense_fp16",&dopts.persistent_dense_fp16},{"prefill_overlap",&dopts.prefill_overlap}})
         if(auto* e=prof.find(lever);e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)*flag=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("decode_row_kernels");e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)p::set_row_kernels_value(dopts,e->value);
     if(auto* e=prof.find("restore_decode_residency");e&&e->status!=rp::Status::explicit_cli)dopts.restore_decode_residency=e->value!="off"&&e->value!="0";
@@ -239,6 +240,7 @@ int main(int argc,char** argv){try{
         if(lever=="restore_decode_residency")return dopts.restore_decode_residency?"on":"off";
         if(lever=="skip_empty_expert_groups")return dopts.skip_empty_expert_groups?"1":"0";
         if(lever=="persistent_dense_fp16")return dopts.persistent_dense_fp16?"1 (dropped at startup if the plan cannot afford it)":"0";
+        if(lever=="prefill_overlap")return dopts.prefill_overlap?"1 (off when the arena cannot keep two layers)":"0";
         if(lever=="decode_row_kernels")return p::row_kernels_name(dopts);
         if(lever=="predicted_prefetch")return dopts.tier_predict?"1":"0";
         if(lever=="prefill_tile_large")return tile>=8192?"8192":"off";

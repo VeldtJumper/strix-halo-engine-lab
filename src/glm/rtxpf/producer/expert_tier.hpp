@@ -115,6 +115,10 @@ public:
     // Between tokens: device-resident keys, most recent first (ss_dg_residency;
     // written at shutdown, it seeds the next open). Empty when unsupported.
     virtual std::vector<std::uint32_t> residency(){return {};}
+    // Between tokens: lower the boundary spare target to n for a prefill (ss_dg_set_budgets; placement only), and put
+    // the open-time target back. false = unsupported (the caller keeps today's behaviour).
+    virtual bool lower_spare_target(unsigned){return false;}
+    virtual void restore_spare_target(){}
     // Overlapped next-layer prefetch (ss_dg_enqueue_predict): with n > 0, every
     // export of a gated layer g < through promises n predicted ids of g + 1, and
     // enqueue_predict(g) hands them over on a side stream joined before g+1's export.
@@ -466,8 +470,70 @@ struct PrefillResidency {
     static std::uint64_t min_resident(){return units;}
     static std::string refusal(const TierBudget& b){
         return b.slots>=units+b.spare_slots?std::string():"tierstream arena of "+std::to_string(b.slots)+" persistent slots cannot keep one layer's "+std::to_string(units)+" units + "+std::to_string(b.spare_slots)+" spares for prefill through the cache (expert batches not wired)";}
+    // Prefill overlap (PrefillOverlap) keeps two layers at once: slots >= 2 * 288 + spare slots.
+    static bool two_layers(const TierBudget& b){return b.slots>=2ULL*units+b.spare_slots;}
     // Between tokens: make layer g resident; any refusal retires the worker (CacheTokenSite).
     void acquire(CacheTokenSite& site,unsigned g)const{site.make_resident(g,ids.data(),units);}
+    // As acquire, but SS_E_CAPACITY returns false (nothing changed); any other failure retires.
+    bool try_acquire(CacheTokenSite& site,unsigned g)const{return site.try_make_resident(g,ids.data(),units);}
+};
+// Prefill overlap's spare target (placement only). Two held layers need slots >= 2 x 288 + the spare target; when only
+// the boundary spares stand in the way (24 GiB: 606 slots = 575 residents + 31 spares) the prefill lowers the target to
+// slots - 576 for its duration and puts the open-time target back at its end or abort.
+class PrefillSpareTarget {
+    unsigned lowered_=0;
+public:
+    unsigned lowered()const{return lowered_;}
+    // true = lowered (overlap on). A cache without the call keeps overlap off; so does a throwing call (why = its error),
+    // after the open-time target is set again (a failing reset retires the worker and throws).
+    bool lower(TierCacheApi& api,CacheTokenSite& site,const TierBudget& b,bool want,std::string& why){
+        why.clear();
+        if(!want||lowered_||PrefillResidency::two_layers(b)||b.slots<2ULL*PrefillResidency::units+1)return false;
+        const unsigned n=unsigned(b.slots-2ULL*PrefillResidency::units);
+        try{if(!api.lower_spare_target(n))return false;}
+        catch(const std::exception& e){why=e.what();}catch(...){why="non-standard exception";}
+        if(!why.empty()){try{api.restore_spare_target();}catch(...){const std::string m="spare target reset after a failed lowering ("+why+")";site.retire(m);throw std::runtime_error(m);}
+            return false;}
+        lowered_=n;return true;}
+    // The open-time target again. A failure retires the worker; with rethrow (a prefill's normal end) the request fails
+    // too, the abort path keeps its original error.
+    void restore(TierCacheApi& api,CacheTokenSite& site,bool rethrow){
+        if(!lowered_)return;lowered_=0;std::string why;
+        try{api.restore_spare_target();}catch(const std::exception& e){why=e.what();}catch(...){why="non-standard exception";}
+        if(why.empty())return;const std::string m="spare target restore: "+why;site.retire(m);if(rethrow)throw std::runtime_error(m);}
+};
+// Opt-in prefill overlap (DecodeOptions::prefill_overlap), the library's held-layer contract: a layer
+// held by make_resident runs its kernels with NO token (slots from the device table only; held sets
+// are never victims); make_resident of another layer may run while they are in flight (refused only
+// inside a token); a set is released only after its kernels' completion event. Per routed layer:
+// begin (only the first layer is acquired here) -> bind + kernels + event -> end(k): wait and release
+// the PREVIOUS layer (its event), then make_resident of the NEXT layer (host; overlaps k's kernels);
+// k is not waited here, so the next layer is enqueued behind k with no GPU gap. After the last layer
+// k is waited and released too (nothing stays held). At most two held (PrefillResidency::two_layers);
+// exact by construction (only copies vs kernels reorder).
+class PrefillOverlap {
+    std::vector<unsigned> held_; // gated ordinals, oldest first
+public:
+    const std::vector<unsigned>& held()const{return held_;}
+    void reset(){held_.clear();}
+    template<class Acquire> void begin(unsigned g,Acquire&& acquire){if(!held_.empty()&&held_.back()==g)return;
+        expert_need(held_.empty(),"prefill overlap: an earlier layer is still held");acquire(g);held_.push_back(g);}
+    // next: the next routed layer's gated ordinal, < 0 after the last. wait(h): h's completion event.
+    template<class Acquire,class Wait,class Release> void end(unsigned g,int next,Acquire&& acquire,Wait&& wait,Release&& release){
+        expert_need(!held_.empty()&&held_.size()<=2&&held_.back()==g,"prefill overlap: end of a layer that is not the newest held");
+        if(held_.size()==2){const unsigned p=held_.front();wait(p);release(p);held_.erase(held_.begin());}
+        if(next>=0){acquire(unsigned(next));held_.push_back(unsigned(next));}
+        else{wait(g);release(g);held_.clear();}}
+    // As end, but a capacity refusal of the next layer (try_acquire false: nothing changed) runs this step serially
+    // instead of retiring the worker: wait and release g, then acquire the next layer alone (a refusal there retires).
+    // Returns false for such a serial step.
+    template<class TryAcquire,class Acquire,class Wait,class Release>
+    bool end(unsigned g,int next,TryAcquire&& try_acquire,Acquire&& acquire,Wait&& wait,Release&& release){
+        expert_need(!held_.empty()&&held_.size()<=2&&held_.back()==g,"prefill overlap: end of a layer that is not the newest held");
+        if(held_.size()==2){const unsigned p=held_.front();wait(p);release(p);held_.erase(held_.begin());}
+        if(next<0){wait(g);release(g);held_.clear();return true;}
+        if(try_acquire(unsigned(next))){held_.push_back(unsigned(next));return true;}
+        wait(g);release(g);held_.clear();acquire(unsigned(next));held_.push_back(unsigned(next));return false;}
 };
 // Owns a cache together with the binding whose name it consumes. Members are
 // destroyed in reverse declaration order, so on every path (normal teardown,

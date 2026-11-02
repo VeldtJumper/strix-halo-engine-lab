@@ -1142,6 +1142,35 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(levers['restore_decode_residency']['effective'], 'off')
         self.assertIn('290 slots', levers['spare_share']['effective'])
 
+    def test_prefill_overlap_flag_reaches_the_service(self):
+        """--prefill-overlap 0|1 (prefill overlap, on in every profile) passes through the harness to the service
+        command and the worker like --tier-clean-evict; omitted, nothing is sent (the service profile default, on); other
+        values are refused; a TTFT arm carries the overlap decision, its GPU idle gap and host wait into the repeat comparison.
+        Python only: no service binary is run (a binary older than the option would refuse it)."""
+        for value in ('0', '1'):
+            with patch.object(dw, 'host_total_gib', return_value=191.6):
+                a = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--prefill-overlap', value])
+            for argv in (dw.service_command(a, 'svc'), dw.worker_options(a)):
+                self.assertEqual(argv[argv.index('--prefill-overlap') + 1], value)
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            plain = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card'])
+        self.assertNotIn('--prefill-overlap', dw.service_command(plain, 'svc'))
+        self.assertNotIn('--prefill-overlap', dw.worker_options(plain))
+        for bad in ('2', 'on', ''):
+            with self.assertRaises(SystemExit), patch.object(dw, 'host_total_gib', return_value=191.6), contextlib.redirect_stderr(io.StringIO()):
+                dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--prefill-overlap', bad])
+        rec = TileCompareTests.rec(TileCompareTests(), tile=8192)
+        rec.update(make_resident_ms_total=900.0, prefill_overlap='on', prefill_overlap_gpu_idle_ms_total=3.5, prefill_overlap_host_wait_ms_total=120.5,
+                   prefill_overlap_gpu_idle_ms_per_layer=[0.0] * 43)
+        arm = dw.materialize(types.SimpleNamespace(expert_tier='tierstream', steps=4), 'ttft', 8192,
+                             ('ttft', 8192, Path('q8192.u32'), 'allocated'), rec, dict(op='ttft', tokens=8192, prompt='q8192.u32'),
+                             Path('.'), 1.0, 8192, 8192)
+        self.assertEqual((arm['prefill_overlap'], arm['prefill_overlap_gpu_idle_ms_total'], arm['prefill_overlap_host_wait_ms_total']), ('on', 3.5, 120.5))
+        self.assertNotIn('prefill_overlap_gpu_idle_ms_per_layer', arm)  # totals only in the window results
+        timing = dw.repeat_compare([arm, dict(arm)])[0]['timing'][0]
+        self.assertEqual((timing['prefill_overlap'], timing['prefill_overlap_gpu_idle_ms_total'], timing['prefill_overlap_host_wait_ms_total'],
+                          timing['make_resident_ms_total']), ('on', 3.5, 120.5, 900.0))
+
     def test_ttft_only_mode(self):
         """--ttft-only: one load, no gate (summary says so instead of reporting a gap), TTFT 8K and 32K at
         the allocated tile (sent explicitly), 2 repeats each, repeats compared bitwise, phases per arm."""

@@ -109,9 +109,14 @@ tokens, todos los digests de logits y el estado final de la sesión son iguales 
 desactivados, y la cualificación de 1K/8K pasa con ellos activados. Los kernels decodifican cada tesela de pesos
 directamente en fragmentos de tensor cores y mantienen el orden de acumulación de los GEMM fijados; desactívelos con
 `--decode-row-kernels 0` o `STRIX_GLM_RTX_ROW_KERNELS=0`.
+El solapamiento del prefill está activado por defecto: mientras corren los kernels de una capa, los expertos de la
+siguiente se hacen residentes. El estado del prefill, los tokens y los logits son idénticos bit a bit con él desactivado.
+En comparaciones dentro de una misma ventana deja el TTFT en 0.56× (8K) y 0.66× (32K) del tiempo sin solapamiento con la
+tarjeta completa. Se desactiva con `--prefill-overlap 0`.
 Con 24 GiB de VRAM + 32 GiB de
 RAM del host (la mayoría de los expertos leídos del archivo de unidades en disco) también funciona de forma exacta: TTFT
-**64.8 s** con 1K y **76.7 s** con 8K; decode de **0.67 tok/s** en caliente (0.63 en frío). Compilación, archivo de unidades y opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
+**60.3 s** con 1K y **62.4 s** con 8K con el solapamiento del prefill (63.4 / 73.7 s sin él en la misma ventana); decode
+de **0.67 tok/s** en caliente (0.63 en frío). Compilación, archivo de unidades y opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
 
 ## Todos los valores predeterminados incorporados de GLM
 

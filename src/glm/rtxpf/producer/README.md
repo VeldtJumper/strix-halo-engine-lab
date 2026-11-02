@@ -531,7 +531,7 @@ model identity, geometry, rates and per-unit SHA-256, and a one-part
 MTP -> 42; model layer in `x-glm-layer`), format `x-glm-exl3-unit-v1`,
 `offset + unit*stride`, stride == bytes. `glm_native_decode_host` compiles
 tierstream `src/desc.cpp`/`src/json.cpp` read-only from `GLM_TIERSTREAM_SRC`
-(a private `git archive` snapshot `../tierstream-d7277a9` of tierstream `d7277a9`,
+(a private `git archive` snapshot `../tierstream-5fc3441` of tierstream `5fc3441`,
 its STAMP checked against the pin: configuration fails on another commit) and parses the generated descriptor; it reports SKIP
 when that worktree is absent. The adapter
 follows the DS tier site: `begin_token`, `acquire` (export IDs + wait),
@@ -653,7 +653,7 @@ cache); no prefill rings are allocated. `SS_E_CAPACITY` (an arena below
 288 + spares + guard) is refused: expert batches with masked dispatch are not
 implemented. A CPU mock of the contract (decode_host) checks the protocol and
 that every slot-bound descriptor addresses bytes identical to the source
-tensors. Active with the pinned tierstream (d7277a9)
+tensors. Active with the pinned tierstream (5fc3441)
 (`SS_DG_MAKE_RESIDENT`; first GPU run is GLM's: serial pinned -> device
 copy-ins; transfers are transactional: a read failure leaves
 every keep and slot consistent, a device failure poisons the context, which

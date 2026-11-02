@@ -58,6 +58,14 @@ constexpr Lever kTable[] = {
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: the bitwise digest compare in a PRO window (exact by construction: shared experts and dense FFNs keep "
                "the FP16 operands the decode window writes, decoded once; ~2.8 GiB in the whole-device plan, off when it does not fit)"},
+    // exact prefill lever: equal digests and a faster TTFT in PRO windows, on in every profile
+    {.name = "prefill_overlap", .options = {{{"--prefill-overlap", "*"}}}, .value = {"1", "1", "1"}, .builtin = "1",
+     .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "the next routed layer's make_resident runs while this layer's kernels are in flight (held layers without a "
+               "token, released after their completion event); when only the boundary spares block two held layers the "
+               "prefill lowers the spare target and restores it before decode; off when the arena cannot keep two layers. "
+               "Prefill state digests, tokens and logits equal with it off. TTFT full card 8K 44.7 -> 25.1 s, 32K 71.1 -> "
+               "46.7 s; 24 GiB VRAM + 32 GiB RAM 1K 63.4 -> 60.3 s, 8K 73.7 -> 62.4 s. OFF: --prefill-overlap 0"},
     {.name = "decode_row_kernels", .env = "STRIX_GLM_RTX_ROW_KERNELS", .options = {{{"--decode-row-kernels", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "1", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "few-row decode kernels, each output's arithmetic unchanged: MoE / KDA / DSA / MTP trellis GEMMs as "
