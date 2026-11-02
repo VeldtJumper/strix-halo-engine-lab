@@ -1,9 +1,9 @@
-#include "lookup.hpp"
+#include "strix/lookup/index.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 
-namespace strix::gemma4::engine::lookup {
+namespace strix::lookup {
 namespace {
 constexpr std::array<std::uint32_t, 8> levels{16, 12, 8, 6, 4, 3, 2, 1}; // longest first
 constexpr std::uint64_t empty = ~0ULL;
@@ -98,4 +98,4 @@ private:
 
 std::unique_ptr<Index> make_ngram_index(const IndexConfig& config) { return std::make_unique<NgramIndex>(config); }
 
-} // namespace strix::gemma4::engine::lookup
+} // namespace strix::lookup

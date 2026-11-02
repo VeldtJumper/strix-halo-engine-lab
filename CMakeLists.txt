@@ -127,6 +127,12 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# Prompt-lookup (n-gram) index shared by the engines' drafting (it only proposes draft tokens: verification decides).
+add_library(strix_lookup STATIC src/lookup/index.cpp)
+target_include_directories(strix_lookup PUBLIC include)
+target_compile_features(strix_lookup PUBLIC cxx_std_20)
+strix_target_warnings(strix_lookup)
+
 if(STRIX_CUDA_DS41_ONLY)
 # Only what the deepseek41 family and the ds41 libraries link: GGUF reader, manifest, binding, content
 # hash and the family registry.
@@ -4161,6 +4167,7 @@ if(STRIX_FAMILY_MINIMAX)
         add_executable(strix-minimax-lead-tests tests/minimax_lead_tests.cpp src/serve/engine.cpp src/serve/json.cpp
             src/minimax/dspark/minimax_dspark_host.cpp)
         target_compile_definitions(strix-minimax-lead-tests PRIVATE STRIX_SERVE_QUEUE_TEST=1)
+        target_link_libraries(strix-minimax-lead-tests PRIVATE strix_lookup)
         target_include_directories(strix-minimax-lead-tests PRIVATE src include)
         target_compile_features(strix-minimax-lead-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-minimax-lead-tests)
@@ -4215,7 +4222,7 @@ if(STRIX_FAMILY_MINIMAX)
         src/minimax/serve/minimax_observe.cpp src/minimax/serve/minimax_api.cpp)
     target_include_directories(strix_minimax_serve PUBLIC src include)
     target_compile_features(strix_minimax_serve PUBLIC cxx_std_20)
-    target_link_libraries(strix_minimax_serve PUBLIC strix_serve)
+    target_link_libraries(strix_minimax_serve PUBLIC strix_serve strix_lookup)
     strix_target_warnings(strix_minimax_serve)
     if(BUILD_TESTING)
         add_executable(strix-minimax-tokenizer-tests tests/minimax_tokenizer_tests.cpp)

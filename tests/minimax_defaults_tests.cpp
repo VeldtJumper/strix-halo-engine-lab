@@ -94,7 +94,7 @@ std::set<std::string> lines(const std::string& text) {
 
 // The value each item replaced (measurement evidence), written out independently of the table.
 const std::map<std::string, std::string> kFormer = {
-    {"STRIX_MM_SERVE_DSPARK", "0"},
+    {"STRIX_MM_SERVE_DSPARK", "0"}, {"STRIX_MM_LOOKUP", "0"},
     {"STRIX_MM_SERVE_NEST", "0"}, {"STRIX_MM_SERVE_SCHED", "off"}, {"STRIX_MM_SERVE_SERVICE_MS", "0"}, {"STRIX_MM_SERVE_SHORT_FIRST", "0"},
     {"STRIX_MMX_MOE_WIDE", "0"},           {"STRIX_MM_INDEX_CONC", "0"},       {"STRIX_MMX_CRC", "1"},
     {"STRIX_MM_XB_WAIT", "0"},             {"STRIX_MM_XB_INPLACE", "0"},       {"STRIX_MM_XB_PUBLISH", "0"},

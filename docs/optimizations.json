@@ -1479,6 +1479,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Serve prompt lookup",
+    "flag_or_env": "STRIX_MM_LOOKUP; /admin/sched lookup",
+    "default": "1",
+    "exact": "Draft source only: rank 0 places the lookup window's rows in the step it already sends; greedy verification decides every token. Generated token IDs identical with lookup on and off in every measured arm (C1 and C4).",
+    "gain": "Two-node serve, one load, lookup switched per request batch: copy-heavy rewrite (C1, DSpark off) 23.65 / 23.44 -> 26.01 / 25.69 tok/s (+9.8 %); agent edit / agent JSON / prose at C1 and four concurrent requests equal within noise (DSpark keeps drafting where it is admitted; no lookup window at C4 on these prompts).",
+    "preconditions": "Serve decode; a request whose recent output repeats spans of its prompt or of itself.",
+    "off_switch": "STRIX_MM_LOOKUP=0; /admin/sched {\"lookup\": false}; STRIX_MM_BASELINE=1",
+    "doc_anchor": "docs/optimizations.md#mm-serve-lookup"
+  },
+  {
+    "engine": "minimax",
     "name": "o_proj warm during decode attention",
     "flag_or_env": "STRIX_MM_XB_WARM_O",
     "default": "8",

@@ -1,8 +1,8 @@
 // Reviewed source receipt. Do not regenerate to silence a failure: audit the
 // changed/new selectors, update their allow-table and tests, then update hashes.
-{"CMakeLists.txt", 0xf07eda73124e37c5ULL},
+{"CMakeLists.txt", 0xf40438b124ba27aeULL},
 {"apps/minimax_rank_main.cpp", 0x038b6d81d2171430ULL},
-{"apps/minimax_serve_main.cpp", 0x889b24d9a2adc386ULL},
+{"apps/minimax_serve_main.cpp", 0xcce02f4d4f8d64a8ULL},
 {"src/minimax/attn/index_proj.hip", 0x8332b8f8830e98d8ULL},
 {"src/minimax/attn/index_proj.hpp", 0x47d7a6439fff1b5fULL},
 {"src/minimax/attn/index_proj_tests.hip", 0x5fbb91e6ab853a13ULL},
@@ -30,7 +30,7 @@
 {"src/minimax/engine/draft_lin.hpp", 0x05d11d75108270edULL},
 {"src/minimax/engine/engine.hip", 0x1b2f1df922e30a5aULL},
 {"src/minimax/engine/mm_common.hpp", 0x7edb48c85addce60ULL},
-{"src/minimax/engine/mm_defaults.cpp", 0xbc75d6202f053b43ULL},
+{"src/minimax/engine/mm_defaults.cpp", 0x2980829cb702860fULL},
 {"src/minimax/engine/mm_defaults.hpp", 0xb5dce3bd8d8fec71ULL},
 {"src/minimax/engine/mm_kernels.hpp", 0x434413100dddc9edULL},
 {"src/minimax/engine/mm_pack.cpp", 0xf7fd8937982944b9ULL},
@@ -79,7 +79,7 @@
 {"src/minimax/xfer/minimax_xfer_device.hpp", 0x36f81583beafa74eULL},
 {"src/minimax/serve/minimax_sched.hpp", 0xac419165f3c513e3ULL},
 {"src/minimax/serve/minimax_control.hpp", 0x0b04c43b9e0deed4ULL},
-{"src/minimax/serve/minimax_lead.hpp", 0x82d52005425a25e1ULL},
+{"src/minimax/serve/minimax_lead.hpp", 0x7b3e458c075b878eULL},
 {"src/minimax/rtxpf/cuda/build_bench.bat", 0x960318998afb8adfULL},
 {"src/minimax/rtxpf/cuda/bench/core_bench.cu", 0x0c2c431fd6767db4ULL},
 {"src/minimax/rtxpf/cuda/bench/count_core_sass.py", 0xbb04ee428e87cc51ULL},
