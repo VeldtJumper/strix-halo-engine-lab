@@ -70,6 +70,9 @@ class DeviceStream {
     [[nodiscard]] std::unique_ptr<KvTxn> begin();
     [[nodiscard]] std::uint64_t frontier() const;
     [[nodiscard]] std::string digest() const; // matches HostStream canonical logical digest
+    // A new stream admitting `admitted` >= frontier() positions whose committed state is a byte copy of this one
+    // (global slots [0, frontier), the whole sliding rings and their position tags): same digest, same next passes.
+    [[nodiscard]] std::unique_ptr<DeviceStream> fork(std::uint32_t admitted) const;
     // Read-only view of a producing layer: committed snapshot plus, when given, that transaction's current overlay
     // (position-tag checked by the reader). Additive; no layout change. Drafters never write KV.
     [[nodiscard]] KvView kv_view(std::uint32_t layer, const KvTxn* transaction = nullptr) const;

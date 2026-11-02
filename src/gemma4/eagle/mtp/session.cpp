@@ -88,6 +88,14 @@ void Session::stage(std::span<const float>, std::span<const std::uint64_t> posit
     if (positions.empty()) return;
     throw std::runtime_error("mtp session: legacy stage has no hidden rows; requires the staged-rows draft API (stage_rows)");
 }
+bool Session::seed(std::span<const std::uint32_t> tokens, std::span<const float> hidden) {
+    if (staged_ || tokens.size() < 2 || hidden.size() != drafter_->config().backbone) return false;
+    hidden_.assign(hidden.begin(), hidden.end());
+    position_ = tokens.size() - 2;
+    next_ = tokens.back();
+    have_ = true;
+    return true;
+}
 void Session::publish() {
     if (!staged_) return;
     hidden_.swap(pending_hidden_);

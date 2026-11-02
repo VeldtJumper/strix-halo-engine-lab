@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <list>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -145,6 +146,13 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     const bool batched = serve_batched();
     const std::size_t slots = serve_slots();
     const std::size_t prefill_per_step = env_count("STRIX_G4_SERVE_PREFILL_PER_STEP",1,8);
+    // Prompt rows per prefill chunk while other requests decode (0 = whole 512-row chunks).
+    const std::size_t prefill_rows = env_count("STRIX_G4_SERVE_PREFILL_ROWS",64,512);
+    // Prompt prefix cache (STRIX_G4_SERVE_PREFIX=0 off): committed states at the end of each prompt and of each
+    // finished request, reused by a later prompt that starts with exactly those tokens (a conversation's next turn).
+    // LRU within STRIX_G4_SERVE_PREFIX_MB (default 4096) of KV and 16 entries.
+    const bool prefix_cache = batched && [] { const auto* p = std::getenv("STRIX_G4_SERVE_PREFIX"); return !p || std::string(p) != "0"; }();
+    const std::size_t prefix_bytes = env_count("STRIX_G4_SERVE_PREFIX_MB",4096,1U << 20U) << 20U;
     std::thread worker;
     Impl(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request settings)
         : backend(b), adapter(std::move(t)), drafts(std::move(d)), mode(m), defaults(std::move(settings)), model(std::move(name)),
@@ -177,10 +185,67 @@ struct Api::Impl final : strix::serve::GenerationEngine {
             // Per phase, for the receipt: steps while live, summed and widest batch, steps that also prefilled
             // another request's prompt chunk.
             std::uint64_t admitted = 0, steps = 0, width_sum = 0, width_max = 0, shared_prefill = 0;
+            bool prompt_kept = false;
         };
-        std::uint64_t steps = 0;
         Coordinator coordinator(backend,drafts,costs);
         coordinator.set_prefill_limit(prefill_per_step);
+        coordinator.set_prefill_budget(prefill_rows);
+        struct Kept { std::shared_ptr<const PrefixSnapshot> snapshot; std::size_t bytes = 0; };
+        std::list<Kept> kept; // most recently used first
+        std::size_t kept_bytes = 0;
+        std::uint64_t prefix_hits = 0, prefix_misses = 0;
+        // Device KV bytes of a state with `positions` committed rows: global slots grow with it, sliding rings do not.
+        const auto state_bytes = [&](std::size_t positions) {
+            const auto& c = backend.config();
+            std::size_t bytes = 0;
+            for (std::uint32_t l = 0; l < c.layer.size(); ++l)
+                if (c.layer[l].producer == l) {
+                    const std::size_t width = c.kv_heads * c.layer[l].head_dim;
+                    const std::size_t rows = c.layer[l].attention == AttentionKind::global ? positions : c.window;
+                    bytes += rows * (2 * width * sizeof(float) + sizeof(std::uint64_t));
+                }
+            return bytes;
+        };
+        // When prefill rows differ from decode rows, only states the prefill alone wrote, at a chunk boundary, are
+        // reusable: a request without the cache writes exactly those rows the same way (decode-written rows - the
+        // answer, a short prompt tail - would be prefilled instead).
+        const bool decode_states = backend.prefill_matches_decode();
+        const std::size_t chunk = backend.prefill_chunk_rows();
+        const auto reusable = [&](const PrefixSnapshot& p) {
+            return decode_states || (p.prefill_written && chunk && p.tokens.size() % chunk == 0);
+        };
+        const auto keep = [&](std::size_t slot) {
+            std::shared_ptr<PrefixSnapshot> snapshot;
+            {
+                std::lock_guard lock(backend_mutex);
+                snapshot = coordinator.snapshot(slot);
+            }
+            if (!snapshot || !reusable(*snapshot)) return;
+            for (auto it = kept.begin(); it != kept.end(); ++it)
+                if (it->snapshot->tokens == snapshot->tokens) { kept_bytes -= it->bytes; kept.erase(it); break; }
+            const auto bytes = state_bytes(snapshot->tokens.size());
+            kept.push_front({std::move(snapshot),bytes});
+            kept_bytes += bytes;
+            while (kept.size() > 16 || (kept.size() > 1 && kept_bytes > prefix_bytes)) {
+                kept_bytes -= kept.back().bytes;
+                kept.pop_back();
+            }
+        };
+        // The longest kept state whose tokens start the prompt, leaving at least its last token to decode from.
+        const auto lookup = [&](const std::vector<std::uint32_t>& prompt) -> std::shared_ptr<const PrefixSnapshot> {
+            auto best = kept.end();
+            for (auto it = kept.begin(); it != kept.end(); ++it) {
+                const auto& t = it->snapshot->tokens;
+                if (reusable(*it->snapshot) && t.size() < prompt.size() && std::equal(t.begin(),t.end(),prompt.begin()) &&
+                    (best == kept.end() || t.size() > best->snapshot->tokens.size()))
+                    best = it;
+            }
+            if (best == kept.end()) { ++prefix_misses; return nullptr; }
+            ++prefix_hits;
+            kept.splice(kept.begin(),kept,best);
+            return kept.front().snapshot;
+        };
+        std::uint64_t steps = 0;
         std::vector<Live> live;
         const auto finish = [&](Live& l, const std::string& error) {
             strix::serve::GenerationStats stats;
@@ -188,6 +253,8 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                 l.task->result = l.chat->take();
                 stats.prompt_tokens = l.task->result.prompt_tokens; stats.generated_tokens = l.task->result.ids.size();
                 stats.finish = l.task->result.finish;
+                for (const auto& phase : l.task->result.receipts)
+                    if (const auto* cached = phase.find("serve_prefix")) stats.cached_tokens += cached->find("cached_tokens")->as_int();
                 if (l.taken.job.on_tokens) (void)l.taken.job.on_tokens(l.task->result.ids);
             }
             queue.finish(l.taken,stats,error);
@@ -195,18 +262,24 @@ struct Api::Impl final : strix::serve::GenerationEngine {
         const auto receipt = [&](const Live& l) {
             auto r = coordinator.receipt(l.slot);
             r.set("serve_batch",Json(Json::Object{{"mode","continuous"},{"slots",std::uint64_t(slots)},
-                {"prefill_per_step",std::uint64_t(prefill_per_step)},{"slot",std::uint64_t(l.slot)},
+                {"prefill_per_step",std::uint64_t(prefill_per_step)},{"prefill_rows",std::uint64_t(prefill_rows)},{"slot",std::uint64_t(l.slot)},
                 {"admitted_at_step",l.admitted},{"steps",l.steps},{"max_batch",l.width_max},
                 {"mean_batch",l.steps ? double(l.width_sum)/double(l.steps) : 0.0},
                 {"steps_sharing_prefill",l.shared_prefill}}));
+            if (prefix_cache)
+                r.set("serve_prefix",Json(Json::Object{{"cached_tokens",coordinator.result(l.slot).cached_tokens},
+                    {"entries",std::uint64_t(kept.size())},{"bytes",std::uint64_t(kept_bytes)},
+                    {"hits",prefix_hits},{"misses",prefix_misses}}));
             return r;
         };
         const auto submit = [&](Live& l) {
             auto job = l.chat->phase_request();
             l.prompt = job.prompt.size(); l.admitted = steps;
             l.steps = l.width_sum = l.width_max = l.shared_prefill = 0;
+            l.prompt_kept = false;
+            auto prefix = prefix_cache ? lookup(job.prompt) : nullptr;
             std::lock_guard lock(backend_mutex);
-            l.slot = coordinator.submit(std::move(job));
+            l.slot = coordinator.submit(std::move(job),std::move(prefix));
         };
         const auto prefilling = [&](const Live& l) { return coordinator.result(l.slot).frontier+1 < l.prompt; };
         for (;;) {
@@ -245,7 +318,20 @@ struct Api::Impl final : strix::serve::GenerationEngine {
             for (std::size_t i = 0; i < live.size();) {
                 auto& l = live[i];
                 if (!l.chat->absorb(coordinator.result(l.slot))) coordinator.cancel(l.slot);
-                if (coordinator.result(l.slot).status == Status::running) { ++i; continue; }
+                const auto& result = coordinator.result(l.slot);
+                // End of the prompt: the conversation so far, which the next turn renders again as its prefix. When
+                // prefill rows differ from decode rows: the last prefill-written chunk boundary before the prompt's end.
+                if (prefix_cache && !l.prompt_kept && result.status != Status::failed && result.frontier > result.cached_tokens &&
+                    (decode_states ? result.frontier+1 >= l.prompt :
+                        chunk && result.prefill_frontier == result.frontier && result.frontier % chunk == 0 &&
+                        l.prompt-1-result.frontier < chunk)) {
+                    l.prompt_kept = true;
+                    keep(l.slot);
+                }
+                if (result.status == Status::running) { ++i; continue; }
+                // End of a request: prompt and answer, for a prompt that continues the raw output (decode-written rows).
+                if (prefix_cache && decode_states && (result.status == Status::stopped || result.status == Status::length))
+                    keep(l.slot);
                 std::string error;
                 try {
                     if (l.chat->end_phase(coordinator.result(l.slot),receipt(l))) {

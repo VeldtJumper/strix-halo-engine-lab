@@ -104,6 +104,12 @@ public:
     void stage(std::span<const float> taps, std::span<const std::uint64_t> positions) override {
         if (inner_) inner_->stage(taps, positions);
     }
+    // The index then holds the tokens at positions 1..F, as publishing the prefix rows would have fed them.
+    bool seed(std::span<const std::uint32_t> tokens, std::span<const float> hidden) override {
+        if (inner_ && !inner_->seed(tokens, hidden)) return false;
+        for (std::size_t p = 1; p < tokens.size(); ++p) feed(tokens[p], p);
+        return true;
+    }
     void append(std::span<const float> taps, std::span<const std::uint64_t> positions) override {
         if (inner_) inner_->append(taps, positions);
     }

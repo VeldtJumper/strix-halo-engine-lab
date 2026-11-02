@@ -129,6 +129,24 @@ El paso de decode con ocho peticiones iguala el paso C8 del propio motor. Con pr
 procesamiento exacto del prompt (unos 435 tok/s) todavía pausa a las demás peticiones mientras corre un fragmento del
 prompt.
 
+Mientras otras peticiones decodifican, un prompt se procesa en fragmentos de como mucho 64 filas
+(`STRIX_G4_SERVE_PREFILL_ROWS`, `0` = fragmentos completos de 512 filas), así que un prompt largo las pausa durante
+tramos más cortos: con los prompts mixtos de arriba, el mayor hueco entre dos tokens de una petición bajó de 1.05-1.12 s
+a 0.41-0.42 s y el percentil 99 de 0.44 / 1.08 s a 0.17 / 0.20 s (4 / 8 clientes); el rendimiento y los ids de tokens no
+cambian. Con `fast` (decode con activaciones int8 junto al procesamiento exacto del prompt) los fragmentos mantienen
+su tamaño completo, porque dónde termina un fragmento decide qué filas del prompt escribe una pasada de decode.
+
+El servidor también guarda el estado confirmado al final de cada prompt y de cada petición terminada, y lo reutiliza
+cuando un prompt posterior empieza exactamente con esos tokens, normalmente el siguiente turno de una conversación, que
+vuelve a enviar la conversación hasta ese punto: solo se procesan las filas nuevas. Tiempo hasta el primer token del
+turno 2 (`default`, seis conversaciones en paralelo): documento de 4K tokens **0.20 s** frente a 12.59 s sin caché,
+documento de 1K tokens **0.19 s** frente a 3.48 s, chat 0.39-0.51 s frente a 1.31-1.66 s; los ids de tokens de ambos
+turnos son iguales a los obtenidos sin caché. Hasta 16 estados dentro de 4 GB (`STRIX_G4_SERVE_PREFIX_MB`);
+`STRIX_G4_SERVE_PREFIX=0` la desactiva. Con `fast`, cuyo decode con activaciones int8 difiere del procesamiento exacto
+del prompt, solo se reutilizan estados en un límite de 512 filas escritos por el procesamiento del prompt, nunca una
+respuesta. Dos conversaciones distintas que comparten un documento largo pero divergen
+después todavía no lo comparten.
+
 **Drafter MTP** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). Un modelo asistente pequeño (el asistente MTP
 de Gemma-4-E4B-it de Google, 78.8M parámetros) propone los siguientes tokens y el modelo principal los verifica, así
 que la salida es idéntica a la del decode sin él; solo cambia la velocidad. La aceleración procede de la arquitectura
