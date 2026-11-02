@@ -1523,6 +1523,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Decode MoE routed gate/up and down in one launch",
+    "flag_or_env": "STRIX_MMX_MOE_PIPE",
+    "default": "2",
+    "exact": "Same partials, counters, finish and combine; only the gate/up -> down ordering moves from the kernel boundary to per-block readiness. Decode logits bitwise on both ranks vs off at N1/N2/N4 and a 4-row verify window; MoE bench --test (incl. a seeded epoch wrap) and --diverse --test bitwise.",
+    "gain": "Two-node decode, in-process A B A B A B A blocks with matched replay: N2 58.9-59.3 -> 57.3-57.7 ms/step (-2.7 %), N4 81.8-82.6 -> 80.6-80.8 ms/step (-1.6 %).",
+    "preconditions": "v4 decode MoE overlap form, calls of 2-4 rows (DSpark verify windows, C2-C4 steps); N1 and 5-8 rows keep two launches.",
+    "off_switch": "STRIX_MMX_MOE_PIPE=0",
+    "doc_anchor": "docs/optimizations.md#mm-moe-pipe"
+  },
+  {
+    "engine": "minimax",
     "name": "DSpark automatic admission",
     "flag_or_env": "STRIX_MM_SERVE_DSPARK; --dspark-mode; /admin/sched dspark_mode",
     "default": "auto",

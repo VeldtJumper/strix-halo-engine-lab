@@ -46,7 +46,9 @@ constexpr std::size_t kOffPartGu = kOffGu + align256(std::size_t{kMaxPairs} * 2 
 constexpr std::size_t kOffPartDn = kOffPartGu + align256(std::size_t{kMaxPairs} * 2 * 16 * kInter * 4);
 constexpr std::size_t kOffCounters4 = kOffPartDn + align256(std::size_t{kMaxPairs} * 4 * kHidden * 4);
 constexpr unsigned kCounters4 = (kMaxSlots + 1) * kInterBlocks + kOutBlocks;
-constexpr std::size_t kMoeBytes = kOffCounters4 + align256(std::size_t{kCounters4} * 4);
+constexpr std::size_t kOffPipe = kOffCounters4 + align256(std::size_t{kCounters4} * 4);
+constexpr unsigned kPipeWords = 2 + (kMaxSlots + 1) * kInterBlocks;  // epoch, ticket, gate/up block ready epochs
+constexpr std::size_t kMoeBytes = kOffPipe + align256(std::size_t{kPipeWords} * 4);
 
 struct Args {
     unsigned rows;
@@ -105,6 +107,11 @@ struct Args {
     __device__ std::uint32_t* dn4_counter(unsigned block) const {
         return reinterpret_cast<std::uint32_t*>(ws + kOffCounters4) + (kMaxSlots + 1) * kInterBlocks + block;
     }
+    // routed pipeline (STRIX_MMX_MOE_PIPE): route epoch (bumped by every route_tail), CTA ticket, and the epoch at which
+    // each (slot, 128-channel gate/up block) of the down inputs was finished
+    __device__ std::uint32_t* pipe_epoch() const { return reinterpret_cast<std::uint32_t*>(ws + kOffPipe); }
+    __device__ std::uint32_t* pipe_ticket() const { return pipe_epoch() + 1; }
+    __device__ std::uint32_t* gu_ready(unsigned slot, unsigned block) const { return pipe_epoch() + 2 + slot * kInterBlocks + block; }
 };
 
 __device__ __forceinline__ float load_agent(const float* p) {
@@ -233,6 +240,10 @@ __device__ void route_tail(const Args& a) {
         dp->nrows[kSharedSlot] = rows;
         dp->count = count;
         dp->rows = rows;
+        const std::uint32_t epoch = *a.pipe_epoch() + 1U;
+        if (epoch == 0)  // wrap: no stale ready word may carry the reused epoch 1
+            for (unsigned q = 0; q < (kMaxSlots + 1) * kInterBlocks; ++q) a.gu_ready(0, 0)[q] = 0;
+        *a.pipe_epoch() = epoch != 0 ? epoch : 1U;
     }
     __syncthreads();
     if (t < rows * kTopE) {  // per row: its pairs in ascending expert id
@@ -882,12 +893,20 @@ __device__ void split16_rows(const Exl3& w, unsigned output, unsigned kt, unsign
     else run(std::integral_constant<int, 5>{});
 }
 
+// Pipeline producer: after the finisher's at() stores of `block`, release them at agent scope and record the epoch.
+__device__ __forceinline__ void publish_gu_ready(const Args& a, unsigned slot, unsigned block, std::uint32_t epoch) {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (threadIdx.x == 0) __hip_atomic_store(a.gu_ready(slot, block), epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
 // One gate/up CTA of slot `slot` (rows: the slot's call rows, or 0..nrows-1 for the shared expert).
+// ready != 0: the pipelined launch; each finished block is published with that epoch.
 // Wide: cg indexes 16-column groups (2 output blocks per CTA) and the wide core runs (rowbuf: 4 x 8 x Bits uint4).
 template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false>
 __device__ void gate_up4_body(const Args& a, const Dispatch* dp, const ExpertSlices& E, unsigned slot, unsigned nrows,
                               unsigned first, unsigned cg, unsigned split, unsigned m, _Float16* xs, WideV4* rowbuf = nullptr,
-                              bool single = false) {
+                              bool single = false, std::uint32_t ready = 0) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const Exl3& w = m == 0 ? E.gate : E.up;
     for (unsigned job = wave; job < nrows * 3; job += W) {  // input transform of the split's 3 H128 blocks per row
@@ -933,7 +952,10 @@ __device__ void gate_up4_body(const Args& a, const Dispatch* dp, const ExpertSli
                            a.part_gu(first, m, split), std::size_t{2} * 16 * kInter);
 #pragma unroll
         for (unsigned h = 0; h < 2; ++h)
-            if (last_arrival(a.gu4_counter(slot, cg * 2U + h), 2 * kGateSplits)) finish(cg * 2U + h);
+            if (last_arrival(a.gu4_counter(slot, cg * 2U + h), 2 * kGateSplits)) {
+                finish(cg * 2U + h);
+                if (ready != 0) publish_gu_ready(a, slot, cg * 2U + h, ready);
+            }
     } else {
         const unsigned col = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * static_cast<unsigned>(W) + wave)));
         if constexpr (Single) {
@@ -946,26 +968,34 @@ __device__ void gate_up4_body(const Args& a, const Dispatch* dp, const ExpertSli
         } else split4_rows<MaxR, Depth, DepthBig>(w, kInter, kHidden / 16, kGateSplits, col, split, xs, nrows, lane,
                                                  a.part_gu(first, m, split), std::size_t{2} * 16 * kInter);
         const unsigned block = cg * W / 8;
-        if (last_arrival(a.gu4_counter(slot, block), (8 / W) * 2 * kGateSplits)) finish(block);
+        if (last_arrival(a.gu4_counter(slot, block), (8 / W) * 2 * kGateSplits)) {
+            finish(block);
+            if (ready != 0) publish_gu_ready(a, slot, block, ready);
+        }
     }
 }
 
 template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared, bool Wide = false, bool Single = false>
-__global__ __launch_bounds__(32 * W) void gate_up4_kernel(Args a) {
-    __shared__ _Float16 xs[MaxR * kSplitCh];
-    __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
+__device__ __forceinline__ void gate_up4_cta(const Args& a, unsigned bxr, unsigned by, unsigned bz, _Float16* xs, WideV4* rowbuf,
+                                             std::uint32_t ready = 0) {
     const Dispatch* dp = a.disp();
     constexpr unsigned groups = Wide ? kInter / 256U : kInter / (16U * W);
     // Former grid separated a slot's gate/up CTAs by an entire z plane spanning all slots. Pair the two
     // matrices per tile to reduce partial/counter lifetime; CTA counts and split arithmetic stay unchanged.
-    const unsigned bx = a.interleave_gu ? blockIdx.x / 2U : blockIdx.x;
-    const unsigned m = a.interleave_gu ? blockIdx.x % 2U : blockIdx.z;
+    const unsigned bx = a.interleave_gu ? bxr / 2U : bxr;
+    const unsigned m = a.interleave_gu ? bxr % 2U : bz;
     unsigned slot;
-    if (!map_slot(dp, blockIdx.y, slot)) return;
+    if (!map_slot(dp, by, slot)) return;
     if (SkipShared && slot == kSharedSlot) return;  // done by the router + shared launch
     gate_up4_body<MaxR, Depth, W, DepthBig, Wide, Single>(a, dp, slot_slices(a, dp, slot), slot, dp->nrows[slot], dp->first[slot],
                                                        bx % groups, bx / groups, m, xs, rowbuf,
-                                                       Single && single_stream_for<Depth>(a, dp, slot));
+                                                       Single && single_stream_for<Depth>(a, dp, slot), ready);
+}
+template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared, bool Wide = false, bool Single = false>
+__global__ __launch_bounds__(32 * W) void gate_up4_kernel(Args a) {
+    __shared__ _Float16 xs[MaxR * kSplitCh];
+    __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
+    gate_up4_cta<MaxR, Depth, W, DepthBig, SkipShared, Wide, Single>(a, blockIdx.x, blockIdx.y, blockIdx.z, xs, rowbuf);
 }
 
 // Router + shared expert in one launch (STRIX_MMX_MOE_OVERLAP=1): CTAs 0..127 are router CTAs (one expert each, its
@@ -1067,17 +1097,28 @@ __global__ __launch_bounds__(128) void down4_combine_kernel(Args a) {
 }
 
 template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
-__global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
-    __shared__ _Float16 xs[MaxR * kSplitCh];
-    __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
+__device__ __forceinline__ void down4_cta(const Args& a, unsigned bx, unsigned by, _Float16* xs, WideV4* rowbuf,
+                                          std::uint32_t ready = 0) {
     const Dispatch* dp = a.disp();
     unsigned slot;
-    if (!map_slot(dp, blockIdx.y, slot)) return;
+    if (!map_slot(dp, by, slot)) return;
     constexpr unsigned groups = Wide ? kHidden / 256U : kHidden / (16U * W);
-    const unsigned cg = blockIdx.x % groups, split = blockIdx.x / groups;
+    const unsigned cg = bx % groups, split = bx / groups;
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const Exl3& w = slot_slices(a, dp, slot).down;
     const unsigned nrows = dp->nrows[slot], first = dp->first[slot];
+    if (ready != 0 && slot != kSharedSlot) {  // the split's 384 inputs = gate/up blocks 3 split .. 3 split + 2 of this slot
+        if (threadIdx.x == 0)
+            for (unsigned b = 0; b < kSplitCh / 128; ++b) {
+                const std::uint32_t* f = a.gu_ready(slot, split * (kSplitCh / 128) + b);
+                for (unsigned spin = 0; __hip_atomic_load(f, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != ready; ++spin) {
+                    if (spin == (1U << 26)) __builtin_trap();  // a producer never finished: fault instead of hanging
+                    __builtin_amdgcn_s_sleep(1);
+                }
+            }
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
     for (unsigned q = threadIdx.x; q < nrows * (kSplitCh / 2); q += 32U * W) {  // the split's transformed channels
         const unsigned lr = q / (kSplitCh / 2), c = q % (kSplitCh / 2);
         reinterpret_cast<std::uint32_t*>(xs)[lr * (kSplitCh / 2) + c] =
@@ -1115,6 +1156,48 @@ __global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
             }
         }
     }
+}
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
+__global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
+    __shared__ _Float16 xs[MaxR * kSplitCh];
+    __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
+    down4_cta<MaxR, Depth, W, DepthBig, Wide, Single, PartialOnly>(a, blockIdx.x, blockIdx.y, xs, rowbuf);
+}
+
+// Routed gate/up and down in one launch (STRIX_MMX_MOE_PIPE, overlap form only; the shared expert's gate/up ran in the
+// router + shared launch). CTAs take a ticket in arrival order, so every CTA waits only on lower tickets, which are
+// already resident: no dependence on hardware dispatch order. Tickets: [shared down if SharedFirst][routed gate/up, the
+// former x-fastest grid order][routed down (+ shared down)]. A down CTA polls its split's three gate/up blocks of its
+// slot (epoch of this route) instead of a kernel boundary; partials, counters, finish and combine are unchanged.
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide, bool Single, bool SharedFirst>
+__global__ __launch_bounds__(32 * W) void moe_pipe4_kernel(Args a, unsigned gu_x, unsigned gu_z, unsigned slots, unsigned dn_x) {
+    __shared__ _Float16 xs[MaxR * kSplitCh];
+    __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
+    __shared__ unsigned s_ticket;
+    if (threadIdx.x == 0) {
+        const unsigned t = atomicAdd(a.pipe_ticket(), 1U);
+        if (t + 1U == gridDim.x) __hip_atomic_store(a.pipe_ticket(), 0U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        s_ticket = t;
+    }
+    __syncthreads();
+    const std::uint32_t epoch = *a.pipe_epoch();
+    unsigned t = s_ticket;
+    if constexpr (SharedFirst) {
+        if (t < dn_x) {
+            down4_cta<MaxR, Depth, W, DepthBig, Wide, Single>(a, t, a.disp()->count, xs, rowbuf, epoch);
+            return;
+        }
+        t -= dn_x;
+    }
+    const unsigned gu_n = gu_x * slots * gu_z;
+    if (t < gu_n) {
+        gate_up4_cta<MaxR, Depth, W, DepthBig, true, Wide, Single>(a, t % gu_x, (t / gu_x) % slots, t / (gu_x * slots), xs, rowbuf,
+                                                                  epoch);
+        return;
+    }
+    t -= gu_n;
+    if (SharedFirst && t / dn_x == a.disp()->count) return;  // shared down already ran first
+    down4_cta<MaxR, Depth, W, DepthBig, Wide, Single>(a, t % dn_x, t / dn_x, xs, rowbuf, epoch);
 }
 
 Args make_args(const MoeView& v) {
@@ -1157,6 +1240,7 @@ void launched(const char* what) {
 }  // namespace
 
 std::size_t moe_workspace_bytes() { return kMoeBytes; }
+std::size_t moe_pipe_offset() { return kOffPipe; }
 const Dispatch* moe_dispatch(const MoeWorkspace& ws) { return static_cast<const Dispatch*>(ws.base); }
 
 // STRIX_MMX_ROUTER: 1 = 16 CTAs x 8 experts (also the fused post-exchange form), 2 = one CTA per expert (inputs y).
@@ -1226,6 +1310,19 @@ int moe_waves() {
     }();
     return w;
 }
+// STRIX_MMX_MOE_PIPE (read per call; 0 / unset = off): in the decode overlap form, the routed gate/up and down run as one
+// launch whose down CTAs poll per-block gate/up completion instead of the kernel boundary (1 = routed down after all
+// gate/up tickets, 2 = the shared expert's down first, its inputs being ready from the router + shared launch). Same
+// partials, counters, finish and combine: bitwise. Calls of 2-4 rows; takes precedence over the stream-ordered down split.
+// Measurement (two-node decode, in-process A/B, logits bitwise): N2 58.9-59.3 -> 57.3-57.7 ms/step, N4 81.8-82.6 ->
+// 80.6-80.8; N1 44.13-44.17 -> 44.24-44.27 ms/token (hence excluded).
+unsigned moe_pipe() {
+    const char* value = std::getenv("STRIX_MMX_MOE_PIPE");
+    if (value == nullptr || *value == 0 || std::string(value) == "0") return 0;
+    if (std::string(value) == "1") return 1;
+    if (std::string(value) == "2") return 2;
+    throw std::invalid_argument("STRIX_MMX_MOE_PIPE must be 0, 1 or 2");
+}
 // STRIX_MMX_MOE_WIDE: 1 = wide expert kernels at every N, 0 = 4-column CTAs at every N, unset (2) = the split by N:
 // measurement (both forms bitwise; WIDE 0-1-0-1-0-1-0 processes, inline v4 vs wide, MoE layer us, process medians) wide is
 // faster at N2-4 (0.943 / 0.911 / 0.907) and slower at N1 (1.021), N5 (1.040), N6 (1.019), N8 (1.050); N7 even (0.998).
@@ -1266,6 +1363,25 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
     constexpr unsigned gu_groups = Wide ? kInter / 256U : kInter / (16U * W);
     constexpr unsigned dn_groups = Wide ? kHidden / 256U : kHidden / (16U * W);
     const unsigned slots = moe_grid_slots(a.rows);
+    // Calls of 2-4 rows only: merged, the 8-row bodies' live ranges take ~150 VGPRs (85 / 81 apart) and halve occupancy;
+    // capped at 96 they spill (measured +15-19 % at N5-8 either way); at N1 two launches measured 0.1 ms/token faster.
+    if constexpr (MaxR <= 4) {
+        const unsigned pipe = SkipShared && a.rows >= 2 ? moe_pipe() : 0U;
+        if (pipe != 0) {  // replaces the stream-ordered down split too (measured faster at N4)
+            const unsigned gu_x = gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), gu_z = a.interleave_gu ? 1U : 2U;
+            const unsigned dn_x = dn_groups * kDownSplits, grid = gu_x * slots * gu_z + dn_x * slots;
+            if (pipe == 2)
+                hipLaunchKernelGGL((moe_pipe4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>), dim3(grid), dim3(32 * W), 0, stream, a,
+                                   gu_x, gu_z, slots, dn_x);
+            else
+                hipLaunchKernelGGL((moe_pipe4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, false>), dim3(grid), dim3(32 * W), 0, stream,
+                                   a, gu_x, gu_z, slots, dn_x);
+            launched("routed gate/up + down pipeline");
+            if (marks != nullptr) (void)hipEventRecord(marks[1], stream);  // parts: gate/up includes the down
+            if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
+            return;
+        }
+    }
     const dim3 gu_grid(gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), slots,
                        a.interleave_gu ? 1U : 2U);
     hipLaunchKernelGGL((gate_up4_kernel<MaxR, Depth, W, DepthBig, SkipShared, Wide, Single>),

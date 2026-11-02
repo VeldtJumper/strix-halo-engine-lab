@@ -548,7 +548,8 @@ struct EnvMode {
     }
 };
 
-// Full workspace comparison, including inactive bytes and reset counters. Avoid multi-GB host snapshots during
+// Workspace comparison, including inactive bytes and reset counters, up to the pipeline's sequencing words (the route
+// epoch advances on every call; the ticket must be back at 0). Avoid multi-GB host snapshots during
 // the exhaustive gate: the reference remains a separate device allocation and only the mismatch bit comes back.
 __global__ void workspace_equal_kernel(const std::uint32_t* a, const std::uint32_t* b, std::size_t words, unsigned* bad) {
     unsigned differs = 0;
@@ -562,9 +563,10 @@ struct WorkspaceCheck {
     std::uint32_t* reference;
     unsigned* bad;
     const std::size_t bytes = opt::moe_workspace_bytes();
+    const std::size_t compared = opt::moe_pipe_offset();
     WorkspaceCheck() : reference(dalloc<std::uint32_t>(opt::moe_workspace_bytes() / sizeof(std::uint32_t))),
                        bad(dalloc<unsigned>(1)) {
-        if (bytes % sizeof(std::uint32_t) != 0) throw std::runtime_error("workspace alignment");
+        if (bytes % sizeof(std::uint32_t) != 0 || compared % sizeof(std::uint32_t) != 0) throw std::runtime_error("workspace alignment");
     }
     void save(const void* ws) const {
         hip_ok(hipMemcpy(reference, ws, bytes, hipMemcpyDeviceToDevice), "workspace snapshot");
@@ -572,11 +574,13 @@ struct WorkspaceCheck {
     bool equal(const void* ws) const {
         hip_ok(hipMemset(bad, 0, sizeof(unsigned)), "workspace compare reset");
         hipLaunchKernelGGL(workspace_equal_kernel, dim3(256), dim3(256), 0, nullptr,
-                           static_cast<const std::uint32_t*>(ws), reference, bytes / sizeof(std::uint32_t), bad);
+                           static_cast<const std::uint32_t*>(ws), reference, compared / sizeof(std::uint32_t), bad);
         hip_ok(hipGetLastError(), "workspace compare");
-        unsigned mismatch = 0;
+        unsigned mismatch = 0, ticket = 0;
         hip_ok(hipMemcpy(&mismatch, bad, sizeof(mismatch), hipMemcpyDeviceToHost), "workspace compare result");
-        return mismatch == 0;
+        hip_ok(hipMemcpy(&ticket, static_cast<const unsigned char*>(ws) + compared + sizeof(std::uint32_t), sizeof(ticket),
+                         hipMemcpyDeviceToHost), "pipeline ticket");
+        return mismatch == 0 && ticket == 0;
     }
     ~WorkspaceCheck() {
         (void)hipFree(bad);
@@ -913,6 +917,16 @@ struct Bench {
         return b;
     }
 
+    // Routed pipeline epoch wrap (STRIX_MMX_MOE_PIPE): the next route bumps the epoch past UINT32_MAX while every ready word
+    // holds the reused epoch 1 from long ago; the call must still wait for this call's gate/up (same bits as A).
+    void seed_pipe_wrap() {
+        const std::size_t off = opt::moe_pipe_offset(), words = (opt::moe_workspace_bytes() - off) / sizeof(std::uint32_t);
+        std::vector<std::uint32_t> w(words, 1U);
+        w[0] = 0xFFFFFFFFU;  // route epoch
+        w[1] = 0;            // ticket
+        hip_ok(hipMemcpy(static_cast<unsigned char*>(moe_ws) + off, w.data(), words * sizeof(std::uint32_t), hipMemcpyHostToDevice),
+               "pipeline wrap seed");
+    }
     void test_moe() {
         unsigned cases = 0;
         for (unsigned n = 1; n <= 8; ++n)
@@ -923,6 +937,7 @@ struct Bench {
                     run_A(bt);
                     hip_ok(hipDeviceSynchronize(), "A");
                     const auto a = d2h(outA, std::size_t{n} * H);
+                    if (rep == 1 && (n == 2 || n == 4)) seed_pipe_wrap();
                     run_B(bt);
                     hip_ok(hipDeviceSynchronize(), "B");
                     const auto bo = d2h(outB, std::size_t{n} * H);

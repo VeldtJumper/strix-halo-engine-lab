@@ -73,6 +73,8 @@ constexpr Item kItems[] = {
      "Decode measurement: exact (decode logits bitwise both ranks, N1/N4/N8 + verify window), C1 8K in-process ABA x3 44.64-44.66 -> 44.01-44.07 ms/token (8 MB; 14 MB slower)"},
     {"moe_tight_grid", "STRIX_MMX_MOE_TIGHT_GRID", "1", "0",
      "Decode measurement: exact (decode logits bitwise both ranks, N1/N4/N8 + verify window), C1 8K in-process ABA x3 45.12-45.18 -> 44.60-44.68 ms/token"},
+    {"moe_pipe", "STRIX_MMX_MOE_PIPE", "2", "0",
+     "Decode measurement: exact (decode logits bitwise both ranks, N1/N2/N4 + verify window), calls of 2-4 rows, in-process ABA x3 N2 58.9-59.3 -> 57.3-57.7 ms/step (-2.7 %), N4 81.8-82.6 -> 80.6-80.8 ms/step (-1.6 %)"},
     {"dspark_attn", "STRIX_MM_DSPARK_ATTN", "2", "0",
      "Drafter measurement: bitwise, drafter attention B/A 0.964-0.975 / 0.918-0.924 / 0.815-0.819 at ctx 300/1000/4095"},
     {"draft_lin", "STRIX_MM_DRAFT_LIN", "opt", "lib", "Optimized draft linears (measurement evidence)"},
