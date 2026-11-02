@@ -72,6 +72,7 @@ extern "C" const char* hipGetErrorString(hipError_t) { return "injected HIP fail
 
 void async_snapshot_tests();
 void batch_snapshot_tests();
+void cancelled_checkpoint_retry_tests();
 void split_snapshot_tests();
 
 void prefix_dma_tests() {
@@ -629,6 +630,7 @@ void prefix_dma_tests() {
     async_snapshot_tests();
     split_snapshot_tests();
     batch_snapshot_tests();
+    cancelled_checkpoint_retry_tests();
 
 }
 
@@ -926,6 +928,122 @@ void async_snapshot_tests() {
     }
     snapshot_shim=false;
     set_prefix_batch_certification_enabled(false);
+}
+
+// Real adapter, real 4096-row cadence and a deferred HIP shim. Cancellation resets
+// live storage after a completed checkpoint, including an in-unit partial write.
+void cancelled_checkpoint_retry_tests() {
+    using namespace strix;
+    using namespace strix::decode_cli;
+    snapshot_shim=true;drain_error=copy_error=hipSuccess;queued=false;
+    const auto producer=reinterpret_cast<hipStream_t>(2),predictor=reinterpret_cast<hipStream_t>(3);
+    const PrefixCaptureOrder order{producer,predictor,predictor};
+    const auto id=sha256_bytes(std::as_bytes(std::span("cancel-retry",12)));
+    constexpr std::uint64_t n=8000,t=1024,p=4096;
+    std::vector<std::uint32_t> tokens(n);
+    for(std::size_t i=0;i<tokens.size();++i) tokens[i]=static_cast<std::uint32_t>(i%251U);
+    QwenTiledPlanConfig config;config.rows=t;config.schedule=12;
+    config.block={t,QwenPlanOutput::terminal,1,2};
+    config.tails={{256,QwenPlanOutput::terminal,3,4},{64,QwenPlanOutput::terminal,5,6},{16,QwenPlanOutput::terminal,7,8}};
+    config.ladder={256,64,16};config.generations_per_row[0]=1;
+    QwenBatchConfig batch;batch.groups=false;batch.cohort=false;batch.nest_rows=0;
+    const auto counted=[](PrefixStateCache& store,std::string_view reason) {
+        const auto stats=store.counters();
+        for(std::size_t i=0;i<prefix_certificate_decline_names.size();++i)
+            if(prefix_certificate_decline_names[i]==reason) return stats.certificate_declines[i];
+        return std::uint64_t{0};
+    };
+    for(bool pooled:{false,true}) for(bool inside_unit:{false,true}) for(bool solo_suffix:{false,true}) {
+        operations.clear();
+        auto store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{1U<<20,{},0},hip_pinned_prefix_capture_buffer);
+        SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=n;
+        SessionStateMemoryBinding memory;memory.layout_identity=1;
+        std::vector<std::byte> rows(n),predictor_rows(n);std::byte held{41},fixed{31};
+        auto route_batch=batch;route_batch.groups=!solo_suffix;
+        const auto bind=[&](HipPrefixStateCacheSession& cache) {
+            cache.add_rows(reinterpret_cast<std::uintptr_t>(rows.data()),1,0);
+            cache.add_rows(reinterpret_cast<std::uintptr_t>(predictor_rows.data()),1,1);
+            cache.add_fixed_device(reinterpret_cast<std::uintptr_t>(&fixed),1);
+            cache.add_fixed_device(reinterpret_cast<std::uintptr_t>(&held),1,"mtp.held");
+            cache.set_plan(config,n,true,2,route_batch);
+        };
+        auto capture=std::make_unique<HipPrefixStateCacheSession>(store,id,t,p,ModelContract{},layout,memory);
+        bind(*capture);if(pooled) capture->attach_capture_pool(true);
+        SerialSessionContext session;session.state_layout_identity=1;
+        require(capture->begin_request(session,tokens)==0 && capture->request().refusal=="prefix-no-compatible-checkpoint",
+            "cold request has a named miss");
+        for(std::uint64_t end=t;end<=p;end+=t) {
+            for(auto i=end-t;i<end;++i) {rows[i]=std::byte(tokens[i]);predictor_rows[i]=std::byte(tokens[i]^31U);}
+            session.arithmetic_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,end-t,end,1,2,1);
+            session.next_position=session.committed_tokens=end;session.state.generations[0]=end;
+            auto d=capture->try_prepare_capture(session,tokens,producer,true,order,n-1U);
+            require(bool(d),"every pre-cancel full-T boundary prepares row prefetch or checkpoint");
+            // A synthetic old preparation time demonstrates that even an
+            // unselected row-prefetch descriptor contributes elapsed overlap.
+            if(end==t) d->prepared-=std::chrono::seconds(2);
+            pump(producer);d->submit_predictor(predictor);pump(predictor);pump(d->download);d->commit(true);
+            PrefixAsyncCapture::reap();
+        }
+        require(store->counters().inserted==1 && capture->cached_boundary(tokens)==p,
+            "4096 checkpoint is stored before cancellation, not merely a private row chain");
+        require(capture->request().captured_checkpoints==1 && capture->request().capture_ms>=2000,
+            "capture_ms includes unselected descriptor lifetime, not only checkpoint DMA time");
+        const auto saved_rows=rows,saved_predictor=predictor_rows;
+        const auto saved_session=session;
+        // Cancel either during the next native unit or between units. A later
+        // partial write and the slot reset must never mutate the stored snapshot.
+        if(inside_unit) {rows[p]=std::byte{99};fixed=held=std::byte{99};}
+        capture->before_target_reset();capture.reset();session={};
+        std::fill(rows.begin(),rows.end(),std::byte{77});
+        std::fill(predictor_rows.begin(),predictor_rows.end(),std::byte{77});fixed=held=std::byte{77};
+        HipPrefixStateCacheSession retry(store,id,t,p,ModelContract{},layout,memory);bind(retry);
+        std::uint64_t frontier=0;retry.bind_restore_runtime([&](std::uint64_t end){frontier=end-1U;});
+        session.state_layout_identity=1;
+        if(!solo_suffix) {
+            const auto before=copies;
+            require(retry.begin_request(session,tokens)==0 && retry.request().refusal=="batch-suffix-not-solo" &&
+                counted(*store,"batch-suffix-not-solo")==1 && copies==before && !session.next_position && !frontier,
+                "original grouped 8000-token retry finds its stored checkpoint and names the suffix refusal");
+            continue;
+        }
+        require(retry.begin_request(session,tokens)==p && retry.request().restored_position==p && frontier==p-1U,
+            "cancelled prefill retry restores 4096 and predictor frontier 4095");
+        require(std::equal(rows.begin(),rows.begin()+p,saved_rows.begin()) &&
+            std::equal(predictor_rows.begin(),predictor_rows.begin()+p-1U,saved_predictor.begin()) &&
+            rows[p]==std::byte{77} && predictor_rows[p-1U]==std::byte{77} && fixed==std::byte{31} && held==std::byte{41} &&
+            session.state.generations==saved_session.state.generations &&
+            session.arithmetic_lineage.intervals==saved_session.arithmetic_lineage.intervals,
+            "retry restores exact checkpoint bytes and metadata without writing beyond the frontier");
+        const auto checkpoint=store->find_longest(retry.active_identity(),tokens,t,p);
+        require(checkpoint && checkpoint->tokens()==std::vector<std::uint32_t>(tokens.begin(),tokens.begin()+p),
+            "all 4096 stored token IDs equal the retry prefix");
+        // Reproduce the reported configuration: its final 64-row tail can group.
+        auto grouped=batch;grouped.groups=true;
+        HipPrefixStateCacheSession refused(store,id,t,p,ModelContract{},layout,memory);bind(refused);
+        refused.set_plan(config,n,true,2,batch,false);session={};session.state_layout_identity=1;
+        require(refused.begin_request(session,tokens)==0 && refused.request().refusal=="prefix-restore-disabled" &&
+            counted(*store,"prefix-restore-disabled")==1,"service-disabled restore names its refusal");
+        // Keep the same stored namespace and change only suffix eligibility via
+        // nesting_possible, which deliberately is not part of the namespace.
+        refused.set_plan(config,n,true,2,batch,true,true);session={};session.state_layout_identity=1;
+        const auto before=copies;
+        require(refused.begin_request(session,tokens)==0 && refused.request().refusal=="batch-suffix-not-solo" &&
+            counted(*store,"batch-suffix-not-solo")==1 && copies==before && !session.next_position,
+            "stored but non-solo suffix is a named zero-write miss");
+        require(!qwen_suffix_solo_class(config,n,p,grouped,false),"8000-token grouped suffix reproduces original refusal");
+        const auto mutable_checkpoint=std::const_pointer_cast<PrefixCacheCheckpoint>(checkpoint);
+        mutable_checkpoint->producer_certificate[4]^=1;
+        refused.set_plan(config,n,true,2,batch);session={};session.state_layout_identity=1;
+        require(refused.begin_request(session,tokens)==0 && refused.request().refusal=="prefix-producer-plan-mismatch" &&
+            counted(*store,"prefix-producer-plan-mismatch")==1 && copies==before,
+            "corrupt stored certificate is a named zero-write miss");
+        mutable_checkpoint->producer_certificate[4]^=1;
+        mutable_checkpoint->metadata.clear();session={};session.state_layout_identity=1;
+        require(refused.begin_request(session,tokens)==0 && refused.request().refusal=="prefix-checkpoint-preflight" &&
+            counted(*store,"prefix-checkpoint-preflight")==1 && copies==before,
+            "corrupt stored metadata is a named zero-write miss");
+    }
+    operations.clear();snapshot_shim=false;
 }
 
 // Real adapter + deferred HIP shim: namespace, restore preflight, hook routing and no-wait tripwire.

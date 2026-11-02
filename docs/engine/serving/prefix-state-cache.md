@@ -124,7 +124,7 @@ store counters) or `mtp_tiled_prompt.prefix_cache` (MTP route).
 
 ## What a checkpoint holds
 
-A checkpoint at block boundary P = k·T is the session state after the first P prompt tokens:
+A checkpoint at block boundary P = kÂ·T is the session state after the first P prompt tokens:
 
 - per-position rows of every attention layer: KV rows and raw indexer keys, positions [0, P);
 - the state overwritten in place: GDN recurrent matrices, GDN and PLE convolution histories, the
@@ -206,7 +206,7 @@ With `--mtp` and the tiled prefill flags the prompt itself runs through the tile
    producer, whose last ticket starts the first draft cycle. Decode is unchanged (adaptive windows).
 
 `STRIX_MTP_TILED_START=0` restores the previous handoff (the last prompt row always serial; a prompt
-of exactly k·T tokens then runs its last T rows through the tail blocks and serial rows). The receipt's
+of exactly kÂ·T tokens then runs its last T rows through the tail blocks and serial rows). The receipt's
 `mtp_tiled_prompt.tiled_start` says which handoff ran. A split numerical-profile pair is rejected on
 this route.
 
@@ -333,6 +333,9 @@ private row leases remain inside the existing host allocation ledger. Stats expo
 `capture_busy_skips`, and `row_prefetches`; pool `move_staging_bytes` mirrors live
 staging. Per-request capture counters report reaped work; async `capture_ms` is
 descriptor elapsed time, including overlap, rather than a request stall measurement.
+It sums all reaped descriptors, including row-only prefetches; dividing it by
+`captured_checkpoints` does not measure the cost of a checkpoint. A descriptor
+completed on the download stream may be reaped only after another native block.
 This bounded snapshot workspace does not implement a resident KV pool.
 
 When checkpoint cadence exceeds T, intervening ordinary full-T boundaries may stage
@@ -603,6 +606,36 @@ cursor. For broader diagnostic coverage, explicitly set `STRIX_PROMPT_BATCH=0
 STRIX_PROMPT_WINDOW_COHORT=0 STRIX_BATCH_NEST_ROWS=0` in both comparison arms.
 The cache does not alter these scheduler settings itself. Batch equivalence and
 native exactness remain unqualified; this opt-in is not a production contract.
+
+With the default prompt grouping and window cohorts this guard refuses nearly every
+stored boundary on the batch route (whenever the remaining suffix ends in a grouped
+tail-owner unit or window), so the batch route usually recomputes the prompt; the
+single tiled-MTP route does not use this guard.
+
+A stored boundary rejected by this suffix guard reports `batch-suffix-not-solo`
+in the request's `cache_refusal` and the cache's `certificate_declines` counters.
+Service-mode admissions report `prefix-restore-disabled`. Missing/incompatible
+certificates, producer-plan mismatch, failed metadata preflight and unsupported
+continuations have separate named counters; a lookup without a matching candidate
+reports `prefix-no-compatible-checkpoint`. A completed certified snapshot remains
+valid after its producer is cancelled; cancellation of a later unit does not
+invalidate the owned snapshot. Reuse still requires a certified consumer suffix.
+`tests/cancelled_prefix_retry_gpu_gate.py` checks a 4096 checkpoint surviving a
+mid-prefill cancellation against a fresh request's complete IDs and state. Its
+default diagnostic arms explicitly disable grouping and window cohorts in both
+processes; `--scheduler-defaults` instead checks the named suffix refusal.
+Run `--arm offdef` and `--arm fresh` in separate turns, then use
+`--compare RETRY/offdef.json FRESH/fresh.json` offline. Each arm has a shared
+monotonic deadline (default and maximum `--budget 400` seconds, including a
+20-second cleanup reserve); an exhausted budget fails and one arm alone stays
+unqualified. Saved receipts bind the executable, supplied asset files, command,
+prompt identity, client and relevant environment. Comparison revalidates the raw
+request-local `cached_tokens` against the matched prompt's `restored_position`,
+requiring explicit zero for fresh and refusal arms. It requires complete token
+and logit-row coverage, terminal metadata, zero snapshot tripwires and all canonical
+final fields except `request_order`. No predictor fields or `mtp.*` components are
+excluded: the measured retry executes after the optional decoder retires.
+Offline fail-closed controls: `python3 tests/cancelled_prefix_retry_gate_tests.py`.
 
 With batch certification enabled and `STRIX_PREFIX_CACHE_DIGEST=1`, prompt receipts include an execution trace,
 submission order, omitted full-T units, continuation cursor and configuration

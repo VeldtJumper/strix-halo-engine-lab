@@ -41,6 +41,19 @@ void operator delete[](void* p) noexcept {::operator delete(p);}
 void operator delete[](void* p,std::size_t) noexcept {::operator delete(p);}
 
 
+namespace strix {
+struct PrefixStateCacheTestAccess {
+    static void decline_while_locked(PrefixStateCache& cache) {
+        std::lock_guard lock(cache.mutex_);
+        // A recursive store lock hangs this regression; heap allocation throws.
+        prefix_test_fail_host_allocations=true;
+        cache.record_certificate_decline(PrefixCertificateDecline::prefix_no_compatible_checkpoint);
+        cache.record_certificate_decline(PrefixCertificateDecline::batch_suffix_not_solo);
+        prefix_test_fail_host_allocations=false;
+    }
+};
+}
+
 namespace {
 void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
@@ -908,6 +921,14 @@ int main(int argc, char** argv) {
             }
         }
         std::filesystem::remove_all(dir);
+        {
+            strix::PrefixStateCache cache({32768,{},0},heap);
+            strix::PrefixStateCacheTestAccess::decline_while_locked(cache);
+            const auto counters=cache.counters();
+            require(counters.certificate_declines[19]==1 && counters.certificate_declines[14]==1,
+                    "decline counters publish without heap allocation or another store lock");
+            static_assert(static_cast<std::size_t>(strix::PrefixCertificateDecline::serial_capture_metadata_mismatch)==10);
+        }
         prefix_dma_tests();
         std::cout << "prefix state cache tests passed\n";
         return 0;

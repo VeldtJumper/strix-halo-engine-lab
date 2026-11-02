@@ -954,7 +954,7 @@ explícitos mantienen su comportamiento. El arranque, `--print-effective-config`
 `/v1/cache/stats` informan de la política solicitada y efectiva y de su motivo. La unión a prefijos en curso
 (una petición espera el checkpoint certificado que otro slot está produciendo en lugar de recalcularlo) está
 activada por defecto allí donde la caché está activada y solo actúa en rutas batch concurrentes con certificación
-L0 estricta; `STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` la desactiva. La restauración MTP solo acepta planes de sufijo equivalentes a la ejecución sin caché;
+L0 estricta; `STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` la desactiva. La restauración MTP solo acepta planes de sufijo equivalentes a la ejecución sin caché (en la ruta batch la restauración de prefijo necesita una unidad de sufijo en solitario, así que con la agrupación de prompts suele recalcular; los rechazos se nombran `batch-suffix-not-solo`);
 las copias de checkpoints siguen los límites de bloque existentes.
 
 <a id="deepseek-pair"></a>

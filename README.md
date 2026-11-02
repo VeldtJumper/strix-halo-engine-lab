@@ -913,7 +913,7 @@ runs exactly as cache-off; explicit host bytes keep their behaviour. Startup, `-
 `/v1/capabilities` and `/v1/cache/stats` report the requested and effective policy and its reason. In-flight
 prefix joining (a request waits for the certified checkpoint another slot is producing instead of recomputing it)
 is on by default wherever the cache is on and only acts on concurrent strict-L0 certified batch routes;
-`STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` turns it off. MTP restore accepts only suffix plans equivalent to the uncached execution;
+`STRIX_PREFIX_CACHE_INFLIGHT=0` / `--prefix-cache-inflight off` turns it off. MTP restore accepts only suffix plans equivalent to the uncached execution (on the batch route, prefix restore needs a solo suffix unit, so with prompt grouping it usually recomputes; refusals are named `batch-suffix-not-solo`);
 checkpoint copies follow existing block boundaries.
 
 #### Qwen `--profile default|fast|quality`
