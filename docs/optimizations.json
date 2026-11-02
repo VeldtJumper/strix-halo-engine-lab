@@ -1138,6 +1138,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Prefill hyper-connection collapse with the expansion",
+    "flag_or_env": "STRIX_DS41_PREFILL_HC_COLLAPSE",
+    "default": "on (with STRIX_DS41_PREFILL_HC_FUSE)",
+    "exact": "The collapsed rows are formed with the same operations in the same order as the separate collapse: device tests against the separate expansion, mix and collapse kernels (row tiles 1-4, incomplete tiles, signed zeros, subnormals, infinities and NaNs) are bitwise equal; two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens in every arm.",
+    "gain": "The next site's RMSNorm reads the 20 KB collapsed row instead of the 80 KB 4-copy stream. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, four GPU turns in alternating arm order): 8.008 / 28.017 s with STRIX_DS41_PREFILL_HC_COLLAPSE=0 vs 7.996 / 27.809 s default (-0.2 / -0.7 %, 32,499 tokens faster in 3 of 4 turns).",
+    "preconditions": "Device prefill path with STRIX_DS41_PREFILL_HC_FUSE on; boundaries whose expansion is fused with the next mixes and whose next site starts at the same row.",
+    "off_switch": "STRIX_DS41_PREFILL_HC_COLLAPSE=0",
+    "doc_anchor": "docs/optimizations.md#ds-prefill-hc-collapse"
+  },
+  {
+    "engine": "deepseek",
     "name": "Exact dense prefill selector",
     "flag_or_env": "STRIX_DS41_DENSE_SELECT",
     "default": "auto",
