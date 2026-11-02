@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/known_prefill_limits.hpp"
+#include "strix/qpf2k_defaults.hpp"
 #include <array>
 #include <algorithm>
 #include <bit>
@@ -32,6 +33,12 @@ struct QwenTiledPlanConfig {
     std::vector<QwenPlanOwner> tails;
     std::vector<std::uint32_t> ladder;
 };
+// The schedule the tiled MTP bridge (CLI --mtp, HTTP serving, cohorts) executes for a STRIX_QPF2K_SCHED value:
+// the bridge never defers a block, so bit 2 is inert there and its plan, batch certification and plan identity
+// see the schedule-12 equivalent (the default 14 and an explicit 14 alike).
+inline std::uint32_t qwen_bridge_plan_schedule(const char* sched) {
+    return static_cast<std::uint32_t>(qpf2k::effective_sched(sched?std::strtoul(sched,nullptr,0):0UL,false));
+}
 struct QwenPlanCursor {
     QwenPlanPhase phase=QwenPlanPhase::blocks;
     std::size_t tail=0;

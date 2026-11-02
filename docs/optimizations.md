@@ -391,7 +391,7 @@ disables only stage batching; HC mask values select folds. Use explicit tiling t
 
 | Environment | Default | Off | Operator detail |
 |---|---|---|---|
-| `STRIX_QPF2K_SCHED` | `12` | `STRIX_QPF2K_SCHED=0` | [Merged tails and lazy tail owners](#qwen-schedule) |
+| `STRIX_QPF2K_SCHED` | `14` | `STRIX_QPF2K_SCHED=0` (bit 2 only: `STRIX_QPF2K_SCHED=12`) | [Merged tails, lazy tail owners and deferred block completion](#qwen-schedule) |
 | `STRIX_QPF2K_DENSE` | `1` | `STRIX_QPF2K_DENSE=0` | [Register-blocked dense projections](#qwen-dense) |
 | `STRIX_QPF2K_GDN` | `1` | `STRIX_QPF2K_GDN=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | `1` | `STRIX_QPF2K_GDN_GATES_BATCH=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
@@ -408,19 +408,34 @@ disables only stage batching; HC mask values select folds. Use explicit tiling t
 
 <a id="qwen-schedule"></a>
 
-### Merged tails and lazy tail owners
+### Merged tails, lazy tail owners and deferred block completion
 
-**Engine:** `qwen`. **Control:** `STRIX_QPF2K_SCHED=12`. **Default:** auto.
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_SCHED=14`. **Default:** auto.
 
 Bit 4 merges eligible tail work into the main arena; bit 8 allocates only the tail owners the prompt ladder uses.
+Bit 2 (SCHED bit 2, see the row below) lets a headless tiled block that another block of the same owner follows end
+without its host fence; that next block runs its completion checks before it publishes anything.
 
 - **Preconditions:** Tiled full rows; merged tails require terminal-row output and exclude the dense8 fast component. Lazy owner pruning requires a single known CLI prompt without serving, import, prefix caches, cohorts, lookup or wide-copy work.
-- **Automatic selection:** The defaults bundle supplies 12. Ineligible pruning retains the full tail-owner ladder; ineligible merging retains the configured chunks.
+- **Automatic selection:** The defaults bundle supplies 14 (bits 2, 4 and 8). Ineligible pruning retains the full tail-owner ladder; ineligible merging retains the configured chunks.
 - **Fallback notice:** No ordinary decline line. Requesting merged/balanced scheduling with dense8 throws STRIX_QPF2K_SCHED bits 4/16 (merged / balanced prefill blocks) exclude the dense8 prefill component.
 - **Exactness evidence:** The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison.
 - **Off switch:** STRIX_QPF2K_SCHED=0
 - **Measured gain:** -
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults), [chunk cursor](../src/known_prompt_chunks.cpp)
+
+#### SCHED bit 2: deferred block completion
+
+| Item | Detail |
+|---|---|
+| Default | On (part of the default `14`) on the main CLI known-prompt path |
+| Off switch | `STRIX_QPF2K_SCHED=12` (keeps bits 4 and 8) |
+| Measured gain | Plain command, tokens identical: 128K TTFT 84,132 -> 83,255 ms (-1.04 %, seven deferred blocks, release build); 32K neutral on the current route (2 x T16384, one boundary; five paired rounds -0.1 / -0.2 / +6.6 outlier / -0.7 / +0.1 %). On the earlier T8192 route: 32K 20,933 -> 20,734 ms (-0.95 %, three paired rounds) and 21,809 -> 21,396 ms (-1.9 %, n=4/5); 128K -0.8 % |
+| Exactness | Same kernels, rows and order; only the host fence moves. A failed completion check or any exception while a block is unchecked poisons the session before any output. The last block of a prompt always fences. |
+| Inert | MTP bridge, HTTP serving and cohorts never defer a block. They plan, certify and key their caches with bit 2 masked (cache-family qualification, the batch plan identity and the prefix-state storage namespace), so the default and an explicit 14 compare as 12 there and prefix-cache entries written under the former default 12 still hit. A CLI prefix-state cache run with a defaulted schedule keys the same way; a CLI run that defers binds 14. |
+| Dropped | YaRN: a defaulted schedule resolves to 12 (an explicit 14 is still refused). CLI prefix-state cache: with a defaulted schedule bit 2 is dropped for the run, so full-T boundaries stay save/resume points; an explicit 14 keeps bit 2 and those runs have no save points after a deferred block. |
+| Excluded | Baseline, `STRIX_QPF2K_DEFAULTS=0` and GSQ checkpoints (the same exclusion as the other QPF2K items); teacher-forced scoring and all-row heads (no headless block). |
+| Batch certification | Batch certification runs on the MTP bridge, where bit 2 is inert: the default and an explicit 14 certify as 12. |
 
 <a id="qwen-dense"></a>
 

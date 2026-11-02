@@ -48,6 +48,8 @@ struct KnownPromptChunkRequest {
     // Enable the incumbent deferred/merged/balanced schedule. Observers must decline
     // unsupported boundaries rather than change this numerical plan.
     bool schedule_extensions = false;
+    // STRIX_QPF2K_SCHED bit 2 (deferred block completion) for this request; false drops it (qpf2k::cli_sched_defers).
+    bool schedule_defer = true;
     // The configured tail ladder (descending) for the S3 eligibility check; empty: the set tail backends' sizes.
     std::vector<std::uint32_t> ladder_tail_rows{};
     GreedyEmissionHook emission_hook{};

@@ -293,11 +293,22 @@
     "engine": "qwen",
     "name": "QPF2K_SCHED",
     "flag_or_env": "STRIX_QPF2K_SCHED",
-    "default": "12",
+    "default": "14",
     "exact": "The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison.",
     "gain": "-",
     "preconditions": "Tiled full rows; merged tails require terminal-row output and exclude the dense8 fast component. Lazy owner pruning requires a single known CLI prompt without serving, import, prefix caches, cohorts, lookup or wide-copy work.",
     "off_switch": "STRIX_QPF2K_SCHED=0",
+    "doc_anchor": "docs/optimizations.md#qwen-schedule"
+  },
+  {
+    "engine": "qwen",
+    "name": "QPF2K_SCHED bit 2",
+    "flag_or_env": "STRIX_QPF2K_SCHED",
+    "default": "ON",
+    "exact": "Same kernels, rows and order; only the host fence of a headless tiled block moves to the next block of the same owner, which runs its completion checks before publishing anything. Plain-command interleaved runs produced identical tokens.",
+    "gain": "128K TTFT 84,132 -> 83,255 ms (-1.04%, seven deferred blocks, release build); 32K neutral on the current route (2 x T16384, one boundary); on the earlier T8192 route 32K -0.95% (three paired rounds) and -1.9% (n=4/5), 128K -0.8%",
+    "preconditions": "Main CLI known-prompt path only. Inert on the MTP bridge, HTTP serving and cohorts (cache-family qualification, batch certification, the plan identity and the prefix-state namespace use the schedule-12 equivalent there). Dropped for YaRN (a defaulted schedule resolves to 12) and for CLI prefix-state cache runs with a defaulted schedule. Excluded by baseline, STRIX_QPF2K_DEFAULTS=0 and GSQ.",
+    "off_switch": "STRIX_QPF2K_SCHED=12",
     "doc_anchor": "docs/optimizations.md#qwen-schedule"
   },
   {

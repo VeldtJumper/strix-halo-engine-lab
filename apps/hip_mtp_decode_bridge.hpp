@@ -341,8 +341,8 @@ public:
         if(pipe_mtp()) spare_hidden_=block_hidden_+buffer;
         plan_config_=tiled_.numerical_plan;
         plan_config_.rows=tiled_.rows;
-        const char* sched=std::getenv("STRIX_QPF2K_SCHED");
-        plan_config_.schedule=sched?static_cast<std::uint32_t>(std::strtoul(sched,nullptr,0)):0U;
+        // Bit 2 is inert on this route (no block is deferred): plan, batch certification and identity use 12 for 14.
+        plan_config_.schedule=qwen_bridge_plan_schedule(std::getenv("STRIX_QPF2K_SCHED"));
         const char* ts=std::getenv("STRIX_MTP_TILED_START");
         plan_config_.tiled_start=!ts || ts[0]!='0';
         plan_config_.suppressed=qpf2k::suppressed(qpf2k::Item::sched,tiled_.blocks->gsq_model());

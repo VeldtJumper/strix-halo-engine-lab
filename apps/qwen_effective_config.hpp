@@ -685,7 +685,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
             }
             try {
                 apply_default_known_prefill_tails(candidate, result.environment.contains("STRIX_QPF2K_SCHED") ?
-                    result.environment.at("STRIX_QPF2K_SCHED").c_str() : "12");
+                    result.environment.at("STRIX_QPF2K_SCHED").c_str() : "14");
                 if (candidate.known_prefix_ladder_tail_rows.empty())
                     candidate.known_prefix_ladder_tail_rows = candidate.known_prefix_tail_rows;
                 if (rows == 16384U) {
@@ -1303,7 +1303,9 @@ inline bool prepare_automatic_cache_fit(Options& o, const CacheLateFit& fit, boo
 }
 // Bind the actual runner only after OFF sizing; batch N=1 remains a batch family.
 inline void finalize_cache_family(Options& o, CacheRunner runner, std::uint32_t slots,
-    const CacheFamilyIdentity& identity={}) {
+    const CacheFamilyIdentity& resolved_identity={}) {
+    // Compare the schedule this runner executes (STRIX_QPF2K_SCHED bit 2 is inert off the CLI cursor).
+    const auto identity=effective_cache_family(resolved_identity,runner);
     auto& a=*o.cache_activation;
     a.runner=runner; a.finalized=true;
     a.context_admitted=o.context_tokens; a.slots_admitted=slots;

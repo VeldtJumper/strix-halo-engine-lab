@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/qpf2k_defaults.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -37,6 +38,16 @@ struct CacheFamilyIdentity {
         return true;
     }
 };
+// The schedule a runner actually executes: STRIX_QPF2K_SCHED bit 2 runs only on the CLI known-prompt cursor, and
+// there not with a defaulted schedule under a prefix-state cache (the only CLI case that resolves a family). Other
+// runners never defer, so bit 2 is masked before any qualification comparison; nothing is re-qualified.
+inline bool cache_runner_defers(CacheRunner runner) {
+    return runner==CacheRunner::cli && qpf2k::cli_sched_defers(true);
+}
+inline CacheFamilyIdentity effective_cache_family(CacheFamilyIdentity id, CacheRunner runner) {
+    id.scheduler.schedule=qpf2k::effective_sched(id.scheduler.schedule,cache_runner_defers(runner));
+    return id;
+}
 struct CacheQualification {
     std::string_view family, route, evidence_id;
     CacheUse use;

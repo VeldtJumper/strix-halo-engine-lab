@@ -1104,10 +1104,69 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         {"STRIX_QPF2K_HC_OUTPUT3_BAND","16"}, {"STRIX_QPF2K_MOE_DA16","1"},
         {"STRIX_QPF2K_MOE_DEFAULTED","3"}, {"STRIX_QPF2K_MOE_ROUTE","14"},
         {"STRIX_QPF2K_QSA","1"}, {"STRIX_QPF2K_QSA_MASK","0x2257"},
-        {"STRIX_QPF2K_SCHED","12"}};
+        {"STRIX_QPF2K_SCHED","14"}};
     expect(startup.environment == recorded_startup, "YaRN exact recorded startup environment");
-    expect(resolve(startup,memory).admitted && !resolve(startup,memory).admission.empty(),
-        "YaRN exact resolver startup environment reaches full admission");
+    // The binary never passes pre-injected startup values as requested ones (requested_prefill_environment):
+    // YaRN re-injects the defaults and keeps a defaulted schedule at its audited 12.
+    auto startup_request = startup;
+    startup_request.environment.erase("STRIX_QPF2K_SCHED");
+    {
+        const auto resolved = resolve(startup_request,memory);
+        expect(resolved.admitted && !resolved.admission.empty() &&
+            resolved.environment.at("STRIX_QPF2K_SCHED") == "12" &&
+            resolved.sources.at("STRIX_QPF2K_SCHED") == OptionSource::automatic,
+            "YaRN exact resolver startup environment reaches full admission with the defaulted schedule at 12");
+        const auto plain = resolve(request,memory);
+        expect(plain.admitted && plain.environment.at("STRIX_QPF2K_SCHED") == "12",
+            "YaRN with the default schedule resolves to 12, not the native default 14");
+    }
+    // The recorded startup environment as a restarted image sees it: eager code loading re-executes the process
+    // before undo_pre_injected, so the new image inherits every injected value. The startup marker hands their
+    // provenance over; the binary's capture still excludes them and YaRN resolves the defaulted schedule to 12.
+    {
+        const auto saved_injected = qpf2k::pre_injected, saved_defaulted = qpf2k::defaulted_items;
+        const auto saved_marker = qpf2k::pre_injected_moe_marker;
+        const auto get_in = [](const Environment& env) {
+            return [&env](const char* name) -> const char* {
+                const auto it = env.find(name);
+                return it == env.end() ? nullptr : it->second.c_str();
+            };
+        };
+        const auto put_in = [](Environment& env) {
+            return [&env](const char* name, const char* value) { return env.emplace(name,value).second; };
+        };
+        auto parent = request.environment;
+        qpf2k::pre_injected = qpf2k::defaulted_items = 0U; qpf2k::pre_injected_moe_marker = false;
+        qpf2k::initialize_before_main(get_in(parent),put_in(parent));
+        const auto parent_injected = qpf2k::pre_injected;
+        auto child = parent; // execv hands the environment over unchanged
+        qpf2k::pre_injected = qpf2k::defaulted_items = 0U; qpf2k::pre_injected_moe_marker = false;
+        qpf2k::initialize_before_main(get_in(child),put_in(child));
+        expect(child == parent && qpf2k::pre_injected == parent_injected && qpf2k::pre_injected_moe_marker &&
+            (qpf2k::pre_injected & qpf2k::bit(qpf2k::Item::sched)) && qpf2k::defaulted_items == parent_injected,
+            "restarted image keeps the startup injections as defaulted");
+        auto restarted = startup;
+        restarted.environment = requested_prefill_environment(get_in(child));
+        expect(!restarted.environment.contains("STRIX_QPF2K_SCHED") &&
+            !restarted.environment.contains("STRIX_QPF2K_MOE_DEFAULTED") &&
+            !restarted.environment.contains(qpf2k::pre_injected_env), "restarted capture excludes startup injections");
+        const auto resolved = resolve(restarted,memory);
+        expect(resolved.admitted && !resolved.admission.empty() &&
+            resolved.environment.at("STRIX_QPF2K_SCHED") == "12" &&
+            resolved.sources.at("STRIX_QPF2K_SCHED") == OptionSource::automatic &&
+            resolved.sources.at("STRIX_QPF2K_MOE_DEFAULTED") == OptionSource::automatic,
+            "YaRN after an image restart resolves the defaulted schedule to 12, not a refusal");
+        qpf2k::pre_injected = saved_injected; qpf2k::defaulted_items = saved_defaulted;
+        qpf2k::pre_injected_moe_marker = saved_marker;
+    }
+    // An explicit 14 (the native default's value, requested by name) is still refused, as before.
+    {
+        auto explicit_14 = request;
+        explicit_14.environment["STRIX_QPF2K_SCHED"] = "14";
+        const auto refused = resolve(explicit_14,memory);
+        expect(!refused.admitted && refused.error == "YaRN requires STRIX_QPF2K_SCHED=12; got 14",
+            "YaRN refuses an explicit STRIX_QPF2K_SCHED=14");
+    }
     for (const auto& item : qpf2k::defaults) {
         expect(yarn_environment_path(item.item) != YarnEnvironmentPath::uncovered_rotary,
             "every resolver item has an audited rotary classification");
@@ -2942,7 +3001,7 @@ int main(int argc, char** arguments) {
     expect(!automatic.options.mtp.enabled && !automatic.options.prepared_eager && !automatic.options.moe_shared_overlap &&
         !automatic.options.gdn_islands, "prefill organization does not enable speculation, prepared overlap or islands");
     expect(automatic.options.known_prefix_tail_rows.empty() && automatic.options.known_prefix_ladder_tail_rows ==
-        std::vector<std::uint32_t>({1024U,256U,64U,16U}), "SCHED=12 retains configured ladder and prunes unused owners");
+        std::vector<std::uint32_t>({1024U,256U,64U,16U}), "default SCHED (bit 8) retains configured ladder and prunes unused owners");
     const auto json = effective_config_json(automatic);
     expect(json.starts_with("{\"rotary\":{\"rope_mode\":\"native\",\"factor\":0,"),
         "effective-config inspection golden deliberately includes native rotary status; numerical identity unchanged");
@@ -4312,6 +4371,28 @@ int main(int argc, char** arguments) {
             return row.matches(CacheRunner::single_mtp,1,16384,2048,id);
         };
         expect(match(row.identity),"single family exact identity matches");
+        {
+            // STRIX_QPF2K_SCHED bit 2 is inert on this route (the MTP bridge never defers a block): the default 14 and
+            // an explicit 14 compare as 12; an explicit 13 still differs. Nothing is re-qualified.
+            const auto saved=qpf2k::defaulted_items;
+            for(const unsigned defaulted:{qpf2k::bit(qpf2k::Item::sched),0U}) {
+                qpf2k::defaulted_items=defaulted;
+                auto id=row.identity; id.scheduler.schedule=14;
+                expect(!match(id),"raw schedule 14 differs from the qualified identity");
+                for(const auto runner:{CacheRunner::single_mtp,CacheRunner::batch_mtp,CacheRunner::target})
+                    expect(effective_cache_family(id,runner).scheduler.schedule==12,"non-deferring runners mask bit 2");
+                expect(match(effective_cache_family(id,CacheRunner::single_mtp)),
+                    defaulted?"default schedule 14 is admitted as 12 on the HTTP prefix-cache route":
+                        "explicit schedule 14 is admitted on the HTTP prefix-cache route (bit 2 inert)");
+                id.scheduler.schedule=13;
+                expect(!match(effective_cache_family(id,CacheRunner::single_mtp)),"explicit schedule 13 still declines");
+                // CLI: a defaulted schedule drops bit 2 with a prefix cache; an explicit 14 keeps it.
+                id.scheduler.schedule=14;
+                expect(effective_cache_family(id,CacheRunner::cli).scheduler.schedule==(defaulted?12U:14U),
+                    "CLI family records the schedule the cached run executes");
+            }
+            qpf2k::defaulted_items=saved;
+        }
         const auto mismatch=[&](const CacheFamilyIdentity& id) { expect(!match(id),"changed identity cannot match single family"); };
         { auto id=row.identity; id.model+="-mismatch"; mismatch(id); }
         { auto id=row.identity; id.layout+="-mismatch"; mismatch(id); }
@@ -4434,6 +4515,27 @@ int main(int argc, char** arguments) {
                 "prompt observer declines production family by name");
             ::unsetenv(name);
             expect(cache_family_execution_signature(cli,false,false)==off,"unset production identity is stable");
+            if(saved) ::setenv(name,saved->c_str(),1);else ::unsetenv(name);
+        }
+        {
+            // STRIX_QPF2K_SCHED bit 2 on a runner that never defers: the numerical contract binds the executed
+            // schedule, so 14 there equals 12 (the qualified contract); 13 and a deferring runner still differ.
+            const char* name="STRIX_QPF2K_SCHED";
+            const char* old=std::getenv(name);
+            const std::optional<std::string> saved=old?std::optional<std::string>(old):std::nullopt;
+            const auto cli=cache_family_execution_cli(candidate());
+            ::setenv(name,"12",1);
+            const auto twelve=cache_family_execution_signature(cli,false,false,{},false);
+            expect(twelve==cache_family_execution_signature(cli,false,false),"schedule 12 has no bit 2 to mask");
+            ::setenv(name,"14",1);
+            expect(cache_family_execution_signature(cli,false,false,{},false)==twelve,
+                "schedule 14 on a non-deferring runner has the schedule-12 numerical contract");
+            expect(cache_family_execution_signature(cli,false,false,{},true)!=twelve,
+                "a deferring runner binds schedule 14");
+            ::setenv(name,"13",1);
+            expect(cache_family_execution_signature(cli,false,false,{},false)!=twelve,"schedule 13 still differs");
+            expect(!cache_runner_defers(CacheRunner::single_mtp) && !cache_runner_defers(CacheRunner::batch_mtp) &&
+                !cache_runner_defers(CacheRunner::target),"HTTP/MTP runners never defer");
             if(saved) ::setenv(name,saved->c_str(),1);else ::unsetenv(name);
         }
 #endif

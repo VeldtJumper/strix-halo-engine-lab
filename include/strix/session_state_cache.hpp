@@ -2,6 +2,7 @@
 // Versioned complete-session envelope layered on PrefixStateCache buffers/accounting.
 #include "strix/prefix_state_cache.hpp"
 #include "strix/rotary_descriptor.hpp"
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -49,8 +50,14 @@ struct SessionIoStats { std::uint64_t bytes = 0; double read_verify_ms = 0, writ
 [[nodiscard]] ModelContentIdentity session_cached_file_hash(const std::filesystem::path&, std::optional<ModelContentIdentity> known_full_digest = std::nullopt);
 // Canonical STRIX_*, HIP_*, HSA_*, AMD_*, ROCR_*, GPU_* environment values plus caller's effective CLI/compiled plan record.
 [[nodiscard]] std::string session_numerical_config(std::string_view effective_cli, const RotaryIdentity& rotary = {});
+// The same, with each "NAME=VALUE" of `replace` standing for the process's NAME entry (the value the route executes).
+[[nodiscard]] std::string session_numerical_config(std::string_view effective_cli, const RotaryIdentity& rotary,
+    std::span<const std::string> replace);
 // Qualification only: storage/certificate callers continue using the unfiltered function.
 [[nodiscard]] std::string session_family_numerical_config(std::string_view effective_cli, const RotaryIdentity& rotary = {});
+// The same, with each "NAME=VALUE" of `replace` standing for the process's NAME entry (the value the route executes).
+[[nodiscard]] std::string session_family_numerical_config(std::string_view effective_cli, const RotaryIdentity& rotary,
+    std::span<const std::string> replace);
 [[nodiscard]] PrefixCacheBuffer encode_session_checkpoint(const SessionCheckpoint&, const PrefixCacheAllocator&);
 // All checks complete before this returns. expected mismatch throws; lookup wrapper returns null.
 [[nodiscard]] SessionCheckpoint decode_session_checkpoint(const PrefixCacheBuffer&, const SessionCompatibility& expected);

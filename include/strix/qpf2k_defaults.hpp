@@ -6,6 +6,8 @@
 #include <array>
 #include <cstdlib>
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 namespace strix::qpf2k {
 
@@ -21,7 +23,7 @@ struct Default {
     const char* value;
 };
 inline constexpr std::array defaults{
-    Default{Item::sched, "STRIX_QPF2K_SCHED", "12"},
+    Default{Item::sched, "STRIX_QPF2K_SCHED", "14"},
     Default{Item::dense, "STRIX_QPF2K_DENSE", "1"},
     Default{Item::gdn, "STRIX_QPF2K_GDN", "1"},
     Default{Item::gdn_gates_batch, "STRIX_QPF2K_GDN_GATES_BATCH", "1"},
@@ -64,6 +66,19 @@ inline bool baseline = false;
 inline thread_local bool gsq_model = false;
 inline bool suppressed(Item item, bool gsq = gsq_model) noexcept {
     return baseline || (gsq && (defaulted_items & bit(item)) != 0U);
+}
+// STRIX_QPF2K_SCHED bit 2 (a headless tiled block ends without its host fence; the next block of the owner runs its
+// completion checks) executes only on the main CLI known-prompt cursor (KnownPromptChunkRequest::schedule_extensions).
+// Elsewhere (MTP bridge, HTTP serving, cohorts) it is inert: a route compares and records the schedule it actually
+// runs, so the default 14 is 12 there, and an explicit 14 is too.
+inline constexpr std::uint64_t sched_defer_bit = 2U;
+constexpr std::uint64_t effective_sched(std::uint64_t value, bool defers) noexcept {
+    return defers ? value : value & ~sched_defer_bit;
+}
+// A deferred block is never a prefix-cache save/resume boundary. With a CLI prefix-state cache and a DEFAULTED
+// schedule, bit 2 is dropped for the run (the cache keeps its boundaries); an explicit value keeps its meaning.
+inline bool cli_sched_defers(bool prefix_cache) noexcept {
+    return !(prefix_cache && (defaulted_items & bit(Item::sched)) != 0U);
 }
 // Code-default exact long-context items (STRIX_QSA_UNION_MERGE, STRIX_QSA_SCORE_ROWS64, STRIX_QSA_DECODE_POOL,
 // STRIX_QSA_DECODE_SELECT, STRIX_QSA_DECODE_POOL_BF16, STRIX_PREFILL_MOE_MERGE_VEC): on unless their variable is "0", the baseline is requested, STRIX_QPF2K_DEFAULTS=0, or the
@@ -148,18 +163,55 @@ inline constexpr unsigned exact_prefill_items = bit(Item::score_rows) | bit(Item
 // launchers (including serving/MTP priming); defer them too, preserving fixture defaults.
 // HC_LOWBAND also waits for decoder admission; its route guard retains unsupported layouts.
 inline constexpr unsigned startup_items = historical_items | bit(Item::ple_reclaim);
+// Startup injection writes into the real environment, so a process that re-executes itself before
+// undo_pre_injected (eager code loading restarts the image) hands its injected values to the new image, which
+// would find them set and treat them as user values. This marker carries the injected set (items, plus
+// pre_injected_marker_moe for STRIX_QPF2K_MOE_DEFAULTED) across execv, like STRIX_QPF2K_MOE_DEFAULTED carries
+// the MoE provenance; the new image restores provenance only for items whose value still equals the default.
+// Internal provenance, not an execution control: identities and environment sweeps skip it, and
+// undo_pre_injected erases it with the values.
+inline constexpr const char* pre_injected_env = "STRIX_QPF2K_PRE_INJECTED";
+inline constexpr unsigned pre_injected_marker_moe = 1U << 31;
+static_assert(defaults.size() < 31U);
+template<class Get>
+unsigned carried_pre_injected(Get get, unsigned allowed) {
+    const char* text = get(pre_injected_env);
+    if (!text || !*text) return 0U;
+    char* end = nullptr;
+    const auto value = std::strtoul(text, &end, 10);
+    if (!end || *end || value > 0xffffffffUL) return 0U;
+    unsigned carried = 0U;
+    for (const auto& entry : defaults) {
+        if (!(value & bit(entry.item)) || !(allowed & bit(entry.item))) continue;
+        const char* current = get(entry.name);
+        if (current && std::string_view(current) == entry.value) carried |= bit(entry.item);
+    }
+    if ((value & pre_injected_marker_moe) && get("STRIX_QPF2K_MOE_DEFAULTED")) carried |= pre_injected_marker_moe;
+    return carried;
+}
 template<class Get, class Put>
 void initialize_before_main(Get get, Put put) {
     const bool had_marker = get("STRIX_QPF2K_MOE_DEFAULTED") != nullptr;
+    // Read before initialize: a marker counts only where defaults are enabled (initialize returns early otherwise).
+    const unsigned carried = carried_pre_injected(get, startup_items);
     pre_injected = initialize(get, put, startup_items);
-    defaulted_items |= pre_injected;
     pre_injected_moe_marker = !had_marker && get("STRIX_QPF2K_MOE_DEFAULTED");
+    const bool enabled = !baseline && !(get("STRIX_BASELINE") && std::string_view(get("STRIX_BASELINE")) == "1") &&
+        !(get("STRIX_QPF2K_DEFAULTS") && get("STRIX_QPF2K_DEFAULTS")[0] == '0');
+    if (enabled) {
+        pre_injected |= carried & ~pre_injected_marker_moe;
+        pre_injected_moe_marker = pre_injected_moe_marker || (carried & pre_injected_marker_moe) != 0U;
+    }
+    defaulted_items |= pre_injected;
+    if (pre_injected || pre_injected_moe_marker)
+        put(pre_injected_env, std::to_string(pre_injected | (pre_injected_moe_marker ? pre_injected_marker_moe : 0U)).c_str());
 }
 template<class Erase>
 void undo_pre_injected(Erase erase) {
     for (const auto& entry : defaults)
         if (pre_injected & bit(entry.item)) erase(entry.name);
     if (pre_injected_moe_marker) erase("STRIX_QPF2K_MOE_DEFAULTED");
+    erase(pre_injected_env);
     pre_injected = defaulted_items = 0U;
     pre_injected_moe_marker = false;
     baseline = true;

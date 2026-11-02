@@ -165,6 +165,14 @@ try {
             require(qwen_batch_capture_eligible(facts,schedule,unit,t,true,true,partial?128U:t,nest)==
                 (!mask && (!partial || !nest)),"batch eligibility truth table");
         }
+        // HTTP/MTP bridge: bit 2 is inert there, so the default 14 (and an explicit 14) plans, certifies and captures
+        // as 12; only the CLI cursor's explicit bit 2 keeps the sched-bit-2 decline.
+        require(qwen_bridge_plan_schedule("14")==12U && qwen_bridge_plan_schedule("12")==12U &&
+            qwen_bridge_plan_schedule("13")==13U && qwen_bridge_plan_schedule("0x1e")==28U && qwen_bridge_plan_schedule(nullptr)==0U,
+            "bridge plan schedule masks only bit 2");
+        require(std::string_view(cfg.decline(14))=="sched-bit-2" && cfg.allowed(qwen_bridge_plan_schedule("14")) &&
+            qwen_batch_capture_eligible(cfg,qwen_bridge_plan_schedule("14"),trace.back(),t,true,true,t,false),
+            "HTTP batch certification admits the default schedule");
         require(!qwen_batch_capture_eligible(cfg,12,trace.back(),t,false,true,t,false),"unobserved prefix refused");
         require(!qwen_batch_capture_eligible(cfg,12,trace.back(),t,true,false,128,false),"foreign next owner refused");
         // Actual T=8192 nesting hazard; T=2048 has no nested row class.

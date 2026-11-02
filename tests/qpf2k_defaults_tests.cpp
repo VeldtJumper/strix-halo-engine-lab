@@ -3,7 +3,9 @@
 #include "strix/known_prompt_chunks.hpp"
 #include "strix/q51_known_rows.hpp"
 #include "hip_decode_options.hpp"
+#include "qwen_prefill_options.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -11,8 +13,13 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
+#if defined(__linux__)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace {
 using namespace strix;
@@ -215,6 +222,165 @@ void schedule_tests() {
     qpf2k::defaulted_items = all;
 }
 
+void sched_defer_tests() {
+    // STRIX_QPF2K_SCHED default 14 = bit 2 (deferred block completion) + the historical bits 4 and 8.
+    const auto entry = std::find_if(qpf2k::defaults.begin(), qpf2k::defaults.end(),
+        [](const auto& d) { return d.item == qpf2k::Item::sched; });
+    expect(entry != qpf2k::defaults.end() && std::string_view(entry->value) == "14", "SCHED default is 14");
+    expect(qpf2k::effective_sched(14U, true) == 14U && qpf2k::effective_sched(14U, false) == 12U &&
+        qpf2k::effective_sched(12U, false) == 12U && qpf2k::effective_sched(13U, false) == 13U &&
+        qpf2k::effective_sched(15U, false) == 13U, "only bit 2 is masked where it cannot run");
+    const auto saved = qpf2k::defaulted_items;
+    qpf2k::defaulted_items = qpf2k::bit(qpf2k::Item::sched);
+    expect(!qpf2k::cli_sched_defers(true) && qpf2k::cli_sched_defers(false),
+        "a defaulted schedule drops bit 2 only for a CLI prefix-state cache run");
+    qpf2k::defaulted_items = 0U;
+    expect(qpf2k::cli_sched_defers(true) && qpf2k::cli_sched_defers(false), "an explicit schedule keeps bit 2");
+    qpf2k::defaulted_items = saved;
+}
+
+// Eager code loading restarts the image (execv) after the static initializer injected its startup defaults into
+// the real environment and before undo_pre_injected: the new image must still see those values as defaulted.
+void reexec_handoff_tests() {
+    const auto saved_injected = qpf2k::pre_injected, saved_defaulted = qpf2k::defaulted_items;
+    const auto saved_marker = qpf2k::pre_injected_moe_marker;
+    const auto fresh_image = [] {
+        qpf2k::pre_injected = qpf2k::defaulted_items = 0U; qpf2k::pre_injected_moe_marker = false; qpf2k::baseline = false;
+    };
+    const auto start = [](Environment& env) {
+        qpf2k::initialize_before_main([&](const char* name) -> const char* {
+            const auto it = env.find(name);
+            return it == env.end() ? nullptr : it->second.c_str();
+        }, [&](const char* name, const char* value) { return env.emplace(name, value).second; });
+    };
+    // Explicit values, one of them equal to its default: neither may become defaulted in either image.
+    const Environment user{{"STRIX_QPF2K_DENSE", "0"}, {"STRIX_QPF2K_GDN", "1"}};
+    auto parent = user;
+    fresh_image(); start(parent);
+    const auto injected = qpf2k::pre_injected;
+    expect((injected & qpf2k::bit(qpf2k::Item::sched)) && !(injected & qpf2k::bit(qpf2k::Item::dense)) &&
+        !(injected & qpf2k::bit(qpf2k::Item::gdn)) && injected == (qpf2k::startup_items &
+        ~qpf2k::bit(qpf2k::Item::dense) & ~qpf2k::bit(qpf2k::Item::gdn)) && qpf2k::pre_injected_moe_marker,
+        "parent image injects every startup item the user left unset");
+    expect(parent.at(qpf2k::pre_injected_env) == std::to_string(injected | qpf2k::pre_injected_marker_moe),
+        "parent image records the injected set for a restart");
+    // execv: the new image starts from the parent's environment, its own globals fresh.
+    auto child = parent;
+    fresh_image(); start(child);
+    expect(child == parent, "restarted image injects nothing new");
+    expect(qpf2k::pre_injected == injected && qpf2k::defaulted_items == injected && qpf2k::pre_injected_moe_marker,
+        "restarted image restores every injected item and the MoE marker as defaulted");
+    for (const auto& entry : qpf2k::defaults)
+        if (injected & qpf2k::bit(entry.item))
+            expect(child.at(entry.name) == entry.value, "restarted image runs the default values");
+    expect(child.at("STRIX_QPF2K_SCHED") == "14" && child.at("STRIX_QPF2K_DENSE") == "0" && child.at("STRIX_QPF2K_GDN") == "1",
+        "effective values are unchanged by the restart");
+    expect(!qpf2k::cli_sched_defers(true) && qpf2k::cli_sched_defers(false),
+        "restarted CLI prefix-state cache run still drops the defaulted bit 2");
+    {
+        const qpf2k::ModelScope gsq(true);
+        expect(qpf2k::suppressed(qpf2k::Item::sched) && qpf2k::suppressed(qpf2k::Item::hc) &&
+            !qpf2k::suppressed(qpf2k::Item::dense) && !qpf2k::suppressed(qpf2k::Item::gdn),
+            "restarted GSQ owner excludes exactly the injected items");
+    }
+    // Without the marker the restarted image would treat every injected value as a user value (the bug).
+    {
+        auto lost = parent; lost.erase(qpf2k::pre_injected_env);
+        fresh_image(); start(lost);
+        expect(qpf2k::pre_injected == 0U && !qpf2k::pre_injected_moe_marker, "the marker is what carries provenance");
+    }
+    // A value changed after injection is no longer the default: it is not carried.
+    {
+        auto changed = parent; changed["STRIX_QPF2K_SCHED"] = "12";
+        fresh_image(); start(changed);
+        expect(qpf2k::pre_injected == (injected & ~qpf2k::bit(qpf2k::Item::sched)),
+            "only items still at their default value are carried");
+    }
+    // Defaults off or baseline in the restarted image: nothing is carried.
+    for (const auto& [name, value] : {std::pair{"STRIX_QPF2K_DEFAULTS", "0"}, std::pair{"STRIX_BASELINE", "1"}}) {
+        auto off = parent; off[name] = value;
+        fresh_image(); start(off);
+        expect(qpf2k::pre_injected == 0U && qpf2k::defaulted_items == 0U && !qpf2k::pre_injected_moe_marker,
+            "defaults-off and baseline restarts carry nothing");
+    }
+    // Malformed markers carry nothing.
+    for (const auto* bad : {"", "x", "12x", "-1", "99999999999999999999"}) {
+        auto forged = parent; forged[qpf2k::pre_injected_env] = bad;
+        fresh_image(); start(forged);
+        expect(qpf2k::pre_injected == 0U, "a malformed marker carries nothing");
+    }
+    // The restarted image undoes its injections exactly like the parent would, marker included.
+    fresh_image(); start(child);
+    qpf2k::undo_pre_injected([&](const char* name) { child.erase(name); });
+    expect(child == user && qpf2k::pre_injected == 0U && qpf2k::defaulted_items == 0U,
+        "restarted image unsets exactly the startup injections and the marker");
+    qpf2k::baseline = false;
+    qpf2k::pre_injected = saved_injected; qpf2k::defaulted_items = saved_defaulted;
+    qpf2k::pre_injected_moe_marker = saved_marker;
+}
+
+#if defined(__linux__)
+// The real restart, in the real process environment: the startup callbacks of src/hip_known_prefix_window.hip, then
+// the eager-code-load policy and the execv of apps/hip_decode_token_main.cpp (run_decode_entry), which hands the new
+// image this process's environ. The new image (--reexec-child) repeats both and reports its provenance.
+const char* const reexec_child_flag = "--reexec-child";
+int reexec_child() {
+    qpf2k::initialize_before_main([](const char* name) { return std::getenv(name); },
+        [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+    const bool restarts_again = decode_cli::apply_eager_code_loading(true, [](const char* name) { return std::getenv(name); },
+        [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+    const char* sched = std::getenv("STRIX_QPF2K_SCHED");
+    std::cout << qpf2k::pre_injected << ' ' << qpf2k::defaulted_items << ' ' << qpf2k::pre_injected_moe_marker << ' '
+              << restarts_again << ' ' << (sched ? sched : "-") << '\n';
+    return 0;
+}
+// Returns the new image's report; `drop_marker` reproduces the restart without the handoff.
+std::string real_restart(const char* self, bool drop_marker) {
+    int out[2];
+    expect(::pipe(out) == 0, "restart pipe");
+    const pid_t pid = ::fork();
+    expect(pid >= 0, "restart fork");
+    if (pid == 0) {
+        // A clean startup environment except two explicit values (one equal to its default).
+        for (const auto& entry : qpf2k::defaults) ::unsetenv(entry.name);
+        for (const char* name : {"STRIX_QPF2K_MOE_DEFAULTED", qpf2k::pre_injected_env, "STRIX_QPF2K_DEFAULTS", "STRIX_BASELINE",
+                "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING"}) ::unsetenv(name);
+        ::setenv("STRIX_QPF2K_DENSE", "0", 1); ::setenv("STRIX_QPF2K_GDN", "1", 1);
+        qpf2k::pre_injected = qpf2k::defaulted_items = 0U; qpf2k::pre_injected_moe_marker = false; qpf2k::baseline = false;
+        qpf2k::initialize_before_main([](const char* name) { return std::getenv(name); },
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+        const bool restart = decode_cli::apply_eager_code_loading(true, [](const char* name) { return std::getenv(name); },
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+        const char* marker = std::getenv(qpf2k::pre_injected_env);
+        const bool carried = restart && marker && std::string_view(marker) ==
+            std::to_string(qpf2k::pre_injected | qpf2k::pre_injected_marker_moe);
+        if (!carried) ::_exit(3);
+        if (drop_marker) ::unsetenv(qpf2k::pre_injected_env);
+        ::dup2(out[1], 1); ::close(out[0]); ::close(out[1]);
+        char* const arguments[] = {const_cast<char*>(self), const_cast<char*>(reexec_child_flag), nullptr};
+        ::execv("/proc/self/exe", arguments);
+        ::_exit(4);
+    }
+    ::close(out[1]);
+    std::string report;
+    char buffer[256];
+    for (ssize_t n; (n = ::read(out[0], buffer, sizeof buffer)) > 0;) report.append(buffer, static_cast<std::size_t>(n));
+    ::close(out[0]);
+    int status = 0;
+    expect(::waitpid(pid, &status, 0) == pid && WIFEXITED(status), "restart child exits");
+    expect(WEXITSTATUS(status) != 3, "the parent environment execv passes carries STRIX_QPF2K_PRE_INJECTED");
+    expect(WEXITSTATUS(status) == 0, "restarted image ran");
+    return report;
+}
+void real_restart_tests(const char* self) {
+    const unsigned injected = qpf2k::startup_items & ~qpf2k::bit(qpf2k::Item::dense) & ~qpf2k::bit(qpf2k::Item::gdn);
+    const auto expected = std::to_string(injected) + ' ' + std::to_string(injected) + " 1 0 14\n";
+    expect(real_restart(self, false) == expected,
+        "after the real execv the new image keeps every startup injection and the MoE marker defaulted, and does not restart again");
+    expect(real_restart(self, true) == "0 0 0 0 14\n", "without the marker the new image would see user values");
+}
+#endif
+
 class EnvSetting {
 public:
     explicit EnvSetting(const char* name) : name_(name) {
@@ -391,6 +557,9 @@ void ple_reclaim_tests() {
 }
 } // namespace
 int main(int argc, char** argv) {
+#if defined(__linux__)
+    if (argc == 2 && std::string_view(argv[1]) == reexec_child_flag) return reexec_child();
+#endif
     if (argc == 2) {
         const bool first_gsq = std::string(argv[1]) == "--gsq-first";
         const EnvSetting parent("STRIX_DISPATCH_FUSE"), inject("STRIX_WINDOW_INJECT_NORM"),
@@ -416,7 +585,11 @@ int main(int argc, char** argv) {
     for (const auto& entry : qpf2k::defaults)
         expect(qpf2k::suppressed(entry.item, false), "baseline suppresses cached controlled settings for ordinary owners too");
     qpf2k::baseline = false;
-    try { policy_tests(); schedule_tests(); ple_reclaim_tests(); }
+    try { policy_tests(); schedule_tests(); sched_defer_tests(); reexec_handoff_tests();
+#if defined(__linux__)
+          real_restart_tests(argv[0]);
+#endif
+          ple_reclaim_tests(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     std::cout << "qpf2k default qualification tests passed\n";
 }
