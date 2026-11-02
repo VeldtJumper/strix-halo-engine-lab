@@ -47,7 +47,11 @@ struct Stream final : e::StreamState {
     std::vector<std::uint64_t> hashes{0x1234567ULL};
     std::unique_ptr<g::KvTxn> begin() override { return std::make_unique<Txn>(this, hashes.size()-1); }
     std::uint64_t frontier() const override { return hashes.size()-1; }
-    std::string digest() const override { return std::to_string(hashes.back()); }
+    bool poisoned = false; // as a device stream after a failed pass: no canonical state to hash
+    std::string digest() const override {
+        if (poisoned) throw std::runtime_error("failed stream has no canonical state");
+        return std::to_string(hashes.back());
+    }
     std::unique_ptr<e::StreamState> fork(std::uint32_t) const override {
         auto out = std::make_unique<Stream>();
         out->hashes = hashes;
@@ -68,6 +72,7 @@ struct Backend final : e::Backend {
     bool same = true;
     std::uint32_t salt = 0;
     std::atomic<std::uint64_t> passes{0}, max_rows{0};
+    std::atomic<int> fail_in{-1}; // > 0: the fail_in-th next pass fails and poisons its streams
     std::uint32_t pick(std::uint64_t h) const { return h % 37 == 0 ? stop : words[h % words.size()]; }
     std::uint64_t row_hash(Txn& tx, std::uint64_t position, std::uint32_t token) const {
         if (position != tx.start + tx.tokens.size()) throw std::runtime_error("fake rows must be contiguous");
@@ -79,6 +84,10 @@ struct Backend final : e::Backend {
     std::unique_ptr<e::StreamState> create_stream() override { return std::make_unique<Stream>(); }
     g::ForwardResult forward_rows(std::span<const g::RowPlan> plans) override {
         ++passes;
+        if (fail_in > 0 && --fail_in == 0) {
+            for (const auto& p : plans) static_cast<Txn*>(p.transaction)->s->poisoned = true;
+            throw std::runtime_error("injected device failure");
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(500)); // lets concurrent requests overlap
         if (plans.size() > max_rows) max_rows = plans.size();
         g::ForwardResult f;
@@ -265,6 +274,19 @@ int main(int argc, char** argv) {
         }
         set_env("STRIX_G4_SERVE_PREFILL_ROWS", nullptr);
         backend.same = true; backend.salt = 0;
+        // A failed pass fails its requests cleanly (no state hash of a poisoned stream) and the server keeps serving.
+        {
+            e::Api api(backend, tokenizer);
+            backend.fail_in = 3;
+            strix::serve::HttpRequest req; req.method = "POST"; req.path = "/v1/chat/completions";
+            req.body = chat("Hello there.", R"(,"max_tokens":16)");
+            Writer failed; api.handle(req, failed);
+            CHECK(failed.status == 500 && failed.body.find("injected device failure") != std::string::npos);
+            backend.fail_in = -1;
+            Writer next; api.handle(req, next);
+            CHECK(next.status == 200);
+        }
+        std::cout << "PASS serve failure: a failed pass fails its request, the next request is served\n";
         std::string doc;
         for (int i = 0; i < 20; ++i) doc += "Line " + std::to_string(i) + " of a shared report about bridges. ";
         const std::vector<std::string> questions = {"Hello there.", doc + "Summarize it.", "Write a haiku.", doc + "List the lines."};

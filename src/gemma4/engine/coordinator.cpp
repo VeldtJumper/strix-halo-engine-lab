@@ -559,7 +559,9 @@ bool Coordinator::step() {
             if (s->draft) s->draft->discard();
             if (s->out.status != Status::running) continue;
             s->out.status = Status::failed; s->out.error = e.what();
-            s->out.frontier = s->state->frontier(); s->out.digest = s->state->digest();
+            s->out.frontier = s->state->frontier();
+            // A stream poisoned by the failure has no canonical state to hash; the request still fails cleanly.
+            try { s->out.digest = s->state->digest(); } catch (const std::exception&) { s->out.digest.clear(); }
         }
     }
     return true;
