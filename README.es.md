@@ -246,6 +246,18 @@ Los logits y los 32 ids generados son iguales a las referencias publicadas en la
 turno de GPU o turnos separados, una carga por brazo): MoE v2 −5.9 / −6.9 / −8.0 %, lectura anticipada de Engram
 −3.3 % con 32,499 y −2.8 % con 44,699 tokens, atención «lean» −1.4 a −2.4 %.
 
+También **activado por defecto**: el cono del decodificador diferido de las piezas de prefill no finales
+(`STRIX_DS41_DEFER_DECODER=0` para desactivarlo). Las piezas anteriores de un prompt largo ya no ejecutan el cono de
+las capas del decodificador; la última pieza construye todo lo que necesita el decode. Mismos logits e ids generados.
+TTFT del servidor, un cliente, caché desactivada, prompts en inglés en frío, 2 nodos, perfil predeterminado, media de
+dos turnos de GPU por brazo:
+
+| Prompt | Palanca desactivada | Ahora | Cambio |
+|---|---:|---:|---:|
+| 8,399 tokens (una pieza) | 8.30 s | **8.19 s** | - |
+| 32,499 tokens (dos piezas) | 29.90 s | **28.92 s** | −3.3 % |
+| 44,699 tokens (tres piezas) | 43.07 s | **40.51 s** | −5.9 % |
+
 `--profile fast` activa la palanca MoE de orden relajado `STRIX_DS41_FAST_MOE=1`: **8.53 / 29.24 / 41.90 s** con los
 mismos prompts. Cambia los logits; su cualificación de calidad está en curso, y `default` no cambia.
 

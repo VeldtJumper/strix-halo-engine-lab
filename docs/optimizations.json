@@ -1039,6 +1039,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Deferred decoder cone of non-final prefill pieces",
+    "flag_or_env": "STRIX_DS41_DEFER_DECODER",
+    "default": "on",
+    "exact": "Bitwise: two-node serve logits and generated ids identical to the published references at 8,399 / 32,499 / 44,699 tokens with the lever on and off, and on/off identical for a prompt whose short last piece is not admitted.",
+    "gain": "Two-node serve TTFT, two GPU turns per arm: 8.30 / 29.90 / 43.07 s off vs 8.19 / 28.92 / 40.51 s on at 8,399 / 32,499 / 44,699 tokens (-3.3 % at 32,499, -5.9 % at 44,699).",
+    "preconditions": "Two-node server device prefill of more than one piece, full layer set with the cone.",
+    "off_switch": "STRIX_DS41_DEFER_DECODER=0",
+    "doc_anchor": "docs/optimizations.md#ds-defer-decoder"
+  },
+  {
+    "engine": "deepseek",
     "name": "Split Engram read of a prefill piece",
     "flag_or_env": "STRIX_DS41_ENGRAM_SPLIT_READ",
     "default": "on",

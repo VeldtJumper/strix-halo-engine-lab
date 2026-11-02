@@ -1531,6 +1531,22 @@ Uses the qualified split gate/up MoE prefill schedule.
 - **Measured gain:** -
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-defer-decoder"></a>
+
+### Deferred decoder cone of non-final prefill pieces
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_DEFER_DECODER`. **Default:** ON.
+
+A prefill piece runs the decoder layers on the cone of rows that the last row's logits, the decode state and the drafter seed need. For a piece that is not the last one, nobody reads those: the next piece's own cone lies inside the next piece, and only the first decoder layer's compressed-KV and index-key entries of every row are read across pieces. The server now runs such a piece with the decoder layers reduced to those entries (no output rows, head or seed) when the next piece's planned cone starts at least one attention window after its first row, there is no prefix-cache insert at the piece's end and no snapshot in it or the next piece. Both ranks agree on the decision before the run, the next piece keeps the planned length, and it checks its own cone before it runs.
+
+- **Preconditions:** Two-node server device prefill of more than one piece, full layer set with the cone.
+- **Automatic selection:** On for every non-final piece that meets the conditions above; other pieces run as before.
+- **Fallback notice:** None.
+- **Exactness evidence:** Bitwise: two-node serve logits and 32 generated ids identical to the published references at 8,399 / 32,499 / 44,699 tokens with the lever on and off, and identical on and off for a 16,500-token prompt whose short last piece is not admitted.
+- **Off switch:** STRIX_DS41_DEFER_DECODER=0
+- **Measured gain:** Two-node serve TTFT, two GPU turns per arm, one load per arm: 8.30 / 29.90 / 43.07 s off vs 8.19 / 28.92 / 40.51 s on at 8,399 / 32,499 / 44,699 tokens (-3.3 % at 32,499, -5.9 % at 44,699; one piece at 8,399).
+- **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-engram-split-read"></a>
 
 ### Split Engram read of a prefill piece
