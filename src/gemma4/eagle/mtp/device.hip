@@ -1,7 +1,10 @@
 #include <hip/hip_runtime.h>
 #include "device.hpp"
+#include "gemma4/kernels/capture_guard.hpp"
 
 #include <array>
+#include <chrono>
+#include <optional>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -337,14 +340,27 @@ struct DeviceDrafter::Impl {
         checked(hipEventRecord(start, stream));
         times.launches = 0;
         times.graph = use_graphs;
-        if (use_graphs) {
+        // A new capture waits for no prefill pass in flight (gpu::CaptureSlot); otherwise this window runs eagerly.
+        std::optional<gpu::CaptureSlot> slot;
+        if (use_graphs && !graphs[from][to]) {
+            slot.emplace();
+            if (!slot->granted()) slot.reset();
+        }
+        if (use_graphs && (graphs[from][to] || slot)) {
             auto& exec = graphs[from][to];
+            auto& counters = gpu::capture_guard_state();
             if (!exec) {
+                const auto capture_begin = std::chrono::steady_clock::now();
                 checked(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
                 try { enqueue(from, to); } catch (...) { hipGraph_t g0 = nullptr; (void)hipStreamEndCapture(stream, &g0); if (g0) (void)hipGraphDestroy(g0); throw; }
                 checked(hipStreamEndCapture(stream, &sources[from][to]));
+                slot.reset();
                 checked(hipGraphInstantiate(&exec, sources[from][to], nullptr, nullptr, 0));
+                counters.draft_captures.fetch_add(1);
+                counters.draft_capture_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - capture_begin).count()));
             } else {
+                counters.draft_replays.fetch_add(1);
                 times.launches = 44ULL * (to - from); // replayed graph nodes
             }
             checked(hipGraphLaunch(exec, stream));

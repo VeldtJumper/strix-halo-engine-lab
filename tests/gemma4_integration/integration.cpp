@@ -1,9 +1,11 @@
 #include "gemma4/engine/runtime.hpp"
 #include "gemma4/engine/lookup.hpp"
 #include "gemma4/prefill/prefill.hpp"
+#include "gemma4/kernels/capture_guard.hpp"
 #include "../gemma4_dflash/fixture.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <numeric>
 #include <cstring>
@@ -210,6 +212,7 @@ void device_tests() {
 #endif
 void prefill_taps_tests();
 void decode_export_tests();
+void capture_guard_tests();
 void host_tests(bool off) {
     const auto model = tiny(); const Tables tables; CountBackend backend(model,tables.view());
     auto r = request(); const auto reference = serial(backend,r);
@@ -367,7 +370,7 @@ void host_tests(bool off) {
     e::Coordinator cancelled(backend); const auto cancelled_slot = cancelled.submit(r); const auto before_cancel = backend.calls;
     cancelled.cancel(cancelled_slot); cancelled.run(); CHECK(backend.calls == before_cancel);
     CHECK(cancelled.result(cancelled_slot).status == e::Status::cancelled);
-    if (!off) { prefill_taps_tests(); decode_export_tests(); }
+    if (!off) { prefill_taps_tests(); decode_export_tests(); capture_guard_tests(); }
     std::cout << "host: C1..C8, shared calls, unequal prompts, cancellation/reuse, DFlash windows/seeds/stops, sampling, costs and prompt taps passed\n";
 }
 
@@ -558,6 +561,38 @@ void decode_export_tests() {
             if (family != 2) CHECK(logs[0]->taps == logs[1]->taps);
         }
     }
+}
+
+// A graph capture is granted only while no prefill pass is in flight, and a prefill pass waits for a running capture
+// to end; STRIX_G4_CAPTURE_GUARD=0 grants every capture.
+void capture_guard_tests() {
+    namespace gpu = strix::gemma4::gpu;
+    auto& state = gpu::capture_guard_state();
+    const auto eager = state.eager_passes.load();
+    { gpu::CaptureSlot slot; CHECK(slot.granted()); }
+    {
+        const gpu::PrefillInFlight prefill;
+        { gpu::CaptureSlot slot; CHECK(!slot.granted()); }
+        CHECK(state.eager_passes.load() == eager + 1);
+        set_env("STRIX_G4_CAPTURE_GUARD", "0");
+        { gpu::CaptureSlot slot; CHECK(slot.granted()); }
+        set_env("STRIX_G4_CAPTURE_GUARD", nullptr);
+    }
+    { gpu::CaptureSlot slot; CHECK(slot.granted()); }
+    // A prefill pass started on another thread during a granted capture waits until the capture is released.
+    std::atomic<bool> entered{false};
+    std::thread prefill;
+    {
+        gpu::CaptureSlot slot;
+        CHECK(slot.granted());
+        prefill = std::thread([&] { const gpu::PrefillInFlight p; entered = true; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(!entered.load());
+        slot.release();
+        prefill.join();
+        CHECK(entered.load());
+    }
+    CHECK(state.prefills.load() == 0);
 }
 
 class ScriptState final : public e::StreamState {

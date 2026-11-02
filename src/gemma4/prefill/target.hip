@@ -1,6 +1,7 @@
 #include "device.hpp"
 #include "validation.hpp"
 #include "gemma4/kernels/rows_linear.hpp"
+#include "gemma4/kernels/capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdlib>
@@ -8,11 +9,20 @@
 #include <algorithm>
 #include <cfenv>
 #include <chrono>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 
 namespace strix::gemma4::prefill {
 namespace {
+// STRIX_G4_PREFILL_QUEUE_IO (default on, read per pass): every per-pass upload, clear and download of the
+// many-row prefill runs on its own non-blocking queue (uploads staged in pinned memory), and scratch that grows
+// with the context grows by doubling, so a pass issues no null-stream work, synchronous copy or frequent
+// reallocation beside another thread's decode pass. Off: the previous synchronous buffer calls.
+bool queue_io_enabled() {
+    const auto* p = std::getenv("STRIX_G4_PREFILL_QUEUE_IO");
+    return !p || std::string_view(p) != "0";
+}
 bool pack_reuse_enabled() {
     static const bool enabled = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_PACK_REUSE"); return !p || std::string_view(p) != "0"; }();
     return enabled;
@@ -80,6 +90,35 @@ struct DevicePrefill::Impl {
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, halves, maximum, attention_halves, global_halves, pair_halves, last_row;
     Buffer canonical_scores, canonical_denominators, canonical_packed, exl3_scratch;
     unsigned table_positions = 0, stride = 0;
+    // QUEUE_IO: pinned staging for one pass's uploads (reused once the pass has synchronized).
+    void* staging = nullptr;
+    std::size_t staging_bytes = 0, staged = 0;
+    bool queue_io = false;
+    void put(Buffer& dst, const void* src, std::size_t bytes) {
+        if (!queue_io) { dst.upload(src, bytes); return; }
+        if (!bytes) return;
+        if (bytes > dst.size() || staged + bytes > staging_bytes) throw std::logic_error("prefill staging bounds");
+        auto* at = static_cast<std::uint8_t*>(staging) + staged;
+        std::memcpy(at, src, bytes);
+        staged += (bytes + 255U) & ~std::size_t(255U);
+        checked(hipMemcpyAsync(dst.data(), at, bytes, hipMemcpyHostToDevice, queue));
+    }
+    void clear(Buffer& dst) {
+        if (!queue_io) { dst.zero(); return; }
+        if (dst.size()) checked(hipMemsetAsync(dst.data(), 0, dst.size(), queue));
+    }
+    void get(void* dst, const Buffer& src, std::size_t bytes, std::size_t offset = 0) {
+        if (!queue_io) { src.download(dst, bytes, offset); return; }
+        if (offset > src.size() || bytes > src.size() - offset) throw std::logic_error("prefill download bounds");
+        if (!bytes) return;
+        checked(hipMemcpyAsync(dst, src.as<std::uint8_t>() + offset, bytes, hipMemcpyDeviceToHost, queue));
+        checked(hipStreamSynchronize(queue));
+    }
+    // Growth-only resize; with QUEUE_IO it at least doubles so reallocations stay rare.
+    void grow(Buffer& buffer, std::size_t bytes) {
+        if (bytes <= buffer.size()) return;
+        buffer.resize(queue_io ? std::max(bytes, 2 * buffer.size()) : bytes);
+    }
     std::vector<Range> ranges;
     std::map<std::string, float> range_maxima;
     Stats stats;
@@ -135,6 +174,7 @@ struct DevicePrefill::Impl {
         if (queue) (void)hipStreamSynchronize(queue);
         if (pinned_taps) (void)hipHostFree(pinned_taps);
         if (pinned_hidden) (void)hipHostFree(pinned_hidden);
+        if (staging) (void)hipHostFree(staging);
         if (tapped) (void)hipEventDestroy(tapped);
         if (copied) (void)hipEventDestroy(copied);
         if (copy_queue) (void)hipStreamDestroy(copy_queue);
@@ -364,7 +404,11 @@ DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency reside
     b.ple.resize(chunk_rows * std::size_t(c.layers) * c.ple_dim * sizeof(float));
     b.logits.resize(std::size_t(c.vocab) * sizeof(float)); b.taps.resize(5 * hbytes);
     b.tokens.resize(chunk_rows * sizeof(unsigned)); b.positions.resize(chunk_rows * sizeof(std::uint64_t));
-    b.reads.resize(chunk_rows * sizeof(gpu::KvRead)); b.writes.resize(chunk_rows * sizeof(gpu::KvWrite));
+    // Every layer's descriptors of a full chunk: the per-pass upload never reallocates.
+    b.reads.resize(std::size_t(c.layers) * chunk_rows * sizeof(gpu::KvRead));
+    b.writes.resize(std::size_t(c.layers) * chunk_rows * sizeof(gpu::KvWrite));
+    b.staging_bytes = b.tokens.size() + b.positions.size() + b.reads.size() + b.writes.size() + 4 * 256;
+    checked(hipHostMalloc(&b.staging, b.staging_bytes, hipHostMallocDefault));
     b.failure.resize(sizeof(unsigned)); b.maximum.resize((2 + 11 * c.layers) * sizeof(unsigned));
     b.halves.resize(chunk_rows * std::size_t((std::max({c.hidden, c.inter, c.heads * 512, c.ple_dim}) + 15U) / 16U) * 16 * sizeof(std::uint16_t));
     b.last_row.resize(std::size_t(c.hidden) * sizeof(float));
@@ -397,6 +441,10 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         tx->start > b.table_positions || input.size() > b.table_positions - tx->start)
         throw std::invalid_argument("prefill row or position bounds");
     for (const auto t : input) if (t >= c.vocab) throw std::invalid_argument("prefill token out of range");
+    // Announced before any device work: no graph capture starts on another thread until this pass returns.
+    const gpu::PrefillInFlight in_flight;
+    // KV_QUEUE: the commit publishes this pass's rows on the queue that wrote them.
+    if (tx->stream->writer_queue) tx->stream->queue = b.queue;
     ChunkResult result; result.rows = n; result.vocab = c.vocab; result.tap_width = 5 * c.hidden;
     // PINNED_TAPS: unconsumed taps are never copied; consumed taps and hidden
     // rows land in pinned memory through asynchronous copies. Off: as before.
@@ -409,18 +457,19 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
     const bool device_finite = lever_enabled(lever_device_finite);
     bool taps_checked = false;
     try {
+        b.queue_io = queue_io_enabled(); b.staged = 0;
         tx->rows = n;
         for (unsigned l = 0; l < c.layers; ++l) {
             const auto bytes = std::size_t(n) * tx->stream->cache[l].width * sizeof(float);
             if (bytes > tx->overlay[l].k.size()) { tx->overlay[l].k.resize(bytes); tx->overlay[l].v.resize(bytes); }
         }
-        b.ranges.clear(); b.maximum.zero(); b.failure.zero();
+        b.ranges.clear(); b.clear(b.maximum); b.clear(b.failure);
         // Pinned copies only the rows this chunk writes; a model with fewer
         // layers than a tap index leaves that tap's columns at zero, as the
         // vector path's full zero does.
         bool every_tap = true;
         for (const auto t : tap_layers) every_tap = every_tap && t < c.layers;
-        if (!pinned) b.taps.zero();
+        if (!pinned) b.clear(b.taps);
         else if (want_taps && !every_tap)
             checked(hipMemsetAsync(b.taps.data(), 0, std::size_t(n) * result.tap_width * sizeof(float), b.queue));
         if (pinned) {
@@ -428,29 +477,31 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             if (want_taps) Impl::host_rows(b.pinned_taps, b.pinned_taps_floats, std::size_t(chunk_rows) * result.tap_width);
             if (hidden) Impl::host_rows(b.pinned_hidden, b.pinned_hidden_floats, std::size_t(chunk_rows) * c.hidden);
         }
-        b.tokens.upload(input.data(), input.size_bytes());
+        b.put(b.tokens, input.data(), input.size_bytes());
         std::vector<std::uint64_t> positions(n);
         for (unsigned r = 0; r < n; ++r) positions[r] = tx->start + r;
-        b.positions.upload(positions.data(), positions.size() * sizeof(std::uint64_t));
-        const auto stride = unsigned(((tx->start + n + 63U) / 64U) * 64U), chunks = stride / 64;
+        b.put(b.positions, positions.data(), positions.size() * sizeof(std::uint64_t));
+        const auto stride = unsigned(((tx->start + n + 63U) / 64U) * 64U);
         if (stride > b.stride) {
-            b.stride = stride;
-            b.scores.resize(8ULL * c.heads * stride * sizeof(float));
-            b.maxima.resize(8ULL * c.heads * (chunks + 1ULL) * sizeof(float));
-            b.partials.resize(8ULL * c.heads * chunks * 513 * sizeof(float));
+            // Capacity only: every kernel takes this pass's stride; QUEUE_IO doubles the capacity.
+            const auto capacity = b.queue_io ? std::max(stride, 2 * b.stride) : stride, capacity_chunks = capacity / 64;
+            b.stride = capacity;
+            b.scores.resize(8ULL * c.heads * capacity * sizeof(float));
+            b.maxima.resize(8ULL * c.heads * (capacity_chunks + 1ULL) * sizeof(float));
+            b.partials.resize(8ULL * c.heads * capacity_chunks * 513 * sizeof(float));
             if (b.stats.attention_packed) {
-                b.attention_halves.resize(attention_packed_bytes(stride, c.kv_heads * 512));
-                b.global_halves.resize(attention_packed_bytes(stride, c.kv_heads * 512));
+                b.attention_halves.resize(attention_packed_bytes(capacity, c.kv_heads * 512));
+                b.global_halves.resize(attention_packed_bytes(capacity, c.kv_heads * 512));
             }
         }
         if (b.stats.canonical_kernel) {
             // Global layers span every key from 0: the widest canonical score span.
             const auto bytes = std::size_t(n) * c.heads * stride * sizeof(float);
-            if (bytes > b.canonical_scores.size()) b.canonical_scores.resize(bytes);
+            b.grow(b.canonical_scores, bytes);
             if (b.canonical_denominators.size() < chunk_rows * std::size_t(c.heads) * sizeof(float))
                 b.canonical_denominators.resize(chunk_rows * std::size_t(c.heads) * sizeof(float));
             const auto packed = canonical_packed_floats(chunk_rows, c.heads, 512, stride) * sizeof(float);
-            if (canonical_pack_enabled() && packed > b.canonical_packed.size()) b.canonical_packed.resize(packed);
+            if (canonical_pack_enabled()) b.grow(b.canonical_packed, packed);
         }
         b.fuse = lever_enabled(lever_fuse_epilogue);
         if (b.fuse) result.levers |= lever_fuse_epilogue;
@@ -500,8 +551,8 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                 }
             if (b.reads.size() < reads.size() * sizeof(gpu::KvRead)) b.reads.resize(reads.size() * sizeof(gpu::KvRead));
             if (b.writes.size() < writes.size() * sizeof(gpu::KvWrite)) b.writes.resize(writes.size() * sizeof(gpu::KvWrite));
-            b.reads.upload(reads.data(), reads.size() * sizeof(gpu::KvRead));
-            b.writes.upload(writes.data(), writes.size() * sizeof(gpu::KvWrite));
+            b.put(b.reads, reads.data(), reads.size() * sizeof(gpu::KvRead));
+            b.put(b.writes, writes.data(), writes.size() * sizeof(gpu::KvWrite));
         }
         // Sliding and global layers pack into separate buffers, so a layer that
         // reads its producer's KV (layers >= 24) reuses that producer's pack.
@@ -605,7 +656,8 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         const unsigned head_rows = all_logits ? n : 1;
         const bool head = logits || all_logits;
         if (head) {
-            b.logits.resize(std::size_t(head_rows) * c.vocab * sizeof(float));
+            if (b.queue_io) b.grow(b.logits, std::size_t(head_rows) * c.vocab * sizeof(float));
+            else b.logits.resize(std::size_t(head_rows) * c.vocab * sizeof(float));
             b.dot("head", w.head.data ? w.head : w.embedding, b.x.as<float>() + (all_logits ? 0 : std::size_t(n - 1) * c.hidden), b.logits.as<float>(), head_rows);
             gpu::cap_logits(b.logits.as<float>(), head_rows * c.vocab, b.queue); b.finite(b.logits, std::size_t(head_rows) * c.vocab);
         } else {
@@ -617,8 +669,8 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         gpu::synchronize(b.queue);
         if (taps_issued) checked(hipEventSynchronize(b.copied));
         synced_at = Clock::now();
-        unsigned failure = 0; b.failure.download(&failure, sizeof(failure));
-        std::vector<unsigned> maxima(b.ranges.size()); b.maximum.download(maxima.data(), maxima.size() * sizeof(unsigned));
+        unsigned failure = 0; b.get(&failure, b.failure, sizeof(failure));
+        std::vector<unsigned> maxima(b.ranges.size()); b.get(maxima.data(), b.maximum, maxima.size() * sizeof(unsigned));
         std::string overflow;
         for (std::size_t i = 0; i < maxima.size(); ++i) {
             const float observed = bit_cast<float>(maxima[i]);
@@ -629,17 +681,17 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                 overflow = "; first overflowing input " + b.ranges[i].tensor + " abs_max=" + std::to_string(observed);
         }
         if (failure) throw std::runtime_error("prefill failed: nonfinite arithmetic, FP16 overflow or missing KV (mask " + std::to_string(failure) + ")" + overflow);
-        if (head) { result.last_logits.resize(c.vocab); b.logits.download(result.last_logits.data(), c.vocab * sizeof(float), std::size_t(head_rows - 1) * c.vocab * sizeof(float)); }
+        if (head) { result.last_logits.resize(c.vocab); b.get(result.last_logits.data(), b.logits, c.vocab * sizeof(float), std::size_t(head_rows - 1) * c.vocab * sizeof(float)); }
         if (pinned) {
             if (want_taps) result.pinned_taps = {b.pinned_taps, std::size_t(n) * result.tap_width};
             result.levers |= lever_pinned_taps;
         } else {
-            result.taps.resize(std::size_t(n) * result.tap_width); b.taps.download(result.taps.data(), result.taps.size() * sizeof(float));
+            result.taps.resize(std::size_t(n) * result.tap_width); b.get(result.taps.data(), b.taps, result.taps.size() * sizeof(float));
         }
         if (taps_checked) result.levers |= lever_device_finite;
-        if (all_logits) { result.all_logits.resize(std::size_t(n) * c.vocab); b.logits.download(result.all_logits.data(), result.all_logits.size() * sizeof(float)); }
+        if (all_logits) { result.all_logits.resize(std::size_t(n) * c.vocab); b.get(result.all_logits.data(), b.logits, result.all_logits.size() * sizeof(float)); }
         if (hidden && pinned) result.pinned_hidden = {b.pinned_hidden, std::size_t(n) * c.hidden};
-        else if (hidden) { result.hidden.resize(std::size_t(n) * c.hidden); b.x.download(result.hidden.data(), result.hidden.size() * sizeof(float)); }
+        else if (hidden) { result.hidden.resize(std::size_t(n) * c.hidden); b.get(result.hidden.data(), b.x, result.hidden.size() * sizeof(float)); }
         tx->evaluated = true;
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
         result.host_ms = ms(launched_at - entered) + ms(Clock::now() - synced_at);
@@ -662,19 +714,20 @@ std::vector<float> DevicePrefill::last_logits() {
     // Same head instruction sequence on the saved final-norm row; its range is
     // recorded after the deferring chunk's ranges, whose maxima slots are free.
     const auto index = b.ranges.size();
-    b.failure.zero();
+    b.queue_io = queue_io_enabled();
+    b.clear(b.failure);
     if (b.logits.size() < std::size_t(c.vocab) * sizeof(float)) b.logits.resize(std::size_t(c.vocab) * sizeof(float));
     b.dot("head", w.head.data ? w.head : w.embedding, b.last_row.as<float>(), b.logits.as<float>(), 1);
     gpu::cap_logits(b.logits.as<float>(), c.vocab, b.queue); b.finite(b.logits, c.vocab);
     gpu::synchronize(b.queue);
     unsigned failure = 0, maximum = 0;
-    b.failure.download(&failure, sizeof(failure)); b.maximum.download(&maximum, sizeof(maximum), index * sizeof(unsigned));
+    b.get(&failure, b.failure, sizeof(failure)); b.get(&maximum, b.maximum, sizeof(maximum), index * sizeof(unsigned));
     const float observed = bit_cast<float>(maximum);
     auto& high = b.range_maxima[b.ranges[index].tensor];
     high = !std::isfinite(observed) ? observed : std::max(high, observed);
     b.ranges[index].input_maximum = high;
     if (failure) throw std::runtime_error("prefill head failed: nonfinite arithmetic or FP16 overflow (mask " + std::to_string(failure) + ")");
-    std::vector<float> out(c.vocab); b.logits.download(out.data(), out.size() * sizeof(float));
+    std::vector<float> out(c.vocab); b.get(out.data(), b.logits, out.size() * sizeof(float));
     return out;
 }
 Result DevicePrefill::run(gpu::DeviceStream& stream, std::span<const unsigned> tokens, DraftContext* context) {
