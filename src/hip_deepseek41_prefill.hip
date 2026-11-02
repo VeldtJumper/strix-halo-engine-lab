@@ -362,6 +362,13 @@ bool prefill_o_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_A8_FUSED");
     return !(v && v[0] == '0');
 }
+// STRIX_DS41_PREFILL_HC_FUSE (read per call; default on, =0 off): the attention's hc expansion also computes the ffn
+// site's mixes (one enqueue_hc_site, no re-read of the stream), and each site's collapse is read by its RMSNorm (no x
+// round trip); same kernels' arithmetic, same bits
+bool prefill_hc_fuse() {
+    const char* v = std::getenv("STRIX_DS41_PREFILL_HC_FUSE");
+    return !(v && v[0] == '0');
+}
 // STRIX_DS41_PREFILL_FINAL_KV=all (default since P17.5: 8K prefill +1.8 %, bitwise) | none | <comma-separated layers>
 bool prefill_final_kv(std::uint32_t layer) {
     static const std::vector<bool> on = [] {
@@ -587,6 +594,7 @@ struct DevicePrefill::Impl {
     bool identity_pre = true;
     Dev<ds41::HcMix> mix_attn, mix_ffn;
     Dev<float> mix_partial;
+    Dev<std::uint32_t> hc_counters;  // enqueue_hc_site's counters, back at zero after every launch
     Dev<float> x, qr, kv, ckv, cscore, iq, iw, y, shared, scores, route_w;
     Dev<std::int8_t> xcodes, qcodes;
     Dev<float> xdeltas, qdeltas;
@@ -931,6 +939,8 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.mix_attn = Dev<ds41::HcMix>(T);
     m.mix_ffn = Dev<ds41::HcMix>(T);
     m.mix_partial = Dev<float>(ds41::hc_mix_partial_floats(static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(H)));
+    m.hc_counters = Dev<std::uint32_t>(ds41::hc_site_counter_count(static_cast<std::uint32_t>(T)));
+    check(hipMemset(m.hc_counters.p, 0, m.hc_counters.n * 4U), "hc counters");
     m.x = Dev<float>(T * H);
     m.xcodes = Dev<std::int8_t>(T * H);
     m.xdeltas = Dev<float>(T * H / 32U);
@@ -1922,6 +1932,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     auto t_head = t_run;
 
     std::vector<std::uint32_t> trace_router;  // options.trace: this layer's router ids until the layer's end
+    const bool hc_fuse = prefill_hc_fuse();
+    bool ffn_mixed = false;  // hc_fuse: the ffn site's mixes came with the attention's expansion
+    // the collapse's mixes of a site from row r0 (attn: the previous layer's ffn mixes, identity before the first)
+    const auto collapse_mixes = [&](const std::string& site, std::uint32_t r0) -> const ds41::HcMix* {
+        return site == "attn" ? (m.identity_pre ? nullptr : m.mix_ffn.p + r0) : m.mix_attn.p + r0;
+    };
     for (const auto& s : m.plan.steps) {
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
         if (defer && (s.layer < 0 ? s.op == Op::head || s.op == Op::argmax : layer >= first_decoder)) {
@@ -1992,6 +2008,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         case Op::hc_mix: {
             if (no == 0U) break;  // row_split: none of this layer's output rows is this rank's
+            if (s.site == "ffn" && ffn_mixed) {  // computed with the attention's expansion
+                ffn_mixed = false;
+                break;
+            }
             ds41::HcMixView v;
             v.stream = stream_now() + std::size_t{o0} * stream_row;
             v.fn = m.devh(s.weights[0]);
@@ -2009,9 +2029,9 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         case Op::hc_pre: {
             const std::uint32_t r0 = s.site == "attn" ? L0.x0 : o0;
-            if (r0 == Tn) break;
-            const ds41::HcMix* mixes = s.site == "attn" ? (m.identity_pre ? nullptr : m.mix_ffn.p + r0) : m.mix_attn.p + r0;
-            ds41::enqueue_hc_collapse(stream_now() + std::size_t{r0} * stream_row, mixes, Tn - r0, H, m.x.p + std::size_t{r0} * H, st);
+            if (r0 == Tn || hc_fuse) break;  // hc_fuse: read by the site's RMSNorm
+            ds41::enqueue_hc_collapse(stream_now() + std::size_t{r0} * stream_row, collapse_mixes(s.site, r0), Tn - r0, H,
+                                      m.x.p + std::size_t{r0} * H, st);
             break;
         }
         case Op::rms_norm: {
@@ -2028,6 +2048,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             v.eps = 1e-20F;
             v.out = const_cast<float*>(v.x);
             v.out_stride = n;
+            if (!q && hc_fuse) {  // the collapse of the stream, as hc_pre
+                v.x = nullptr;
+                v.x_stride = 0;
+                v.hc_stream = stream_now() + std::size_t{r0} * stream_row;
+                v.mixes = collapse_mixes(s.site, r0);
+            }
             v.codes = (q ? m.qcodes.p : m.xcodes.p) + std::size_t{r0} * n;
             v.deltas = (q ? m.qdeltas.p : m.xdeltas.p) + std::size_t{r0} * n / 32U;
             v.sums = (q ? m.qsums.p : m.xsums.p) + std::size_t{r0} * n / 32U;
@@ -2579,7 +2605,30 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         case Op::hc_post: {
             const int next = 1 - m.cur;
-            if (no > 0U)
+            if (no > 0U && hc_fuse && s.site == "attn") {
+                // the expansion + the ffn site's mixes (its hc_mix is skipped), as enqueue_hc_expand + enqueue_hc_mixes
+                ds41::HcSiteView v;
+                v.rows = no;
+                v.hidden = H;
+                v.sub = m.y.p + std::size_t{o0} * H;
+                v.residual = stream_now() + std::size_t{o0} * stream_row;
+                v.expand_mixes = m.mix_attn.p + o0;
+                v.stream = m.streams[next].p + std::size_t{o0} * stream_row;
+                v.fn = m.devh(p + "hc_ffn_fn.weight");
+                v.base = m.devf(p + "hc_ffn_base.weight");
+                v.scale = m.devf(p + "hc_ffn_scale.weight");
+                v.iters = c.hc_sinkhorn_iters;
+                v.hc_eps = static_cast<float>(c.hc_eps);
+                v.mix_norm_eps = 1e-20F;
+                v.mixes_out = m.mix_ffn.p + o0;
+                v.partial = m.mix_partial.p;
+                v.counters = m.hc_counters.p;
+                v.launches = 1;
+                v.form = 2;
+                v.tile = no >= 8U ? 8U : 0U;  // 0: by the row count (1, 2 or 4)
+                ds41::enqueue_hc_site(v, st);
+                ffn_mixed = true;
+            } else if (no > 0U)
                 ds41::enqueue_hc_expand(m.y.p + std::size_t{o0} * H, stream_now() + std::size_t{o0} * stream_row,
                                         (s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p) + o0, no, H, m.streams[next].p + std::size_t{o0} * stream_row,
                                         st);
