@@ -875,7 +875,7 @@ evidence below was measured with FP32 pools.
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
 - **Off switch:** STRIX_QSA_DECODE_POOL=0
-- **Measured gain:** plain serial CLI decode at 262K 75.7 to 53.0 ms/step (-30 %), at 131K -14.7 % (measured with decode selection also on; the separate MTP shared service has no measured gain)
+- **Measured gain:** plain serial CLI decode at 262K 75.7 to 53.0 ms/step (-30 %), at 131K -14.7 % (measured with decode selection also on; the separate MTP committed key service is measured [below](#qwen-qsa-mtp-pool))
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
 
 <a id="qwen-plain-decode-step"></a>
@@ -911,12 +911,15 @@ Four exact changes to the one-row (plain, non-MTP) decode step, each with its ow
 ### QSA MTP committed BF16 key service
 
 The separate [MTP committed key service](engine/qsa-committed-pool.md) uses
-`STRIX_QSA_MTP_POOL` and one thirteen-entry owner per session. Its native
-logits/state and workload qualification remain pending; the YaRN CLI scope
-includes the full 1M factor-4 prose gate described below. The seven-row
-[route table](engine/qsa-committed-pool.md) enables rolling PLE and the MTP pool
-by default for factor 2 through 524288 and factor 4 through 1048576; both `=0`
-off switches remain authoritative.
+`STRIX_QSA_MTP_POOL` and one thirteen-entry owner per session. The
+[route table](engine/qsa-committed-pool.md) enables it by default on the native MTP CLI,
+on the single-request HTTP runner, and for YaRN MTP CLI factor 2 through 524288 and factor 4 through
+1048576 (with rolling PLE); both `=0` off switches remain authoritative.
+
+- **Preconditions:** Single HTTP runner: `--http-batch 0`, a configuration the batch runner cannot take, or an AUTO/capped batch whose measured capacity is one slot. In that last case the fallback keeps the service only when the slot still fits with it charged. Includes the in-memory prefix cache. Batch slots, nested scheduling, sessions, disk prefix restore, state import, serving prefixes and YaRN HTTP keep the opt-in `STRIX_QSA_MTP_POOL=1`. Product profiles do not change the decision.
+- **Exactness evidence:** Bitwise per request, same binary, default vs `STRIX_QSA_MTP_POOL=0`: token IDs, prompt state digest, committed target state and the full-vocabulary logits of every committed step. `STRIX_QSA_MTP_POOL_CHECK=1` compared all 13 roles with 0 differences. The timing-based window controller may pick a different R2/R4/R8 owner on the faster cycle, which changes speculative rows and predictor KV but not a committed token. Details in [the route document](engine/qsa-committed-pool.md#single-request-http-runner).
+- **Measured gain:** single HTTP runner, 127.6K-token prompt (131K context), dense-A8 T=8192, R2/R4/R8 prefix windows, in-memory prefix cache, one Strix Halo node, ABBA on one binary: decode 39.5 to 52.0 tok/s on the cold request (+32 %) and 41.6 to 55.8 tok/s on restored follow-up turns (+34 %); prefill unchanged (176-183 s cold, about 7 s restored); tokens identical.
+- **Off switch:** `STRIX_QSA_MTP_POOL=0`
 
 <a id="qwen-qsa-decode-select"></a>
 

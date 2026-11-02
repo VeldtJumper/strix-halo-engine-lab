@@ -1747,9 +1747,14 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << (config.environment.contains("STRIX_BITCALC_LOGITS_OUT") ? "true" : "false")
         << ",\"forced_tokens\":"
         << (config.environment.contains("STRIX_BITCALC_FORCE_TOKENS") ? "true" : "false") << "},";
-    if(qsa_mtp_pool_route(o,config.gsq_owner)) {
+    // AUTO/capped HTTP batch owns no pool; a one-slot fallback re-admits it at startup (stderr qsa-mtp-pool line).
+    if(const bool pooled=qsa_mtp_pool_route(o,config.gsq_owner); pooled || qsa_mtp_pool_single_fallback_pending(o,config.gsq_owner)) {
         const auto plan=mtp_qsa_pool_plan(o.context_tokens);
-        out << "\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"format\":\"bf16\",\"entries\":13,\"key_bytes\":"
+        out << "\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\""
+            << (pooled?"runtime-admission-required":"single-fallback-only") << "\",\"route\":\""
+            << (!o.http_serve?"cli":o.http_batch?"http-batch":"http-single") << "\",\"source\":\""
+            << (o.qsa_mtp_pool_explicit_opt_in?"STRIX_QSA_MTP_POOL=1":"default")
+            << "\",\"format\":\"bf16\",\"entries\":13,\"key_bytes\":"
             << plan.key_bytes << ",\"scratch_bytes\":" << plan.scratch_bytes << ",\"metadata_bytes\":" << plan.metadata_bytes << ",\"reserved_bytes\":" << plan.reserved_bytes << "},";
     }
     serve::Json session=serve::Json::object();
