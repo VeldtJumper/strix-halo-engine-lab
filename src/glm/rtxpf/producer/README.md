@@ -751,7 +751,43 @@ index order. `--decode-row-kernels 0|1|<subset>` (`moe`, `hc`, `router`, `kda`, 
 joined by `+`) or `STRIX_GLM_RTX_ROW_KERNELS` selects them; decode commands take a
 `row_kernels` field for an in-process A/B. `bench/row_mma_test.cu`
 (`glm_row_mma_test`, run by hand on a GPU) compares the strips with the CUTLASS paths
-on random tiles of every rate.
+on random tiles of every rate. The hyper-connection mix and the router also run for
+two to four rows (the verify step of self-speculation). Round two of the one-row
+kernels is opt-in (`--decode-row-kernels 2`, or `r2` in a subset): FP32 index
+projections for up to four rows in one ascending `fmaf` chain per output
+(`projection_fp32_row`), dense FP16 `[n][k]` strips for the KDA ordinary projections
+(`row_dense`), A operands loaded before each tile's weight decode, four-wide reads in
+the hyper-connection mix, and a parallel expert compaction and prefix sum. The
+values are the same bits, but in an A/B on one RTX PRO 6000 it was not faster than
+round one, so round one stays the default.
+
+**Self-speculation (`mtp_self_spec`, pending: `--mtp-self-spec 1`, tierstream cache only).**
+Each decode step verifies `[pending, draft 1..3]` in one trunk pass of two to four rows
+with the plain step's per-row kernels, so every row's arithmetic is the plain step's
+arithmetic; the step emits the accepted drafts plus the next token, which are the
+plain greedy tokens. Drafts come from the MTP layer (one per step) or, with
+`lookup_drafts` (`--spec-lookup 1`, pending: exact but not faster on the measured
+prompts), from the longest earlier match of the context's suffix. A verify never
+crosses a KDA B32 block: KDA promotes at the block end and replays the open block
+from its checkpoint, so rejected rows need no undo; DSA rewrites their pool rows
+in place. A non-finite flag falls back to the plain step. `generate` and the decode
+commands (`bench` with `"spec": true`) use it; `--mtp-self-spec 1` or
+`STRIX_GLM_RTX_MTP_SPEC=1` turns it on, and it is off without the tierstream cache
+or with `--routes-out` (both one row per layer). It is adaptive: the measured
+milliseconds per emitted token (EMA) of verify cycles and of plain steps pick the
+path for the next 32 steps (the first 8 verify cycles and 4 plain steps measure
+both), then 4 steps probe the other one, so a context where
+drafts are rarely accepted decodes plainly; `--mtp-self-spec always` verifies every
+step.
+
+**Predicted prefetch for several rows (`predicted_prefetch`, pending).** With
+`--tier-predict 1` each routed layer runs the next layer's router on its own copy
+of the current hidden rows (up to four, on a side stream) and hands the predicted
+ids to tierstream, which prefetches them; outputs are unchanged. After 16 tokens
+without a demand miss the step predicts nothing (a warm cache is not churned by
+prefetches) until the next miss. Tokens and every
+logits digest equal `--tier-predict 0` with plain decode and self-speculation; its
+speed is not settled yet (it is pending).
 
 **Exact decode levers (pending rows).** `skip_empty_expert_groups`
 (`--skip-empty-expert-groups 0|1`, `STRIX_GLM_RTX_SKIP_EMPTY_GROUPS`): the routed

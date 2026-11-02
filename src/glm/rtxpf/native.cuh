@@ -38,6 +38,7 @@ struct Call {
     // packed tiles (no FP16 decode window, no grouped GEMM, routed experts only). Same per-output
     // accumulation as the 32-row CUTLASS kernel, so the same bits; the FP16 operands are not used.
     bool row_gemv=false;
+    bool row_r2=false; // row-kernels round 2 (opt-in): A loads before the decode, parallel prefix / compaction
 };
 struct Profile {
     cudaEvent_t begin[18], decoded[18], gate_up[18], down[18];

@@ -68,6 +68,31 @@ __global__ __launch_bounds__(128) void projection_fp32_tiled(const float* x,cons
     }
     if(n0+n<out){if(r0+r<rows)y[std::size_t(r0+r)*out+n0+n]=v0;if(r0+r+4<rows)y[std::size_t(r0+r+4)*out+n0+n]=v1;}
 }
+// projection_fp32_tiled for rows <= 4 (decode): one thread per (row, output) runs the same ascending __fmaf_rn
+// chain over K from 0 on the same operand values (x or hf(a), hf(w)); the row is staged in 256-wide chunks.
+// in must be a multiple of 256.
+__global__ __launch_bounds__(256) void projection_fp32_row(const float* x,const U16* a,const U16* w,float* y,unsigned in,unsigned out,bool ordinary) {
+    __shared__ float sx[256];
+    const unsigned t=threadIdx.x,n=blockIdx.x*256+t,r=blockIdx.y;
+    float v=0;
+    for(unsigned c=0;c<in;c+=256) {
+        sx[t]=ordinary?x[std::size_t(r)*in+c+t]:hf(a[std::size_t(r)*in+c+t]);
+        __syncthreads();
+        if(n<out) {
+            if(ordinary) {
+                const U16* wr=w+std::size_t(n)*in+c;
+                #pragma unroll 8
+                for(unsigned k=0;k<256;++k)v=__fmaf_rn(sx[k],hf(wr[k]),v);
+            } else {
+                const U16* wc=w+std::size_t(c)*out+n;
+                #pragma unroll 8
+                for(unsigned k=0;k<256;++k)v=__fmaf_rn(sx[k],hf(wc[std::size_t(k)*out]),v);
+            }
+        }
+        __syncthreads();
+    }
+    if(n<out)y[std::size_t(r)*out+n]=v;
+}
 __global__ void problem_list(Problem* p,const U16* a,const U16* w,float* y,unsigned rows,unsigned in,unsigned out,bool row) {
     if(threadIdx.x==0){p->size={int(rows),int(out),int(in)};p->a=(Half*)a;p->b=(Half*)w;p->d=y;p->lda=in;p->ldb=row?out:in;p->ldd=out;}
 }
@@ -81,13 +106,15 @@ cudaError_t gemm(const U16* a,const U16* w,float* y,unsigned rows,unsigned in,un
     return cudaGetLastError();
 }
 template<class Arena>
-cudaError_t project(Matrix w,const float* x,float* y,unsigned rows,Arena& a,cudaStream_t s,bool ref,bool tiled=false,bool row=false) {
+// row: the few-row strips (or, with r2 = row-kernels round 2, the FP32 row chains for rows <= 4).
+cudaError_t project(Matrix w,const float* x,float* y,unsigned rows,Arena& a,cudaStream_t s,bool ref,bool tiled=false,bool row=false,bool r2=false) {
     // qkv has 24576 columns, beyond the FFN diagnostic decoder's public bound.
     // Its format and decode kernel are identical; use the layer-local decoder below.
     input_transform<<<(rows*(w.input/128)+7)/8,256,0,s>>>(x,a.operand,w.suh,rows,w.input);
-    if(ref&&tiled)projection_fp32_tiled<<<dim3((w.output+31)/32,(rows+7)/8),128,0,s>>>(nullptr,a.operand,a.decoded,a.raw,rows,w.input,w.output,false);
+    if(ref&&tiled&&row&&r2&&rows<=4&&w.input%256==0)projection_fp32_row<<<dim3((w.output+255)/256,rows),256,0,s>>>(nullptr,a.operand,a.decoded,a.raw,w.input,w.output,false);
+    else if(ref&&tiled)projection_fp32_tiled<<<dim3((w.output+31)/32,(rows+7)/8),128,0,s>>>(nullptr,a.operand,a.decoded,a.raw,rows,w.input,w.output,false);
     else if(ref)projection_reference<<<unsigned((std::size_t(rows)*w.output+255)/256),256,0,s>>>(nullptr,a.operand,a.decoded,a.raw,rows,w.input,w.output,false);
-    else if(row)launch_row_project(w,a.operand,a.raw,rows,s); // the caller skipped the layer decode
+    else if(row)launch_row_project(w,a.operand,a.raw,rows,s,r2); // the caller skipped the layer decode
     else {auto e=gemm<Row>(a.operand,a.decoded,a.raw,rows,w.input,w.output,a.problem,s);if(e!=cudaSuccess)return e;}
     output_transform<<<(rows*(w.output/128)+7)/8,256,0,s>>>(a.raw,y,w.svh,rows,w.output);
     return cudaGetLastError();
@@ -97,9 +124,12 @@ __global__ void layer_decode(Matrix w,U16* q) {
     q[(tile/(w.output/16)*16+qi(p))*w.output+tile%(w.output/16)*16+qo(p)]=book(state(w.packed+tile*16*w.bits,p,w.bits));
 }
 template<class Arena>
-cudaError_t ordinary(const float* x,const U16* w,float* y,unsigned r,unsigned in,unsigned out,Arena& a,cudaStream_t s,bool ref,bool tiled=false) {
-    if(ref&&tiled)projection_fp32_tiled<<<dim3((out+31)/32,(r+7)/8),128,0,s>>>(x,nullptr,w,y,r,in,out,true);
+cudaError_t ordinary(const float* x,const U16* w,float* y,unsigned r,unsigned in,unsigned out,Arena& a,cudaStream_t s,bool ref,bool tiled=false,bool row=false) {
+    if(ref&&tiled&&row&&r<=4&&in%256==0)projection_fp32_row<<<dim3((out+255)/256,r),256,0,s>>>(x,nullptr,w,y,in,out,true);
+    else if(ref&&tiled)projection_fp32_tiled<<<dim3((out+31)/32,(r+7)/8),128,0,s>>>(x,nullptr,w,y,r,in,out,true);
     else if(ref)projection_reference<<<unsigned((std::size_t(r)*out+255)/256),256,0,s>>>(x,nullptr,w,y,r,in,out,true);
-    else {round_input<<<unsigned((std::size_t(r)*in+255)/256),256,0,s>>>(x,a.operand,std::size_t(r)*in);return gemm<Col>(a.operand,w,y,r,in,out,a.problem,s);}
+    else {round_input<<<unsigned((std::size_t(r)*in+255)/256),256,0,s>>>(x,a.operand,std::size_t(r)*in);
+        if(row&&row_dense_fits(r,in,out)){launch_row_dense(w,a.operand,y,r,in,out,s);return cudaGetLastError();} // the same chains
+        return gemm<Col>(a.operand,w,y,r,in,out,a.problem,s);}
     return cudaGetLastError();
 }

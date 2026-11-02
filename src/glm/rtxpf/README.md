@@ -131,3 +131,11 @@ Main options:
   73.7 s with `--prefill-overlap 0`), decode 0.67 tokens/s warm.
 - Tested on an RTX PRO 6000 Blackwell Workstation Edition, driver 617.14,
   CUDA 13.0 (Windows 11).
+- Self-speculation (`mtp_self_spec`, opt-in with `--mtp-self-spec 1` and the
+  tierstream expert cache): the MTP layer drafts the next token and one verify
+  step checks it with the plain step's kernels, so each step emits one to four
+  tokens that are the plain greedy tokens. Tokens, every logits digest and the
+  final state equal plain decode in every measured arm. It is pending, so off by
+  default; its speed is reported with the change that turns it on.
+- In 24 GiB VRAM + 32 GiB RAM most experts are read from the unit file, so decode
+  there is bound by those reads and the kernels above barely change it.

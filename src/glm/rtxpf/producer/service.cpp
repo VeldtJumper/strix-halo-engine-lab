@@ -9,6 +9,7 @@
 #include "profile.hpp"
 #include "schedule.hpp"
 #include "decode_command.hpp"
+#include "crash_report.hpp"
 #include "strix/serve/json.hpp"
 #include <atomic>
 #include <cuda.h>
@@ -129,7 +130,22 @@ Json ttft(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned 
 // Timing arms from one restored initial session (the reference tier has no
 // fetched-expert cache). Each arm also yields complete per-step logits digests
 // and its final state/replay digests; digest work is excluded from the timed loop.
-Json bench(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned steps,const Json& order){
+// One decode call of `left` wanted tokens: plain (one token) or a self-speculation cycle (1..2 tokens).
+Json step(p::Runtime& runtime,bool spec,bool q,unsigned left){return strix::serve::parse_json(spec?runtime.decode_spec(q,left):runtime.decode_one(q));}
+// Kernel trace (decode command "trace"; run under nsys --capture-range=cudaProfilerApi): from one restored
+// session, a warm untimed pass, then profiler ranges around `steps` plain tokens and (when the service was opened
+// with mtp_self_spec) `steps` tokens of self-speculation cycles. Outputs are not compared here (bench does that).
+Json trace(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned steps,bool spec){
+    auto rec=Json::object();rec.set("prompt_tokens",std::uint64_t(prompt.size()));runtime.begin_session(prompt);runtime.snapshot_session();
+    for(unsigned i=0;i<steps;++i)(void)runtime.decode_one(false);runtime.restore_session();
+    auto begin=std::chrono::steady_clock::now();runtime.profiler(true);for(unsigned i=0;i<steps;++i)(void)runtime.decode_one(false);runtime.profiler(false);
+    rec.set("plain_s",std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count());
+    if(spec){runtime.restore_session();for(unsigned i=0;i<steps;){auto r=step(runtime,true,false,steps-i);i+=unsigned(r.find("tokens")->as_array().size());}runtime.restore_session();
+        begin=std::chrono::steady_clock::now();runtime.profiler(true);unsigned calls=0;for(unsigned i=0;i<steps;++calls){auto r=step(runtime,true,false,steps-i);i+=unsigned(r.find("tokens")->as_array().size());}runtime.profiler(false);
+        rec.set("spec_s",std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count());rec.set("spec_calls",int(calls));}
+    runtime.reset_session();return rec;
+}
+Json bench(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned steps,const Json& order,bool spec=false){
     w::require(order.is_array()&&order.as_array().size()==2,"bench order: two arms");
     std::vector<std::string> names;for(auto& n:order.as_array()){w::require(n.is_string()&&(n.as_string()=="cold"||n.as_string()=="warm"),"bench arm label");names.push_back(n.as_string());}
     w::require(names[0]!=names[1],"bench arms must be cold and warm");
@@ -140,11 +156,13 @@ Json bench(p::Runtime& runtime,const std::vector<std::uint32_t>& prompt,unsigned
     // warm-up pass over the same continuation first (then the same restore).
     for(auto& name:names){runtime.restore_session();
         if(name=="cold")runtime.reset_expert_cache(true);
-        else{for(unsigned i=0;i<steps;++i)(void)runtime.decode_one(false);runtime.restore_session();}
-        auto tokens=Json::array(),logits=Json::array(),steps_out=Json::array();double digest_ms=0;auto begin=std::chrono::steady_clock::now();
-        for(unsigned i=0;i<steps;++i){auto r=strix::serve::parse_json(runtime.decode_one(true));digest_ms+=r.find("digest_ms")->as_double();tokens.push(r.find("token")->as_int());logits.push(r.find("logits_sha256")->as_string());steps_out.push(r);}
+        else{for(unsigned i=0;i<steps;){auto r=step(runtime,spec,false,steps-i);i+=spec?unsigned(r.find("tokens")->as_array().size()):1;}runtime.restore_session();}
+        auto tokens=Json::array(),logits=Json::array(),steps_out=Json::array();double digest_ms=0;std::uint64_t drafted=0,accepted=0;auto begin=std::chrono::steady_clock::now();
+        for(unsigned i=0;i<steps;){auto r=step(runtime,spec,true,steps-i);digest_ms+=r.find("digest_ms")->as_double();
+            if(spec){for(auto& t:r.find("tokens")->as_array())tokens.push(t.as_int());for(auto& g:r.find("logits")->as_array())logits.push(g.as_string());i+=unsigned(r.find("tokens")->as_array().size());drafted+=std::uint64_t(r.find("drafted")->as_int());accepted+=std::uint64_t(r.find("accepted")->as_int());}
+            else{tokens.push(r.find("token")->as_int());logits.push(r.find("logits_sha256")->as_string());++i;}steps_out.push(r);}
         auto wall=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count(),loop=wall-digest_ms/1000;
-        auto a=Json::object();a.set("arm",name);a.set("tokens",tokens);a.set("logits_sha256",logits);a.set("generation_loop_s",loop);a.set("digest_s",digest_ms/1000);a.set("tokens_per_s",loop>0?double(steps)/loop:0.0);a.set("steps",steps_out);
+        auto a=Json::object();a.set("arm",name);a.set("tokens",tokens);a.set("logits_sha256",logits);a.set("generation_loop_s",loop);a.set("digest_s",digest_ms/1000);a.set("tokens_per_s",loop>0?double(steps)/loop:0.0);a.set("steps",steps_out);if(spec){a.set("spec",true);a.set("drafted",drafted);a.set("accepted",accepted);a.set("calls",std::uint64_t(steps_out.as_array().size()));}
         // Every integer counter of every step (tierstream and reference alike).
         a.set("expert_totals",p::aggregate_expert_totals(steps_out));
         // --decode-profile: per phase device/host ms per token over the arm (timings include the events' cost).
@@ -178,7 +196,7 @@ Json failed_receipt(p::Runtime& runtime,const std::string& error,const std::stri
 }
 void response(w::Socket fd,int code,const std::string& body){std::string text="HTTP/1.1 "+std::to_string(code)+" Result\r\nContent-Type: application/json\r\nContent-Length: "+std::to_string(body.size())+"\r\nConnection: close\r\n\r\n"+body;w::io(fd,std::as_writable_bytes(std::span(text)),true);}
 
-int main(int argc,char** argv){try{
+int main(int argc,char** argv){p::install_crash_report();try{
     // Lazy module loading + a kernel spinning on a device flag (tierstream's wait kernel) can
     // stall the first launch of another kernel until the wait deadline (as the DS replica and
     // tierstream's own preload guard against): CUDA modules load eagerly, set here before any
@@ -186,6 +204,7 @@ int main(int argc,char** argv){try{
     // then still refuses a lazy driver below).
     std::string module_loading;{const char* v=std::getenv("CUDA_MODULE_LOADING");
         if(v&&*v)module_loading=std::string(v)+" (environment)";else{_putenv_s("CUDA_MODULE_LOADING","EAGER");module_loading="EAGER (set by the service)";}}
+    std::string command_file,command_out; // --decode-commands from a file (e.g. under a profiler that keeps stdin), results also to a file
     std::string cache,model,manifest_hash,key_file,export_dir,prompt_file,identity="glm-pf-rtx-native-v1",bind="127.0.0.1";unsigned port=8097,capacity=8192,tile=0,host_floor_gib=8,max_device_layers=43,max_pinned_layers=43;bool require_file_tier=false,allow=false,graphs=true,self_check=false,legacy_index=false,serial_stage=false,enable_generate=false,decode_commands=false,decode_profile=false;std::vector<std::string> check_prompts;unsigned decode_tokens=0;p::DecodeOptions dopts;bool plan_budget=false,print_effective=false,check_commands=false;double device_total_gib=-1,device_free_gib=-1;
     for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--require-file-tier")require_file_tier=true;else if(a=="--legacy-fp32-index")legacy_index=true;else if(a=="--serial-stage")serial_stage=true;else if(a=="--self-check-schedule")self_check=true;else if(a=="--allow-gpu")allow=true;else if(a=="--no-graphs")graphs=false;else if(a=="--enable-generate")enable_generate=true;else if(a=="--decode-commands")decode_commands=true;else if(a=="--reference-compare")dopts.reference_compare=true;else if(a=="--plan-budget")plan_budget=true;else if(a=="--allow-pending"){}else if(a=="--print-effective-config")print_effective=true;else if(a=="--check-decode-commands")check_commands=true;else if(a=="--decode-profile")decode_profile=true;else {w::require(i+1<argc,"missing option argument");std::string value=argv[++i];if(a=="--profile"){}else if(a=="--cache")cache=value;else if(a=="--model")model=value;else if(a=="--cache-manifest-sha256")manifest_hash=value;else if(a=="--key-file")key_file=value;else if(a=="--export-state")export_dir=value;else if(a=="--prompt"){prompt_file=value;check_prompts.push_back(value);}else if(a=="--identity")identity=value;else if(a=="--decode"){auto n=std::stoul(value);w::require(n>=1&&n<=131072,"decode token count");decode_tokens=unsigned(n);}else if(a=="--expert-tier")dopts.expert_tier=value;else if(a=="--unit-file")dopts.unit_file=value;else if(a=="--vram-total-gib")dopts.vram_total_gib=std::stod(value);else if(a=="--ram-total-gib")dopts.ram_total_gib=std::stod(value);else if(a=="--device-total-gib")device_total_gib=std::stod(value);else if(a=="--device-free-gib")device_free_gib=std::stod(value);else if(a=="--tier-vram-gib")dopts.tier_vram_gib=std::stod(value);else if(a=="--tier-ram-gib")dopts.tier_ram_gib=std::stod(value);
         else if(a=="--tier-spare-slots"){dopts.tier_spare_slots=unsigned(std::stoul(value));dopts.tier_spare_permille=0;}else if(a=="--tier-spare-percent"){const double v=std::stod(value);if(!(v>=0&&v<=50))throw std::runtime_error("--tier-spare-percent must be in [0, 50]");dopts.tier_spare_permille=unsigned(v*10+0.5);}else if(a=="--expert-residency")dopts.expert_residency=value;else if(a=="--expert-routes")dopts.expert_routes=value;else if(a=="--routes-out")dopts.routes_out=value;else if(a=="--routes-prefill"){w::require(value=="0"||value=="1","--routes-prefill 0|1");dopts.routes_prefill=value=="1";}
@@ -193,6 +212,9 @@ int main(int argc,char** argv){try{
         else if(a=="--skip-empty-expert-groups"){w::require(value=="0"||value=="1","--skip-empty-expert-groups 0|1");dopts.skip_empty_expert_groups=value=="1";}
         else if(a=="--persistent-dense-fp16"){w::require(value=="0"||value=="1","--persistent-dense-fp16 0|1");dopts.persistent_dense_fp16=value=="1";}
         else if(a=="--decode-row-kernels")p::set_row_kernels_value(dopts,value);
+        else if(a=="--command-file")command_file=value;else if(a=="--command-out")command_out=value;
+        else if(a=="--mtp-self-spec"){w::require(value=="0"||value=="1"||value=="always","--mtp-self-spec 0|1|always");dopts.mtp_spec=value!="0";dopts.spec_always=value=="always";}
+        else if(a=="--spec-lookup"){w::require(value=="0"||value=="1","--spec-lookup 0|1");dopts.spec_lookup=value=="1";}
         else if(a=="--restore-decode-residency"){w::require(value=="0"||value=="1","--restore-decode-residency 0|1");dopts.restore_decode_residency=value=="1";}
         else if(a=="--prefill-overlap"){w::require(value=="0"||value=="1","--prefill-overlap 0|1");dopts.prefill_overlap=value=="1";}
         else if(a=="--tier-flush-ready"){w::require(value=="0"||value=="1","--tier-flush-ready 0|1");dopts.tier_flush_ready=value=="1";}
@@ -225,9 +247,17 @@ int main(int argc,char** argv){try{
     for(auto [lever,flag]:{std::pair<const char*,bool*>{"skip_empty_expert_groups",&dopts.skip_empty_expert_groups},{"persistent_dense_fp16",&dopts.persistent_dense_fp16},{"prefill_overlap",&dopts.prefill_overlap}})
         if(auto* e=prof.find(lever);e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)*flag=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("decode_row_kernels");e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)p::set_row_kernels_value(dopts,e->value);
+    // mtp_self_spec from the profile applies where it can run (the tierstream cache, no --routes-out); --mtp-self-spec 1 elsewhere is an error.
+    if(auto* e=prof.find("mtp_self_spec");e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)
+        {dopts.mtp_spec=e->value!="off"&&e->value!="0"&&dopts.expert_tier=="tierstream"&&dopts.routes_out.empty();dopts.spec_always=e->value=="always";}
+    if(auto* e=prof.find("lookup_drafts");e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)dopts.spec_lookup=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("restore_decode_residency");e&&e->status!=rp::Status::explicit_cli)dopts.restore_decode_residency=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("flush_ready");e&&e->status!=rp::Status::explicit_cli)dopts.tier_flush_ready=e->value!="off"&&e->value!="0";
     if(auto* e=prof.find("predicted_prefetch");e&&(e->status==rp::Status::pending||e->status==rp::Status::profile||e->status==rp::Status::unqualified))dopts.tier_predict=e->value=="1";
+    // After every profile-derived value: self-speculation exports two rows per layer through the tierstream cache.
+    w::require(!dopts.spec_lookup||dopts.mtp_spec,"--spec-lookup drafts for the self-speculation verify (--mtp-self-spec 1)");
+    w::require(!dopts.mtp_spec||(dopts.routes_out.empty()&&dopts.expert_tier=="tierstream"),
+               "--mtp-self-spec: tierstream expert tier only, not with --routes-out (it records one row per layer)");
     if(auto* e=use("prefill_tile_large");e&&e->status==rp::Status::unqualified){auto* rt=prof.find("row_tile");if(!rt||rt->status!=rp::Status::explicit_cli)tile=std::min(8192u,capacity/32*32);}
     auto effective=[&](std::string_view lever)->std::string{
         if(lever=="expert_tier")return dopts.expert_tier;
@@ -242,6 +272,8 @@ int main(int argc,char** argv){try{
         if(lever=="persistent_dense_fp16")return dopts.persistent_dense_fp16?"1 (dropped at startup if the plan cannot afford it)":"0";
         if(lever=="prefill_overlap")return dopts.prefill_overlap?"1 (off when the arena cannot keep two layers)":"0";
         if(lever=="decode_row_kernels")return p::row_kernels_name(dopts);
+        if(lever=="mtp_self_spec")return dopts.mtp_spec?"1":"0";
+        if(lever=="lookup_drafts")return dopts.spec_lookup?"1":"0";
         if(lever=="predicted_prefetch")return dopts.tier_predict?"1":"0";
         if(lever=="prefill_tile_large")return tile>=8192?"8192":"off";
         if(lever=="prefill_tile_crossover")return tile_crossover?std::to_string(tile_crossover)+" rows (below: min(4096, allocated tile); at/above: the allocated tile)":std::string("off (always the allocated tile)");
@@ -306,18 +338,24 @@ int main(int argc,char** argv){try{
     if(decode_commands){
         // One JSON command per stdin line, one JSON result per stdout line; the
         // harness decides (deadline) whether to send another arm.
-        auto ready=Json::object();ready.set("ready",true);identity_fields(ready);std::cout<<ready.dump()<<"\n"<<std::flush;
-        for(std::string line;std::getline(std::cin,line);){
+        std::ifstream cmd_in;std::ofstream cmd_out;if(!command_file.empty()){cmd_in.open(command_file);w::require(bool(cmd_in),"--command-file unreadable");}
+        if(!command_out.empty()){cmd_out.open(command_out,std::ios::app);w::require(bool(cmd_out),"--command-out unwritable");}
+        std::istream& commands=command_file.empty()?static_cast<std::istream&>(std::cin):cmd_in;
+        auto emit=[&](const Json& j){std::cout<<j.dump()<<"\n"<<std::flush;if(cmd_out.is_open())cmd_out<<j.dump()<<"\n"<<std::flush;};
+        auto ready=Json::object();ready.set("ready",true);identity_fields(ready);emit(ready);
+        for(std::string line;std::getline(commands,line);){if(line.empty())continue;
             const auto cmd=p::parse_decode_command(strix::serve::parse_json(line));const auto& op=cmd.op;if(op=="quit")break;
             // Optional per-command decode_row_kernels / decode timeline (in-process A/B over one load); they stay set.
             if(!cmd.row_kernels.empty())runtime.set_row_kernels(cmd.row_kernels);
             if(cmd.decode_profile>=0)runtime.set_decode_profile(cmd.decode_profile==1);
+            if(cmd.lookup>=0)runtime.set_spec_lookup(cmd.lookup==1);
             auto tokens=read_prompt(cmd.prompt,capacity);const auto steps=cmd.steps;w::require(steps>=1&&steps<=64&&tokens.size()+steps+1<=capacity,"command steps/capacity");
             auto begin=std::chrono::steady_clock::now();Json out;
             try{
             if(op=="qualify")out=qualify(runtime,tokens,steps,cmd.export_dir);
-            else if(op=="bench")out=bench(runtime,tokens,steps,cmd.order);
-            else if(op=="compare")out=compare(runtime,tokens,steps);else if(op=="ttft")out=ttft(runtime,tokens,cmd.row_tile);else throw std::runtime_error("unknown decode command");
+            else if(op=="bench")out=bench(runtime,tokens,steps,cmd.order,cmd.spec);
+            else if(op=="compare")out=compare(runtime,tokens,steps);else if(op=="ttft")out=ttft(runtime,tokens,cmd.row_tile);
+            else if(op=="trace")out=trace(runtime,tokens,steps,cmd.spec);else throw std::runtime_error("unknown decode command");
             }catch(const std::exception& e){
                 // The worker exits (its cache may be retired); the failure receipt (error, peaks,
                 // expert cache diagnostics) goes to stderr, which the harness keeps as the service log.
@@ -325,7 +363,7 @@ int main(int argc,char** argv){try{
                 std::cerr<<"FAILED-RECEIPT "<<f.dump()<<"\n"<<std::flush;throw;}
             persist_residency(runtime,out);
             out.set("memory",strix::serve::parse_json(runtime.memory_report("request:"+op))); // measured peaks vs the whole-device caps
-            out.set("op",op);out.set("row_kernels",runtime.row_kernels());out.set("prompt",cmd.prompt);out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());std::cout<<out.dump()<<"\n"<<std::flush;
+            out.set("op",op);out.set("row_kernels",runtime.row_kernels());out.set("prompt",cmd.prompt);out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());emit(out);
         }
         return 0;
     }

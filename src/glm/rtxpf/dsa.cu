@@ -576,7 +576,7 @@ cudaError_t enqueue_dsa(const DsaCall& v,void* workspace,std::size_t bytes,cudaS
         for(unsigned j=0;j<5;++j)widen<<<(sizes[j]+255)/256,256,0,s>>>(src[j],a.accurate_weights[j],sizes[j]);
     }
     DSA_TRY(mark(0,0,true));
-    auto proj=[&](unsigned j,const float* x,float* y,unsigned rows,bool f32=false){a.decoded=a.weights[j];return project(matrices[j],x,y,rows,a,s,ref||f32,!ref&&f32&&!v.legacy_fp32_index,rowk&&!f32);};
+    auto proj=[&](unsigned j,const float* x,float* y,unsigned rows,bool f32=false){a.decoded=a.weights[j];return project(matrices[j],x,y,rows,a,s,ref||f32,!ref&&f32&&!v.legacy_fp32_index,rowk&&(!f32||v.row_r2),v.row_r2);}; // rowk: strips (non-FP32), with row_r2 also the FP32 row chains
     auto index_project=[&](unsigned j,const float* x,float* y,unsigned n){
         if(v.node_mimic){
             input_transform<<<(n*(matrices[j].input/128)+7)/8,256,0,s>>>(x,a.operand,matrices[j].suh,n,matrices[j].input);
@@ -593,7 +593,7 @@ cudaError_t enqueue_dsa(const DsaCall& v,void* workspace,std::size_t bytes,cudaS
         return cudaGetLastError();
     };
     auto index_ordinary=[&](const float* x,const U16* w,float* y,unsigned n,unsigned out,unsigned slot){
-        return accurate?accurate_gemm<Col>(x,a.accurate_weights[slot],y,n,4096,out,a.accurate_problem,s):ordinary(x,w,y,n,4096,out,a,s,index_fp32,!ref&&index_fp32&&!v.legacy_fp32_index);
+        return accurate?accurate_gemm<Col>(x,a.accurate_weights[slot],y,n,4096,out,a.accurate_problem,s):ordinary(x,w,y,n,4096,out,a,s,index_fp32,!ref&&index_fp32&&!v.legacy_fp32_index,rowk&&v.row_r2);
     };
     for(unsigned base=0,window=0;base<v.rows;base+=dsa_tile,++window){unsigned n=std::min(dsa_tile,v.rows-base);const float* x=v.x+std::size_t(base)*4096;
         DSA_TRY(mark(1,window,false));if(!v.index_only){DSA_TRY(proj(2,x,a.lat,n));rms<<<n,256,0,s>>>(a.lat,w.kv_norm,a.lat,512);}
@@ -729,17 +729,17 @@ cudaError_t enqueue_mtp(const MtpCall& v,void* workspace,std::size_t bytes,cudaS
     rms<<<rows,256,0,s>>>(v.embedding,w.enorm,a.xn,4096);rms<<<rows,256,0,s>>>(v.hidden,w.hnorm,a.part,4096);
     mtp_cat<<<unsigned((std::size_t(rows)*4096+255)/256),256,0,s>>>(a.xn,a.part,a.cat,rows);
     const bool rowk=v.row_proj&&!ref&&row_project_fits(w.eh,rows);
-    if(!rowk)layer_decode<<<8192/16*(4096/16),256,0,s>>>(w.eh,a.decoded);MTP_TRY(project(w.eh,a.cat,a.z,rows,a,s,ref,false,rowk));
+    if(!rowk)layer_decode<<<8192/16*(4096/16),256,0,s>>>(w.eh,a.decoded);MTP_TRY(project(w.eh,a.cat,a.z,rows,a,s,ref,false,rowk,v.row_r2));
     rms<<<rows,256,0,s>>>(a.z,w.input_norm,a.xn,4096);
-    DsaCall d{};d.rows=rows;d.first=v.first;d.w=w.attention;d.state=v.state;d.x=a.xn;d.y=a.part;d.nonfinite=v.nonfinite;d.index=v.index;d.legacy_fp32_index=v.legacy_fp32_index;d.row_kernels=v.row_proj;
+    DsaCall d{};d.rows=rows;d.first=v.first;d.w=w.attention;d.state=v.state;d.x=a.xn;d.y=a.part;d.nonfinite=v.nonfinite;d.index=v.index;d.legacy_fp32_index=v.legacy_fp32_index;d.row_kernels=v.row_proj;d.row_r2=v.row_r2;
     MTP_TRY(enqueue_dsa(d,a.dsa,a.dsa_bytes,s,ref));
     mtp_add<<<blocks,256,0,s>>>(a.z,a.part,a.residual,rows,v.nonfinite);rms<<<rows,256,0,s>>>(a.residual,w.post_norm,a.xn,4096);
     router_logits<<<rows,320,0,s>>>(a.xn,w.router,a.logits,v.nonfinite);router_select<<<rows,320,0,s>>>(a.logits,w.router_bias,a.ids,a.rates);
     if(v.phase==1){MTP_TRY(cudaMemcpyAsync(v.route_ids,a.ids,std::size_t(rows)*8*4,cudaMemcpyDeviceToDevice,s));return cudaGetLastError();}
     }
-    Call moe{rows,288,4096,2048,a.xn,a.ids,a.rates,w.experts,a.routed};moe.row_gemv=v.row_moe;
+    Call moe{rows,288,4096,2048,a.xn,a.ids,a.rates,w.experts,a.routed};moe.row_gemv=v.row_moe;moe.row_r2=v.row_r2;
     if(ref)MTP_TRY(enqueue_reference(moe,a.moe,a.moe_bytes,s));else MTP_TRY(enqueue_cutlass(moe,a.moe,a.moe_bytes,s,exec));
-    Call shared{rows,1,4096,2048,a.xn,nullptr,nullptr,w.shared,a.shared};shared.row_gemv=v.row_moe;
+    Call shared{rows,1,4096,2048,a.xn,nullptr,nullptr,w.shared,a.shared};shared.row_gemv=v.row_moe;shared.row_r2=v.row_r2;
     if(ref)MTP_TRY(enqueue_reference(shared,a.moe,a.moe_bytes,s));else MTP_TRY(enqueue_cutlass(shared,a.moe,a.moe_bytes,s,exec));
     mtp_add<<<blocks,256,0,s>>>(a.routed,a.shared,a.part,rows,v.nonfinite);mtp_add<<<blocks,256,0,s>>>(a.residual,a.part,a.z,rows,v.nonfinite);rms<<<rows,256,0,s>>>(a.z,w.head_norm,v.y,4096);
     #undef MTP_TRY

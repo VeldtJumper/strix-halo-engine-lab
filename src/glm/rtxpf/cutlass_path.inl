@@ -155,6 +155,7 @@ __global__ void c1_down_transform(U16* ad,const U32* offsets,unsigned first,unsi
 // rows == 1 (decode): the C1 GEMMs as row_mma.cuh strips (same accumulation as the 32-row kernel).
 // Gate/up (gu: a0/d0 gate, a1/d1 up, K = hidden) or down (a0 -> d0, K = inter), the first `count`
 // experts of the slot list; a, d are the expert's entry rows (offsets), as the problem list.
+template<bool Pre>
 __global__ __launch_bounds__(128) void row_gemv(const Expert* ex,const U32* offsets,const U16* a0,const U16* a1,
     float* d0,float* d1,unsigned count,unsigned k,unsigned n,bool gu,const U32* act) {
     __shared__ __align__(16) U32 staging[4][48];
@@ -164,10 +165,25 @@ __global__ __launch_bounds__(128) void row_gemv(const Expert* ex,const U32* offs
     if(!m) return;
     const Expert e=ex[x]; const Matrix w=gu?(which?e.up:e.gate):e.down;
     const U16* a=(which?a1:a0)+std::size_t(begin)*k; float* d=(which?d1:d0)+std::size_t(begin)*n;
-    strip_rows_any<1>(w,a,d,m,k,n,strip,staging[threadIdx.x/32]); // m <= rows <= 16: one 16-row tile
+    strip_rows_any<1,Pre>(w,a,d,m,k,n,strip,staging[threadIdx.x/32]); // m <= rows <= 16: one 16-row tile
 }
 
-__global__ void compact_active(const U32* counts,U32* act,unsigned e){if(threadIdx.x==0&&blockIdx.x==0)c1_compact(counts,act,e);}
+__global__ void compact_serial(const U32* counts,U32* act,unsigned e){if(threadIdx.x==0&&blockIdx.x==0)c1_compact(counts,act,e);}
+// Row-kernels round 2 (opt-in, Call::row_r2): prefix and c1_compact with one thread per expert, same results.
+// prefix's offsets/cursor (exclusive sums of counts, offsets[e] = total), one thread per expert (e <= 288).
+__global__ __launch_bounds__(288) void prefix_par(const U32* counts,U32* offsets,U32* cursor,unsigned e){
+    __shared__ U32 c[288];const unsigned j=threadIdx.x;
+    if(j<e)c[j]=counts[j];__syncthreads();
+    if(j<e){unsigned n=0;for(unsigned k=0;k<j;++k)n+=c[k];offsets[j]=n;cursor[j]=n;if(j==e-1)offsets[e]=n+c[j];}
+}
+// c1_compact's permutation (routed experts ascending, then the empty ones ascending), one thread per expert
+// (e <= 288 = blockDim): each finds its place by counting the experts before it.
+__global__ __launch_bounds__(288) void compact_active(const U32* counts,U32* act,unsigned e){
+    __shared__ U32 on[288];const unsigned j=threadIdx.x;
+    if(j<e)on[j]=counts[j]?1u:0u;__syncthreads();if(j>=e)return;
+    unsigned before=0,total=0;for(unsigned k=0;k<e;++k){total+=on[k];before+=k<j?on[k]:0u;}
+    act[on[j]?before:total+(j-before)]=j;
+}
 cudaError_t decode_one_expert(const Expert* x,unsigned h,unsigned i,U16* qg,U16* qu,U16* qd,const U32* one,
     const CutlassExecution& exec,cudaStream_t s) {
     if(!x||!qg||!qu||!qd||!one||exec.decode_blocks<=0)return cudaErrorInvalidValue;
@@ -189,26 +205,28 @@ cudaError_t launch_cutlass(const Call& v,void* ws,std::size_t bytes,cudaStream_t
     cudaError_t err;
     #define C1_CHECK(call) do { err=(call); if(err!=cudaSuccess)return err; } while(0)
     C1_CHECK(cudaMemsetAsync(l.counts,0,v.experts*4,s));
+    auto compact=[&](const U32* counts,U32* act){if(v.row_r2)compact_active<<<1,288,0,s>>>(counts,act,v.experts);else compact_serial<<<1,1,0,s>>>(counts,act,v.experts);};
     unsigned entries=v.rows*routes;
     if(routes==1) dense_dispatch<<<(entries+255)/256,256,0,s>>>(l.counts,l.offsets,l.map,entries);
     else {
         histogram<<<(entries+255)/256,256,0,s>>>(v.ids,l.counts,entries,v.experts);
-        prefix<<<1,1,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);
+        if(v.row_r2)prefix_par<<<1,288,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);else prefix<<<1,1,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);
         scatter<<<(entries+255)/256,256,0,s>>>(v.ids,l.cursor,l.map,entries,v.experts);
     }
     if(v.row_gemv&&v.rows<=4&&v.hidden%64==0&&v.inter%64==0) {
         // The routed experts listed first (compact_active), or the one expert; same transforms,
         // epilogues and merge as the grouped path, on the stream, with fewer idle CTAs.
         const U32* act=nullptr; const unsigned count=std::min(v.experts,v.rows*routes);
-        if(routes!=1){compact_active<<<1,1,0,s>>>(l.counts,l.cursor,v.experts);act=l.cursor;}
+        if(routes!=1){compact(l.counts,l.cursor);act=l.cursor;}
         auto ctas=[&](unsigned width){return (v.rows*(width/128)+7)/8;};
         transform<<<dim3(ctas(v.hidden),count),256,0,s>>>(v.matrices,v.x,l.activation,l.offsets,l.map,l.ag,l.au,l.ad,0,count,v.hidden,routes,false,act);
         unsigned warps=count*2*(v.inter/16);
-        row_gemv<<<(warps+3)/4,128,0,s>>>(v.matrices,l.offsets,l.ag,l.au,l.scratch_g,l.scratch_u,count,v.hidden,v.inter,true,act);
+        auto gemv=[&](auto... args){if(v.row_r2)row_gemv<true><<<(warps+3)/4,128,0,s>>>(args...);else row_gemv<false><<<(warps+3)/4,128,0,s>>>(args...);};
+        gemv(v.matrices,l.offsets,l.ag,l.au,l.scratch_g,l.scratch_u,count,v.hidden,v.inter,true,act);
         c1_epilogue<true><<<dim3(ctas(v.inter),count),256,0,s>>>(v.matrices,l.offsets,l.map,l.scratch_g,l.scratch_u,l.ad,l.contribution,0,count,v.inter,act);
         c1_down_transform<<<dim3(ctas(v.inter),count),256,0,s>>>(l.ad,l.offsets,0,count,v.inter,act);
         warps=count*(v.hidden/16);
-        row_gemv<<<(warps+3)/4,128,0,s>>>(v.matrices,l.offsets,l.ad,nullptr,l.scratch_g,nullptr,count,v.inter,v.hidden,false,act);
+        gemv(v.matrices,l.offsets,l.ad,static_cast<const U16*>(nullptr),l.scratch_g,static_cast<float*>(nullptr),count,v.inter,v.hidden,false,act);
         c1_epilogue<false><<<dim3(ctas(v.hidden),count),256,0,s>>>(v.matrices,l.offsets,l.map,l.scratch_g,nullptr,l.ad,l.contribution,0,count,v.hidden,act);
         if(v.combine) merge<<<unsigned((std::size_t(v.rows)*v.hidden+255)/256),256,0,s>>>(l.contribution,routes==1?nullptr:v.weights,v.y,v.rows,v.hidden,routes);
         return cudaGetLastError();
@@ -216,7 +234,7 @@ cudaError_t launch_cutlass(const Call& v,void* ws,std::size_t bytes,cudaStream_t
     // Decode, routed: the routed experts first (cursor is free after the scatter), and only the
     // groups that can hold them (c1_schedule.hpp); the slot -> expert list is the only change.
     const U32* act=nullptr;
-    if(v.compact_groups&&routes!=1){compact_active<<<1,1,0,s>>>(l.counts,l.cursor,v.experts);act=l.cursor;}
+    if(v.compact_groups&&routes!=1){compact(l.counts,l.cursor);act=l.cursor;}
     const unsigned groups=c1_groups(v.experts,v.rows,routes,act!=nullptr);
     // One expert with startup-decoded operands: no decode window (same FP16 values).
     const bool pre=routes==1&&v.fp16_gate&&v.fp16_up&&v.fp16_down;
