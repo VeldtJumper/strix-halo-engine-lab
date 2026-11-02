@@ -100,6 +100,9 @@ struct MtpServeResult {
     // (n-gram or context drafter), and the frame drafter's cycles inside a frame / its shadow proposals.
     std::uint64_t source_shadow = 0, source_scored = 0, source_right = 0, frame_cycles = 0, frame_shadow = 0;
     std::uint64_t tool_rows = 0, tool_accepted = 0; // strict tool-call frame rows proposed / accepted (batched, default on)
+    // Shared-execution witness of the request's cohort cycles (batched serving): shared verification windows,
+    // batched draft launches and the reasons it drafted or verified alone (strix.shared_execution).
+    MtpSharedExecutionReceipt shared_execution;
     double prompt_ms = 0.0, decode_ms = 0.0;
     std::string finish = "length"; // stop|length|context|cancelled
     // --rtx-state-import: the receipt of the imported state this request started from (JSON object), else empty.
@@ -1511,6 +1514,7 @@ private:
         }
         static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
         auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
+        for (std::size_t k = 0; k < live.size(); ++k) live[k]->result.shared_execution.add(results[k].shared);
         for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], std::move(results[k]));
         return true;
     }

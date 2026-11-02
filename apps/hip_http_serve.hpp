@@ -520,6 +520,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.constraint = result.constraint;
                 if (!result.cache_refusal.empty()) stats.engine_extra.emplace_back("state_cache_refusal", serve::Json(result.cache_refusal).dump());
                 stats.engine_extra.push_back({"batch_service","{"+batch_service_receipt(result.service)+"}"});
+                stats.engine_extra.push_back({"shared_execution",result.shared_execution.json()});
                 if(!result.final_state_digest.empty()) {
                     stats.engine_extra.push_back({"final_state_digest","\""+result.final_state_digest+"\""});
                     if(!result.final_state_components.empty()) stats.engine_extra.push_back({"final_state_components",result.final_state_components});

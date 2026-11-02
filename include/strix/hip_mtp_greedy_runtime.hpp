@@ -4,6 +4,7 @@
 #include "strix/mtp_context_draft.hpp"
 #include "strix/mtp_ngram_draft.hpp"
 #include "strix/mtp_frame_draft.hpp"
+#include "strix/mtp_shared_execution_witness.hpp"
 namespace strix {
 class HipMtpWindowVerifier;
 class HipKnownPrefixWindow;
@@ -20,6 +21,7 @@ struct HipMtpGreedyCycleResult {
     bool attempted_target_window=false,accepted_target_window=false,target_checkpoint_restored=false;
     std::uint32_t target_r2_dispatches=0,target_projection_launches_saved=0;
     std::uint32_t target_window_rows=0; // verifier choice: owner rows, 1 = serial; 0 without verifier
+    MtpSharedExecutionCycle shared; // cohort cycles: shared verification window / batched draft launches (witness)
 };
 // Explicit qualified native MTP consumer, with serial or prepared closed-window target verification.
 // Native execution/performance qualification is separate from source admission.
@@ -100,6 +102,8 @@ public:
     // Multi-session draft batch (STRIX_MTP_DRAFT_BATCH=1): the native runtime of an open fast greedy predictor chain
     // (after draft_begin), or null; draft_after_step/draft_end keep their meaning for a batched chain.
     [[nodiscard]] HipMtpRuntime* draft_batch_runtime() noexcept;
+    // Why draft_batch_runtime() is null (none when it is not); diagnostics only (shared-execution witness).
+    [[nodiscard]] MtpDraftBatchDecline draft_batch_decline() const noexcept;
     [[nodiscard]] std::span<const std::uint32_t> drafted_candidates() const noexcept;
     [[nodiscard]] std::span<const float> drafted_probabilities() const noexcept;
     // Candidates from this index on came from a context source (the n-gram extension or the context drafter),
@@ -165,7 +169,8 @@ struct HipMtpGreedyCohortMember {
     std::uint32_t slot=0;
     MtpSelectionTransaction* transaction=nullptr;
 };
-struct HipMtpGreedyCohortStats {std::uint64_t cohort_windows=0,cohort_sessions=0,cohort_rows=0,solo_windows=0,cohort_chunks=0;};
+struct HipMtpGreedyCohortStats {std::uint64_t cohort_windows=0,cohort_sessions=0,cohort_rows=0,solo_windows=0,cohort_chunks=0;
+    MtpSharedExecutionStats shared;};
 class MtpBatchWindowController;
 [[nodiscard]] std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(
     std::span<const HipMtpGreedyCohortMember> members,HipMtpGreedyCohortStats* stats=nullptr,

@@ -4,7 +4,9 @@
 The fake enforces each engine's request contract (MiniMax string prompts, Nemotron chat field whitelist, token-ID
 prompts for the shared API), runs a step loop that batches active requests like the real schedulers, and exposes the
 same server-side evidence (Qwen 'batch cycle sessions=N' log, DeepSeek /api/status batch counters, MiniMax /metrics
-mm_* counters, Nemotron serve_batch receipts). FAKE_FAULT (comma list) injects one defect per adversarial test.
+mm_* counters, Nemotron serve_batch receipts). FAKE_FAULT (comma list) injects one defect per adversarial test;
+'witness' makes the Qwen fake emit the shared-execution witness (cycle line suffix + strix.shared_execution), and
+'witness-separate' / 'witness-draft-declined' / 'witness-fallback' emit it for grouped-but-separate execution.
 """
 import collections
 import hashlib
@@ -42,6 +44,30 @@ def fnv64(ids):
     return "%016x" % h
 
 
+# The C++ witness suffix (include/strix/mtp_shared_execution_witness.hpp mtp_shared_execution_log; the same string
+# is asserted by tests/mtp_shared_execution_witness_tests.cpp).
+CXX_WITNESS_SUFFIX = (" shared_windows=1 shared_sessions=2 shared_rows=8 max_members=2 draft_batches=1 draft_batch_sessions=2"
+                      " draft_launches=3 draft_shared_launches=2 draft_shared_rows=4 draft_max_rows=2 joint_fallbacks=0"
+                      " draft_declines=sampled:1 verify_declines=none")
+
+
+def fake_witness(n, faults, chunked, draft):
+    """One cycle of n live sessions: (log suffix, verify shared, draft shared) as the engine would report it."""
+    shared = n >= 2 and not faults & {"witness-separate", "witness-fallback"}
+    drafted = draft and n >= 2 and "witness-draft-declined" not in faults
+    chunks = 1 if chunked and n >= 2 and "witness-fallback" not in faults else 0
+    w = n if shared else 0
+    d = n if drafted else 0
+    draft_declines = f"sampled:{n}" if draft and not drafted else "none"
+    verify_declines = f"no_owner:{n}" if n >= 2 and not shared else "none"
+    suffix = (f" chunks={chunks} shared_windows={int(shared)} shared_sessions={w} shared_rows={2 * w} max_members={w}"
+              f" draft_batches={int(drafted)} draft_batch_sessions={d} draft_launches={2 * int(drafted)}"
+              f" draft_shared_launches={2 * int(drafted)} draft_shared_rows={2 * d} draft_max_rows={d}"
+              f" joint_fallbacks={int('witness-fallback' in faults and n >= 2)}"
+              f" draft_declines={draft_declines} verify_declines={verify_declines}")
+    return suffix, shared, drafted
+
+
 # ---------------------------------------------------------------- fake engine server
 
 def fake_server(argv):
@@ -67,6 +93,9 @@ def fake_server(argv):
     admit_cap = 1 if faults & {"serial-only", "delayed-receipt"} else slots
     streams = int(flags["--streams"]) if "--streams" in flags else slots
     log_batch = flavor == "qwen" and os.environ.get("STRIX_MTP_BATCH_LOG")
+    witness = flavor == "qwen" and any(f.startswith("witness") for f in faults)
+    chunked = os.environ.get("STRIX_MTP_BATCH_JOINT", "").startswith("1") or os.environ.get("STRIX_COHORT_ROWS") in ("16", "32")
+    draft_batch = os.environ.get("STRIX_MTP_DRAFT_BATCH", "").startswith("1")
     drafter = flavor == "deepseek" and "--dspark" in flags
     cond = threading.Condition()
     waiting, active = collections.deque(), []
@@ -76,6 +105,9 @@ def fake_server(argv):
     class Req:
         def __init__(self, seed, n):
             self.seed, self.n, self.ids, self.width, self.done = seed, n, [], 0, threading.Event()
+            self.shared = dict(cohort_cycles=0, verify_shared_cycles=0, verify_shared_rows=0, verify_max_members=0,
+                               draft_steps=0, draft_shared_steps=0, draft_max_rows=0, draft_declines={},
+                               verify_declines={})
 
     def step_loop():
         while True:
@@ -98,17 +130,31 @@ def fake_server(argv):
                     counters["windows"] += len(batch)
                     if "mixed-prefill" not in faults or counters["armed_steps"] % 2:
                         counters["dspark_steps"] += 1
+                suffix, shared, drafted = fake_witness(len(batch), faults, chunked, draft_batch)
                 for r in batch:
                     r.ids.append((r.seed + 7 * len(r.ids)) % 50000)
                     r.width = max(r.width, len(batch))
+                    if len(batch) >= 2:
+                        w = r.shared
+                        w["cohort_cycles"] += 1
+                        w["verify_shared_cycles"] += int(shared)
+                        w["verify_shared_rows"] += 2 * int(shared)
+                        w["verify_max_members"] = max(w["verify_max_members"], len(batch) if shared else 0)
+                        w["draft_steps"] += 2
+                        w["draft_shared_steps"] += 2 * int(drafted)
+                        w["draft_max_rows"] = max(w["draft_max_rows"], len(batch) if drafted else 0)
+                        if not shared:
+                            w["verify_declines"]["no_owner"] = w["verify_declines"].get("no_owner", 0) + 1
+                        if draft_batch and not drafted:
+                            w["draft_declines"]["sampled"] = w["draft_declines"].get("sampled", 0) + 1
                     if len(r.ids) == r.n:
                         active.remove(r)
                         r.done.set()
             if log_batch:
                 n = len(batch)
                 groups = 0 if n < 2 or "qwen-solo-groups" in faults else 1
-                print(f"batch cycle sessions={n} groups={groups} rows={4 * groups} solo={n - 2 * groups} emitted={n}",
-                      file=sys.stderr, flush=True)
+                print(f"batch cycle sessions={n} groups={groups} rows={4 * groups} solo={n - 2 * groups} emitted={n}"
+                      + (suffix if witness else ""), file=sys.stderr, flush=True)
                 if "joint" in faults and n >= 2:
                     print(f"joint cycle sessions={n} rows=2,2 drafts=1 emitted={n}", file=sys.stderr, flush=True)
             time.sleep(0.02)
@@ -220,6 +266,8 @@ def fake_server(argv):
                 final.update(usage=usage, strix={"token_ids": ids, "prompt_state_digest": "p" + str(time.monotonic()),
                                                  "final_state_position": len(prompt_ids) + n,
                                                  "final_state_components": components})
+                if witness and "witness-no-receipt" not in faults:
+                    final["strix"]["shared_execution"] = req.shared
             elif flavor == "deepseek":
                 final.update(usage=usage, strix={"token_ids": ids})
             elif flavor == "minimax":
@@ -474,7 +522,80 @@ class GateTests(unittest.TestCase):
         finally:
             os.environ.pop("STRIX_COHORT_ROWS")
         self.assertEqual((code, s["verdict"]), (5, "UNQUALIFIED"), s["message"])
-        self.assertIn("shared-chunk", s["message"])
+        self.assertIn("shared-execution witness", s["message"])
+
+    # -- shared-execution witness (joint / budget / draft-batch arms)
+
+    def qwen_env(self, fault, **env):
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            return self.run_gate("qwen", self.ids, "--generic", "--modes", "4", fault=fault)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_witness_parse_matches_engine_format(self):
+        line = "batch cycle sessions=2 groups=1 rows=8 solo=0 emitted=4 ms=1.5 begin_ns=1 end_ns=2 chunks=1" + CXX_WITNESS_SUFFIX
+        (c,) = gate.parse_batch_cycles("noise\n" + line + "\n")
+        self.assertEqual((c["sessions"], c["chunks"], c["shared_windows"], c["max_members"]), (2, 1, 1, 2))
+        self.assertEqual((c["draft_shared_launches"], c["draft_max_rows"]), (2, 2))
+        self.assertEqual((c["draft_declines"], c["verify_declines"]), ({"sampled": 1}, {}))
+        arms = gate.qwen_arms({"STRIX_MTP_BATCH_JOINT": "1", "STRIX_MTP_DRAFT_BATCH": "1"})
+        d = gate.shared_execution_detail(arms, [c], None)
+        self.assertEqual((d["shared"], d["verify_shared"], d["draft_shared"]), (True, True, True))
+        # grouped but executed separately: no shared window / chunks only from the ordinary fallback
+        for key, value in (("shared_windows", 0), ("chunks", 0), ("draft_shared_launches", 0)):
+            d = gate.shared_execution_detail(arms, [dict(c, **{key: value})], None)
+            self.assertFalse(d["shared"], key)
+        # receipts must show every request sharing
+        receipt = dict(verify_shared_cycles=1, draft_shared_steps=1)
+        self.assertTrue(gate.shared_execution_detail(arms, [c], [receipt, receipt])["shared"])
+        self.assertFalse(gate.shared_execution_detail(arms, [c], [receipt, dict(receipt, draft_shared_steps=0)])["shared"])
+        # joint without cycle lines cannot prove the path; the default cohort path can rest on receipts
+        self.assertIsNone(gate.shared_execution_detail(arms, [], [receipt, receipt])["shared"])
+        self.assertTrue(gate.shared_execution_detail(gate.qwen_arms({}), [], [receipt, receipt])["shared"])
+
+    def test_witness_qualifies_joint_and_budget_paths(self):
+        code, s = self.qwen_env("witness,joint", STRIX_MTP_BATCH_JOINT="1")
+        self.assertEqual((code, s["verdict"]), (0, "EXACT"), s["message"])
+        detail = next(r["witness_detail"] for r in s["rounds"] if r["pair_round"])
+        self.assertEqual(detail["arms"], ["joint"])
+        self.assertGreaterEqual(detail["shared_windows"], 1)
+        self.assertGreaterEqual(detail["chunks"], 1)
+        self.assertEqual(len(detail["receipts"]), 2)
+        code, s = self.qwen_env("witness", STRIX_COHORT_ROWS="16")
+        self.assertEqual((code, s["verdict"]), (0, "EXACT"), s["message"])
+
+    def test_witness_grouped_but_separate_is_no_witness(self):
+        for fault in ("witness-separate", "witness-fallback"):
+            code, s = self.qwen_env(fault, STRIX_MTP_BATCH_JOINT="1")
+            self.assertEqual((code, s["verdict"]), (2, "NO-WITNESS"), fault + ": " + s["message"])
+        detail = next(r["witness_detail"] for r in s["rounds"] if r["pair_round"])
+        self.assertGreaterEqual(detail["joint_fallbacks"], 1)
+        self.assertIn("no_owner", detail["verify_declines"])
+
+    def test_witness_draft_batch_arm(self):
+        code, s = self.qwen_env("witness", STRIX_MTP_DRAFT_BATCH="1", STRIX_MTP_BATCH_JOINT="1")
+        self.assertEqual((code, s["verdict"]), (0, "EXACT"), s["message"])
+        detail = next(r["witness_detail"] for r in s["rounds"] if r["pair_round"])
+        self.assertEqual(detail["arms"], ["draft_batch", "joint"])
+        self.assertTrue(detail["draft_shared"])
+        self.assertGreaterEqual(detail["draft_max_rows"], 2)
+        code, s = self.qwen_env("witness-draft-declined", STRIX_MTP_DRAFT_BATCH="1")
+        self.assertEqual((code, s["verdict"]), (2, "NO-WITNESS"), s["message"])
+        detail = next(r["witness_detail"] for r in s["rounds"] if r["pair_round"])
+        self.assertEqual((detail["verify_shared"], detail["draft_shared"]), (True, False))
+        self.assertIn("sampled", detail["draft_declines"])
+        self.assertIn("request.sampled", detail["draft_declines"])
+
+    def test_witness_cycle_lines_alone_suffice(self):
+        code, s = self.qwen_env("witness,witness-no-receipt", STRIX_MTP_BATCH_JOINT="1")
+        self.assertEqual((code, s["verdict"]), (0, "EXACT"), s["message"])
+        self.assertIsNone(next(r["witness_detail"] for r in s["rounds"] if r["pair_round"])["receipts"])
 
     def test_r2_2_nemotron_live_width_is_not_a_witness(self):
         code, s = self.nemotron("--modes", "4")

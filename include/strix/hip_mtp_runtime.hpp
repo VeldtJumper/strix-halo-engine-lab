@@ -4,6 +4,7 @@
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/hip_mtp_target_hidden.hpp"
+#include "strix/mtp_shared_execution_witness.hpp"
 #include "strix/qualified_mtp_forward_runtime.hpp"
 #include "strix/token_sampling.hpp"
 #include <functional>
@@ -131,7 +132,11 @@ public:
     //   stream) -> draft_batch_leave() on each row once its chain stopped (its owner stream waits for the batch
     //   stream; propose_chain_finish and failure leave implicitly). A failed batch launch fails every member.
     [[nodiscard]] bool draft_batch_open() const noexcept;
-    [[nodiscard]] static std::optional<std::uint32_t> draft_batch_compatible(std::span<HipMtpRuntime* const> members);
+    // Why draft_batch_open() is false (none when it is true); diagnostics only (shared-execution witness).
+    [[nodiscard]] MtpDraftBatchDecline draft_batch_decline() const noexcept;
+    // why (optional): on nullopt, the reason every member of the set declines.
+    [[nodiscard]] static std::optional<std::uint32_t> draft_batch_compatible(std::span<HipMtpRuntime* const> members,
+        MtpDraftBatchDecline* why=nullptr);
     static void draft_batch_enter(std::span<HipMtpRuntime* const> members,void* stream);
     static void draft_batch_launch(std::span<HipMtpRuntime* const> rows,void* stream,std::uint32_t shared_head_rows);
     void draft_batch_leave();
