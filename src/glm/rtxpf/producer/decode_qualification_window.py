@@ -46,6 +46,7 @@ def capacity(a):
 QUALIFY = (1024, 8192)
 CHAT_KINDS = ('explanation', 'coding', 'arithmetic', 'extraction', 'summarization', 'instruction', 'multiturn')
 MAX_SECONDS = 30 * 60
+UNIT_BYTES = 12648448  # one GLM expert unit (unit file stride): a D2H write-back moves one
 CLEANUP_MARGIN = 150  # service exit after releasing device + pinned memory
 PRIOR_SECONDS = {('qualify', 1024): 240, ('qualify', 8192): 480, ('bench', 1024): 120, ('bench', 8192): 200,
                  ('compare', 1024): 120, ('compare', 8192): 240,
@@ -102,6 +103,13 @@ TILE_REQUEST_LENGTHS = (8192, 16384, 32000)
 TTFT_ONLY_LENGTHS = (8192, 32000)
 TTFT_REPEATS = 2
 SMALL_PREFILL_TILE = 4096
+# A/B arm (--ab-arm): one arm of a two-build comparison in ONE service load, no exactness gate
+# (proven on each binary's gate run) and no uncached reference tier (no --reference-compare): TTFT once
+# each at 1K/8K (+32K with --full-card) at the allocated tile, then the decode bench cold/warm on
+# FULL_CARD_CHATS at 1K/8K; every first token / state / logits digest is listed (arm_digests) and
+# --compare-arms DIR_A DIR_B compares two arms' results.json bitwise (CPU only, no service).
+# Census (--census KINDS): ONE load, TTFT 8K per chat kind at the allocated tile with --routes-out and
+# --routes-prefill 1 (every prefill row's routes: a later --expert-routes seed); no gate, no bench.
 
 
 def ttft_prompt(d, n):
@@ -111,6 +119,36 @@ def ttft_prompt(d, n):
 def ttft_only_items(a):
     """Every (op, length, path, 'allocated') of a TTFT-only run."""
     return [('ttft', n, ttft_prompt(a.prompt_dir, n), 'allocated') for n in TTFT_ONLY_LENGTHS for _ in range(TTFT_REPEATS)]
+
+
+def run_mode(a):
+    """'ab-arm', 'census' or None (the gated modes record no mode key)."""
+    return 'ab-arm' if getattr(a, 'ab_arm', False) else 'census' if getattr(a, 'census', None) else None
+
+
+def reference_compare(a):
+    """The uncached reference tier is loaded only for runs that may hold the untimed compare."""
+    return run_mode(a) is None
+
+
+def bench_items(a):
+    """The decode bench: FULL_CARD_CHATS at 1K/8K, cold/warm order interleaved per kind."""
+    return [('bench', n, a.prompt_dir / f'chat-{kind}-{n}.u32', ['cold', 'warm'] if i % 2 == 0 else ['warm', 'cold'])
+            for n in QUALIFY for i, kind in enumerate(FULL_CARD_CHATS)]
+
+
+def ab_arm_items(a):
+    """Every item of an A/B arm: TTFT once per length at the allocated tile, then the decode bench
+    (--bench-only: the decode bench alone, for decode ablations)."""
+    if getattr(a, 'bench_only', False):
+        return bench_items(a)
+    lengths = TTFT if getattr(a, 'full_card', False) else QUALIFY
+    return [('ttft', n, ttft_prompt(a.prompt_dir, n), 'allocated') for n in lengths] + bench_items(a)
+
+
+def census_items(a):
+    """Every item of a placement census: TTFT 8K on each requested chat kind at the allocated tile."""
+    return [('ttft', 8192, a.prompt_dir / f'chat-{kind}-8192.u32', 'allocated') for kind in a.census]
 
 
 def repeat_compare(results):
@@ -210,8 +248,9 @@ def priors(a):
     p = dict(PRIOR_SECONDS)
     if getattr(a, 'full_card', False):
         p.update(FULL_CARD_PRIORS)
-    if getattr(a, 'tile_sweep', None) or getattr(a, 'tile_requests', None) or getattr(a, 'ttft_only', False):
-        p.update(SWEEP_PRIORS)
+    if getattr(a, 'tile_sweep', None) or getattr(a, 'tile_requests', None) or getattr(a, 'ttft_only', False) \
+            or (getattr(a, 'ab_arm', False) and getattr(a, 'full_card', False)):
+        p.update(SWEEP_PRIORS)  # full-card A/B arm: allocated-tile TTFT + bench, as measured on the full card
     return p
 
 
@@ -219,6 +258,7 @@ def whole_card(a):
     """A whole-device run below the full card (e.g. 24 GiB + 32 GiB)."""
     return getattr(a, 'vram_total_gib', None) is not None and not getattr(a, 'full_card', False)
 FULL_CARD_CHATS = ('explanation',)  # one chat kind at 1K and 8K: the schedule fits the 30 min deadline
+CENSUS_REFUSED = FULL_CARD_CHATS + ('coding',)  # bench prompts stay out of the placement census (coding: a common decode bench prompt)
 FULL_CARD_VRAM_GIB = 93.0  # the usable PRO device (99.86e9 B = 93.0 GiB), the runtime's limit
 FULL_CARD_HOST_MARGIN_GIB = 16
 
@@ -280,6 +320,10 @@ def prompt_plan(a):
     """Every planned (op, length, path[, order]); chat cases are planned whether present or not."""
     if getattr(a, 'ttft_only', False):
         return ttft_only_items(a)
+    if getattr(a, 'ab_arm', False):
+        return ab_arm_items(a)
+    if getattr(a, 'census', None):
+        return census_items(a)
     if getattr(a, 'tile_requests', None):
         return tile_request_items(a)
     if getattr(a, 'tile_sweep', None):
@@ -297,10 +341,7 @@ def prompt_plan(a):
         path = ttft_prompt(a.prompt_dir, n)
         tiles = FULL_CARD_TTFT_TILES[n] if getattr(a, 'full_card', False) else (None,)
         items += [('ttft', n, path, tile) for tile in tiles]
-    for n in QUALIFY:
-        for i, kind in enumerate(FULL_CARD_CHATS):
-            items.append(('bench', n, a.prompt_dir / f'chat-{kind}-{n}.u32', ['cold', 'warm'] if i % 2 == 0 else ['warm', 'cold']))
-    return items
+    return items + bench_items(a)
 
 
 def check_inputs(a):
@@ -343,7 +384,9 @@ def service_command(a, binary):
               ['--cache', str(a.cache), '--cache-manifest-sha256', digest(a.cache_manifest_sha256)])
     tier = ['--expert-tier', a.expert_tier]
     if a.expert_tier == 'tierstream':
-        tier += ['--unit-file', str(a.unit_file), '--unit-manifest-sha256', str(a.unit_manifest_sha256), '--reference-compare']
+        tier += ['--unit-file', str(a.unit_file), '--unit-manifest-sha256', str(a.unit_manifest_sha256)]
+        if reference_compare(a):  # A/B arm and census load no uncached reference tier
+            tier += ['--reference-compare']
         for flag, value in (('--vram-total-gib', getattr(a, 'vram_total_gib', None)), ('--ram-total-gib', getattr(a, 'ram_total_gib', None)),
                             ('--tier-vram-gib', a.tier_vram_gib), ('--tier-ram-gib', a.tier_ram_gib),
                             ('--tier-spare-percent', getattr(a, 'tier_spare_percent', None)),
@@ -358,8 +401,15 @@ def service_command(a, binary):
                             ('--expert-residency', getattr(a, 'expert_residency', None)),
                             ('--expert-routes', getattr(a, 'expert_routes', None)),
                             ('--routes-out', getattr(a, 'routes_out', None)),
+                            ('--routes-prefill', getattr(a, 'routes_prefill', None)),
                             ('--row-tile', getattr(a, 'row_tile', None)),
                             ('--prefill-tile-crossover', crossover_option(a)),
+                            ('--weight-dirs', getattr(a, 'weight_dirs', None)),
+                            ('--drive-readers', getattr(a, 'drive_readers', None)),
+                            ('--tier-staging', getattr(a, 'tier_staging', None)),
+                            ('--tier-disk-queue', getattr(a, 'tier_disk_queue', None)),
+                            ('--tier-clean-evict', getattr(a, 'tier_clean_evict', None)),
+                            ('--disk-prefetch', getattr(a, 'disk_prefetch', None)),
                             ('--profile', getattr(a, 'profile', None))):
             if value is not None:
                 tier += [flag, str(value)]
@@ -412,6 +462,18 @@ def expected_seconds_single(a):
 
 
 def plan(a):
+    out = plan_base(a)
+    if run_mode(a):  # no gate, no reference tier: the digests are compared across arms (--compare-arms)
+        out.update(run_mode=run_mode(a), reference_compare=False,
+                   gates=['none: exactness proven on each binary\'s gate run; no uncached reference tier loaded'] +
+                         (['timing arms: labels, token counts, every logits digest and final state/replay digests equal',
+                           'across arms: --compare-arms DIR_A DIR_B (tokens, every logits digest, final and prefill state digests)']
+                          if run_mode(a) == 'ab-arm' else
+                          [f'every prefill row\'s routes recorded to --routes-out {getattr(a, "routes_out", None)}']))
+    return out
+
+
+def plan_base(a):
     return dict(mode='DECODE-SELF-CONSISTENCY', identity=IDENTITY, capacity=capacity(a), steps=a.steps,
                 bench_steps=a.bench_steps, expert_tier=a.expert_tier,
                 command=service_command(a, Path('BUILD') / 'glm_native_service.exe'),
@@ -805,6 +867,15 @@ def cache_summary(arm, steps):
     out['per_token'] = {k: v / steps for k, v in totals.items()} if steps else {}
     rate = lambda k: out.get(k, 0) / steps if steps else 0
     out.update(misses_per_token=rate('misses'), file_bytes_per_token=rate('file_bytes'), h2d_bytes_per_token=rate('h2d_bytes'))
+    # Where each lookup was served (device / pinned RAM / file) and the D2H write-backs
+    # (device victims copied into pinned blocks: one unit each), per token.
+    lookups = out.get('lookups', 0)
+    out['source_share'] = ({k: out.get(v, 0) / lookups for k, v in (('device', 'device_hits'), ('pinned', 'ram_copies'), ('file', 'file_reads'))}
+                           if lookups else {})
+    out['writeback_bytes_per_token'] = rate('writebacks') * UNIT_BYTES
+    out['file_read_s_per_token'] = rate('file_read_ns') / 1e9
+    out['file_wait_s_per_token'] = rate('file_wait_ns') / 1e9  # exposed: < read time once reads overlap
+    out['clean_drop_bytes_per_token'] = rate('clean_drop_bytes')
     return out
 
 
@@ -870,7 +941,7 @@ def health_coverage(health, a):
         plan = decode.get('tier_plan', {})
         if not plan.get('three_tier'):
             gaps.append('tierstream plan has no file tier (lower --tier-ram-gib to exercise the disk tier)')
-        if not plan.get('reference_compare'):
+        if reference_compare(a) and not plan.get('reference_compare'):
             gaps.append('no reference backend for the comparison (--reference-compare)')
         if plan.get('unit_manifest_sha256') != a.unit_manifest_sha256:
             raise ValueError('service unit manifest pin differs from the requested pin')
@@ -912,7 +983,7 @@ def memory_gate(rec, a, peaks):
     return gaps
 
 
-def summarize(results, extra_gaps=(), gate=True):
+def summarize(results, extra_gaps=(), gate=True, gate_note=None):
     """Exactness of completed cases and completion of the planned workload, separately."""
     done = [r for r in results if r['verdict'] not in ('INCOMPLETE',)]
     exactness = ('MISMATCH' if any(r['verdict'] == 'MISMATCH' for r in done) else
@@ -929,8 +1000,170 @@ def summarize(results, extra_gaps=(), gate=True):
     out = dict(verdict=verdict, exactness_of_completed=exactness, completion=completion, gaps=gaps,
                completed_cases=len(done), planned_cases=len(results))
     if not gate:
-        out['gate'] = 'skipped (TTFT-only: exactness proven on this binary\'s gate run; repeats compared bitwise)'
+        out['gate'] = gate_note or 'skipped (TTFT-only: exactness proven on this binary\'s gate run; repeats compared bitwise)'
     return out
+
+
+GATE_NOTES = {'ab-arm': 'skipped (A/B arm: exactness proven on this binary\'s gate run; arms compared with --compare-arms)',
+              'census': 'skipped (placement census: prefill routes only, no decode)'}
+
+
+def state_digest(s):
+    """One SHA-256 over a canonical state signature (both ranks' SHA/bytes, replay, frontier, components)."""
+    return hashlib.sha256(json.dumps(s, sort_keys=True).encode()).hexdigest()
+
+
+def arm_digests(results):
+    """Every digest of an A/B arm: per TTFT item the first token and the canonical prefill state digest; per
+    bench item and arm the generated tokens, every logits digest, the final state digest, tok/s and the cache
+    summary. Items that are not EXACT are listed with their verdict only."""
+    ttft, bench = [], []
+    for r in results:
+        if not isinstance(r, dict) or r.get('op') not in ('ttft', 'bench'):
+            continue
+        e = r.get('evidence') if r.get('verdict') == 'EXACT' else None
+        row = dict(tokens=r.get('tokens'), prompt=r.get('prompt'), verdict=r.get('verdict'))
+        if r['op'] == 'ttft':
+            if isinstance(e, dict):
+                row.update(row_tile=e['row_tile'], token=e['token'], ttft_s=e['ttft_s'], prefill_s=e['prefill_s'],
+                           state_sha256=state_digest(e['state']),
+                           state={k: e['state'][k] for k in ('rank0', 'rank1', 'bytes0', 'bytes1', 'replay', 'frontier')})
+            ttft.append(row)
+            continue
+        cache = {x.get('arm'): x.get('cache') for x in r.get('arms') or [] if isinstance(x, dict)}
+        row['arms'] = [dict(arm=x['arm'], tokens=x['tokens'], logits=x['logits'], final_sha256=state_digest(x['final']),
+                            final={k: x['final'][k] for k in ('rank0', 'rank1', 'bytes0', 'bytes1', 'replay', 'frontier')},
+                            tokens_per_s=x['tokens_per_s'], generation_loop_s=x['generation_loop_s'], cache=cache.get(x['arm']))
+                       for x in (e['arms'] if isinstance(e, dict) else [])]
+        bench.append(row)
+    return dict(ttft=ttft, bench=bench)
+
+
+def routes_file(path):
+    """The routes census file after the run: path, bytes and line count (never raises)."""
+    if not path:
+        return dict(path=None, exists=False)
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return dict(path=str(p), exists=False)
+        lines = 0
+        with p.open('rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                lines += chunk.count(b'\n')
+        return dict(path=str(p.resolve()), exists=True, bytes=p.stat().st_size, lines=lines)
+    except Exception as exc:  # noqa: BLE001 - informational only
+        return dict(path=str(path), exists=None, error=f'{type(exc).__name__}: {exc}')
+
+
+def census_summary(a, results):
+    """The placement census: the kinds, every prefill's first token / timing / file traffic, the routes file."""
+    rows = [dict(prompt=r.get('prompt'), verdict=r.get('verdict'),
+                 **{k: r[k] for k in ('token', 'ttft_s', 'prefill_s', 'prefill_file_bytes', 'prefill_file_reads') if k in r})
+            for r in results if isinstance(r, dict) and r.get('op') == 'ttft']
+    return dict(kinds=list(getattr(a, 'census', None) or []), routes_prefill=getattr(a, 'routes_prefill', None), prefills=rows,
+                routes_out=routes_file(getattr(a, 'routes_out', None)))
+
+
+# ---- --compare-arms DIR_A DIR_B: two A/B arms' results.json, CPU only ------------------
+STATE_FIELDS = ('rank0', 'rank1', 'bytes0', 'bytes1', 'replay', 'frontier', 'components')
+
+
+def load_results(d):
+    """(results, error) of DIR/results.json written by this script (any version); never raises."""
+    try:
+        r = json.loads((Path(d) / 'results.json').read_text(encoding='utf-8'))
+    except Exception as exc:  # noqa: BLE001
+        return [], f'{d}: {type(exc).__name__}: {exc}'
+    if not isinstance(r, list):
+        return [], f'{d}: results.json is not a list'
+    return [x for x in r if isinstance(x, dict)], None
+
+
+def comparable_items(results):
+    """{key: item}: ('bench', tokens, prompt, arm) per bench arm and ('ttft', tokens, prompt, k) for the k-th
+    TTFT record of a prompt (plan order: repeats and tile arms line up between runs of one mode). An item's
+    'evidence' is None unless the record is EXACT with every field the comparison needs (older versions
+    may lack optional keys: such items are not comparable, never an error)."""
+    items, seen = {}, {}
+    for r in results:
+        op, n, e = r.get('op'), r.get('tokens'), r.get('evidence')
+        e = e if r.get('verdict') == 'EXACT' and isinstance(e, dict) else None
+        if op == 'ttft':
+            k = seen.get((n, r.get('prompt')), 0)
+            seen[(n, r.get('prompt'))] = k + 1
+            ok = e is not None and 'token' in e and isinstance(e.get('state'), dict)
+            items[('ttft', n, r.get('prompt'), k)] = dict(prompt=r.get('prompt'), verdict=r.get('verdict'),
+                                         evidence=dict(token=e['token'], state=e['state']) if ok else None,
+                                         row_tile=(e or {}).get('row_tile', r.get('row_tile')),
+                                         ttft_s=(e or {}).get('ttft_s', r.get('ttft_s')), prefill_s=(e or {}).get('prefill_s', r.get('prefill_s')))
+        elif op == 'bench':
+            arms = {x.get('arm'): x for x in (e or {}).get('arms') or [] if isinstance(x, dict)}
+            labels = list(arms) or [x.get('arm') for x in r.get('arms') or [] if isinstance(x, dict)] or ['cold', 'warm']
+            for label in labels:
+                x = arms.get(label)
+                ok = x is not None and all(k in x for k in ('tokens', 'logits')) and isinstance(x.get('final'), dict)
+                items[('bench', n, r.get('prompt'), label)] = dict(
+                    prompt=r.get('prompt'), verdict=r.get('verdict'),
+                    evidence=dict(tokens=x['tokens'], logits=x['logits'], final=x['final']) if ok else None,
+                    tokens_per_s=(x or {}).get('tokens_per_s'))
+    return items
+
+
+def item_label(key):
+    return f'bench {key[2]} {key[3]}' if key[0] == 'bench' else f'ttft {key[2]}#{key[3]}'
+
+
+def ratio(x, y):
+    return y / x if type(x) in (int, float) and type(y) in (int, float) and x > 0 else None
+
+
+def compare_items(key, x, y):
+    """Every mismatch between two comparable items (empty = bitwise equal)."""
+    label, ex, ey = item_label(key), x['evidence'], y['evidence']
+    if key[0] == 'ttft':
+        problems = [f'{label}: first token {ex["token"]} != {ey["token"]}'] if ex['token'] != ey['token'] else []
+        return problems + [f'{label}: prefill state {k}' for k in STATE_FIELDS if ex['state'].get(k) != ey['state'].get(k)]
+    problems = []
+    if ex['tokens'] != ey['tokens']:
+        problems.append(f'{label}: tokens {ex["tokens"]} != {ey["tokens"]}')
+    la, lb = list(ex['logits']), list(ey['logits'])
+    problems += [f'{label}: logits digest [{j}]' for j in range(max(len(la), len(lb)))
+                 if (la[j] if j < len(la) else None) != (lb[j] if j < len(lb) else None)]
+    return problems + [f'{label}: final state {k}' for k in STATE_FIELDS if ex['final'].get(k) != ey['final'].get(k)]
+
+
+def compare_arms(dir_a, dir_b):
+    """Two A/B arms bitwise (tokens, every logits digest, final and prefill state digests, first tokens) plus
+    tok/s and TTFT A vs B. EXACT: everything present on both sides equal and at least one bench pair; DIFF: any
+    mismatch; INCOMPLETE: nothing comparable or an EXACT item missing on one side. Exit 0 only for EXACT."""
+    (ra, err_a), (rb, err_b) = load_results(dir_a), load_results(dir_b)
+    A, B = comparable_items(ra), comparable_items(rb)
+    pairs, diffs, missing, not_compared = [], [], [], []
+    for key in sorted(set(A) | set(B), key=lambda k: [str(v) for v in k]):
+        x, y = A.get(key), B.get(key)
+        if x is None or y is None or x['evidence'] is None or y['evidence'] is None:
+            row = dict(item=item_label(key), a=(x or {}).get('verdict', 'absent'), b=(y or {}).get('verdict', 'absent'))
+            ((missing if (x or {}).get('evidence') or (y or {}).get('evidence') else not_compared)).append(row)
+            continue
+        problems = compare_items(key, x, y)
+        diffs += problems
+        pair = dict(item=item_label(key), verdict='DIFF' if problems else 'EQUAL', problems=problems)
+        if key[0] == 'bench':
+            pair.update(tokens_per_s_a=x['tokens_per_s'], tokens_per_s_b=y['tokens_per_s'],
+                        ratio_b_over_a=ratio(x['tokens_per_s'], y['tokens_per_s']))
+        else:
+            pair.update(ttft_s_a=x['ttft_s'], ttft_s_b=y['ttft_s'], ratio_b_over_a=ratio(x['ttft_s'], y['ttft_s']),
+                        prefill_s_a=x['prefill_s'], prefill_s_b=y['prefill_s'], row_tile_a=x['row_tile'], row_tile_b=y['row_tile'])
+        pairs.append(pair)
+    bench_pairs = sum(1 for p in pairs if p['item'].startswith('bench'))
+    errors = [e for e in (err_a, err_b) if e]
+    verdict = ('DIFF' if diffs else 'INCOMPLETE' if errors or missing or not bench_pairs else 'EXACT')
+    modes = lambda r: sorted({x['mode'] for x in r if isinstance(x.get('mode'), str)})
+    print(json.dumps(dict(mode='compare-arms', verdict=verdict, a=str(dir_a), b=str(dir_b), modes_a=modes(ra), modes_b=modes(rb),
+                          bench_pairs=bench_pairs, ttft_pairs=len(pairs) - bench_pairs, diffs=diffs, missing=missing,
+                          not_compared=not_compared, errors=errors, pairs=pairs), indent=2, default=str))
+    return 0 if verdict == 'EXACT' else 3 if verdict == 'DIFF' else 4
 
 
 class Service:
@@ -1022,6 +1255,8 @@ def execute(a, out, deadline, candidate, pins):
                     for j, item in enumerate(items):
                         op, n, path = item[:3]
                         entry = dict(op=op, tokens=n, prompt=path.name)
+                        if run_mode(a):
+                            entry['mode'] = run_mode(a)  # results.json alone tells an A/B arm / census apart
                         if sweep:
                             entry['sweep_tile'] = tile
                         if stopped:
@@ -1107,13 +1342,16 @@ def finalize(a, out, results, plan_gaps, peaks, startup_s, starts, segments, don
                                  reason=f"not run: {failure['type']}: {failure['error']}")
                         if sweep:
                             r['sweep_tile'] = tile
+                        if run_mode(a):
+                            r['mode'] = run_mode(a)
                         results.append(r)
             (out / 'results.json').write_text(json.dumps(results, indent=2))
     except Exception as exc:  # noqa: BLE001
         failure = dict(failure or {}, finalize_error=str(exc))
     builder_errors = []  # every summary-stage error is a structured run failure (non-zero exit)
     try:
-        summary = summarize(results, plan_gaps, gate=not getattr(a, 'ttft_only', False))
+        summary = summarize(results, plan_gaps, gate=not getattr(a, 'ttft_only', False) and run_mode(a) is None,
+                            gate_note=GATE_NOTES.get(run_mode(a)))
     except Exception as exc:  # noqa: BLE001 - a summary is always printed
         summary = dict(verdict='NO-REFERENCE', exactness_of_completed='NO-REFERENCE', completion='UNKNOWN', gaps=list(plan_gaps),
                        summary_error=f'summarize: {exc}')
@@ -1121,6 +1359,10 @@ def finalize(a, out, results, plan_gaps, peaks, startup_s, starts, segments, don
     builders = [('tile_compare', lambda: tile_compare(results))]
     if getattr(a, 'ttft_only', False):
         builders.append(('ttft_repeats', lambda: repeat_compare(results)))
+    if getattr(a, 'ab_arm', False):
+        builders.append(('arm_digests', lambda: arm_digests(results)))
+    if getattr(a, 'census', None):
+        builders.append(('census', lambda: census_summary(a, results)))
     if getattr(a, 'tile_requests', None):
         def tile_requests_summary():
             compare = tile_compare(results)
@@ -1152,6 +1394,8 @@ def finalize(a, out, results, plan_gaps, peaks, startup_s, starts, segments, don
         builder_errors.append(f'metadata: {type(exc).__name__}: {exc}')
     if builder_errors:
         failure = dict(failure or dict(type='SummaryError', error='summary builders failed'), summary_builders=builder_errors)
+    if run_mode(a):
+        summary['mode'] = run_mode(a)
     if starts:
         summary['profile'] = starts[0].get('profile')  # the service's --profile resolution (its ready event)
     if failure is not None:
@@ -1170,7 +1414,8 @@ def worker_options(a):
     the fitted tile sweep (and the note of an arm the parent dropped)."""
     argv = []
     for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency',
-                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'expert_residency', 'expert_routes', 'routes_out', 'row_tile', 'profile', 'prefill_tile_crossover'):
+                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'expert_residency', 'expert_routes', 'routes_out', 'routes_prefill', 'row_tile', 'profile', 'prefill_tile_crossover',
+                 'weight_dirs', 'drive_readers', 'tier_staging', 'tier_disk_queue', 'tier_clean_evict', 'disk_prefetch'):
         if getattr(a, name, None) is not None:
             argv += ['--' + name.replace('_', '-'), str(getattr(a, name))]
     if getattr(a, 'full_card', False):
@@ -1181,6 +1426,12 @@ def worker_options(a):
         argv += ['--decode-profile']
     if getattr(a, 'ttft_only', False):
         argv += ['--ttft-only']
+    if getattr(a, 'ab_arm', False):
+        argv += ['--ab-arm']
+    if getattr(a, 'bench_only', False):
+        argv += ['--bench-only']
+    if getattr(a, 'census', None):
+        argv += ['--census', ','.join(a.census)]
     if getattr(a, 'tile_requests', None):
         argv += ['--tile-requests', ','.join(str(x) for x in a.tile_requests)]
     if getattr(a, 'tile_sweep', None):
@@ -1202,6 +1453,8 @@ def run_worker(a, out, end):
 
 
 def run(a):
+    if getattr(a, 'compare_arms', None):
+        return compare_arms(*a.compare_arms)  # CPU only: no service, no --build/--model
     if not 1 <= a.timeout <= MAX_SECONDS:
         raise ValueError('aggregate deadline must be 1..1800 seconds')
     if (a.model is None) == (a.cache is None):
@@ -1248,12 +1501,12 @@ def run(a):
 
 def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--build', type=Path, required=True)
+    p.add_argument('--build', type=Path, help='required except with --compare-arms')
     p.add_argument('--model', type=Path, help='direct shards including root lm_head')
     p.add_argument('--cache', type=Path, help='decode-capable cache (cache.py --with-head)')
     p.add_argument('--cache-manifest-sha256')
-    p.add_argument('--prompt-dir', type=Path, required=True,
-                   help='private: q1024.u32, q8192.u32 and chat-<kind>-<1024|8192>.u32 (exact lengths)')
+    p.add_argument('--prompt-dir', type=Path,
+                   help='private: q1024.u32, q8192.u32 and chat-<kind>-<1024|8192>.u32 (exact lengths); required except with --compare-arms')
     p.add_argument('--steps', type=int, default=4)
     p.add_argument('--bench-steps', type=int, default=4)
     p.add_argument('--expert-tier', default='tierstream', choices=['tierstream'],
@@ -1278,6 +1531,8 @@ def arguments(argv=None):
     p.add_argument('--expert-residency', help='residency file (default <unit-file>.residency; "none" = off)')
     p.add_argument('--expert-routes', help='routes census file(s), comma-separated (glm_route_census.py output)')
     p.add_argument('--routes-out', help='record the routes of every decoded token (DS routes format) to this file; receipts carry them')
+    p.add_argument('--routes-prefill', choices=['0', '1'],
+                   help='with --routes-out: also record every prefill row\'s routes (placement census from non-bench prompts)')
     p.add_argument('--row-tile', type=int,
                    help='startup prefill tile allocation (multiple of 32, <= min(capacity, 32768)); default: the 5%% rule '
                         '(largest tile <= 8192 whose growth over 2048 costs <= 5%% of the expert arena). E.g. 8192 measures '
@@ -1291,9 +1546,30 @@ def arguments(argv=None):
     p.add_argument('--ttft-only', action='store_true',
                    help='full card: ONE service load, no exactness gate (proven on the binary\'s gate run): TTFT 8K and 32K at the '
                         'allocated tile, 2 repeats each, repeats compared bitwise, prefill phases per arm (A/B windows)')
+    p.add_argument('--bench-only', action='store_true', help='with --ab-arm: the decode bench alone (no TTFT items)')
+    p.add_argument('--ab-arm', action='store_true',
+                   help='one arm of a two-build A/B: ONE load, no exactness gate and no reference tier; TTFT 1K/8K '
+                        '(+32K with --full-card) at the allocated tile, then decode cold/warm at 1K/8K; every digest listed '
+                        '(arm_digests) for --compare-arms')
+    p.add_argument('--census', metavar='KINDS',
+                   help='placement census: comma-separated chat kinds (e.g. arithmetic,extraction,instruction,summarization), '
+                        'TTFT 8K on chat-<kind>-8192.u32 each in ONE load, no gate/bench; needs --routes-out and --routes-prefill 1; '
+                        f"refuses {', '.join(CENSUS_REFUSED)}")
     p.add_argument('--prefill-tile-crossover', type=int,
                    help='service: prefill rows below which a request runs at min(4096, allocated tile) (default: the '
                         'profile row prefill_tile_crossover, 0 = always the allocated tile (the one-load tile sweep: 8192 fastest at every length); --tile-sweep sets 0)')
+    p.add_argument('--weight-dirs', help="service: ';'-separated directories holding ts-stripe copies of the unit file "
+                   '(glm_unit_file plan --stripe); file-tier misses and make_resident read every drive (default: the primary only)')
+    p.add_argument('--tier-staging', type=int, choices=range(1, 65), metavar='1..64',
+                   help='service: three-tier file staging buffers (pinned; one per read in flight)')
+    p.add_argument('--tier-disk-queue', type=int, choices=range(1, 65), metavar='1..64',
+                   help='service: three-tier file reads in flight (<= --tier-staging; default 1 = one at a time)')
+    p.add_argument('--disk-prefetch', choices=['0', '1'],
+                   help='service: three-tier predicted units homed on the file are read ahead (dg_disk_prefetch; with --tier-predict 1)')
+    p.add_argument('--tier-clean-evict', choices=['0', '1'],
+                   help='service: three-tier device victims with no free pinned block go to their file with no D2H copy')
+    p.add_argument('--drive-readers', type=int, choices=range(1, 33), metavar='1..32',
+                   help='service: reader threads per volume with --weight-dirs (default: the library default, 4)')
     p.add_argument('--profile', choices=['default', 'fast', 'quality'],
                    help='the service profile (one switch for every lever; default = today; per-lever options override)')
     p.add_argument('--skip-empty-expert-groups', choices=['0', '1'], help='routed MoE: launch only expert groups holding routed rows (exact; pending row)')
@@ -1310,6 +1586,9 @@ def arguments(argv=None):
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--allow-gpu', action='store_true')
     mode.add_argument('--check-inputs', action='store_true', help='CPU-only: validate prompts and pin executables')
+    mode.add_argument('--compare-arms', nargs=2, type=Path, metavar=('DIR_A', 'DIR_B'),
+                      help='CPU only, no service: compare two --ab-arm runs\' results.json (tokens, every logits digest, '
+                           'final/prefill state digests, first tokens; tok/s and TTFT A vs B); exit 0 only for EXACT')
     p.add_argument('--capacity', type=int,
                    help=f'service capacity (default {CAPACITY}; {WHOLE_CARD_CAPACITY} with --vram-total-gib below the full card)')
     p.add_argument('--full-card', action='store_true',
@@ -1320,6 +1599,13 @@ def arguments(argv=None):
     p.add_argument('--device-total-gib', type=float, help='--plan-budget: device total (default: idle PRO at the cap)')
     p.add_argument('--device-free-gib', type=float, help='--plan-budget: device free (default: the total)')
     a = p.parse_args(argv)
+    if a.compare_arms is not None:
+        if a.ab_arm or a.census is not None or a.ttft_only or a.tile_requests is not None or a.tile_sweep is not None:
+            p.error('--compare-arms runs no service: it excludes --ab-arm / --census / --ttft-only / --tile-requests / --tile-sweep')
+        return a
+    missing = [flag for flag, value in (('--build', a.build), ('--prompt-dir', a.prompt_dir)) if value is None]
+    if missing:
+        p.error(f"the following arguments are required: {', '.join(missing)}")
     if a.full_card:
         if a.expert_tier != 'tierstream':
             p.error('--full-card measures the cached tierstream path only')
@@ -1337,10 +1623,39 @@ def arguments(argv=None):
         p.error('--tier-spare-slots and --tier-spare-percent are exclusive')
     if a.tier_spare_slots is not None and not 0 <= a.tier_spare_slots <= 100000:
         p.error('--tier-spare-slots: 0..100000')
+    if a.weight_dirs is not None:  # the service's rule (expert_tier.hpp check_weight_dirs)
+        def key(d):
+            k = d.replace('\\', '/').lower()
+            while len(k) > 1 and k.endswith('/'):
+                k = k[:-1]
+            return k
+        keys = [key(d) for d in a.weight_dirs.split(';')]
+        if any(not k.strip() for k in keys) or len(set(keys)) != len(keys):
+            p.error("--weight-dirs: ';'-separated stripe directories, no empty entry, none listed twice")
     if a.prefill_tile_crossover is not None and not 0 <= a.prefill_tile_crossover <= 131072:
         p.error('--prefill-tile-crossover: rows in 0..131072')
     if a.ttft_only and (not a.full_card or a.tile_requests is not None or a.tile_sweep is not None):
         p.error('--ttft-only needs --full-card and excludes --tile-requests / --tile-sweep')
+    if a.bench_only and not a.ab_arm:
+        p.error('--bench-only needs --ab-arm')
+    if a.ab_arm and (a.ttft_only or a.tile_requests is not None or a.tile_sweep is not None or a.census is not None):
+        p.error('--ab-arm excludes --ttft-only / --tile-requests / --tile-sweep / --census')
+    if a.census is not None:
+        kinds = [x.strip() for x in a.census.split(',') if x.strip()]
+        if a.ttft_only or a.tile_requests is not None or a.tile_sweep is not None:
+            p.error('--census excludes --ttft-only / --tile-requests / --tile-sweep')
+        if not kinds or len(set(kinds)) != len(kinds):
+            p.error('--census: one or more distinct comma-separated chat kinds')
+        unknown = [k for k in kinds if k not in CHAT_KINDS]
+        if unknown:
+            p.error(f"--census: unknown chat kind(s) {', '.join(unknown)} (known: {', '.join(CHAT_KINDS)})")
+        refused = [k for k in kinds if k in CENSUS_REFUSED]
+        if refused:
+            p.error(f"--census: {', '.join(refused)} refused (the decode bench kind(s) {', '.join(FULL_CARD_CHATS)} and coding, "
+                    'common decode bench prompts, stay out of the placement census)')
+        if a.routes_out is None or a.routes_prefill != '1':
+            p.error('--census needs --routes-out FILE and --routes-prefill 1 (every prefill row\'s routes)')
+        a.census = kinds
     if a.tile_requests is not None:
         try:
             req = [int(x) for x in a.tile_requests.split(',') if x.strip()]

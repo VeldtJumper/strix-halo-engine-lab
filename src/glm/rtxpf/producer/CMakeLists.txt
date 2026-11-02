@@ -57,12 +57,12 @@ add_test(NAME producer_receiver_host COMMAND glm_native_receiver)
 add_test(NAME producer_shard_sources COMMAND python -B "${REPO}/tests/glm_native/test_shards.py" --build "${CMAKE_BINARY_DIR}")
 # The tierstream descriptor test compiles the real desc-v1 parser from a
 # read-only tierstream source tree; absent -> the test reports SKIP for that part.
-set(GLM_TIERSTREAM_SRC "${REPO}/../tierstream-602702b" CACHE PATH "private tierstream snapshot (git archive of tierstream 602702b + STAMP): cache library, budget planner/ledger, desc parser")
+set(GLM_TIERSTREAM_SRC "${REPO}/../tierstream-d7277a9" CACHE PATH "private tierstream snapshot (git archive of tierstream d7277a9 + STAMP): cache library, budget planner/ledger, desc parser")
 # The tierstream commit this producer is qualified against (bound opens with
 # expected source identities, ss_budget_plan / ss_budget_ledger). The source is a
 # `git archive` export of that commit (not a moving checkout); its STAMP
 # file names the exported commit and must match the pin, or configuration fails.
-set(GLM_TIERSTREAM_PIN "602702b" CACHE STRING "required tierstream commit (prefix)")
+set(GLM_TIERSTREAM_PIN "d7277a9" CACHE STRING "required tierstream commit (prefix)")
 # The host test publishes the service-shaped receipt arm (fresh each run) that the
 # Python test reads: an explicit fixture pair, never a stale or racing artifact.
 set(GLM_DECODE_RECEIPT "${CMAKE_BINARY_DIR}/ctest-fixtures/decode-receipt-arm.json")

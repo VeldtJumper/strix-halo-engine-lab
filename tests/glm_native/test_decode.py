@@ -452,6 +452,10 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(c[key], value, key)
             self.assertEqual(c['per_token'][key], value / 4, key)
         self.assertEqual((c['misses_per_token'], c['file_bytes_per_token'], c['h2d_bytes_per_token']), (30.0, 40960.0, 79*1024.0))
+        self.assertEqual(c['source_share'], dict(device=1256/1376, pinned=39/1376, file=40/1376))
+        self.assertEqual(c['writeback_bytes_per_token'], 21 / 4 * dw.UNIT_BYTES)
+        self.assertAlmostEqual(c['file_read_s_per_token'], 123456789 / 4 / 1e9)
+        self.assertEqual(dw.cache_summary(dict(expert_totals={}), 0)['source_share'], {})
         ref = dw.cache_summary(dict(expert_totals=dict(device_selections=10, pinned_selections=6, file_selections=2)), 2)
         self.assertEqual((ref['device_hits'], ref['ram_copies'], ref['file_reads'], ref['device_selections']), (10, 6, 2, 10))
 
@@ -970,6 +974,28 @@ class WindowTests(unittest.TestCase):
         cmd = dw.service_command(b, 'svc')
         self.assertEqual(cmd[cmd.index('--prefill-tile-crossover') + 1], '12000')
         self.assertEqual(dw.worker_options(b)[dw.worker_options(b).index('--prefill-tile-crossover') + 1], '12000')
+        self.assertNotIn('--weight-dirs', cmd)  # default: the primary only
+        for bad in ('', 'D:/s;;C:/s', 'D:/s;d:\\S\\', ' ;D:/s'):
+            with self.assertRaises(SystemExit), patch.object(dw, 'host_total_gib', return_value=191.6),                     contextlib.redirect_stderr(io.StringIO()):
+                dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--weight-dirs', bad])
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            m = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card',
+                              '--weight-dirs', r'C:\s;D:\s', '--drive-readers', '8'])
+        for argv in (dw.service_command(m, 'svc'), dw.worker_options(m)):
+            self.assertEqual(argv[argv.index('--weight-dirs') + 1], r'C:\s;D:\s')
+            self.assertEqual(argv[argv.index('--drive-readers') + 1], '8')
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            c = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card',
+                              '--routes-out', 'census.routes', '--routes-prefill', '1'])
+        for argv in (dw.service_command(c, 'svc'), dw.worker_options(c)):
+            self.assertEqual(argv[argv.index('--routes-prefill') + 1], '1')
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            q = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card',
+                              '--tier-staging', '16', '--tier-disk-queue', '16', '--tier-clean-evict', '1', '--disk-prefetch', '1'])
+        for argv in (dw.service_command(q, 'svc'), dw.worker_options(q)):
+            for flag, value in (('--tier-staging', '16'), ('--tier-disk-queue', '16'), ('--tier-clean-evict', '1'), ('--disk-prefetch', '1')):
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertNotIn('--tier-disk-queue', dw.service_command(m, 'svc'))  # default: one read at a time
         cmd = dw.service_command(s, 'svc')
         self.assertEqual(cmd[cmd.index('--prefill-tile-crossover') + 1], '0')  # per-start sweep: crossover off
         for bad in (['--tile-requests', '4096'], ['--tile-requests', '4096,4096'], ['--tile-requests', '4096,8200'],
@@ -995,7 +1021,9 @@ class WindowTests(unittest.TestCase):
         if not exe.is_file():
             self.skipTest('service binary not built')
         modes = [[], ['--full-card'], ['--full-card', '--tile-sweep', '2048,8192'], ['--full-card', '--tile-requests', '4096,8192'],
-                 ['--full-card', '--row-tile', '8192', '--tile-requests', '2048,4096,8192'], ['--full-card', '--ttft-only']]
+                 ['--full-card', '--row-tile', '8192', '--tile-requests', '2048,4096,8192'], ['--full-card', '--ttft-only'],
+                 ['--ab-arm', '--vram-total-gib', '24', '--ram-total-gib', '32'], ['--full-card', '--ab-arm'],
+                 ['--census', 'arithmetic,instruction', '--routes-out', 'R', '--routes-prefill', '1']]
         lines, expected = [], []
         seg = Path('SEG')
         for mode in modes:
@@ -1337,6 +1365,255 @@ class TileCompareTests(unittest.TestCase):
         good = TileCompareTests.rec(TileCompareTests(), tile=4096)
         self.assertEqual(dw.judge_ttft(good, 8192, dw.auto_tile(8191, 8192, 16384), 8192)[0], 'EXACT')
         self.assertEqual(dw.judge_ttft(dict(good, row_tile=8192), 8192, dw.auto_tile(8191, 8192, 16384), 8192)[0], 'NO-REFERENCE')
+
+
+class ArmModeTests(unittest.TestCase):
+    """--ab-arm (one arm of a main-vs-best-stack A/B), --census (placement census load) and --compare-arms."""
+    BASE = ['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--unit-file', 'U', '--unit-manifest-sha256', 'f' * 64]
+    CENSUS = ['--census', 'arithmetic,extraction,instruction,summarization', '--routes-out', 'R', '--routes-prefill', '1']
+
+    def parse(self, extra):
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            return dw.arguments(self.BASE + extra)
+
+    def refused(self, extra, why=None):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), patch.object(dw, 'host_total_gib', return_value=191.6), contextlib.redirect_stderr(err):
+            dw.arguments(extra if extra[:1] == ['--compare-arms'] else self.BASE + extra)
+        if why:
+            self.assertIn(why, err.getvalue())
+
+    def test_bench_only_arm(self):
+        b = self.parse(['--ab-arm', '--bench-only', '--full-card'])
+        self.assertEqual([i[0] for i in dw.prompt_plan(b)], ['bench', 'bench'])
+        self.assertIn('--bench-only', dw.worker_options(b))
+        self.refused(['--bench-only'], '--bench-only needs --ab-arm')
+
+    def test_ab_arm_plan_command_and_estimate(self):
+        whole = self.parse(['--ab-arm', '--vram-total-gib', '24', '--ram-total-gib', '32'])
+        self.assertEqual(whole.capacity, dw.WHOLE_CARD_CAPACITY)
+        self.assertEqual([(i[0], i[1], i[2].name, i[3]) for i in dw.prompt_plan(whole)],
+                         [('ttft', 1024, 'q1024.u32', 'allocated'), ('ttft', 8192, 'q8192.u32', 'allocated'),
+                          ('bench', 1024, 'chat-explanation-1024.u32', ['cold', 'warm']),
+                          ('bench', 8192, 'chat-explanation-8192.u32', ['cold', 'warm'])])
+        full = self.parse(['--full-card', '--ab-arm'])
+        self.assertEqual([(i[0], i[1], i[3]) for i in dw.prompt_plan(full) if i[0] == 'ttft'],
+                         [('ttft', 1024, 'allocated'), ('ttft', 8192, 'allocated'), ('ttft', 32000, 'allocated')])
+        self.assertEqual([i for i in dw.prompt_plan(full) if i[0] == 'bench'], [i for i in dw.prompt_plan(whole) if i[0] == 'bench'])
+        default = self.parse(['--vram-total-gib', '24', '--ram-total-gib', '32'])
+        for a in (whole, full):
+            self.assertFalse({i[0] for i in dw.prompt_plan(a)} & {'qualify', 'compare'})
+            cmd = dw.service_command(a, 'svc')
+            self.assertNotIn('--reference-compare', cmd)
+            self.assertIn('--unit-manifest-sha256', cmd)
+            self.assertIn('--ab-arm', dw.worker_options(a))
+            self.assertEqual(dw.plan(a)['run_mode'], 'ab-arm')
+            self.assertLessEqual(dw.expected_seconds(a), 20 * 60)
+            self.assertLess(dw.expected_seconds(a), dw.expected_seconds(default))
+        self.assertEqual(dw.expected_seconds(whole), dw.STARTUP_PRIOR + 60 + 90 + 120 + 200 + dw.CLEANUP_MARGIN)
+        self.assertIn('--reference-compare', dw.service_command(default, 'svc'))  # unchanged without the new flags
+        self.assertNotIn('--ab-arm', dw.worker_options(default))
+        self.assertNotIn('run_mode', dw.plan(default))
+        for bad in (['--ab-arm', '--full-card', '--ttft-only'], ['--ab-arm', '--full-card', '--tile-requests', '4096,8192'],
+                    ['--ab-arm', '--full-card', '--tile-sweep', '2048,8192'], ['--ab-arm'] + self.CENSUS):
+            self.refused(bad, '--ab-arm excludes')
+
+    def test_census_plan_and_refusals(self):
+        a = self.parse(self.CENSUS + ['--vram-total-gib', '24', '--ram-total-gib', '32'])
+        self.assertEqual(a.census, ['arithmetic', 'extraction', 'instruction', 'summarization'])
+        self.assertEqual([(i[0], i[1], i[2].name, i[3]) for i in dw.prompt_plan(a)],
+                         [('ttft', 8192, f'chat-{k}-8192.u32', 'allocated') for k in a.census])
+        cmd = dw.service_command(a, 'svc')
+        self.assertNotIn('--reference-compare', cmd)
+        self.assertEqual((cmd[cmd.index('--routes-out') + 1], cmd[cmd.index('--routes-prefill') + 1]), ('R', '1'))
+        w = dw.worker_options(a)
+        self.assertEqual(w[w.index('--census') + 1], 'arithmetic,extraction,instruction,summarization')
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            again = dw.arguments(self.BASE + w)  # the worker re-parses the forwarded options
+        self.assertEqual((again.census, dw.run_mode(again)), (a.census, 'census'))
+        self.assertLessEqual(dw.expected_seconds(a), 15 * 60)
+        self.refused(['--census', 'explanation', '--routes-out', 'R', '--routes-prefill', '1'], 'refused')
+        self.refused(['--census', 'arithmetic,coding', '--routes-out', 'R', '--routes-prefill', '1'], 'refused')
+        self.refused(['--census', 'arithmetic,poetry', '--routes-out', 'R', '--routes-prefill', '1'], 'unknown chat kind')
+        self.refused(['--census', 'arithmetic,arithmetic', '--routes-out', 'R', '--routes-prefill', '1'], 'distinct')
+        self.refused(['--census', ',', '--routes-out', 'R', '--routes-prefill', '1'], 'distinct')
+        self.refused(['--census', 'arithmetic'], '--routes-out')
+        self.refused(['--census', 'arithmetic', '--routes-out', 'R'], '--routes-prefill 1')
+        self.refused(['--census', 'arithmetic', '--routes-out', 'R', '--routes-prefill', '0'], '--routes-prefill 1')
+        self.refused(['--full-card', '--ttft-only'] + self.CENSUS, '--census excludes')
+        self.refused(['--full-card', '--tile-requests', '4096,8192'] + self.CENSUS, '--census excludes')
+
+    def execute(self, td, mode, replies, routes=None):
+        """execute() through a fake service whose plan has NO reference tier (the A/B arm / census load)."""
+        W = WindowTests()
+        a = W.cached(W.args(W.prompts(td)), td)
+        a.ab_arm, a.census, a.routes_out, a.routes_prefill = mode == 'ab-arm', (['arithmetic', 'extraction'] if mode == 'census' else None), \
+            (str(Path(td) / 'routes.txt') if mode == 'census' else None), ('1' if mode == 'census' else None)
+        for k in a.census or []:
+            (a.prompt_dir / f'chat-{k}-8192.u32').write_bytes(struct.pack('<8192I', *([3] * 8192)))
+        out = Path(td) / 'out'
+        out.mkdir()
+        ready = dict(ready=True, producer_executable_sha256='e' * 64,
+                     health=dict(decode_identity=dw.IDENTITY, row_tile=2048, residency=dict(decode=dict(expert_tier='tierstream', tier_plan=dict(
+                         three_tier=True, unit_manifest_sha256='f' * 64)))))
+        sent = []
+
+        class FakeService:
+            def __init__(self, command, *_):
+                sent.append(command)
+                self.proc = types.SimpleNamespace(poll=lambda: 0)
+                self.replies = [ready] + list(replies)
+
+            def read(self, deadline):
+                return self.replies.pop(0)
+
+            def send(self, command):
+                sent.append(command)
+                if command.get('op') == 'quit' and routes is not None:
+                    Path(a.routes_out).write_bytes(routes)
+
+        with patch.object(dw, 'Service', FakeService), patch.object(dw, 'stop'), contextlib.redirect_stdout(io.StringIO()) as printed:
+            rc = dw.execute(a, out, types.SimpleNamespace(left=lambda: 100000), dict(service_sha256='e' * 64), dw.check_inputs(a))
+        return rc, json.loads(printed.getvalue()), sent, out
+
+    @staticmethod
+    def ttft_reply(n, token=5):
+        return dict(backend='tierstream', prompt_tokens=n, ttft_s=1.5, prefill_s=1.4, token=token, row_tile=2048, allocated_row_tile=2048,
+                    prefill_state=WindowTests.prefill_state(n), prefill_file_bytes=4096)
+
+    def test_ab_arm_execute_lists_every_digest(self):
+        W = WindowTests()
+        with tempfile.TemporaryDirectory(dir=BUILD) as td:
+            replies = [self.ttft_reply(n) for n in dw.QUALIFY] + [W.bench(n=n) for n in dw.QUALIFY]
+            rc, summary, sent, out = self.execute(td, 'ab-arm', replies)
+            self.assertEqual((rc, summary['verdict'], summary['completion'], summary['mode']), (0, 'EXACT', 'COMPLETE', 'ab-arm'), summary['gaps'])
+            self.assertNotIn('--reference-compare', sent[0])
+            self.assertIn('A/B arm', summary['gate'])
+            self.assertEqual([c['op'] for c in sent[1:]], ['ttft', 'ttft', 'bench', 'bench', 'quit'])
+            self.assertEqual([c.get('row_tile') for c in sent[1:3]], [2048, 2048])  # the allocated tile, sent explicitly
+            self.assertTrue(all(r['mode'] == 'ab-arm' for r in summary['results']))
+            self.assertTrue(all(r['mode'] == 'ab-arm' for r in json.loads((out / 'results.json').read_text())))
+            d = summary['arm_digests']
+            self.assertEqual([(t['tokens'], t['token'], t['state']['rank0']) for t in d['ttft']], [(1024, 5, 'a' * 64), (8192, 5, 'a' * 64)])
+            self.assertTrue(all(len(t['state_sha256']) == 64 for t in d['ttft']))
+            arms = d['bench'][0]['arms']
+            self.assertEqual([x['arm'] for x in arms], ['cold', 'warm'])
+            self.assertEqual((arms[0]['tokens'], arms[0]['logits'], arms[0]['final']['rank0'], arms[0]['tokens_per_s']),
+                             ([5] * 4, ['c' * 64] * 4, 'd' * 64, 4.0))
+            self.assertEqual(arms[0]['cache']['file_bytes'] if 'file_bytes' in arms[0]['cache'] else 0, 0)
+            self.assertIn('misses_per_token', arms[0]['cache'])
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(dw.compare_arms(out, out), 0)  # an arm against itself
+            self.assertEqual(json.loads(printed.getvalue())['modes_a'], ['ab-arm'])
+
+    def test_census_execute_reports_routes_file(self):
+        with tempfile.TemporaryDirectory(dir=BUILD) as td:
+            rc, summary, sent, _ = self.execute(td, 'census', [self.ttft_reply(8192), self.ttft_reply(8192, token=6)], routes=b'# seq\n3:1,2\n3:4,5\n')
+            self.assertEqual((rc, summary['verdict'], summary['mode']), (0, 'EXACT', 'census'), summary['gaps'])
+            self.assertNotIn('--reference-compare', sent[0])
+            self.assertEqual([(c['op'], Path(c['prompt']).name) for c in sent[1:3]],
+                             [('ttft', 'chat-arithmetic-8192.u32'), ('ttft', 'chat-extraction-8192.u32')])
+            c = summary['census']
+            self.assertEqual((c['kinds'], c['routes_out']['exists'], c['routes_out']['bytes'], c['routes_out']['lines']),
+                             (['arithmetic', 'extraction'], True, 18, 3))
+            self.assertEqual([p['token'] for p in c['prefills']], [5, 6])
+        with tempfile.TemporaryDirectory(dir=BUILD) as td:  # no routes file: reported, never a failure
+            rc, summary, _, _ = self.execute(td, 'census', [self.ttft_reply(8192), self.ttft_reply(8192)])
+            self.assertEqual((rc, summary['census']['routes_out']['exists']), (0, False))
+            self.assertNotIn('failure', summary)
+        self.assertEqual(dw.routes_file(None), dict(path=None, exists=False))
+
+    # ---- --compare-arms on synthetic results.json ----
+    @staticmethod
+    def results(token=5, logits=None, ttft_token=7, rank0='d' * 64, tps=4.0, ttft_s=2.0, drop=(), mode='ab-arm'):
+        state = lambda f: dict(rank0=rank0, rank1='b' * 64, bytes0=10, bytes1=10, replay='e' * 64, frontier=f, components=[[0, 0, 10]])
+        out = []
+        for n in dw.QUALIFY:
+            out.append(dict(op='ttft', tokens=n, prompt=f'q{n}.u32', verdict='EXACT', mode=mode, ttft_s=ttft_s,
+                            evidence=dict(kind='ttft', n=n, row_tile=2048, allocated=2048, token=ttft_token, ttft_s=ttft_s, prefill_s=ttft_s - 0.1,
+                                          state=state(n - 1))))
+        for n in dw.QUALIFY:
+            arms = [dict(arm=arm, tokens=[token, 6, 7, 8], logits=list(logits or ['c' * 64] * 4), positions=[n - 1 + j for j in range(4)],
+                         final=state(n + 3), generation_loop_s=1.0, tokens_per_s=tps) for arm in ('cold', 'warm')]
+            out.append(dict(op='bench', tokens=n, prompt=f'chat-explanation-{n}.u32', verdict='EXACT', mode=mode,
+                            evidence=dict(kind='bench', n=n, steps=4, arms=arms), arms=[dict(arm=x['arm'], tokens_per_s=tps) for x in arms]))
+        return [r for r in out if (r['op'], r['tokens']) not in drop]
+
+    def compare(self, a, b):
+        with tempfile.TemporaryDirectory(dir=BUILD) as td:
+            dirs = []
+            for name, results in (('A', a), ('B', b)):
+                d = Path(td) / name
+                d.mkdir()
+                if results is not None:
+                    (d / 'results.json').write_text(json.dumps(results, indent=2))
+                dirs.append(d)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                rc = dw.run(dw.arguments(['--compare-arms', str(dirs[0]), str(dirs[1])]))  # no --build / --model / --prompt-dir
+            return rc, json.loads(printed.getvalue())
+
+    def test_compare_arms_exact(self):
+        old = self.results(mode=None)
+        for r in old:  # an OLDER version's results: no mode key, no optional timing keys
+            r.pop('mode')
+            r.pop('ttft_s', None)
+            r['evidence'].pop('prefill_s', None)
+            r.pop('arms', None)
+        rc, d = self.compare(old, self.results(tps=6.0, ttft_s=1.0))
+        self.assertEqual((rc, d['verdict'], d['bench_pairs'], d['ttft_pairs'], d['diffs'], d['missing']), (0, 'EXACT', 4, 2, [], []))
+        bench = [p for p in d['pairs'] if p['item'] == 'bench chat-explanation-8192.u32 warm'][0]
+        self.assertEqual((bench['tokens_per_s_a'], bench['tokens_per_s_b'], bench['ratio_b_over_a']), (4.0, 6.0, 1.5))
+        ttft = [p for p in d['pairs'] if p['item'] == 'ttft q8192.u32#0'][0]
+        self.assertEqual((ttft['ttft_s_a'], ttft['ttft_s_b'], ttft['ratio_b_over_a'], ttft['prefill_s_a']), (2.0, 1.0, 0.5, None))
+        self.assertEqual((d['modes_a'], d['modes_b']), ([], ['ab-arm']))
+
+    def test_compare_arms_diff(self):
+        rc, d = self.compare(self.results(), self.results(logits=['c' * 64] * 3 + ['f' * 64]))
+        self.assertEqual((rc, d['verdict']), (3, 'DIFF'))
+        self.assertEqual(len(d['diffs']), 4)  # every bench item and arm, the last logits digest
+        self.assertTrue(all(x.endswith('logits digest [3]') for x in d['diffs']))
+        rc, d = self.compare(self.results(), self.results(token=9))
+        self.assertEqual((rc, d['verdict']), (3, 'DIFF'))
+        self.assertTrue(all(': tokens [5, 6, 7, 8] != [9, 6, 7, 8]' in x for x in d['diffs']) and len(d['diffs']) == 4)
+        rc, d = self.compare(self.results(), self.results(rank0='0' * 64, ttft_token=8))
+        self.assertEqual(rc, 3)
+        self.assertIn('ttft q1024.u32#0: first token 7 != 8', d['diffs'])
+        self.assertIn('ttft q1024.u32#0: prefill state rank0', d['diffs'])
+        self.assertIn('bench chat-explanation-1024.u32 cold: final state rank0', d['diffs'])
+        rc, d = self.compare(self.results(), self.results(token=9, drop={('bench', 8192)}))
+        self.assertEqual((rc, d['verdict']), (3, 'DIFF'))  # a mismatch wins over a missing item
+
+    def test_compare_arms_incomplete(self):
+        rc, d = self.compare(self.results(), self.results(drop={('bench', 8192)}))
+        self.assertEqual((rc, d['verdict'], d['diffs']), (4, 'INCOMPLETE', []))
+        self.assertEqual(sorted(m['item'] for m in d['missing']),
+                         ['bench chat-explanation-8192.u32 cold', 'bench chat-explanation-8192.u32 warm'])
+        self.assertEqual(d['missing'][0]['b'], 'absent')
+        broken = self.results()
+        broken[-1] = dict(broken[-1], verdict='MISMATCH', evidence=None, arms=[])  # not EXACT on one side
+        rc, d = self.compare(self.results(), broken)
+        self.assertEqual((rc, d['verdict'], d['missing'][0]['b']), (4, 'INCOMPLETE', 'MISMATCH'))
+        rc, d = self.compare(self.results(drop={('bench', 1024), ('bench', 8192)}),
+                             self.results(drop={('bench', 1024), ('bench', 8192)}))
+        self.assertEqual((rc, d['verdict'], d['bench_pairs'], d['ttft_pairs']), (4, 'INCOMPLETE', 0, 2))  # no bench pair compared
+        rc, d = self.compare([], [])
+        self.assertEqual((rc, d['verdict']), (4, 'INCOMPLETE'))
+        rc, d = self.compare(self.results(), None)  # no results.json
+        self.assertEqual((rc, d['verdict']), (4, 'INCOMPLETE'))
+        self.assertTrue(d['errors'] and d['missing'])
+
+    def test_compare_arms_arguments(self):
+        a = dw.arguments(['--compare-arms', 'A', 'B'])
+        self.assertEqual(a.compare_arms, [Path('A'), Path('B')])
+        self.refused(['--compare-arms', 'A', 'B', '--ab-arm'], 'excludes')
+        self.refused(['--compare-arms', 'A', 'B', '--allow-gpu'])
+        self.refused(['--compare-arms', 'A'])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            dw.arguments(['--model', 'M'])
+        self.assertIn('required: --build, --prompt-dir', err.getvalue())
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            dw.arguments(['--model', 'M', '--build', '.'])
+        self.assertIn('required: --prompt-dir', err.getvalue())
 
 
 class PlacementInputTests(unittest.TestCase):

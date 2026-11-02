@@ -43,6 +43,11 @@ struct TierOpenConfig {
     // ss_options.dg_flush_ready (DS TierSite flush_ready): flush the demand stream
     // after each ready signal (WDDM submission; outputs unchanged).
     bool flush_ready=true;
+    // ss_options.weight_dirs / drive_readers: stripe copies of the unit file on other drives
+    // (placement of reads only; every chunk is checked against the stripe manifest). Empty: primary only.
+    std::string weight_dirs;std::uint32_t drive_readers=0;
+    // ss_options.dg_disk_queue (1..64, <= staging) / dg_clean_evict; three-tier opens only.
+    std::uint32_t disk_queue=1;bool clean_evict=false;
 };
 // The tierstream commit this build compiled (CMake pin / snapshot STAMP), for health.
 const char* tierstream_commit();
@@ -57,7 +62,8 @@ struct TierLibraryBudget {std::uint64_t device_bytes=0,host_bytes=0;std::uint32_
 inline TierLibraryBudget library_budget(const TierBudget& b,std::uint64_t unit,std::uint64_t keys,std::uint32_t max_ids){
     TierLibraryBudget l;const std::uint64_t host_stride=align_up(unit,4096),slack=64ULL<<20;
     l.ring_slots=2*max_ids+1;l.device_bytes=(b.slots+2ULL*max_ids+1)*unit+keys*4+slack;
-    l.host_bytes=(b.pinned+b.host_spares+b.staging+1+4)*host_stride+(16ULL<<20)+slack;return l;
+    // +1 staging unit, +4 startup load buffers, + one bounce per disk reader (dg_disk_queue > 1).
+    l.host_bytes=(b.pinned+b.host_spares+b.staging+1+4+b.disk_readers)*host_stride+(16ULL<<20)+slack;return l;
 }
 std::unique_ptr<TierCacheApi> open_tierstream(const TierOpenConfig&);
 // CPU backend: runs every library admission rule (descriptor, plan, budgets,
