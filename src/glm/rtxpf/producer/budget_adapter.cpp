@@ -20,19 +20,24 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
     const auto& t=w.tier;expert_need(t.unit_bytes>0&&t.keys>0&&t.max_ids>=1,"tier budget inputs");
     const std::uint64_t ring=2ULL*t.max_ids+1,unit=t.unit_bytes;WholeDevicePlan r;
     r.device=w.device;r.pinned=w.pinned;r.device.push_back({"tierstream ring/guard slots",ring*unit});
+    // Landing blocks (dg_landing_blocks, one 4 KiB-rounded host stride each; run_plan passes them only for a
+    // three-tier placement): a pinned part under a RAM cap and taken off the host memory available, since the
+    // planner sizes the pinned tier from host_avail without the pinned parts.
+    const std::uint64_t landing=std::uint64_t(t.landing_blocks)*align_up(unit,4096);
+    if(landing)r.pinned.push_back({"tierstream landing blocks",landing});
     if(library_parts){r.device.push_back({"tierstream unit table + controls",t.keys*4+(64ULL<<20)});r.pinned.push_back({"tierstream bounce + load ring",(5ULL+t.disk_readers)*align_up(unit,4096)+(80ULL<<20)});}
     auto comps=[](const std::vector<BudgetPart>& v){std::vector<ts_budget_component> c;c.reserve(v.size());for(auto& x:v)c.push_back({x.name.c_str(),x.bytes});return c;};
     auto d=comps(r.device),p=comps(r.pinned),g=comps(w.pageable);
     ts_budget_in in;ts_budget_in_defaults(&in);in.file_tier=t.file_tier?1u:0u;in.vram_total_bytes=w.vram_total;in.ram_total_bytes=caps?w.ram_total:0;in.device_context_bytes=w.context;
     in.device_fixed=d.data();in.n_device_fixed=std::uint32_t(d.size());in.pinned_fixed=p.data();in.n_pinned_fixed=std::uint32_t(p.size());in.pageable_fixed=g.data();in.n_pageable_fixed=std::uint32_t(g.size());
     in.host_spares=t.host_spares;in.keys=t.keys;in.slot_bytes=unit;in.unit_bytes=unit;in.arena_spares=t.spare_slots;in.staging=t.staging;in.min_resident=w.min_resident;in.vram_margin_bytes=w.vram_margin;in.ram_margin_bytes=w.ram_margin;
-    in.arena_units=w.arena_units==~0ULL?TS_BUDGET_AUTO:w.arena_units;in.ram_expert_bytes=w.ram_expert_bytes==~0ULL?TS_BUDGET_AUTO:w.ram_expert_bytes;in.host_avail_bytes=w.host_avail==~0ULL?TS_BUDGET_AUTO:w.host_avail;
+    in.arena_units=w.arena_units==~0ULL?TS_BUDGET_AUTO:w.arena_units;in.ram_expert_bytes=w.ram_expert_bytes==~0ULL?TS_BUDGET_AUTO:w.ram_expert_bytes;in.host_avail_bytes=w.host_avail==~0ULL?TS_BUDGET_AUTO:(w.host_avail>landing?w.host_avail-landing:0);
     ts_budget_out out{};out.struct_size=sizeof out;const auto s=ts_budget_plan(&in,&out);
     if(s!=TS_OK&&s!=TS_E_CAPACITY)ts_ok(s,"budget plan");
     r.device_fixed=out.device_fixed_bytes;r.device_planned=out.device_planned_bytes;r.host_fixed=out.host_fixed_bytes;r.host_planned=out.host_planned_bytes;
     r.min_vram_total=out.min_vram_total_bytes;r.min_ram_total=out.min_ram_total_bytes;if(out.refused)r.refuse=out.refuse;
     auto& b=r.tier;b.ring=ring;b.resident=out.resident;b.spare_slots=out.arena_spares;b.slots=out.resident+out.arena_spares;b.pinned=out.pinned;b.disk=out.disk;
-    b.staging=out.staging;b.host_spares=t.host_spares;b.disk_readers=t.disk_readers;b.three_tier=out.three_tier!=0;
+    b.staging=out.staging;b.host_spares=t.host_spares;b.disk_readers=t.disk_readers;b.landing_blocks=t.landing_blocks;b.three_tier=out.three_tier!=0;
     // Device-gated library rules (not budget arithmetic): at least one global
     // spare slot, never more spares than non-resident units; no file tier means
     // every non-resident unit plus the spare blocks must be pinned.
@@ -41,16 +46,25 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
     if(r.refuse.empty()){const auto nonres=b.pinned+b.disk;if(b.spare_slots>nonres){b.spare_slots=nonres;b.slots=b.resident+b.spare_slots;}if(!b.spare_slots)r.refuse="every unit resident: no spare slot (lower --tier-vram-gib)";}
     b.refuse=r.refuse;return r;
 }
+// Landing blocks exist only with a file tier (tierstream allocates none otherwise): one placement is planned
+// without them, then again with them charged when it has one (less host room only moves more units to the file,
+// so it stays three-tier). A refusal of the charged plan stands: the operator asked for the blocks. Applied to
+// each spare count below, so the plan chosen always carries blocks exactly when it is three-tier.
+WholeDevicePlan run_plan_landing(const WholeDeviceIn& w,bool library_parts,bool caps){
+    auto w0=w;w0.tier.landing_blocks=0;auto bare=run_plan_once(w0,library_parts,caps);
+    if(!w.tier.landing_blocks||!bare.refuse.empty()||!bare.tier.three_tier)return bare;
+    return run_plan_once(w,library_parts,caps);
+}
 // Spares as a share of the arena: one more planner call with the larger count
 // (the arena is the same bytes; residents give way to spares). A refusal of the
 // second call falls back to the first plan (the explicit minimum).
 WholeDevicePlan run_plan(const WholeDeviceIn& w,bool library_parts,bool caps){
-    auto first=run_plan_once(w,library_parts,caps);const auto& t=w.tier;
+    auto first=run_plan_landing(w,library_parts,caps);const auto& t=w.tier;
     if(!t.spare_permille||!first.refuse.empty())return first;
     const std::uint64_t arena=first.tier.resident+first.tier.spare_slots,want=(arena*t.spare_permille+999)/1000;
     if(want<=t.spare_slots)return first;
     auto w2=w;w2.tier.spare_slots=std::uint32_t(std::min<std::uint64_t>(want,0xFFFFFFFFULL));w2.tier.spare_permille=0;
-    auto second=run_plan_once(w2,library_parts,caps);return second.refuse.empty()?second:first;
+    auto second=run_plan_landing(w2,library_parts,caps);return second.refuse.empty()?second:first;
 }
 }
 TierBudget tier_budget(const TierBudgetIn& in){

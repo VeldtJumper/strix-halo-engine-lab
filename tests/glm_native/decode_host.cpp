@@ -390,6 +390,21 @@ void tier_budget_tests(){
     in.host_bytes=48ULL<<30;auto three=tier_budget(in);
     check(three.refuse.empty()&&three.three_tier&&three.staging==8&&three.disk>0&&three.resident+three.pinned+three.disk==keys,"three-tier when RAM is short");
     check((three.pinned+three.host_spares+three.staging)*unit<=in.host_bytes&&(three.pinned+three.host_spares+three.staging+1)*unit>in.host_bytes,"pinned tier fills the RAM budget");
+    // Landing blocks through the arena-only planner: none on a two-tier plan (no file tier, nothing billed); on a
+    // three-tier plan they come out of the RAM budget (one host stride each), so the pinned tier shrinks to make room.
+    {auto l=in;l.landing_blocks=16;const auto l3=tier_budget(l);const auto stride=(unit+4095)/4096*4096;
+     check(l3.refuse.empty()&&l3.three_tier&&l3.landing_blocks==16&&l3.pinned+16<=three.pinned&&l3.resident==three.resident&&l3.resident+l3.pinned+l3.disk==keys,"three-tier: landing blocks billed, pinned tier smaller");
+     check((l3.pinned+l3.host_spares+l3.staging)*unit+16*stride<=in.host_bytes,"pinned tier + landing blocks fit the RAM budget");
+     l.host_bytes=400ULL<<30;const auto l2=tier_budget(l);
+     check(l2.refuse.empty()&&!l2.three_tier&&l2.landing_blocks==0&&l2.pinned==two.pinned&&l2.host_bytes(unit)==two.host_bytes(unit),"two-tier: landing requested but not billed (no file tier)");}
+    // Landing with a spare share: the blocks are decided per spare count, so the chosen plan carries them exactly when
+    // it is three-tier. Boundary case (host 80 units, staging 64, 5% spares): the charged share plan is refused,
+    // the fallback is the two-tier minimum, which must carry no blocks.
+    {TierBudgetIn s;s.keys=keys;s.unit_bytes=unit;s.device_bytes=(12364ULL+16+17)*unit;s.staging=64;s.spare_permille=50;s.landing_blocks=16;
+     for(std::uint64_t host:{80ULL,100ULL,200ULL,600ULL,4000ULL}){s.host_bytes=host*unit;const auto p=tier_budget(s);
+         check(p.refuse.empty()&&p.landing_blocks==(p.three_tier?16u:0u),("spare share + landing: blocks exactly when three-tier (host "+std::to_string(host)+" units)").c_str());
+         if(p.three_tier)check((p.pinned+p.host_spares+p.staging)*unit+16*unit<=s.host_bytes,"spare share + landing: blocks fit beside the pinned tier");}
+     s.host_bytes=80*unit;const auto edge=tier_budget(s);check(!edge.three_tier&&edge.landing_blocks==0&&edge.host_bytes(unit)==(edge.pinned+edge.host_spares+edge.staging)*unit,"spare-share fallback: two-tier minimum, no blocks billed");}
     auto lib=library_budget(three,unit,keys,8);check(lib.ring_slots==17&&lib.device_bytes>=(three.slots+17)*unit&&lib.host_bytes>=three.host_bytes(unit),"library budget covers arena/ring and pinned blocks");
     // Defaults: no new option changes today's behaviour (queue 1 = no extra bounce buffers, no stripes, no clean evict).
     {const DecodeOptions d{};check(disk_bounce_readers(d)==0&&d.weight_dirs.empty()&&d.drive_readers==0&&d.tier_disk_queue==1&&!d.tier_clean_evict&&!d.routes_prefill&&TierBudgetIn{}.disk_readers==0,"new options default off");
@@ -399,6 +414,10 @@ void tier_budget_tests(){
     // dg_disk_queue > 1: one bounce buffer per disk reader, billed in the plan, host bytes and library budget.
     {auto q=three;q.disk_readers=8;const auto lq=library_budget(q,unit,keys,8);const auto stride=(unit+4095)/4096*4096;
      check(q.host_bytes(unit)==three.host_bytes(unit)+8*unit&&lq.host_bytes==lib.host_bytes+8*stride&&lq.device_bytes==lib.device_bytes,"disk-reader bounce buffers are billed to pinned host memory");}
+    // Landing blocks (dg_landing_blocks): off by default; when requested, one pinned host stride each in the plan and library budget.
+    {const DecodeOptions d{};check(d.tier_landing_blocks==0&&d.tier_landing_max_queued==0&&d.tier_landing_ttl==0&&d.tier_landing_chunk==0&&TierBudgetIn{}.landing_blocks==0&&TierOpenConfig{}.landing_blocks==0,"landing off by default");
+     auto q=three;q.landing_blocks=16;const auto lq=library_budget(q,unit,keys,8);const auto stride=(unit+4095)/4096*4096;
+     check(q.host_bytes(unit)==three.host_bytes(unit)+16*unit&&lq.host_bytes==lib.host_bytes+16*stride&&lq.device_bytes==lib.device_bytes,"landing blocks are billed to pinned host memory");}
     in.device_bytes=10*unit;check(!tier_budget(in).refuse.empty(),"VRAM below ring + spares refused");
     in.device_bytes=40ULL<<30;in.host_bytes=10*unit;check(!tier_budget(in).refuse.empty(),"host below spares + staging refused");
     in.host_bytes=48ULL<<30;in.file_tier=false;check(!tier_budget(in).refuse.empty(),"no file tier and short RAM refused");
@@ -558,6 +577,12 @@ void tier_mapping_tests(){
     check(std::uint64_t(d.find("h2d_bytes")->as_int())==34*stride&&std::uint64_t(d.find("file_bytes")->as_int())==12*stride,"copy/file bytes");
     auto back=b;back.misses=a.misses-1;rejects([&]{cache_delta(a,back,stride);},"counters backwards");auto timeout=b;timeout.timeouts=1;rejects([&]{cache_delta(a,timeout,stride);},"device timeout fails the token");
     auto bad=b;bad.file_reads=a.file_reads+40;rejects([&]{cache_delta(a,bad,stride);},"file reads beyond copies are inconsistent");
+    {auto l=b;l.landing_issued=9;l.landing_promoted=6;l.landing_late=2;l.landing_wait_ns=700;l.landing_read_bytes=9*stride;l.landing_expired_layer=3;l.landing_yields=4;l.landing_aborted_bytes=5;
+     const auto ld=cache_delta(a,l,stride);check(ld.find("landing_issued")->as_int()==9&&ld.find("landing_promoted")->as_int()==6&&ld.find("landing_late")->as_int()==2&&ld.find("landing_wait_ns")->as_int()==700,"landing receipts");
+     check(std::uint64_t(ld.find("landing_read_bytes")->as_int())==9*stride&&ld.find("landing_expired_layer")->as_int()==3&&ld.find("landing_yields")->as_int()==4&&ld.find("landing_aborted_bytes")->as_int()==5,"landing expiry/yield receipts");
+     for(auto k:{"landing_issued","landing_promoted","landing_late","landing_wait_ns","landing_expired","landing_dropped_full","landing_read_bytes","landing_cancelled","landing_expired_layer","landing_skipped_passed","landing_yields","landing_aborted_bytes"})
+         check(d.find(k)&&d.find(k)->as_int()==0,"every landing receipt present and 0 when off");
+     auto lb=l;lb.landing_promoted=5;rejects([&]{cache_delta(l,lb,stride);},"landing counters backwards");}
     // Failed-token teardown: an injected failure after begin retires the cache; the
     // next begin reports the ORIGINAL failure, never "already open".
     TokenGuard g;g.begin();g.end();g.begin();g.fail("injected: CUTLASS launch failed at layer 17");
@@ -608,6 +633,19 @@ void production_admission_tests(){
     // spares exceeds the device budget at 3,353 residents; zero per-layer billing fits.
     auto [old_billing,ob]=probe(3353,48ULL<<30,2);(void)ob;check(old_billing.first!=8&&old_billing.first!=0,("per-layer dynamic billing is refused (got "+std::to_string(old_billing.first)+")").c_str());
     std::cout<<"INFO full 43x288 admission at stride "<<stride<<": ok; per-layer billing refused: "<<old_billing.second<<"\n";
+    // Landing blocks through the real library open (CPU backend), with the group passed as runtime.cu passes it:
+    // three-tier + disk queue 8 admitted with the blocks; a two-tier plan keeps none and sends no landing option.
+    auto landing=[&](std::uint64_t host_bytes,std::uint32_t queue){TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=(3353+16+17)*stride;in.host_bytes=host_bytes;in.disk_readers=queue>1?queue:0;in.landing_blocks=16;
+        TierOpenConfig cfg;cfg.budget=tier_budget(in);cfg.descriptor_json=tierstream_descriptor(c,"OUT_DIR/glm-units.bin",std::string(64,'b')).dump();cfg.tiers=tier_assignment(cfg.budget,keys,{});cfg.unit_bytes=stride;cfg.cuda=false;cfg.disk_queue=queue;
+        if(cfg.budget.landing_blocks){cfg.landing_blocks=std::uint32_t(cfg.budget.landing_blocks);cfg.landing_max_queued=4;cfg.landing_chunk=0xFFFFFFFFu;}return cfg;};
+    {auto three=landing(48ULL<<30,8);check(three.budget.three_tier&&three.budget.landing_blocks==16,"landing plan: three-tier keeps 16 blocks");
+     auto r=tierstream_admission_probe(three);check(r.first==8,("landing blocks admitted by the library (got "+std::to_string(r.first)+": "+r.second+")").c_str());
+     auto two=landing(~0ULL>>1,8);check(!two.budget.three_tier&&two.budget.landing_blocks==0&&!two.landing_blocks&&!two.landing_chunk,"landing plan: two-tier keeps none");
+     auto r2=tierstream_admission_probe(two);check(r2.first==8,("two-tier plan with landing requested admitted (got "+std::to_string(r2.first)+": "+r2.second+")").c_str());
+     auto orphan=two;orphan.landing_chunk=0xFFFFFFFFu;check(tierstream_admission_probe(orphan).first==-1,"landing options without blocks refused before the library");
+     auto unbilled=three;unbilled.landing_blocks=32;check(tierstream_admission_probe(unbilled).first==-1,"landing blocks beyond the billed count refused before the library");
+     auto q1=landing(48ULL<<30,1);auto r1=tierstream_admission_probe(q1);check(r1.first!=8&&r1.second.find("dg_disk_queue > 1")!=std::string::npos,"landing blocks with disk queue 1 refused by the library for that reason");
+     std::cout<<"INFO landing admission: three-tier 16 blocks ok; two-tier none; disk queue 1 refused: "<<r1.second<<"\n";}
     // Full-card shape with the DS placement: 5% spares, round-robin seed (dg_seed +
     // matching tier array), each boundary policy; all admitted by the library.
     {TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=(6262ULL+17)*stride;in.host_bytes=~0ULL>>1;in.spare_permille=50;
@@ -668,6 +706,17 @@ void decode_budget_tests(){
     check(p.refuse.empty()&&p.device_planned<=24*gib&&p.host_planned<=32*gib&&p.tier.resident>0&&p.tier.resident+p.tier.pinned+p.tier.disk==c.size(),("whole-device 24/32 admitted within the caps: "+p.refuse).c_str());
     check(p.device_planned+in.vram_margin<=24*gib&&p.device_planned+in.vram_margin+stride>24*gib,"the arena is everything the VRAM cap leaves after the margin (one more slot would not fit)");
     check(p.min_vram_total<=24*gib&&p.min_ram_total<=32*gib,"minimum caps below the requested ones");
+    {   // Landing blocks in the whole-device plan: billed only with a file tier, under the RAM cap and under the host
+        // memory available (the planner sizes the pinned tier from host_avail without the pinned parts).
+        const std::uint64_t lb=16*((stride+4095)/4096*4096);
+        auto l=glm();l.tier.landing_blocks=16;const auto lp=plan_whole_device(l);
+        check(p.tier.three_tier&&lp.refuse.empty()&&lp.tier.landing_blocks==16&&lp.tier.pinned+16<=p.tier.pinned&&lp.host_planned<=32*gib&&lp.tier.resident==p.tier.resident,"whole-device RAM cap: landing blocks billed, pinned tier smaller");
+        auto a0=glm();a0.ram_total=0;a0.host_avail=20*gib;const auto ap=plan_whole_device(a0);
+        auto a1=a0;a1.tier.landing_blocks=16;const auto aq=plan_whole_device(a1);
+        check(ap.tier.three_tier&&aq.refuse.empty()&&aq.tier.landing_blocks==16&&aq.tier.pinned+16<=ap.tier.pinned,"host-available bound: landing blocks reserved too");
+        check((aq.tier.pinned+aq.tier.host_spares+aq.tier.staging)*stride+lb<=(ap.tier.pinned+ap.tier.host_spares+ap.tier.staging+1)*stride,"host-available bound: landing taken from the same room");
+        auto b0=glm();b0.ram_total=0;b0.host_avail=1000*gib;const auto bp=plan_whole_device(b0);auto b1=b0;b1.tier.landing_blocks=16;const auto bq=plan_whole_device(b1);
+        check(!bp.tier.three_tier&&!bq.tier.three_tier&&bq.tier.landing_blocks==0&&bq.tier.pinned==bp.tier.pinned&&bq.host_fixed==bp.host_fixed,"two-tier whole-device: landing not billed");}
     {   // host growth after open (session snapshot + driver headroom) comes out of the pinned tier, not the cap
         auto grown=glm();const std::uint64_t snap=489406976;add_host_growth_parts(grown.pageable,snap);auto g=plan_whole_device(grown);
         check(g.refuse.empty()&&g.host_planned<=32*gib&&g.tier.pinned<p.tier.pinned,"host growth parts admitted under the RAM cap, fewer pinned units");

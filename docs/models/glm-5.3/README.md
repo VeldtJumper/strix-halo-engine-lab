@@ -109,7 +109,9 @@ state, tokens and logits are bitwise equal with it off. In same-window compariso
 (32K) of the overlap-off time on the full card. Turn it off with `--prefill-overlap 0`.
 With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on disk) it also runs exact: TTFT
 **60.3 s** at 1K and **62.4 s** at 8K with the prefill overlap (63.4 / 73.7 s with it off in the same window); decode
-**0.67 tok/s** warm (0.63 cold). Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
+**0.67 tok/s** warm (0.63 cold). With the opt-in two-stage file prefetch (`--tier-landing-blocks 16`, three striped
+drives) decode was 20-40 % faster than without it in the same windows, identical output (repeats varied by 15-55 %).
+Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
 
 ## Every shipped GLM default
 

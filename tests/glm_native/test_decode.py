@@ -456,6 +456,9 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(c['writeback_bytes_per_token'], 21 / 4 * dw.UNIT_BYTES)
         self.assertAlmostEqual(c['file_read_s_per_token'], 123456789 / 4 / 1e9)
         self.assertEqual(dw.cache_summary(dict(expert_totals={}), 0)['source_share'], {})
+        self.assertIsNone(c['landing_used'])  # no landing reads: no share
+        h = dw.cache_summary(dict(expert_totals=dict(landing_issued=8, landing_promoted=6, landing_wait_ns=4000000, landing_read_bytes=8 * dw.UNIT_BYTES)), 2)
+        self.assertEqual((h['landing_used'], h['landing_wait_s_per_token'], h['landing_read_bytes_per_token']), (0.75, 0.002, 4 * dw.UNIT_BYTES))
         ref = dw.cache_summary(dict(expert_totals=dict(device_selections=10, pinned_selections=6, file_selections=2)), 2)
         self.assertEqual((ref['device_hits'], ref['ram_copies'], ref['file_reads'], ref['device_selections']), (10, 6, 2, 10))
 
@@ -996,6 +999,21 @@ class WindowTests(unittest.TestCase):
             for flag, value in (('--tier-staging', '16'), ('--tier-disk-queue', '16'), ('--tier-clean-evict', '1'), ('--disk-prefetch', '1')):
                 self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertNotIn('--tier-disk-queue', dw.service_command(m, 'svc'))  # default: one read at a time
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            land = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--tier-disk-queue', '8',
+                                 '--tier-landing-blocks', '16', '--tier-landing-max-queued', '4', '--tier-landing-ttl', '0', '--tier-landing-chunk', 'whole'])
+        for argv in (dw.service_command(land, 'svc'), dw.worker_options(land)):
+            for flag, value in (('--tier-landing-blocks', '16'), ('--tier-landing-max-queued', '4'), ('--tier-landing-ttl', '0'), ('--tier-landing-chunk', 'whole')):
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+        for argv in (dw.service_command(m, 'svc'), dw.worker_options(m)):
+            self.assertFalse([f for f in argv if str(f).startswith('--tier-landing')])  # default: landing off, nothing sent
+        base = ['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card']
+        with patch.object(dw, 'host_total_gib', return_value=191.6):
+            for ok in (['--tier-landing-ttl', '0'], ['--tier-landing-ttl', '1024'], ['--tier-landing-chunk', '0'], ['--tier-landing-chunk', '4096'], ['--tier-landing-chunk', 'whole']):
+                dw.arguments(base + ok)
+            for bad in (['--tier-landing-ttl', '1025'], ['--tier-landing-chunk', '4097'], ['--tier-landing-chunk', '-4096'], ['--tier-landing-chunk', str(2**32)], ['--tier-landing-blocks', '4097']):
+                with self.assertRaises(SystemExit, msg=bad), patch('sys.stderr'):
+                    dw.arguments(base + bad)
         cmd = dw.service_command(s, 'svc')
         self.assertEqual(cmd[cmd.index('--prefill-tile-crossover') + 1], '0')  # per-start sweep: crossover off
         for bad in (['--tile-requests', '4096'], ['--tile-requests', '4096,4096'], ['--tile-requests', '4096,8200'],

@@ -40,6 +40,13 @@ CAPACITY = 32768
 WHOLE_CARD_CAPACITY = 8320
 
 
+def landing_chunk(value):
+    """--tier-landing-chunk: 0, a multiple of 4096 bytes up to 2^32 - 4096, or 'whole' (as the service and tierstream)."""
+    if value == 'whole' or (value.isdigit() and int(value) < 2**32 and int(value) % 4096 == 0):
+        return value
+    raise argparse.ArgumentTypeError('BYTES (0 or a multiple of 4096) or whole')
+
+
 def capacity(a):
     """The service capacity this run plans and starts with."""
     return getattr(a, 'capacity', None) or CAPACITY
@@ -412,6 +419,10 @@ def service_command(a, binary):
                             ('--tier-staging', getattr(a, 'tier_staging', None)),
                             ('--tier-disk-queue', getattr(a, 'tier_disk_queue', None)),
                             ('--tier-clean-evict', getattr(a, 'tier_clean_evict', None)),
+                            ('--tier-landing-blocks', getattr(a, 'tier_landing_blocks', None)),
+                            ('--tier-landing-max-queued', getattr(a, 'tier_landing_max_queued', None)),
+                            ('--tier-landing-ttl', getattr(a, 'tier_landing_ttl', None)),
+                            ('--tier-landing-chunk', getattr(a, 'tier_landing_chunk', None)),
                             ('--disk-prefetch', getattr(a, 'disk_prefetch', None)),
                             ('--profile', getattr(a, 'profile', None))):
             if value is not None:
@@ -879,6 +890,10 @@ def cache_summary(arm, steps):
     out['file_read_s_per_token'] = rate('file_read_ns') / 1e9
     out['file_wait_s_per_token'] = rate('file_wait_ns') / 1e9  # exposed: < read time once reads overlap
     out['clean_drop_bytes_per_token'] = rate('clean_drop_bytes')
+    # Landing blocks: the share of landing reads a demand used, and the host time demands still waited on them.
+    out['landing_used'] = out.get('landing_promoted', 0) / out['landing_issued'] if out.get('landing_issued') else None
+    out['landing_wait_s_per_token'] = rate('landing_wait_ns') / 1e9
+    out['landing_read_bytes_per_token'] = rate('landing_read_bytes')
     return out
 
 
@@ -1418,7 +1433,8 @@ def worker_options(a):
     argv = []
     for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency', 'prefill_overlap',
                  'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'mtp_self_spec', 'spec_lookup', 'expert_residency', 'expert_routes', 'routes_out', 'routes_prefill', 'row_tile', 'profile', 'prefill_tile_crossover',
-                 'weight_dirs', 'drive_readers', 'tier_staging', 'tier_disk_queue', 'tier_clean_evict', 'disk_prefetch'):
+                 'weight_dirs', 'drive_readers', 'tier_staging', 'tier_disk_queue', 'tier_clean_evict', 'disk_prefetch',
+                 'tier_landing_blocks', 'tier_landing_max_queued', 'tier_landing_ttl', 'tier_landing_chunk'):
         if getattr(a, name, None) is not None:
             argv += ['--' + name.replace('_', '-'), str(getattr(a, name))]
     if getattr(a, 'full_card', False):
@@ -1574,6 +1590,13 @@ def arguments(argv=None):
                    help='service: three-tier predicted units homed on the file are read ahead (dg_disk_prefetch; with --tier-predict 1)')
     p.add_argument('--tier-clean-evict', choices=['0', '1'],
                    help='service: three-tier device victims with no free pinned block go to their file with no D2H copy')
+    p.add_argument('--tier-landing-blocks', type=int, choices=range(0, 4097), metavar='0..4096',
+                   help='service: pinned landing blocks for predicted file-homed units (three-tier, --tier-disk-queue > 1; 0 = off)')
+    p.add_argument('--tier-landing-max-queued', type=int, choices=range(0, 65), metavar='0..64',
+                   help='service: landing reads running at once (0 = 1; with --tier-landing-blocks)')
+    p.add_argument('--tier-landing-ttl', type=int, choices=range(0, 1025), metavar='0..1024',
+                   help='service: 0 = an undemanded landing goes back to its file right after its target layer; N >= 1 = after N tokens')
+    p.add_argument('--tier-landing-chunk', type=landing_chunk, help='service: landing reads in chunks of BYTES that yield to demand reads (0 = 4 MiB; whole = unchunked; tierstream dg_landing_chunk)')
     p.add_argument('--drive-readers', type=int, choices=range(1, 33), metavar='1..32',
                    help='service: reader threads per volume with --weight-dirs (default: the library default, 4)')
     p.add_argument('--profile', choices=['default', 'fast', 'quality'],
