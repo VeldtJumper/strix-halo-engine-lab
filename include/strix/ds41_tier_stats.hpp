@@ -29,6 +29,9 @@ struct TierTokenStats {
     std::uint64_t device_timeouts = 0;
     double boundary_sync_us = 0, boundary_select_us = 0, boundary_upload_us = 0, boundary_issue_us = 0;
     std::uint64_t wb_issued_bytes = 0;  // write-back bytes submitted in the token (deferred parts included)
+    // three-tier file reads of the token (0 without a file tier): reads / bytes, the service's wall wait for them,
+    // stage waits, pinned units dropped to their file, prefetch reads carried into a later service call
+    std::uint64_t disk_reads = 0, disk_read_bytes = 0, disk_wait_ns = 0, disk_stage_waits = 0, disk_drops = 0, disk_carried = 0;
 };
 
 // One layer of the last token (the library's timeline, dg_diag).

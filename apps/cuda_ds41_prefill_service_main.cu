@@ -6,6 +6,7 @@
 //       [--vram-cap-gib G] [--vram-reserve-gib G] [--no-auto-budget [--device-gib G | --tiers DHF..]] [--no-expert-residency]
 //       [--expert-rank FILE] [--xfer-group N] [--xfer-piece-mib N] [--host-gib G | --host-gib-auto G (opportunistic, e.g. 32)] [--overlay OVERLAY.gguf] [--host-pin-order layer|deadline|early]
 //       [--host-commit-floor-gib F (20 with --host-gib-auto)] [--host-pin-wait-s S] [--slots S] [--chunk C] [--moe-chunk M]
+//       [--no-host-promote | --host-promote] [--host-promote-max-gib G] [--baseline]
 //       [--window W] [--io-threads N] [--engram-threads N] [--buffered] [--engram-upload mapped|stream]
 //       [--engram-cache-mib N] [--no-gpu-probe] [--device D] [--layers L]
 //       [--exact | --no-fast-dense | --no-fast-moe | --no-fast-attention] [--fast-attention-min-rows N] [--fast-moe-signed-lut] [--fast-moe-wide-tiles]
@@ -22,6 +23,13 @@
 // rest stream; the device budget comes from the free memory after the dense weights and buffers, less
 // --vram-reserve-gib (default 1), and under --vram-cap-gib G when given (everything the object allocates stays under
 // G). --no-auto-budget: --device-gib / --tiers as given; --no-expert-residency: whole-layer tiers.
+// Lazy host promotion (default ON; CudaPrefillOptions::host_promote): a file-tier expert layer read for a request is
+// kept in a new pinned buffer and streams from host memory in the next requests (the same bytes), while the host keeps
+// max(--host-commit-floor-gib, 20) GiB free and, with --host-promote-max-gib G, the promoted layers stay under G GiB;
+// below the floor at a request start the least recently used promoted layers go back to the file. Off:
+// --no-host-promote, STRIX_DS41_HOST_PROMOTE=0, --baseline / STRIX_DS41_RTX_BASELINE=1 (the service's default-ON
+// levers off; strix/ds41_rtx_profile.hpp, app prefill-service; the last of a lever's options and --baseline decides).
+// Streamer transport only (not with --no-expert-residency, --pass-rows).
 // --layers L: layers [0, L) only (tests: no head, no cone; the next token is not the model's).
 //
 // Closed batches (--batch-max B > 1; default 1 = one prompt at a time): when the GPU frees, the worker takes the queue
@@ -41,7 +49,8 @@
 //                        X-State-Reserve-Tokens of the import)}
 //       -> {"session","tokens","next_token","logits_fnv","state_bytes","sha256","digest","fast":{dense,moe,attention},
 //           "seconds":{"queue","prefill","export","sha256","transfer","import","handoff","total"},
-//           "prefill":{engram_s, expert_io_s, expert_gb_streamed, row_layers}, "import":<the import reply>|null,
+//           "prefill":{engram_s, expert_io_s, expert_gb_streamed, file_gb_streamed, host_promoted_layers,
+//                      host_promoted_total, host_promoted_gb, host_demoted_layers, row_layers}, "import":<the import reply>|null,
 //           "batch":{"size","index","prefill_s" (the batch's wall)}}  (seconds.prefill: until this member's logits)
 //       --fast-export services take "export":"legacy"|"fast"|"check" per request (legacy: the old export, idle preload released first).
 //       The prefills run one at a time in arrival order (a queue of at most --max-queue waiting requests; 503 when
@@ -86,6 +95,7 @@
 #endif
 
 #include "strix/ds41_memory_budget.hpp"
+#include "strix/ds41_rtx_profile.hpp"
 #include "strix/ds41_state_transfer.hpp"
 #ifdef _WIN32
 #include <bcrypt.h>
@@ -372,6 +382,7 @@ struct Config {
     int v2_timeout = 30;
     bool handoff_v2 = false;
     std::string state_identity, handoff_only;
+    std::string levers_json = "null";  // the default-ON service levers as resolved (profile receipt)
 };
 
 struct Handoff {
@@ -750,6 +761,9 @@ public:
         s.set("expert_residency", Json(o_.expert_residency));
         s.set("auto_budget", Json(o_.auto_budget));
         s.set("vram_cap_gib", Json(o_.vram_cap_gib));
+        s.set("host_promote", Json(o_.host_promote));
+        s.set("host_promote_max_gib", Json(o_.host_promote_max_gib));
+        s.set("levers", strix::serve::parse_json(c_.levers_json));
         s.set("max_queue", Json(static_cast<std::uint64_t>(c_.max_queue)));
         s.set("timing", Json(c_.timing));
         s.set("pipeline", Json(c_.pipeline));
@@ -1283,6 +1297,11 @@ private:
         const auto weight_io = p_.weight_io_json();
         if (weight_io != "null") pre.set("weight_io", strix::serve::parse_json(weight_io));
         pre.set("expert_gb_streamed", Json(double(res.expert_bytes_streamed) / 1e9));
+        pre.set("file_gb_streamed", Json(double(res.file_bytes_streamed) / 1e9));
+        pre.set("host_promoted_layers", Json(static_cast<std::uint64_t>(res.host_promoted_layers)));
+        pre.set("host_promoted_total", Json(static_cast<std::uint64_t>(res.host_promoted_total)));
+        pre.set("host_promoted_gb", Json(double(res.host_promoted_bytes) / 1e9));
+        pre.set("host_demoted_layers", Json(static_cast<std::uint64_t>(res.host_demoted_layers)));
         pre.set("row_layers", Json(res.row_layers));
         pre.set("expert_copy_busy_s", Json(res.expert_copy_busy_s));
         pre.set("expert_stall_ms", Json(res.expert_stall_ms));
@@ -1490,6 +1509,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--host-commit-floor-gib") { o.host_commit_floor_gib = std::stod(next()); host_floor_given = true; }
         else if (a == "--host-pin-wait-s") { o.host_pin_wait_s = std::stod(next()); host_wait_given = true; }
+        else if (a == "--host-promote" || a == "--no-host-promote" || a == "--baseline") {}  // resolved below
+        else if (a == "--host-promote-max-gib") o.host_promote_max_gib = std::stod(next());
         else if (a == "--tiers") tiers = next();
         else if (a == "--slots") o.slots = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--chunk") o.chunk_rows = static_cast<std::uint32_t>(std::stoul(next()));
@@ -1558,6 +1579,17 @@ int main(int argc, char** argv) {
     }
     if (!strix::ds41::valid_host_pin_policy(o.host_commit_floor_gib, o.host_pin_wait_s))
         usage("host floor/wait must be finite and nonnegative");
+    if (!(o.host_promote_max_gib >= 0.0 && o.host_promote_max_gib <= 1024.0)) usage("--host-promote-max-gib must be within 0..1024");
+    {
+        // the default-ON service levers: the last of a lever's own options and --baseline, else STRIX_DS41_RTX_BASELINE=1,
+        // else the lever's variable, else on (the service does not take --profile yet: the default column)
+        namespace pf = strix::ds41::rtx::profile;
+        const auto levers = pf::resolve(pf::Name::standard, false, pf::App::prefill_service,
+                                        pf::Inputs{std::vector<std::string>(argv + 2, argv + argc), {}});
+        const auto* hp = levers.find("host_promote");
+        o.host_promote = hp != nullptr && hp->value == "on";
+        c.levers_json = levers.json();
+    }
     if (!tiers.empty()) {
         o.tiers.assign(40, ExpertTier::file);
         for (std::size_t l = 0; l < tiers.size() && l < 40; ++l)
@@ -1669,9 +1701,10 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         Service svc(p, o, c);
         std::printf("{\"event\":\"READY\",\"http\":\"%s:%d\",\"max_positions\":%u,\"fast_dense\":%s,\"fast_moe\":%s,\"fast_attention_min_rows\":%u,"
-                    "\"timing\":%s,\"pipeline\":%s,\"handoff_queue\":%zu%s}\n",
+                    "\"timing\":%s,\"pipeline\":%s,\"handoff_queue\":%zu,\"host_promote\":%s,\"levers\":%s%s}\n",
                     c.host.c_str(), c.port, o.max_positions, c.fast_dense ? "true" : "false", c.fast_moe ? "true" : "false",
-                    o.fast_attention ? c.fast_attention_min_rows : 0U, c.timing ? "true" : "false", c.pipeline ? "true" : "false", c.handoff_queue, p.weight_io_fields().c_str());
+                    o.fast_attention ? c.fast_attention_min_rows : 0U, c.timing ? "true" : "false", c.pipeline ? "true" : "false", c.handoff_queue,
+                    o.host_promote ? "true" : "false", c.levers_json.c_str(), p.weight_io_fields().c_str());
         std::fflush(stdout);
         std::vector<std::thread> conns;
         std::atomic<int> live{0};

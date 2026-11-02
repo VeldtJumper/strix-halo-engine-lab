@@ -22,6 +22,12 @@
 // --baseline restores old defaults at that argument; later flags override each item.
 // STRIX_DS41_RTX_BASELINE=1 applies baseline before all arguments. --print-config emits
 // resolved JSON and exits before CUDA, fixtures or model reads (dummy model paths allowed).
+// --profile default|fast|quality (STRIX_DS41_PROFILE; strix/ds41_rtx_profile.hpp): one switch for every lever. default (= no
+// --profile) is today's configuration; quality = default (no higher-precision expert pack on the RTX); fast = default +
+// the qualified fast-only levers (none yet: they are listed as pending and not used). Per-lever options stay as expert
+// overrides (CLI > environment > profile > builtin); --allow-pending (STRIX_DS41_PROFILE_ALLOW_PENDING=1) runs a pending
+// lever that is in this build, for benchmarks only (receipts "unqualified: <rows>"). The resolution is the "profile"
+// object of --print-config / the census effective_config and the run's first "profile" event.
 //
 // Phases, in the given order, in one loaded process (each re-imports the state):
 //   exact0 / exact<K>   greedy steps from the imported state with prediction off / K predicted experts per layer:
@@ -85,9 +91,13 @@
 #include "strix/ds41_dspark_driver.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
+#include "strix/ds41_rtx_schedule.hpp"
+#include "strix/ds41_rtx_budget.hpp"
+#include "strix/ds41_rtx_profile.hpp"
 
 #include "cuda_ds41_replica_serve.hpp"
 #include "cuda_ds41_session_draft.hpp"
+#include "cuda_ds41_replica_budget.hpp"
 
 #include "strix/cuda_ds41_moe_v2.hpp"
 
@@ -138,6 +148,10 @@ bool g_serving = false;
     if (g_serving) throw rs::RequestReject(why);
     std::fprintf(stderr, "strix-cuda-ds41-replica: %s\n", why);
     std::fprintf(stderr, "  --weight-dirs LIST (; separated; empty disables) --drive-readers N (4) --weight-verify cached|always (cached)\n  Environment when absent: STRIX_WEIGHT_DIRS, STRIX_WEIGHT_VERIFY\n");
+    std::fprintf(stderr, "  tiers: --vram-expert-gib G|auto (= --arena-gib) --ram-expert-gib G|auto (auto) --ram-inclusive-gib G|auto|0 (0)\n"
+                         "         --file-tier|--no-file-tier (on; STRIX_DS41_FILE_TIER=0) --disk-prefetch --disk-staging N (8) --disk-queue N (4; STRIX_DS41_DISK_QUEUE; 0 = library default, 1 = one read at a time)\n"
+                         "  whole-device budgets: --vram-total-gib N|none --ram-total-gib M|none (STRIX_DS41_VRAM_TOTAL_GIB / STRIX_DS41_RAM_TOTAL_GIB;\n"
+                         "         default none = today) --vram-margin-gib G (1.5) --ram-margin-gib G (1) --budget-receipt --budget-sample-ms N (100; 0 = stages only)\n");
     std::exit(2);
 }
 
@@ -350,6 +364,43 @@ int main(int argc, char** argv) {
     double arena_gib = -1.0, host_margin_gib = 6.0, max_pinned_gib = 68.0;
     bool arena_auto = false;
     double arena_headroom_gib = 1.5;
+    // Three-tier expert placement (rtx::tier_plan; tierstream SS_DG_DISK_TIER): --vram-expert-gib = --arena-gib;
+    // --ram-expert-gib G|auto = the pinned tier (spares and staging included; auto = what the host can pin now within
+    // --host-margin-gib and --max-pinned-gib); the rest of the experts stays in the model file (read on demand,
+    // through --weight-dirs stripes). The file tier replaces the old refusal when RAM cannot pin every non-resident
+    // expert: default ON, --no-file-tier / STRIX_DS41_FILE_TIER=0 / --baseline = refuse as before. With budgets that
+    // cover every expert nothing changes (same tiers, same library path). --ram-inclusive-gib G|auto|0: pinned blocks
+    // device experts keep as clean copies (eviction = a drop, no write-back); default 0 until measured.
+    double ram_expert_gib = -1.0, ram_inclusive_gib = 0.0;
+    const char* file_tier_env = std::getenv("STRIX_DS41_FILE_TIER");
+    bool file_tier = !(file_tier_env && std::string(file_tier_env) == "0");
+    bool disk_prefetch = false;       // --disk-prefetch: predictions may read file-tier experts (default: demand only)
+    std::uint32_t disk_staging = 8;   // --disk-staging N: pinned staging buffers of the file reads
+    // --disk-queue auto|N: file reads in flight (0 = library default, 1 = one at a time). Default auto = the library's
+    // clamp(3 x read locations, 4, 8): one drive 4 (measured at 24+32 on tierstream's serialization fixes: 4 in flight
+    // +20 % plain / +26 % DSpark vs one at a time, 16 = 4, identical bytes; one drive saturates at 4), two 6, three or more 8;
+    // a library without the auto value gets 4. STRIX_DS41_DISK_QUEUE=auto|N sets it, --disk-queue 1 / --baseline = one at a time.
+    const char* disk_queue_env = std::getenv("STRIX_DS41_DISK_QUEUE");
+    std::uint32_t disk_queue = disk_queue_env && std::string(disk_queue_env) != "auto"
+                                   ? static_cast<std::uint32_t>(std::strtoul(disk_queue_env, nullptr, 10)) : strix::ds41::cuda::kDiskQueueAuto;
+    // Whole-device budgets (strix/ds41_rtx_budget.hpp; tierstream ss_budget_plan / ss_budget_ledger): --vram-total-gib N = the WHOLE device
+    // (CUDA context + trunk + attention state for --max-positions + drafter + workspaces + arena + margin), --ram-total-gib
+    // M = the process's whole commit (pinned included). The arena and the pinned tier get what the measured fixed parts
+    // leave (never more than --vram-expert-gib / --ram-expert-gib ask: a cap only shrinks a tier); refused at startup
+    // with the minimum N / M when the fixed part does not fit. Peaks are measured (cudaMemGetInfo stages + NVML sampler,
+    // process commit) and checked against the caps in the 'budget' events. Unset (default) = today, nothing measured.
+    // A load-time setting (not a request option); --baseline keeps it (a device limit, not a tuning).
+    strix::ds41::rtx::BudgetCaps caps;
+    std::uint32_t budget_sample_ms = 100;  // --budget-sample-ms N: the NVML sampler's period (0: stage samples only)
+    const auto total_gib_value = [](const std::string& name, const std::string& v) {
+        if (v == "none" || v == "0") return -1.0;
+        double g = -1.0;
+        try { g = std::stod(v); } catch (const std::exception&) { g = -1.0; }
+        if (!std::isfinite(g) || g <= 0.0 || g > 65536.0) usage(("bad value of " + name + ": " + v + " (GiB > 0, or none)").c_str());
+        return g;
+    };
+    if (const char* v = std::getenv("STRIX_DS41_VRAM_TOTAL_GIB"); v && *v) caps.vram_total_gib = total_gib_value("STRIX_DS41_VRAM_TOTAL_GIB", v);
+    if (const char* v = std::getenv("STRIX_DS41_RAM_TOTAL_GIB"); v && *v) caps.ram_total_gib = total_gib_value("STRIX_DS41_RAM_TOTAL_GIB", v);
     std::string receipt, cache_kind = "tierstream";
     bool chat_logits = false, moe_v1b3 = false, router_form0 = false, qakv_auto = false, dsrtxk_on = true, fuse_on = true, flush_ready = false;
     std::uint32_t wb_alt = 0;  // --wb-alt N: chats phases alternate the spare target --spares / 0 every N decode tokens
@@ -421,6 +472,12 @@ int main(int argc, char** argv) {
         wb_defer = false;
         ce_pacing = false;
         wb_stream = false;
+        file_tier = false;          // the old refusal when the pinned tier does not fit
+        ram_expert_gib = -1.0;
+        ram_inclusive_gib = 0.0;
+        disk_prefetch = false;
+        disk_staging = 8;
+        disk_queue = 1;
         evict = "lru";
         controller_scope = "run";
         host_spares = 96;
@@ -462,6 +519,8 @@ int main(int argc, char** argv) {
         bool known = true;  // two chains: one else-if chain this long nests too deeply for MSVC inside a lambda
         if (a == "--baseline") baseline();
         else if (a == "--print-config" || a == "--print-effective-config") print_config = true;
+        else if (a == "--profile") next();             // resolved before the options (strix/ds41_rtx_profile.hpp)
+        else if (a == "--allow-pending") {}            // idem
         else if (a == "--ce-pacing") ce_pacing = true;
         else if (a == "--no-ce-pacing") ce_pacing = false;
         else if (a == "--session-cache" || a == "--session-disk") {
@@ -528,6 +587,46 @@ int main(int argc, char** argv) {
         else if (a == "--pressure-recent") pressure_recent = u32();
         else if (a == "--fuse-hc") o.decode_fuse_hc = true;          // bitwise (cuda-decode-fuse gates)
         else if (a == "--fuse-shared") o.decode_fuse_shared = true;  // bitwise at R1 (cuda-decode-fuse gates)
+        else known = false;
+        if (known) continue;
+        known = true;  // three-tier placement (its own chain: MSVC C1061)
+        const auto gib_or_auto = [&](double auto_value) {
+            const auto v = next();
+            if (v == "auto") return auto_value;
+            double g = -1.0;
+            try { g = std::stod(v); } catch (const std::exception&) { g = -1.0; }
+            if (!std::isfinite(g) || g < 0.0 || g > 65536.0) usage(("bad value of " + a + ": " + v).c_str());
+            return g;
+        };
+        if (a == "--vram-expert-gib") {  // = --arena-gib
+            const double g = gib_or_auto(-2.0);
+            arena_auto = g == -2.0;
+            if (!arena_auto) arena_gib = g;
+        }
+        else if (a == "--ram-expert-gib") ram_expert_gib = gib_or_auto(-1.0);
+        else if (a == "--ram-inclusive-gib") ram_inclusive_gib = gib_or_auto(-1.0);
+        else if (a == "--file-tier") file_tier = true;
+        else if (a == "--no-file-tier") file_tier = false;
+        else if (a == "--disk-prefetch") disk_prefetch = true;
+        else if (a == "--no-disk-prefetch") disk_prefetch = false;
+        else if (a == "--disk-staging") {
+            disk_staging = u32();
+            if (disk_staging < 1 || disk_staging > 256) usage("--disk-staging must be 1..256");
+        } else if (a == "--disk-queue") {
+            const std::string v = next();
+            disk_queue = v == "auto" ? strix::ds41::cuda::kDiskQueueAuto : static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+            if (disk_queue != strix::ds41::cuda::kDiskQueueAuto && (disk_queue > 64 || v.find_first_not_of("0123456789") != std::string::npos))
+                usage("--disk-queue must be auto or 0..64");
+        }
+        else if (a == "--vram-total-gib") caps.vram_total_gib = total_gib_value(a, next());
+        else if (a == "--ram-total-gib") caps.ram_total_gib = total_gib_value(a, next());
+        else if (a == "--vram-margin-gib" || a == "--ram-margin-gib") {
+            const double g = gib_or_auto(-1.0);
+            if (g < 0.0) usage(("bad value of " + a + " (GiB >= 0)").c_str());
+            (a == "--vram-margin-gib" ? caps.vram_margin_gib : caps.ram_margin_gib) = g;
+        }
+        else if (a == "--budget-receipt") caps.receipt = true;
+        else if (a == "--budget-sample-ms") budget_sample_ms = u32();
         else known = false;
         if (known) continue;
         if (a == "--draft") draft_file = next();
@@ -625,6 +724,54 @@ int main(int argc, char** argv) {
 
     };
     const std::vector<std::string> launch_args(argv + 2, argv + argc);
+    // --profile: resolved on the launch options and the environment before they are parsed (a profile value is the
+    // lowest explicit layer: the parser's options and the levers' variables already read above win over it)
+    namespace rprof = strix::ds41::rtx::profile;
+    rprof::Resolution prof;
+    try { prof = rprof::resolve(rprof::App::replica, rprof::Inputs{launch_args, {}}); }
+    catch (const std::exception& e) { usage(e.what()); }
+    {
+        // a profile value other than the builtin form: today none (every ready row is the replica's default)
+        const auto apply_lever = [&](std::string_view lever, const std::string& v) {
+            const bool on = v == "on";
+            if (v != "on" && v != "off") return false;
+            if (lever == "lean_state") o.lean_state = on;
+            else if (lever == "q8_r1") { q8_r1 = on; q8_r1_pad = false; }
+            else if (lever == "dsrtxk") dsrtxk_on = on;
+            else if (lever == "fuse") fuse_on = on;
+            else if (lever == "decode_forms") records_inline = router_form0 = qakv_auto = !on;
+            else if (lever == "evict_auto") evict = on && TierSite::can_auto_evict() ? "auto" : "lru";
+            else if (lever == "controller") {
+                controller_prior = on ? "builtin:64" : "none";
+                controller_costs = on ? "14.8,18.7,26.6,28.9,33.2,37.3,1.6" : "none";
+                controller_scope = on ? "chat" : "run";
+                controller_costs_given = false;
+            }
+            else if (lever == "draft_keep") draft_keep = on ? 64U : 0U;
+            else if (lever == "draft_vocab_auto") draft_vocab = on ? "auto" : "full";
+            else if (lever == "wb_defer") wb_defer = on;
+            else if (lever == "ce_pacing") ce_pacing = on;
+            else if (lever == "wb_stream") wb_stream = on;
+            else if (lever == "file_tier") file_tier = on;
+            else if (lever == "residency_auto") residency_seed = residency_save = on ? "auto" : "none";
+            else if (lever == "warmup_graphs") warmup_graphs = on ? "auto" : "none";
+            else if (lever == "engram_cache") o.engram_cache_mb = on ? 512U : 0U;
+            else return false;
+            return true;
+        };
+        for (const auto& e : prof.entries) {
+            if ((e.status != rprof::Status::profile && e.status != rprof::Status::unqualified) || e.value == e.lever->builtin) continue;
+            if (!apply_lever(e.lever->name, e.value))
+                usage(("--profile " + std::string(rprof::name(prof.name)) + ": lever " + std::string(e.lever->name) + " = " + e.value +
+                       " has no binding in this build").c_str());
+        }
+        for (const auto& e : prof.entries)
+            if (e.status == rprof::Status::pending)
+                std::fprintf(stderr, "profile %s: %s pending, not used (%s)\n", rprof::name(prof.name), std::string(e.lever->name).c_str(),
+                             std::string(e.lever->source).c_str());
+        if (prof.qualification() != "qualified")
+            std::fprintf(stderr, "profile %s: %s (--allow-pending: benchmarks only)\n", rprof::name(prof.name), prof.qualification().c_str());
+    }
     parse_args(launch_args);
     namespace fs = std::filesystem;
     if (arena_gib < 0) arena_gib = draft_file.empty() ? 80.0 : baseline_arena ? 71.5 : draft_keep == 64 ? 74.8 : draft_keep == 32 ? 76.5 : 71.5;
@@ -657,6 +804,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+    const bool residency_save_auto = residency_save == "auto", warmup_graphs_auto = warmup_graphs == "auto";
     if (residency_save == "auto") residency_save = serve_dir.empty() ? "" : auto_path;
     if (warmup_graphs == "auto") warmup_graphs = serve_dir.empty() ? "" : "0,8";
     if (residency_seed == "none") residency_seed.clear();
@@ -723,6 +871,41 @@ int main(int argc, char** argv) {
             windows = windows || ph.rfind("wforce", 0) == 0 || ph.rfind("spec", 0) == 0 || ph.rfind("schats", 0) == 0 || ph.rfind("wsmoke", 0) == 0;
         max_rows = windows ? 6U : 1U;
     }
+    // the profile receipt: the resolution plus every lever's effective form after the options ("on" = today's default)
+    const auto profile_json = [&]() {
+        const auto onoff = [](bool b) { return std::string(b ? "on" : "off"); };
+        return prof.json([&](std::string_view lever) -> std::string {
+            if (lever == "lean_state") return onoff(o.lean_state);
+            if (lever == "q8_r1") return q8_r1 ? (q8_r1_pad ? "pad" : "on") : "off";
+            if (lever == "dsrtxk") return onoff(dsrtxk_on);
+            if (lever == "fuse") return onoff(fuse_on);
+            if (lever == "decode_forms") {
+                if (!records_inline && !router_form0 && !qakv_auto) return "on";
+                return records_inline && router_form0 && qakv_auto ? "off" : "custom";
+            }
+            if (lever == "evict_auto") return evict == "auto" ? "on" : evict;
+            if (lever == "controller") {
+                const bool on = window_arg == "controller" && controller_prior == "builtin:64" && controller_scope == "chat" &&
+                                controller_costs == "14.8,18.7,26.6,28.9,33.2,37.3,1.6";
+                const bool off = (controller_prior.empty() || controller_prior == "none") && controller_costs == "none" && controller_scope == "run";
+                return on ? "on" : off ? "off" : "custom";
+            }
+            if (lever == "draft_keep") return draft_keep == 64U && draft_keep_from.empty() ? "on" : draft_keep == 0U ? "off" : std::to_string(draft_keep);
+            if (lever == "draft_vocab_auto") return draft_vocab.rfind("auto", 0) == 0 ? "on" : draft_vocab == "full" ? "off" : draft_vocab;
+            if (lever == "wb_defer") return onoff(wb_defer);
+            if (lever == "ce_pacing") return onoff(ce_pacing);
+            if (lever == "wb_stream") return onoff(wb_stream);
+            if (lever == "file_tier") return onoff(file_tier);
+            if (lever == "residency_auto")
+                return residency_auto && residency_save_auto ? "on" : !residency_auto && residency_seed.empty() && residency_save.empty() ? "off" : "custom";
+            if (lever == "warmup_graphs")
+                return warmup_graphs_auto ? (serve_dir.empty() ? "on (serve only)" : "on") : warmup_graphs.empty() ? "off" : "custom";
+            if (lever == "engram_cache")
+                return o.engram_cache_mb == 512U ? "on" : o.engram_cache_mb == 0U ? "off" : std::to_string(o.engram_cache_mb);
+            if (lever == "prompt_layer_major") return "off";
+            return "";
+        });
+    };
     const auto effective_config = [&](bool session_policy = false) {
         // Resolve the same feature expansion as below, without calling any CUDA entry point.
         std::ostringstream j;
@@ -774,6 +957,26 @@ int main(int argc, char** argv) {
         field("wb_defer", wb_defer); field("wb_alt", wb_alt); field("flush_ready", flush_ready);
         field("ce_pacing", ce_pacing);
         field("wb_stream", wb_stream);
+        field("file_tier", file_tier);
+        const auto gib_str = [](double g) {
+            if (g < 0) return std::string("auto");
+            std::ostringstream gs;
+            gs << g;
+            return gs.str();
+        };
+        str("ram_expert_gib", gib_str(ram_expert_gib));
+        str("ram_inclusive_gib", gib_str(ram_inclusive_gib));
+        field("disk_prefetch", disk_prefetch); field("disk_staging", disk_staging); if (disk_queue == strix::ds41::cuda::kDiskQueueAuto) str("disk_queue", "auto"); else field("disk_queue", disk_queue);
+        str("vram_total_gib", caps.device_capped() ? gib_str(caps.vram_total_gib) : std::string("none"));
+        str("ram_total_gib", caps.host_capped() ? gib_str(caps.ram_total_gib) : std::string("none"));
+        field("vram_margin_gib", caps.vram_margin_gib); field("ram_margin_gib", caps.ram_margin_gib);
+        field("budget_receipt", caps.measuring()); field("budget_sample_ms", budget_sample_ms);
+        // the plan itself needs the measured fixed parts (load time: the 'budget' event, stage "plan"); here its rule
+        str("budget_plan", !caps.capped() ? std::string("none: today's arena (--vram-expert-gib) and pinned tier (--ram-expert-gib)") :
+            std::string("at load: arena slots = min(--vram-expert-gib, (") + (caps.device_capped() ? gib_str(caps.vram_total_gib) : std::string("no cap")) +
+            " GiB - measured context/trunk/drafter/workspaces - " + gib_str(caps.vram_margin_gib) + " margin - bank/site/graph reserves) / expert); pinned blocks = min(--ram-expert-gib, (" +
+            (caps.host_capped() ? gib_str(caps.ram_total_gib) : std::string("no cap")) + " GiB - measured commit - " + gib_str(caps.ram_margin_gib) +
+            " margin - load staging) / expert); the rest in the model file; refused with the minimum when the fixed part does not fit");
         str("warmup_graphs", warmup_graphs.empty() ? "none" : warmup_graphs);
         str("residency_seed", residency_seed.empty() ? "none" : (residency_auto ? "auto:" : "") + residency_seed);
         str("residency_save", residency_save.empty() ? "none" : residency_save);
@@ -798,6 +1001,7 @@ int main(int argc, char** argv) {
         field("winpf_prior_cap", winpf_knobs.prior_cap); field("winpf_prior_pmin", winpf_knobs.prior_pmin);
         field("winpf_revert", winpf_knobs.revert_unused);
         field("serve", !serve_dir.empty()); field("serve_idle", serve_idle_s); field("serve_max", serve_max);
+        field("profile", profile_json());
         if (session_policy) {
         field("session_cache",session_config.enabled);field("session_disk",session_config.enabled&&session_config.disk);
         field("session_ram_bytes",session_config.ram==UINT64_MAX?0:session_config.ram);field("session_max_parked",session_config.max_parked);
@@ -1013,6 +1217,7 @@ int main(int argc, char** argv) {
         if (js) js << line << "\n";
     };
     int failures = 0;
+    emit("{\"event\":\"profile\"," + profile_json().substr(1));
     try {
         const auto t_load = std::chrono::steady_clock::now();
         const auto& imported = imported0;
@@ -1032,8 +1237,19 @@ int main(int argc, char** argv) {
         o.decode_graphs = true;
         o.timing = timing;
         o.timing_ops = false;
+        // --vram-total-gib / --ram-total-gib / --budget-receipt: the device's use before this process's context (NVML),
+        // then every fixed part measured as it lands (context, trunk, drafter, workspaces), then the planner
+        std::unique_ptr<replica_budget::Meter> meter;
+        if (caps.measuring()) {
+            meter = std::make_unique<replica_budget::Meter>(budget_sample_ms);
+            meter->begin(o.device);
+        }
         CudaPrefill p(model, o);
         const double dense_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count();
+        if (meter) {  // dense / trunk weights + attention state for --max-positions + the prefill object's buffers
+            STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            meter->stage("trunk");
+        }
         int target_device = 0;
         STRIX_CUDA_CHECK(cudaGetDevice(&target_device));
         // DSpark drafter (before the pinned tier: its weights pass through host memory once). On the target's device it
@@ -1065,6 +1281,10 @@ int main(int argc, char** argv) {
                  ",\"device_bytes\":" + std::to_string(drafter->device_bytes()) + ",\"load_s\":" + std::to_string(draft_load_s) + "}");
         }
 
+        if (meter) {
+            STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            meter->stage("drafter");
+        }
         auto reader = std::make_unique<GgufExpertReader>(model);
         auto shape = reader->shape();
         if (shape.top_k == 0) shape.top_k = 6;
@@ -1091,7 +1311,11 @@ int main(int argc, char** argv) {
             CudaPrefill& p;
             ~DecodeGraphReset() { p.clear_decode_graphs(); }
         };
-        if (arena_auto) p.reserve_decode_buffers();
+        if (arena_auto || meter) p.reserve_decode_buffers();  // (budgets: the fixed decode buffers land before the measurement)
+        if (meter) {  // hidden rows, decode ABI / boundary buffers, router counters, Engram rows
+            STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            meter->stage("workspaces");
+        }
 
         const std::uint32_t L = layers_arg, E = shape.experts;
         // --arena-gib = the experts kept on the device; the free-slot target comes on top of it
@@ -1116,28 +1340,92 @@ int main(int argc, char** argv) {
             if (slots <= spare_reserve) throw std::runtime_error("auto arena: no resident slots after spare reserve");
         }
         const std::uint32_t requested_slots = slots;
-        // budgets before any big allocation
+        // budgets before any big allocation; the three-tier plan (rtx::tier_plan) sizes the pinned tier, the clean-copy
+        // share and the file tier. Budgets that cover every expert give today's numbers (and today's checks).
+        strix::ds41::rtx::TierPlan tplan;
+        std::optional<strix::ds41::rtx::BudgetPlan> bplan;  // the whole-device plan (budgets measured)
+        const auto budget_caps_json = [&]() {
+            std::ostringstream c;
+            c << "\"vram_total_gib\":" << (caps.device_capped() ? caps.vram_total_gib : 0.0) << ",\"ram_total_gib\":" << (caps.host_capped() ? caps.ram_total_gib : 0.0)
+              << ",\"vram_margin_gib\":" << caps.vram_margin_gib << ",\"ram_margin_gib\":" << caps.ram_margin_gib
+              << ",\"device_cap_bytes\":" << (caps.device_capped() ? strix::ds41::rtx::budget_bytes(caps.vram_total_gib) : 0U)
+              << ",\"host_cap_bytes\":" << (caps.host_capped() ? strix::ds41::rtx::budget_bytes(caps.ram_total_gib) : 0U);
+            return c.str();
+        };
         {
             std::size_t free_b = 0, total_b = 0;
             STRIX_CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+            const double have_host = host_available_gib();
+            strix::ds41::rtx::TierPlanIn tin;
+            tin.keys = std::uint64_t{L} * E;
+            tin.unit_bytes = shape.expert_bytes();
+            tin.residents = slots - (arena_auto ? spare_reserve : spares);
+            tin.host_spares = host_spares;
+            tin.ram_gib = ram_expert_gib;
+            tin.inclusive_gib = ram_inclusive_gib;
+            tin.host_avail_gib = have_host;
+            tin.host_margin_gib = host_margin_gib;
+            tin.engine_pinned_gib = static_cast<double>(p.pinned_bytes()) / 1073741824.0;
+            tin.max_pinned_gib = max_pinned_gib;
+            tin.extra_gib = 16.0 * static_cast<double>(shape.down_expert_bytes()) / 1073741824.0;  // load staging (8 workers x 2)
+            tin.file_tier = file_tier && TierSite::can_disk_tier();
+            tin.staging = disk_staging;
+            if (meter) {  // tierstream's planner: the caps minus the measured fixed parts size the arena and the pinned tier
+                namespace rtx = strix::ds41::rtx;
+                rtx::BudgetPlanIn bi;
+                bi.caps = caps;
+                bi.device_fixed = meter->stages();  // context, trunk, drafter, workspaces (measured)
+                const auto hm = replica_budget::host_mem();
+                bi.host_pageable = {{"process_commit", hm.commit == replica_budget::kNone ? 0U : hm.commit}};
+                bi.host_pinned = {{"engine_pinned", static_cast<std::uint64_t>(p.pinned_bytes())}};
+                bi.units = tin.keys;
+                bi.unit_bytes = tin.unit_bytes;
+                bi.request_slots = slots;
+                bi.spare_slots = arena_auto ? spare_reserve : spares;
+                bi.min_residents = max_rows * shape.top_k + (spare_reserve - bi.spare_slots);
+                bi.arena_extra_bytes = bank_reserve + site_reserve + graph_reserve;
+                bi.host_request_blocks = rtx::tier_plan(tin).cap_units;  // today's RAM ceiling: a cap only lowers it
+                bi.host_spares = host_spares;
+                bi.staging = disk_staging;
+                bi.host_extra_bytes = 16ULL * shape.down_expert_bytes();
+                bi.file_tier = tin.file_tier;
+                bi.inclusive_bytes = tin.inclusive_gib < 0.0 ? SS_BUDGET_AUTO : rtx::budget_bytes(tin.inclusive_gib);
+                bi.inclusive_auto_cap_bytes = rtx::budget_bytes(tin.inclusive_auto_cap_gib);
+                bplan = rtx::budget_plan(bi);
+                emit("{\"event\":\"budget\",\"stage\":\"plan\"," + budget_caps_json() + ",\"plan\":{" + bplan->json() + "}}");
+                if (bplan->refused()) throw std::runtime_error(bplan->refusal());
+                if (caps.device_capped()) slots = static_cast<std::uint32_t>(bplan->out.arena_slots);
+                tin = rtx::apply_budget(tin, *bplan);
+            }
             const double need_dev = arena_auto ? double(std::uint64_t{slots} * shape.expert_bytes() + bank_reserve +
                 site_reserve + graph_reserve + headroom_bytes) / 1073741824.0 :
                 (static_cast<double>(slots) + 2.0 * shape.top_k * max_rows) * static_cast<double>(shape.expert_bytes()) / 1073741824.0 + 1.5;
-            const double need_host = (static_cast<double>(L * E - (slots - (arena_auto ? spare_reserve : spares)) + host_spares) * static_cast<double>(shape.expert_bytes()) +
-                                      16.0 * static_cast<double>(shape.down_expert_bytes())) / 1073741824.0 + host_margin_gib;  // + load staging (8 workers x 2)
-            const double have_dev = static_cast<double>(free_b) / 1073741824.0, have_host = host_available_gib();
+            const double have_dev = static_cast<double>(free_b) / 1073741824.0;
+            tplan = strix::ds41::rtx::tier_plan(tin);
+            if (bplan) strix::ds41::rtx::check_budget_parity(tplan, *bplan);
             // host blocks + the two load bounce buffers + the engine's own pinned buffers (Engram rows, staging)
-            const double pinned_peak = need_host - host_margin_gib + static_cast<double>(p.pinned_bytes()) / 1073741824.0;
+            const double need_host = tplan.need_host_gib, pinned_peak = tplan.pinned_peak_gib;
             std::ostringstream os;
             os << "{\"event\":\"budget\",\"engine_pinned_gib\":" << static_cast<double>(p.pinned_bytes()) / 1073741824.0 << ",\"pinned_peak_gib\":" << pinned_peak << ",\"max_pinned_gib\":" << max_pinned_gib << ",\"device_free_gib\":" << have_dev << ",\"device_need_gib\":" << need_dev << ",\"host_avail_gib\":" << have_host
                << ",\"host_need_gib\":" << need_host << "}";
             emit(os.str());
+            std::ostringstream ts;  // the plan: GiB and experts per tier (also for 'auto')
+            ts << "{\"event\":\"tier_plan\",\"vram_gib\":" << tplan.vram_gib << ",\"vram_experts\":" << tplan.resident << ",\"ram_gib\":" << tplan.ram_gib
+               << ",\"ram_experts\":" << tplan.pinned << ",\"ram_auto\":" << (tplan.ram_auto ? "true" : "false") << ",\"file_gib\":" << tplan.file_gib
+               << ",\"file_experts\":" << tplan.disk << ",\"file_tier\":" << (tplan.three_tier ? "true" : "false") << ",\"file_tier_allowed\":" << (tin.file_tier ? "true" : "false")
+               << ",\"spare_blocks\":" << tplan.spare_blocks << ",\"inclusive_experts\":" << tplan.inclusive << ",\"inclusive_gib\":" << tplan.inclusive_gib
+               << ",\"staging\":" << tplan.staging << ",\"ram_room_gib\":" << tplan.room_gib << ",\"disk_prefetch\":" << (disk_prefetch ? "true" : "false")
+               << ",\"weight_dirs\":" << rs::json_str(o.weight_read.weight_dirs) << "}";
+            emit(ts.str());
+            if (file_tier && !TierSite::can_disk_tier()) std::fprintf(stderr, "file tier: the linked tierstream has no SS_DG_DISK_TIER; refusing as before\n");
+            if (tplan.refuse) throw std::runtime_error(tplan.refuse);
             if (!arena_auto && have_dev < need_dev) throw std::runtime_error("not enough device memory for the arena");
             if (have_host < need_host) throw std::runtime_error("not enough available host memory for the pinned tier");
             if (pinned_peak > max_pinned_gib) throw std::runtime_error("the pinned peak exceeds --max-pinned-gib");
         }
         std::unique_ptr<TierSite> tier;
         bool tier_test_hooks = false;
+        const std::uint64_t commit_before_tiers = meter ? replica_budget::host_mem().commit : 0U;
         {
             TierSiteOptions to;
             to.model = model;
@@ -1146,7 +1434,12 @@ int main(int argc, char** argv) {
             to.slots = slots;
             to.spare_slots = std::max(spares, pressure_spares);  // slots - spare_slots experts start resident
             to.spare_target = spares;                            // kept free: exactly --spares
-            to.host_spares = host_spares;
+            to.host_spares = static_cast<std::uint32_t>(tplan.spare_blocks);  // --host-spares + the inclusive share
+            to.inclusive_units = static_cast<std::uint32_t>(tplan.inclusive);
+            if (tplan.three_tier) to.pinned_units = static_cast<std::uint32_t>(tplan.pinned);
+            to.disk_prefetch = disk_prefetch;
+            to.disk_staging = disk_staging;
+            to.disk_queue = disk_queue;
             if (!routes.empty()) to.seed = seed_order(routes, seqmod, L, E);
             if (!residency_seed.empty()) {  // the last session's residency first (validated), then the routes' order
                 std::vector<std::uint32_t> keys;
@@ -1190,6 +1483,94 @@ int main(int argc, char** argv) {
         }
         DecodeGraphReset graph_destinations{p};
         reader.reset();  // no buffered handle on the model file while decoding (Engram reads share the disk)
+        // budgets: the arena's measured bytes, then every later sample against the caps (tierstream ss_budget_ledger:
+        // ss_budget_ledger_observe / _within_caps; the ledger charges nothing here, it keeps the measured peaks)
+        std::unique_ptr<ss_budget_ledger, void (*)(ss_budget_ledger*)> budget_ledger(nullptr, ss_budget_ledger_free);
+        if (meter) {
+            ss_budget_ledger* l = nullptr;
+            if (ss_budget_ledger_create(caps.device_capped() ? strix::ds41::rtx::budget_bytes(caps.vram_total_gib) : 0U,
+                                        caps.host_capped() ? strix::ds41::rtx::budget_bytes(caps.ram_total_gib) : 0U, &l) != SS_OK)
+                throw std::runtime_error(std::string("budget: ") + ss_last_error());
+            budget_ledger.reset(l);
+        }
+        std::uint64_t unseen_pinned = 0;   // pinned bytes the process commit does not show (added to every host sample)
+        bool pinned_in_commit = true;
+        std::string budget_load_detail;    // the load event's breakdown (declared + measured)
+        if (meter) {
+            STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            meter->stage("arena");
+            const auto hm = replica_budget::host_mem();
+            const std::uint64_t tier_pinned = tier->host_bytes();
+            const std::uint64_t seen = hm.commit != replica_budget::kNone && hm.commit > commit_before_tiers ? hm.commit - commit_before_tiers : 0U;
+            pinned_in_commit = static_cast<double>(seen) >= 0.9 * static_cast<double>(tier_pinned);
+            if (!pinned_in_commit) unseen_pinned = tier_pinned + static_cast<std::uint64_t>(p.pinned_bytes());
+            const std::string d = p.describe();
+            const auto gb = [&](const char* key) -> std::uint64_t {  // describe()'s GB (1e9) figures, as bytes
+                const std::string k = std::string("\"") + key + "\":";
+                const auto at = d.find(k);
+                if (at == std::string::npos) return 0U;
+                try { return static_cast<std::uint64_t>(std::stod(d.substr(at + k.size())) * 1e9); } catch (const std::exception&) { return 0U; }
+            };
+            std::ostringstream os;
+            os << ",\"measured_device\":{";
+            for (std::size_t i = 0; i < meter->stages().size(); ++i)
+                os << (i ? "," : "") << rs::json_str(meter->stages()[i].first) << ":" << meter->stages()[i].second;
+            os << "},\"declared_device\":{\"dense\":" << gb("dense_gb") << ",\"attention_state\":" << gb("state_gb") << ",\"prefill_buffers\":" << gb("buffers_gb")
+               << ",\"batch\":" << gb("batch_gb") << ",\"drafter\":" << (drafter ? drafter->device_bytes() : 0U)
+               << ",\"arena_library\":" << tier->device_bytes() << ",\"arena_slots\":" << std::uint64_t{slots} * shape.expert_bytes()
+               << ",\"bank_reserve\":" << bank_reserve << ",\"site_reserve\":" << site_reserve << ",\"graph_reserve\":" << graph_reserve << "}"
+               << ",\"max_positions\":" << o.max_positions << ",\"draft_device\":" << ddev << ",\"target_device\":" << target_device
+               << ",\"measured_host\":{\"commit_before_tiers\":" << commit_before_tiers << ",\"commit_after_tiers\":" << (hm.commit == replica_budget::kNone ? 0U : hm.commit)
+               << "},\"declared_host\":{\"pinned_tiers\":" << tier_pinned << ",\"engine_pinned\":" << p.pinned_bytes() << "}"
+               << ",\"tiers\":{\"arena_slots\":" << slots << ",\"requested_slots\":" << requested_slots << ",\"vram_experts\":" << tplan.resident
+               << ",\"pinned_experts\":" << tplan.pinned << ",\"pinned_blocks\":" << (tplan.pinned + tplan.spare_blocks + tplan.staging)
+               << ",\"spare_blocks\":" << tplan.spare_blocks << ",\"staging\":" << tplan.staging << ",\"file_experts\":" << tplan.disk
+               << ",\"inclusive_experts\":" << tplan.inclusive << "}";
+            if (bplan) os << ",\"plan\":{" << bplan->json() << "}";
+            budget_load_detail = os.str();
+        }
+        // one sample against the caps; the 'budget' event (stage load / warmup / request / run). false: a peak above a cap
+        const auto budget_point = [&](const std::string& stage, const std::string& name) -> bool {
+            if (!meter) return true;
+            constexpr auto none = replica_budget::kNone;
+            const auto pt = meter->sample();
+            const std::uint64_t host_now = pt.host_commit == none ? none : pt.host_commit + unseen_pinned;
+            const std::uint64_t host_peak = pt.host_peak == none ? none : pt.host_peak + unseen_pinned;
+            static_assert(replica_budget::kNone == SS_BUDGET_NO_SAMPLE, "no sample = UINT64_MAX on both sides");
+            strix::ds41::rtx::budget_check(ss_budget_ledger_observe(budget_ledger.get(), stage.c_str(), pt.charged, host_peak));
+            const auto sp = meter->sampler_peak();
+            if (sp != none) strix::ds41::rtx::budget_check(ss_budget_ledger_observe(budget_ledger.get(), "nvml-sampler", sp, none));
+            const bool ok = ss_budget_ledger_within_caps(budget_ledger.get()) != 0;
+            ss_budget_stats bs{};
+            bs.struct_size = static_cast<std::uint32_t>(sizeof bs);
+            strix::ds41::rtx::budget_check(ss_budget_ledger_stats(budget_ledger.get(), &bs));
+            const std::uint64_t dcap = bs.kind[SS_BUDGET_DEVICE].cap, hcap = bs.kind[SS_BUDGET_PINNED].cap;
+            const auto opt = [&](std::uint64_t v) { return v == none ? std::string("null") : std::to_string(v); };
+            const auto gib = [](std::uint64_t v) { return static_cast<double>(v) / 1073741824.0; };
+            std::ostringstream os;
+            os << "{\"event\":\"budget\",\"stage\":" << rs::json_str(stage);
+            if (!name.empty()) os << ",\"name\":" << rs::json_str(name);
+            os << "," << budget_caps_json() << ",\"device_baseline\":\"" << meter->baseline() << "\",\"device_before_bytes\":" << meter->before()
+               << ",\"device_total_bytes\":" << pt.device_total << ",\"device_used_bytes\":" << pt.device_used << ",\"device_charged_bytes\":" << pt.charged
+               << ",\"device_charged_gib\":" << gib(pt.charged) << ",\"nvml_used_bytes\":" << opt(pt.nvml_used) << ",\"nvml_process_bytes\":" << opt(pt.nvml_process)
+               << ",\"host_commit_bytes\":" << opt(host_now) << ",\"host_commit_gib\":" << (host_now == none ? 0.0 : gib(host_now))
+               << ",\"pinned_in_commit\":" << (pinned_in_commit ? "true" : "false") << ",\"unseen_pinned_bytes\":" << unseen_pinned
+               << ",\"device_peak_bytes\":" << bs.measured_device_peak << ",\"device_peak_gib\":" << gib(bs.measured_device_peak)
+               << ",\"device_peak_at\":" << rs::json_str(bs.measured_device_peak_at) << ",\"host_peak_bytes\":" << bs.measured_host_peak
+               << ",\"host_peak_gib\":" << gib(bs.measured_host_peak) << ",\"host_peak_at\":" << rs::json_str(bs.measured_host_peak_at)
+               << ",\"sampler_ms\":" << meter->sample_ms() << ",\"sampler_samples\":" << meter->sampler_samples() << ",\"sampler_peak_bytes\":" << opt(sp)
+               << ",\"sampler_process_peak_bytes\":" << opt(meter->sampler_process_peak()) << ",\"device_over_samples\":" << bs.device_over
+               << ",\"host_over_samples\":" << bs.host_over
+               << ",\"device_peak_le_cap\":" << (!dcap || (bs.measured_device_peak <= dcap && !bs.device_over) ? "true" : "false")
+               << ",\"host_peak_le_cap\":" << (!hcap || (bs.measured_host_peak <= hcap && !bs.host_over) ? "true" : "false")
+               << ",\"peak_le_cap\":" << (ok ? "true" : "false");
+            if (stage == "load") os << budget_load_detail;
+            os << "}";
+            emit(os.str());
+            if (!ok) std::fprintf(stderr, "budget: a measured peak exceeds a total cap at %s (device peak %.2f GiB at %s, host peak %.2f GiB at %s)\n", stage.c_str(),
+                                  gib(bs.measured_device_peak), bs.measured_device_peak_at, gib(bs.measured_host_peak), bs.measured_host_peak_at);
+            return ok;
+        };
         const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count();
         {
             std::ostringstream os;
@@ -1206,6 +1587,8 @@ int main(int argc, char** argv) {
                << ",\"dense_s\":" << dense_s << ",\"load_s\":" << load_s << "}";
             emit(os.str());
         }
+        if (!budget_point("load", "") && caps.capped())  // enforcement: never serve above a cap
+            throw std::runtime_error("budget: the measured use at load exceeds a total cap (see the budget event; raise --vram-margin-gib / --ram-margin-gib or the cap)");
         std::uint64_t census_nonrouted = 0, census_embedding_row = 0, census_head = 0, census_draft_nonrouted = 0, census_draft_expert = 0;
         if (census || serving) {
             const auto manifest = strix::build_model_manifest(strix::gguf::read_file(model));
@@ -2675,6 +3058,7 @@ int main(int argc, char** argv) {
             qs::require(bool(ordinary_logits)&&bool(ordinary_tokens)&&bool(ordinary_greedy),"qualification dump flush failed");
             ordinary_logits.close();ordinary_tokens.close();ordinary_greedy.close();
         }
+        if (const std::string t3 = tier->tier3_json(); !t3.empty()) emit("{\"event\":\"tier3\"," + t3 + "}");  // file tier / clean copies on
         };  // run_request
         if (!warmup_graphs.empty()) {  // every common graph captured + instantiated + launched once now
             const auto tw = std::chrono::steady_clock::now();
@@ -2702,6 +3086,8 @@ int main(int argc, char** argv) {
             hinted_rows = 0;
             emit("{\"event\":\"warmup\",\"steps\":" + std::to_string(wsteps) + ",\"graph_captures\":" + std::to_string(wcaptures) + ",\"ms\":" +
                  std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count()) + "}");
+            if (!budget_point("warmup", "") && caps.capped())
+                throw std::runtime_error("budget: the measured use after the graph warmup exceeds a total cap (see the budget event; raise --vram-margin-gib or the cap)");
         }
 
         namespace sc = strix::ds41::session;
@@ -2748,6 +3134,10 @@ int main(int argc, char** argv) {
         if (!serving) {
             configure_request();
             run_request();
+            if (meter) {
+                STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+                if (!budget_point("run", "") && caps.capped()) ++failures;
+            }
         } else {
             // ---- the persistent worker (design notes) ----
             rs::Spool spool(serve_dir);
@@ -3317,6 +3707,19 @@ int main(int argc, char** argv) {
                         try {  // quiescent before the answer: Engram reads and every queued copy / write-back retired
                             p.wait_io();
                             STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+                        } catch (const std::exception& e) {
+                            rc = 1;
+                            error = e.what();
+                            fatal = true;
+                        }
+                    }
+                    if (meter && !fatal) {  // quiescent: the request's peak against the caps
+                        try {
+                            if (!budget_point("request", *name) && caps.capped()) {
+                                ++failures;
+                                rc = 1;
+                                if (error.empty()) error = "budget: a measured peak exceeds a total cap (see the budget event)";
+                            }
                         } catch (const std::exception& e) {
                             rc = 1;
                             error = e.what();

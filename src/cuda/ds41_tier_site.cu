@@ -70,6 +70,7 @@ struct TierSite::Impl {
     TierTokenStats last{};
     bool in_token = false;
     bool winpf = false;
+    bool three_tier = false, inclusive = false;  // the file tier / the inclusive share are on
 
     Impl(const GgufExpertReader& r, const TierSiteOptions& opt) : o(opt), s(r.shape()), L(opt.layers), K(r.shape().top_k ? r.shape().top_k : 6) {
         s.top_k = K;
@@ -101,6 +102,33 @@ struct TierSite::Impl {
                 tiers[static_cast<std::size_t>(k)] = static_cast<std::uint8_t>(TS_TIER_RESIDENT);
                 ++placed;
             }
+        // three-tier: the next pinned_units keys by the same priority stay pinned, every other non-resident key is
+        // file-tier (rtx::tier_plan sized the counts); pinned_units >= the non-resident keys = the two-tier tiers
+        three_tier = std::uint64_t{o.pinned_units} < keys - residents;
+        if (three_tier) {
+#ifndef SS_DG_DISK_TIER
+            throw std::runtime_error("ds41 tier site: the file tier needs a tierstream with SS_DG_DISK_TIER");
+#endif
+            std::vector<std::uint8_t> pin(static_cast<std::size_t>(keys), 0);
+            std::uint32_t pinned = 0;
+            for (const std::uint32_t k : o.seed)
+                if (pinned < o.pinned_units && k < keys && tiers[k] != TS_TIER_RESIDENT && !pin[k]) {
+                    pin[k] = 1;
+                    ++pinned;
+                }
+            for (std::uint64_t k = 0; k < keys && pinned < o.pinned_units; ++k)
+                if (tiers[static_cast<std::size_t>(k)] != TS_TIER_RESIDENT && !pin[static_cast<std::size_t>(k)]) {
+                    pin[static_cast<std::size_t>(k)] = 1;
+                    ++pinned;
+                }
+            for (std::uint64_t k = 0; k < keys; ++k)
+                if (tiers[static_cast<std::size_t>(k)] != TS_TIER_RESIDENT && !pin[static_cast<std::size_t>(k)])
+                    tiers[static_cast<std::size_t>(k)] = static_cast<std::uint8_t>(TS_TIER_DISK);
+        }
+        inclusive = o.inclusive_units != 0;
+#ifndef SS_DG_DISK_TIER
+        if (inclusive) throw std::runtime_error("ds41 tier site: the inclusive share needs a tierstream with SS_DG_DISK_TIER");
+#endif
         ss_budget b;
         ts_budget_defaults(&b);
         b.device_bytes = o.device_bytes;
@@ -110,7 +138,7 @@ struct TierSite::Impl {
         b.tier_mode = TS_TIER_MODE_EXCLUSIVE;
         b.dynamic_slots_per_layer = 2;  // the plan's billing only: dg_spare_slots sets the arena's D
         b.ring_slots = 2U * o.max_rows * K + 1U;
-        b.host_spare_units = o.host_spares;
+        b.host_spare_units = o.host_spares;  // (+ the inclusive share: the replica adds it)
         ts_check(ts_plan_from_tiers(desc, &b, tiers.data(), tiers.size(), &plan), "plan");
         ss_options so;
         ts_options_defaults(&so);
@@ -146,6 +174,21 @@ struct TierSite::Impl {
         so.dg_prior_len = o.prior.size();
         so.dg_wb_defer = o.wb_defer ? 1U : 0U;
         so.dg_wb_stream = o.wb_stream ? 1U : 0U;  // explicit both ways: an older tierstream's default was 0
+#ifdef SS_DG_DISK_TIER
+        if (three_tier) {  // only then: a full pinned tier keeps the two-tier library path byte for byte
+            so.dg_disk_tier = 1U;
+            so.dg_disk_prefetch = o.disk_prefetch ? 1U : 0U;
+            so.dg_disk_staging = o.disk_staging;
+#ifdef SS_DG_DISK_QUEUE
+#ifdef SS_DG_DISK_QUEUE_AUTO
+            so.dg_disk_queue = o.disk_queue == kDiskQueueAuto ? SS_DG_DISK_QUEUE_AUTO : o.disk_queue;
+#else
+            so.dg_disk_queue = o.disk_queue == kDiskQueueAuto ? 4U : o.disk_queue;
+#endif
+#endif
+        }
+        so.dg_inclusive_blocks = o.inclusive_units;
+#endif
         if (o.ce_pacing) {
             const auto p = rtx::ce_pacing(static_cast<std::uint32_t>(s.gate_expert_bytes()), static_cast<std::uint32_t>(s.down_expert_bytes()));
             so.dg_wb_layer_bytes = p.layer_bytes;
@@ -388,6 +431,18 @@ std::vector<TierLayer> TierSite::collect() {
     t.wb_forced = now.wb_forced - m.before.wb_forced;
     t.wb_boundary_flushed = now.wb_boundary_flushed - m.before.wb_boundary_flushed;
     t.device_timeouts = now.device_timeouts - m.before.device_timeouts;
+#ifdef SS_DG_DISK_TIER
+    t.disk_reads = now.disk_reads - m.before.disk_reads;
+    t.disk_read_bytes = now.disk_read_bytes - m.before.disk_read_bytes;
+    t.disk_stage_waits = now.disk_stage_waits - m.before.disk_stage_waits;
+    t.disk_drops = now.disk_drops - m.before.disk_drops;
+#endif
+#ifdef SS_DG_DISK_QUEUE
+    t.disk_wait_ns = now.disk_wait_ns - m.before.disk_wait_ns;
+#endif
+#ifdef SS_DG_DISK_RECEIPTS
+    t.disk_carried = now.disk_carried - m.before.disk_carried;
+#endif
     ss_dg_boundary_timeline bt{};
     ts_check(ts_dg_boundary_timeline_sized(m.c, &bt, sizeof bt), "boundary timeline");
     t.boundary_sync_us = bt.sync_us;
@@ -425,6 +480,32 @@ std::vector<TierLayer> TierSite::collect() {
 }
 
 const TierTokenStats& TierSite::stats() const noexcept { return impl_->last; }
+
+bool TierSite::can_disk_tier() noexcept {
+#ifdef SS_DG_DISK_TIER
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::string TierSite::tier3_json() const {
+    const auto& m = *impl_;
+    if (!m.three_tier && !m.inclusive) return {};
+#ifdef SS_DG_DISK_TIER
+    ss_dg_stats s{};
+    ts_check(ts_stats_dg(m.c, &s), "stats");
+    std::ostringstream j;
+    j << "\"file_tier\":" << (m.three_tier ? "true" : "false") << ",\"disk_reads\":" << s.disk_reads << ",\"disk_read_bytes\":" << s.disk_read_bytes
+      << ",\"disk_read_ms\":" << static_cast<double>(s.disk_read_ns) / 1e6 << ",\"disk_stage_waits\":" << s.disk_stage_waits
+      << ",\"disk_drops\":" << s.disk_drops << ",\"disk_discards\":" << s.disk_discards << ",\"inclusive_kept\":" << s.inclusive_kept
+      << ",\"inclusive_drops\":" << s.inclusive_drops << ",\"disk_units\":" << s.disk_units << ",\"backed_units\":" << s.backed_units
+      << ",\"tokens\":" << s.tokens << ",\"misses\":" << s.misses << ",\"wb_issued_bytes\":" << s.wb_issued_bytes;
+    return j.str();
+#else
+    return {};
+#endif
+}
 
 std::vector<std::uint32_t> TierSite::residency() const {
     std::vector<std::uint32_t> out;
