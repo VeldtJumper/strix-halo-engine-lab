@@ -126,7 +126,7 @@ Add `--print-effective-config` to inspect before HIP initialization. See [Defaul
 The command produces a JSON receipt with token IDs and timing. Actual model files and prompt tokens are **not included**. For model assets, optional MTP/DSpark acceleration, serving and two-node transport, continue with [requirements](docs/getting-started/README.md#what-you-need), [build](docs/getting-started/README.md#build), [run](docs/getting-started/README.md#run), and the [full engine reference](docs/getting-started/engine-reference.md). Some CTest cases require the GPU and model assets.
 
 Requirements, the complete build for every engine and each engine's launch command:
-[getting started](docs/getting-started/README.md).
+[getting started](docs/getting-started/README.md). Optional NVIDIA GPU routes: [using a discrete GPU](#discrete-gpu).
 
 ## Profiles: `default`, `fast`, `quality`
 
@@ -151,10 +151,15 @@ Per-engine profile details: [Qwen](docs/models/qwen3.8/README.md#qwen-profile),
 [Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.md#profiles); GLM on one RTX has its own `--profile` in its
 [guide](src/glm/rtxpf/README.md).
 
-## Using a discrete GPU (opt-in)
+<a id="discrete-gpu"></a>
+
+## Using a discrete GPU (optional)
 
 Everything above runs on Strix Halo alone. An RTX PRO 6000 (96 GB) adds four opt-in routes; none of them changes the
-single-node or pair defaults, and each has its own declared identity and gates.
+single-node or pair defaults, and each has its own declared identity and gates. Tested on Windows 11, NVIDIA driver
+617.14, CUDA 13.0; select the card by UUID (`CUDA_DEVICE_ORDER=PCI_BUS_ID`, `CUDA_VISIBLE_DEVICES=GPU-<uuid>`).
+Requirements, one build or launch per route, what runs where, when a route does not help and troubleshooting:
+[using a discrete GPU](docs/discrete-gpu.md).
 
 - **DeepSeek V4.1 Flash, standalone RTX (Production, Windows WDDM).** The whole model on the card: Q2 GGUF routed
   experts, Q8_0 dense, an exclusive VRAM + pinned-host expert cache, the target and the DSpark draft on the same GPU.

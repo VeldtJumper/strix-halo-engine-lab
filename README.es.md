@@ -129,7 +129,7 @@ Añada `--print-effective-config` para inspeccionar antes de la inicialización 
 El comando produce un recibo JSON con los IDs de token y los tiempos. Los ficheros reales del modelo y los tokens del prompt **no se incluyen**. Para los assets del modelo, la aceleración opcional MTP/DSpark, el servicio y el transporte entre dos nodos, continúe con los [requisitos](docs/getting-started/README.es.md#what-you-need), la [compilación](docs/getting-started/README.es.md#build), la [ejecución](docs/getting-started/README.es.md#run) y la [referencia completa del motor](docs/getting-started/engine-reference.md). Algunos casos de CTest requieren la GPU y los assets del modelo.
 
 Requisitos, la compilación completa de cada motor y el comando de lanzamiento de cada uno:
-[primeros pasos](docs/getting-started/README.es.md).
+[primeros pasos](docs/getting-started/README.es.md). Rutas opcionales con GPU NVIDIA: [uso de una GPU discreta](#discrete-gpu).
 
 ## Perfiles: `default`, `fast`, `quality`
 
@@ -154,10 +154,15 @@ determinista y exacto respecto a sí mismo. Detalles de los perfiles por motor:
 [Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.es.md#profiles); GLM en una RTX tiene su propio `--profile` en su
 [guía](src/glm/rtxpf/README.md).
 
-## Uso de una GPU discreta (opt-in)
+<a id="discrete-gpu"></a>
+
+## Uso de una GPU discreta (opcional)
 
 Todo lo anterior funciona solo con Strix Halo. Una RTX PRO 6000 (96 GB) añade cuatro rutas opcionales; ninguna cambia
-los valores predeterminados de un nodo ni del par, y cada una tiene su propia identidad declarada y sus gates.
+los valores predeterminados de un nodo ni del par, y cada una tiene su propia identidad declarada y sus gates. Probado
+con Windows 11, controlador NVIDIA 617.14 y CUDA 13.0; seleccione la tarjeta por UUID (`CUDA_DEVICE_ORDER=PCI_BUS_ID`,
+`CUDA_VISIBLE_DEVICES=GPU-<uuid>`). Requisitos, una compilación o un lanzamiento por ruta, qué se ejecuta dónde, cuándo
+no ayuda una ruta y solución de problemas: [uso de una GPU discreta](docs/discrete-gpu.es.md).
 
 - **DeepSeek V4.1 Flash, RTX independiente (Production, Windows WDDM).** Todo el modelo en la tarjeta: expertos
   enrutados del GGUF Q2, denso Q8_0, una caché de expertos en VRAM exclusiva + host pinned, el modelo objetivo y el
