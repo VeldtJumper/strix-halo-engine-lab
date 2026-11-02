@@ -617,7 +617,8 @@ use `v3`.
 | Short chat prompts, 256 tokens: batching on / llama.cpp server | — | — | **172.4** / 245.9 |
 
 The decode step with eight requests matches the engine's own C8 step. With long prompts in the mix, exact prompt
-processing (about 435 tok/s) still pauses the other requests while a prompt chunk runs; that is the main remaining gap.
+processing (about 435 tok/s) still pauses the other requests while a prompt chunk runs; overlapping prompt chunks with
+decode is the next serving lever.
 
 **MTP drafter** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). A small assistant model (Google's
 Gemma-4-E4B-it MTP assistant, 78.8M parameters) proposes the next few tokens and the main model verifies them, so the
@@ -679,7 +680,7 @@ reads each K/V chunk once per pass, byte-identical, `STRIX_G4_ATTN_KV_SHARED=0` 
 | 32K | 9.8 | **26.7** | 42.6 |
 | 64K | 5.7 | **18.4** | 36.2 |
 
-llama.cpp is still ahead at long context; the next lever reduces the KV-cache bytes read per token.
+The next lever reduces the KV-cache bytes read per token.
 
 Prefill (tok/s; every profile uses exact prefill):
 
@@ -691,11 +692,10 @@ Prefill (tok/s; every profile uses exact prefill):
 | 16K | 404 | 403 | 618 | 1,684 |
 | 32K | 358 | 355 | 520 | 1,373 |
 
-Exact prefill uses FP32 arithmetic without contraction: `default` and `fast` reach about a quarter of llama.cpp's
-speed, `quality` (EXL3, exact many-row prefill) about 37-38 % at every length. The `quality` column was
-measured in a later session, where llama.cpp gave 2,048 / 2,053 / 1,875 / 1,664 / 1,371 tok/s;
+Exact prefill uses FP32 arithmetic without contraction; `quality` uses the EXL3 exact many-row prefill. The `quality`
+column was measured in a later session, where llama.cpp gave 2,048 / 2,053 / 1,875 / 1,664 / 1,371 tok/s;
 `STRIX_G4_PREFILL_EXACT_MANYROW=0` restores the eight-row passes with the same bytes. The `fast` profile's WMMA
-prefill is pending qualification and is not applied. `default` C4/C8 is below llama.cpp; `fast` is above it.
+prefill is pending qualification and is not applied. `fast` C4/C8 is above llama.cpp.
 
 llama.cpp commands: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
