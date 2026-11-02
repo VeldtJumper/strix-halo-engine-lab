@@ -111,7 +111,7 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 25);
+    CHECK(rd::env_items().size() == 26);
     CHECK(resolve(cat(kDeploy, kDecodeWork), {}).env.at("STRIX_GLM_SPEC_XCH").value == "xfer");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_SPEC_XCH").value == "comm");
     CHECK(resolve({}, {{"STRIX_GLM_SPEC_XCH", "comm"}}).env.at("STRIX_GLM_SPEC_XCH").source == "explicit");
