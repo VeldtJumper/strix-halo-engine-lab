@@ -365,12 +365,17 @@ bool BatchSpeculator::follow_packet(std::span<const std::byte> packet, std::span
 ds::Draft BatchSpeculator::coop_draft(std::uint32_t slot, std::uint32_t token) {
     flush(slot);
     drafter_.select(slot);
-    // each Markov step's candidate (value, id: 8 bytes) through the 512-byte host exchange
+    // each Markov step's candidate (value, id: 8 bytes) in one 512-byte host exchange; the candidate chain's payload
+    // (STRIX_DS41_DSPARK_MARKOV=cand, once per draft) in exchanges of at most 64 KiB (the control channel's limit)
     drafter_.set_rank(options_.rank, 2U, [this](void* stream, const void* local, void* remote, std::size_t bytes) {
-        std::array<std::byte, round_bytes> o{}, i{};
+        constexpr std::size_t chunk = std::size_t{64} << 10U;
+        std::vector<std::byte> o(std::max(bytes, round_bytes)), i(o.size());
         check(hipMemcpyAsync(o.data(), local, bytes, hipMemcpyDeviceToHost, static_cast<hipStream_t>(stream)), "coop candidate");
         check(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "coop candidate");
-        options_.exchange(o, i);
+        for (std::size_t off = 0; off < o.size(); off += chunk) {
+            const std::size_t n = std::min(chunk, o.size() - off);
+            options_.exchange(std::span<const std::byte>(o).subspan(off, n), std::span<std::byte>(i).subspan(off, n));
+        }
         check(hipMemcpyAsync(remote, i.data(), bytes, hipMemcpyHostToDevice, static_cast<hipStream_t>(stream)), "coop candidate");
         check(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "coop candidate");  // i is on this frame
     });

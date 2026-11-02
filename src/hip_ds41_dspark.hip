@@ -6,7 +6,10 @@
 
 #include "strix/hip_ds41_formats.hpp"
 
+#include "dspark_common/markov_cand_kernels.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +25,8 @@ namespace {
 void check(hipError_t status, const char* what) {
     if (status != hipSuccess) throw std::runtime_error(std::string("ds41 dspark: ") + what + ": " + hipGetErrorString(status));
 }
+namespace mc = ::strix::dspark::markov_cand;
+static_assert(block_size <= mc::kMaxRows && markov_rank == mc::kRank);
 hipStream_t as_stream(void* stream) { return static_cast<hipStream_t>(stream); }
 
 __device__ __forceinline__ float f16_device(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
@@ -480,6 +485,13 @@ __global__ void markov_combine_kernel(const std::uint32_t* local, const std::uin
     const float a = __uint_as_float(local[0]), b = __uint_as_float(remote[0]);
     tokens[step + 1U] = better(b, remote[1], a, local[1]) ? remote[1] : local[1];
 }
+// Candidate-form chain (STRIX_DS41_DSPARK_MARKOV=cand): markov[r] = embed[tokens[r]] for the confidence (the full pass
+// writes the same values).
+__global__ __launch_bounds__(256) void markov_rows_kernel(const std::uint16_t* embed, const std::uint32_t* tokens, float* markov) {
+    const unsigned r = blockIdx.x;
+    const std::uint16_t* e = embed + static_cast<unsigned long long>(tokens[r]) * markov_rank;
+    for (unsigned j = threadIdx.x; j < markov_rank; j += 256U) markov[static_cast<unsigned long long>(r) * markov_rank + j] = f16_device(e[j]);
+}
 // Gathers Q8_0 head rows of extra vocabulary ids into a packed table (rows first .. first + count).
 __global__ __launch_bounds__(256) void gather_rows_kernel(const std::uint8_t* table, unsigned long long row_bytes, const std::uint32_t* ids,
                                                           unsigned first, std::uint8_t* out) {
@@ -713,6 +725,23 @@ struct DeviceDrafter::Impl {
     Buffer<float> best_values{markov_blocks};
     Buffer<std::uint32_t> best_ids{markov_blocks};
     Buffer<float> confidence_out{block_size};
+    // Candidate-form Markov chain (STRIX_DS41_DSPARK_MARKOV=cand; kernels in dspark_common/markov_cand_kernels.hpp). The
+    // domain (core ids, then extras) splits in two halves by position as in local_rows(); every chain step of row k scores
+    // each half's top-C of row k's head logits (value desc, position asc) and H, the |H| domain ids of largest Markov-head
+    // row sum of squares, with the full pass's per-candidate arithmetic. One rank selects both halves; two ranks select
+    // their own half and exchange the payload once per draft. Both see the same candidates and `better` is a total order,
+    // so the tokens do not depend on the rank count. The full pass's token is kept whenever it is a candidate.
+    DeviceDrafter::MarkovConfig mcfg = DeviceDrafter::markov_config();
+    struct CandState {
+        std::vector<std::uint32_t> order;            // every id by row sum of squares desc, id asc (first use)
+        std::uint64_t key = 0;                       // the domain H was derived for (0: none yet)
+        std::vector<std::uint32_t> hid[2], hpos[2];  // H per half: ids, positions within the half
+        std::uint32_t hmax = 0;
+        Buffer<std::uint32_t> d_hid[2], d_hpos[2];
+        Buffer<unsigned char> pay[2], ws;  // pay[0]: the payload of this rank's half (one rank: half 0), pay[1]: the other half's
+        Buffer<mc::Cand> cand;
+        std::array<std::uint32_t, 2U * block_size> counts{};  // both payloads' row counts (the fallback decision)
+    } cs;
     // Sequence contexts (set_sequences): what one request's drafting owns -- the stage rings, the position and the
     // draft vocabulary. The active context lives in the fields above; the others are parked here (parked[active]
     // holds nothing while it is active). Selecting swaps buffers, nothing is copied.
@@ -816,6 +845,7 @@ struct DeviceDrafter::Impl {
         };
         if (const char* v = std::getenv("STRIX_DS41_DSPARK_WIDE_ROWS")) wide_rows = static_cast<unsigned>(v[0] - '0');
         gpu_routes = flag("STRIX_DS41_DSPARK_GPU_ROUTES");
+        if (mcfg.cand) cand_init();
         check(hipDeviceSynchronize(), "upload");
         memlog("route tables + extra rows", gtt_mark, std::uint64_t{extra_capacity} * output.row_bytes);
     }
@@ -1004,7 +1034,8 @@ struct DeviceDrafter::Impl {
         }
         HeadView h{logits.data, cc, cb, logits_extra.data, ec, eb, extra_ids.data, markov_embed.data, markov_head.data, tokens.data,
                    markov.data, best_values.data, best_ids.data};
-        for (std::uint32_t i = 0; i < rows; ++i) {
+        const std::uint32_t full_steps = mcfg.cand && cand_head(rows) ? 0U : rows;  // the candidate chain did them all
+        for (std::uint32_t i = 0; i < full_steps; ++i) {
             hipLaunchKernelGGL(markov_pass_kernel, dim3(markov_blocks), dim3(256), 0, stream, h, i);
             hipLaunchKernelGGL(markov_pick_kernel, dim3(1), dim3(markov_blocks), 0, stream, h, i, world > 1U ? candidate.data : nullptr);
             if (world > 1U) {
@@ -1014,6 +1045,108 @@ struct DeviceDrafter::Impl {
         }
         check(hipGetLastError(), "markov launch");
         enqueue_confidence(confidence.data, x.data, markov.data, rows, confidence_out.data, stream);
+    }
+    // This rank's logits of the domain positions [lo, hi) (inside local_rows()).
+    mc::TwoSegments half_view(std::uint32_t lo, std::uint32_t hi, const LocalRows& l) const {
+        const std::uint32_t clo = std::min(lo, core), chi = std::min(hi, core), elo = std::max(lo, core) - core, ehi = std::max(hi, core) - core;
+        return {logits.data, l.core_count, clo - l.core_base, chi - clo, clo, logits_extra.data, l.extra_count, elo - l.extra_base, extra_ids.data,
+                elo, (chi - clo) + (ehi - elo)};
+    }
+    // H of the current domain (re-derived when the core or the extras change).
+    void cand_h(std::uint32_t half) {
+        std::uint64_t key = 14695981039346656037ULL;
+        const auto mix = [&](std::uint64_t v) { key = (key ^ v) * 1099511628211ULL; };
+        mix(core);
+        mix(extra_host.size());
+        for (const auto id : extra_host) mix(id);
+        key |= 1U;
+        if (key == cs.key) return;
+        std::vector<std::uint32_t> extra_at;  // extra id -> its index (with extras only)
+        if (!extra_host.empty()) {
+            extra_at.assign(vocab, 0xffffffffU);
+            for (std::uint32_t i = 0; i < extra_host.size(); ++i) extra_at[extra_host[i]] = i;
+        }
+        for (std::uint32_t h = 0; h < 2U; ++h) cs.hid[h].clear(), cs.hpos[h].clear();
+        std::uint32_t found = 0;
+        for (const auto id : cs.order) {
+            if (found == mcfg.H) break;
+            const std::uint32_t pos = id < core ? id : !extra_at.empty() && extra_at[id] != 0xffffffffU ? core + extra_at[id] : 0xffffffffU;
+            if (pos == 0xffffffffU) continue;
+            const std::uint32_t h = pos < half ? 0U : 1U;
+            cs.hid[h].push_back(id);
+            cs.hpos[h].push_back(pos - (h == 0U ? 0U : half));
+            ++found;
+        }
+        cs.hmax = static_cast<std::uint32_t>(std::max(cs.hid[0].size(), cs.hid[1].size()));
+        for (std::uint32_t h = 0; h < 2U; ++h) {
+            cs.d_hid[h].upload(cs.hid[h].data(), cs.hid[h].size(), stream);
+            cs.d_hpos[h].upload(cs.hpos[h].data(), cs.hpos[h].size(), stream);
+        }
+        cs.key = key;
+    }
+    // Top-C + owned-H payload of one half (h: which half's H).
+    void cand_select(const mc::TwoSegments& lg, std::uint32_t rows, std::uint32_t h, unsigned char* pay) {
+        const std::uint32_t nb = (lg.n + mc::kCh - 1U) / mc::kCh;
+        unsigned char* ws = cs.ws.data;
+        hipLaunchKernelGGL(mc::v2_hist_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, block_size, ws, nb);
+        hipLaunchKernelGGL(mc::v2_compact_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, mcfg.C, block_size, ws, nb);
+        hipLaunchKernelGGL(mc::v2_refine_kernel, dim3(rows), dim3(1024), 0, stream, lg.n, mcfg.C, block_size, ws, nb, pay);
+        hipLaunchKernelGGL(mc::v2_emit_kernel<mc::TwoSegments>, dim3(nb, rows), dim3(mc::kV2Threads), 0, stream, lg, mcfg.C, block_size,
+                           cs.d_hpos[h].data, static_cast<std::uint32_t>(cs.hpos[h].size()), cs.hmax, ws, nb, pay);
+    }
+    // At construction: the buffers and the H order (Markov-head row norms; one device sync, not in a draft).
+    void cand_init() {
+        const std::uint32_t n_max = (vocab + 1U) / 2U, nb_max = (n_max + mc::kCh - 1U) / mc::kCh;
+        cs.ws = Buffer<unsigned char>(mc::ws_bytes(nb_max, n_max, block_size));
+        check(hipMemsetAsync(cs.ws.data, 0, mc::ws_words(nb_max, block_size) * 4U, stream), "markov cand ws");
+        for (std::uint32_t h = 0; h < 2U; ++h) {
+            cs.pay[h] = Buffer<unsigned char>(mc::payload_bytes(mcfg.C, block_size, mcfg.H));
+            cs.d_hid[h] = Buffer<std::uint32_t>(mcfg.H);
+            cs.d_hpos[h] = Buffer<std::uint32_t>(mcfg.H);
+        }
+        cs.cand = Buffer<mc::Cand>((2U * mcfg.C + mcfg.H + 7U) / 8U);
+        Buffer<float> row_norms(vocab);
+        hipLaunchKernelGGL(mc::norm_kernel<mc::F16>, dim3((vocab + 7U) / 8U), dim3(256), 0, stream, markov_head.data, vocab, row_norms.data);
+        check(hipGetLastError(), "markov cand norms");
+        const auto n = row_norms.download(stream);
+        cs.order.resize(vocab);
+        for (std::uint32_t v = 0; v < vocab; ++v) cs.order[v] = v;
+        std::sort(cs.order.begin(), cs.order.end(), [&](std::uint32_t ia, std::uint32_t ib) { return n[ia] > n[ib] || (n[ia] == n[ib] && ia < ib); });
+    }
+    // The chain over the candidates (tokens[1..rows], markov[0..rows)). false: the full passes run - a half holds fewer
+    // than C positions, or a row of either half has a nonfinite logit (its count is not C). Both ranks decide alike:
+    // same domain, and the counts of both halves are in both ranks' payloads.
+    bool cand_head(std::uint32_t rows) {
+        const auto size = core + static_cast<std::uint32_t>(extra_host.size()), half = (size + 1U) / 2U;
+        if (size - half < mcfg.C) return false;
+        cand_h(half);
+        const auto l = local_rows();
+        unsigned char *own = cs.pay[0].data, *peer = cs.pay[1].data;
+        const std::uint32_t mine = world == 1U ? 0U : rank, other = 1U - mine;
+        if (world == 1U) {
+            cand_select(half_view(0U, half, l), rows, 0U, own);
+            cand_select(half_view(half, size, l), rows, 1U, peer);
+        } else {
+            cand_select(rank == 0U ? half_view(0U, half, l) : half_view(half, size, l), rows, mine, own);
+        }
+        check(hipGetLastError(), "markov cand select");
+        if (world > 1U) exchange(stream, own, peer, mc::payload_bytes(mcfg.C, block_size, cs.hmax));
+        const std::size_t counts_at = std::size_t{block_size} * mcfg.C * 4U;  // Payload::counts
+        check(hipMemcpyAsync(cs.counts.data(), own + counts_at, block_size * 4U, hipMemcpyDeviceToHost, stream), "markov cand counts");
+        check(hipMemcpyAsync(cs.counts.data() + block_size, peer + counts_at, block_size * 4U, hipMemcpyDeviceToHost, stream), "markov cand counts");
+        check(hipStreamSynchronize(stream), "markov cand counts");
+        for (std::uint32_t k = 0; k < rows; ++k)
+            if (cs.counts[k] != mcfg.C || cs.counts[block_size + k] != mcfg.C) return false;
+        const auto nh_own = static_cast<std::uint32_t>(cs.hid[mine].size()), nh_peer = static_cast<std::uint32_t>(cs.hid[other].size());
+        const std::uint32_t nb = (2U * mcfg.C + nh_own + nh_peer + 7U) / 8U;
+        for (std::uint32_t k = 0; k < rows; ++k) {
+            hipLaunchKernelGGL((mc::cand_kernel<mc::F16>), dim3(nb), dim3(256), 0, stream, markov_embed.data, markov_head.data, tokens.data + k,
+                               k, block_size, own, peer, mcfg.C, cs.d_hid[mine].data, nh_own, cs.d_hid[other].data, nh_peer, cs.hmax, cs.cand.data);
+            hipLaunchKernelGGL(mc::pick_kernel, dim3(1), dim3(256), 0, stream, cs.cand.data, nb, nullptr, tokens.data + k + 1U);
+        }
+        hipLaunchKernelGGL(markov_rows_kernel, dim3(rows), dim3(256), 0, stream, markov_embed.data, tokens.data, markov.data);
+        check(hipGetLastError(), "markov cand chain");
+        return true;
     }
     void output_projection(DeviceStage& s, float* out) {
         constexpr std::uint32_t rows = block_size;
@@ -1063,6 +1196,25 @@ void DeviceDrafter::set_rank(std::uint32_t rank, std::uint32_t world, RankExchan
     impl_->exchange = std::move(exchange);
 }
 Vocab DeviceDrafter::vocabulary() const { return Vocab{impl_->core, impl_->extra_host}; }
+DeviceDrafter::MarkovConfig DeviceDrafter::markov_config() {
+    MarkovConfig c;
+    const char* m = std::getenv("STRIX_DS41_DSPARK_MARKOV");
+    const std::string mode = m != nullptr && *m != '\0' ? m : "cand";
+    if (mode != "full" && mode != "cand") throw std::invalid_argument("STRIX_DS41_DSPARK_MARKOV must be full or cand");
+    c.cand = mode == "cand";
+    const auto number = [](const char* name, std::uint32_t fallback, std::uint32_t most) {
+        const char* v = std::getenv(name);
+        if (v == nullptr || *v == '\0') return fallback;
+        char* end = nullptr;
+        const unsigned long n = std::strtoul(v, &end, 10);
+        if (*end != '\0' || n == 0UL || n > most) throw std::invalid_argument(std::string(name) + " must be 1.." + std::to_string(most));
+        return static_cast<std::uint32_t>(n);
+    };
+    c.C = number("STRIX_DS41_DSPARK_MARKOV_C", c.C, (vocab + 1U) / 2U);  // a half's size: every position a candidate (= full)
+    c.H = number("STRIX_DS41_DSPARK_MARKOV_H", c.H, vocab);
+    return c;
+}
+DeviceDrafter::MarkovConfig DeviceDrafter::markov() const noexcept { return impl_->mcfg; }
 ContextSnapshot DeviceDrafter::export_context() const {
     if (sequences() != 1U) throw std::logic_error("DSpark export requires a single context");
     const auto& m = *impl_;
@@ -1134,6 +1286,11 @@ DeviceDrafter::Footprint DeviceDrafter::footprint(const Weights& w, std::uint32_
     e1 += B * K * inter + B * inter;                                                                               // act / shared codes
     e4 += slots + (slots + 1U) + 3U * B * K + B;                                                                   // device routes
     e4 += B * vocab + 2U + 2U + B * markov_rank + 2U * u64{markov_blocks} + B;                                     // logits .. confidence_out
+    if (const auto mk = markov_config(); mk.cand) {  // Impl::cand_head's buffers
+        const u64 n = (vocab + 1U) / 2U, nb = (n + mc::kCh - 1U) / mc::kCh;
+        e1 += mc::ws_bytes(static_cast<std::uint32_t>(nb), static_cast<std::uint32_t>(n), block_size) + 2U * mc::payload_bytes(mk.C, block_size, mk.H);
+        e4 += 4U * u64{mk.H} + 2U * ((2U * u64{mk.C} + mk.H + 7U) / 8U);
+    }
     f.scratch = 4U * e4 + e1;
     // a context: the stage rings, the extra vocabulary ids / head rows and their logits (the active one lives in Impl)
     const u64 context = u64{stages} * window * entry_bytes + 8192U * 4U + 8192U * w.output.row_bytes() + B * 8192U * 4U;
