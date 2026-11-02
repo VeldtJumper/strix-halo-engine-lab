@@ -1,10 +1,14 @@
-# Prefill MoE table ring (draft)
+# Prefill MoE table ring
 
-Status: implemented behind a default-off switch. Native HIP compilation, GPU
-byte comparisons, model fidelity and complete-workload qualification are pending.
-No performance improvement is claimed from the local host checks.
+Status: default on in `strix-minimax-rank` only (the app sets
+STRIX_MM_PF_TABLE_RING=1 when unset and STRIX_MM_BASELINE is not 1);
+`strix-minimax-serve` and the library keep it off because serve is not qualified.
+Qualification (rank app, both ranks): prefill state, final rows and tokens
+identical at 1K and 8K, in-process A/B/A and fresh-process B A B A; 1K TTFT
+-0.5 %, 8K not slower. The ring is process-wide: one engine per process driven
+by a single host thread.
 
-STRIX_MM_PF_TABLE_RING=0 (default) retains the table-lifetime stream sync; =1
+STRIX_MM_PF_TABLE_RING=0 retains the table-lifetime stream sync; =1
 stages the same table bytes through four pinned host slots. The environment is
 captured once at Engine startup. Engine::set_prefill_table_ring(int) and
 moe::opt::set_prefill_table_ring(int) accept -1 to restore that captured default,

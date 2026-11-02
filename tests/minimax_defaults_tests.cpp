@@ -112,6 +112,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_DOWN_SPLIT", "0"},    {"STRIX_MM_ATTEND_DIET", "0"},
     {"STRIX_MM_ATTEND4_DECODE", "0"},
     {"STRIX_MMX_PREFILL_GATHER_TOK", "0"}, {"STRIX_MM_PF_DENSE_QKV", "0"},
+    {"STRIX_MM_PF_ROUTER_ROWS", "8"}, {"STRIX_MM_PF_MSA_SCRATCH_MB", "512"}, {"STRIX_MM_PF_DENSE_O", "0"},
     {"STRIX_MM_XB_WARM_O", "0"},           {"STRIX_MMX_MOE_TIGHT_GRID", "0"},
 };
 

@@ -6,7 +6,7 @@
 //   TRANSPORT: usb4-auto | usb4gpu (DS production: GPU-direct streams + host path, size routes) | tcp-listen:PORT |
 //              tcp-connect:HOST:PORT
 //   STRIX_MM_STAGING=fused: exchanged partials written / read in the communicator's pinned buffers (host-path routes)
-// STRIX_MM_PFX=off|load|on (default load): prefill exchange module (src/minimax/pfx) constructed
+// STRIX_MM_PFX=off|load|on (default on): prefill exchange module (src/minimax/pfx) constructed
 //                                  and switched off (load) / on; STRIX_MM_PF_INTERLEAVE (default on; =0 serial, =comm
 //                                  communicator even with the module on) interleaves the max_rows chunks of a prompt;
 //                                  STRIX_MM_STATE_FNV=0 skips the state hash prints
@@ -19,7 +19,7 @@
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
-//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbwarmo | moegrid | xbilp | xbset | pfx | pfil | pfxip | pfcore | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pftab | pfgufuse | pfrouter | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall): TTFT and decode blocks
+//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbwarmo | moegrid | xbilp | xbset | pfx | pfil | pfxip | pfcore | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall): TTFT and decode blocks
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
@@ -970,14 +970,14 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     unsigned rework_mode = 1U, rework_base = 0U;
     if (flag == "pfmsarework") {
         if (const char* mode = std::getenv("STRIX_MM_AB_REWORK")) {
-            if (std::string(mode) != "1" && std::string(mode) != "2" && std::string(mode) != "3" && std::string(mode) != "4" && std::string(mode) != "5")
-                throw std::invalid_argument("STRIX_MM_AB_REWORK must be 1, 2, 3, 4 or 5");
-            rework_mode = std::string(mode) == "5" ? 5U : std::string(mode) == "4" ? 4U : std::string(mode) == "3" ? 3U : std::string(mode) == "2" ? 2U : 1U;
+            if (std::string(mode) != "1" && std::string(mode) != "2" && std::string(mode) != "3" && std::string(mode) != "4" && std::string(mode) != "5" && std::string(mode) != "6")
+                throw std::invalid_argument("STRIX_MM_AB_REWORK must be 1, 2, 3, 4, 5 or 6");
+            rework_mode = std::string(mode) == "6" ? 6U : std::string(mode) == "5" ? 5U : std::string(mode) == "4" ? 4U : std::string(mode) == "3" ? 3U : std::string(mode) == "2" ? 2U : 1U;
         }
         if (const char* base = std::getenv("STRIX_MM_AB_REWORK_BASE")) {
             const std::string mode = base;
-            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4" && mode != "5")
-                throw std::invalid_argument("STRIX_MM_AB_REWORK_BASE must be 0, 1, 2, 3, 4 or 5");
+            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4" && mode != "5" && mode != "6")
+                throw std::invalid_argument("STRIX_MM_AB_REWORK_BASE must be 0, 1, 2, 3, 4, 5 or 6");
             rework_base = static_cast<unsigned>(mode[0] - '0');
         }
         std::printf("pfmsarework modes A=%u B=%u\n", rework_base, rework_mode);
@@ -1043,6 +1043,21 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(on ? idx_conc_b : 0);
         else if (flag == "pfkvtile") eng.set_prefill_kv_tile(on ? kv_tile_b : -1);
         else if (flag == "pfrouter") eng.set_prefill_router_batch(on);
+        else if (flag == "pfrouterrows") {  // batch router: 8 rows (A) vs STRIX_MM_AB_ROUTER_ROWS (B, default 32 = tiled)
+            const char* e = std::getenv("STRIX_MM_AB_ROUTER_ROWS");
+            const unsigned rows = e != nullptr ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 32U;
+            eng.set_prefill_router_batch(true);
+            eng.set_prefill_router_rows(on ? rows : 8U);
+        }
+        else if (flag == "core8v2") {  // production MT8 (A: process PIPE/core8) vs PIPE 0 + core8 STRIX_MM_AB_CORE8 (B, default 2)
+            const char* e = std::getenv("STRIX_MM_AB_CORE8");
+            const std::string value = e != nullptr ? e : "2";
+            if (value != "1" && value != "2") throw std::invalid_argument("STRIX_MM_AB_CORE8 must be 1 or 2");
+            strix::minimax::moe::opt::set_prefill_core(3);
+            eng.set_prefill_mtfit(1);
+            eng.set_prefill_pipe(on ? 0 : -1);
+            eng.set_prefill_core8(on ? (value == "1" ? 1 : 2) : -1);
+        }
         else if (flag == "pftab") eng.set_prefill_table_ring(on ? 1 : 0);
         else if (flag == "pfgufuse") eng.set_prefill_gufuse(on ? 1 : 0);
         else if (flag == "pfil") eng.set_prefill_interleave(on);
@@ -1103,6 +1118,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : eng.shared_first();
     const bool pfx0 = eng.prefill_xchg(), pfxip0 = eng.prefill_inplace();
     const bool msa0 = eng.prefill_msa_batch(), att0 = eng.prefill_attend4(), rtr0 = eng.prefill_router_batch();  // pfall restores these
+    const unsigned router_rows0 = eng.prefill_router_rows();  // pfrouterrows restores it
     const bool xb = flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "xbilp" || flag == "xbset";
     const bool xb_w0 = eng.xb_wait(), xb_i0 = eng.xb_inplace(), xb_p0 = eng.xb_prep(), xb_u0 = eng.xb_publish();
     const unsigned xb_m0 = eng.xb_warm(), xb_o0 = eng.xb_warm_o();
@@ -1116,9 +1132,9 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = (flag != "pfcore" && (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || flag == "pfcore" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    const bool hash_state = (flag != "pfcore" && (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || flag == "pfcore" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfcore / pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
-    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
+    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
@@ -1173,6 +1189,16 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     }
     else if (flag == "pftab") eng.set_prefill_table_ring(-1);
     else if (flag == "pfgufuse") eng.set_prefill_gufuse(-1);
+    else if (flag == "pfrouterrows") {
+        eng.set_prefill_router_batch(rtr0);
+        eng.set_prefill_router_rows(router_rows0);
+    }
+    else if (flag == "core8v2") {
+        eng.set_prefill_core8(-1);
+        eng.set_prefill_pipe(-1);
+        eng.set_prefill_mtfit(-1);
+        strix::minimax::moe::opt::set_prefill_core(-1);
+    }
     else if (flag == "pfpipe") eng.set_prefill_pipe(pipe0);
     else if (flag == "core8") {
         eng.set_prefill_core8(-1);
@@ -1679,6 +1705,10 @@ int main(int argc, char** argv) {
         // sessions, tokens identical, each deferred arm below its two inline neighbours by 0.04-0.12 ms/token).
         // STRIX_MMX_CRC: 0 = off, 1 = inline, deferred = deferred check.
         (void)::setenv("STRIX_MMX_CRC", "deferred", 0);
+        // Prefill MoE table ring ON in this app only (qualified here, single engine owner; serve keeps it off).
+        // Measurement: exact, 1K -0.5 %, 8K not slower. An explicit value or STRIX_MM_BASELINE=1 wins.
+        if (const char* base = std::getenv("STRIX_MM_BASELINE"); base == nullptr || std::string(base) != "1")
+            (void)::setenv("STRIX_MM_PF_TABLE_RING", "1", 0);
         auto transport = open_transport(argv[3], opt.rank, receipt);
         if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
         strix::dist::Group group;
@@ -1700,9 +1730,13 @@ int main(int argc, char** argv) {
             exchanger = std::make_unique<strix::minimax::xfer::Exchanger>(std::make_unique<Borrowed>(*transport), xo);
             std::printf("rank %u: exchange module %s\n", opt.rank, exchanger->name().c_str());
         }
-        // STRIX_MM_PFX=off|load|on (default load): the prefill exchange module (shares the host transport)
+        // STRIX_MM_PFX=off|load|on (default on: exact, GPU-gated prefill exchange, 1K -3.5 %, 8K -1.5 %): the prefill
+        // exchange module (shares the host transport)
         const char* pfx_env = std::getenv("STRIX_MM_PFX");
         const bool pfx_load = (pfx_env == nullptr || std::string(pfx_env) != "off") && !gpu_direct;
+        // Unset = on only on the qualified host-path USB4 transport; elsewhere unset = load (constructed, off).
+        const bool pfx_default_on = std::string(argv[3]).rfind("usb4", 0) == 0;
+        const bool pfx_on = pfx_env == nullptr ? pfx_default_on : std::string(pfx_env) == "on";
         std::unique_ptr<strix::minimax::pfx::Exchanger> pfx;
         if (pfx_load) {
             strix::minimax::pfx::Options po;
@@ -1713,7 +1747,7 @@ int main(int argc, char** argv) {
             pfx = std::make_unique<strix::minimax::pfx::Exchanger>(*transport, po);
             g_pfx = pfx.get();
             std::printf("rank %u: prefill exchange module %s, %s, interleave %s\n", opt.rank, pfx->name().c_str(),
-                        pfx_env != nullptr && std::string(pfx_env) == "on" ? "on" : "loaded (off)",
+                        pfx_on ? "on" : "loaded (off)",
                         std::getenv("STRIX_MM_PF_INTERLEAVE") != nullptr && std::getenv("STRIX_MM_PF_INTERLEAVE")[0] == '1' ? "on" : "off");
         }
         const bool borrow = xfer_load || pfx_load;
@@ -1726,7 +1760,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         mm::Engine eng(opt, comm);
         if (exchanger) eng.set_exchanger(exchanger.get(), xfer_env == nullptr || std::string(xfer_env) == "on");
-        if (pfx) eng.set_prefill_exchanger(pfx.get(), pfx_env != nullptr && std::string(pfx_env) == "on");
+        if (pfx) eng.set_prefill_exchanger(pfx.get(), pfx_on);
         const auto lr = eng.load();
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);

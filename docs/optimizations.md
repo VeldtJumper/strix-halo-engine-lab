@@ -2478,7 +2478,7 @@ Choose fitting prefill MoE tiles.
 
 ### MSA prefill mode 5
 
-**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 5.
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 6 (mode 5 below is the previous default).
 
 Rework attention scheduling without changing the reference result.
 
@@ -2521,6 +2521,107 @@ Run the attention q, k and v projections of a prefill piece as one call on the e
 - **Off switch:** STRIX_MM_PF_DENSE_QKV=0
 - **Measured gain:** q+k+v per piece 12.37 -> 7.78 ms at 4096 rows, 2.61 -> 1.96 ms at 1024 rows (k+v alone 5.47 -> 2.09 ms). Together with the token-major gather: 8K TTFT -2.3 to -4.3 %, 32K -4.3 to -5.3 %.
 - **Implementation / evidence:** [dense call](../src/minimax/moe/mmx_prefill.hip), [engine site](../src/minimax/engine/engine.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
+<a id="mm-pf-router-v2"></a>
+
+### Prefill router, tiled scores
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_ROUTER_ROWS`. **Default:** 32.
+
+Compute the prefill router scores in tiles of 16 rows by 32 experts, so the router weights are read once per 16 rows instead of once per 4 or 8; the expert selection runs as a separate small kernel.
+
+- **Preconditions:** Batch router on (the default) and prefill pieces of 1024 to 4096 rows (other piece sizes keep the 8-row form).
+- **Automatic selection:** Resolver supplies 32 only when unset; explicit values win.
+- **Fallback notice:** None: every row count uses the same kernels.
+- **Exactness evidence:** Exact: routes and weights byte-identical to the fused and 4/8-row forms for every input kind (ties, zeros, denormals, huge values) on the tested boundary and tail row counts; prefill state, final rows and tokens identical on both ranks in every PAIR arm.
+- **Off switch:** STRIX_MM_PF_ROUTER_ROWS=8 (previous default) or =4
+- **Measured gain:** post-exchange + router per 4096-row piece 5.40 -> 4.82 ms; TTFT 1K -0.9 %, 8K -0.8 % (in-process A/B/A, two Strix Halo nodes).
+- **Implementation / evidence:** [router kernels](../src/hip_minimax_moe.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [router tests](../tests/hip_minimax_moe_tests.hip)
+
+<a id="mm-pf-msa-scratch"></a>
+
+### Prefill MSA scratch for whole pieces
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_SCRATCH_MB`. **Default:** 1152.
+
+Size the prefill attention scratch so that every 16-row window of a 4096-row piece runs in one batch (512 MiB fitted about 124 windows, so each piece ran three batches, the last one nearly empty).
+
+- **Preconditions:** At least 4 GiB of device memory left after the request; otherwise the former 512 MiB cap is kept with one notice.
+- **Automatic selection:** Resolver supplies 1152 only when unset; explicit values (64 to 8192) win.
+- **Fallback notice:** One stderr line when the headroom check keeps 512 MiB.
+- **Exactness evidence:** Exact: windows are independent, so only the number of launches changes; prefill state, final rows and tokens identical on both ranks in every PAIR arm.
+- **Off switch:** STRIX_MM_PF_MSA_SCRATCH_MB=512
+- **Measured gain:** Part of the shipping set below (8K -2.4 %, 32K -3.0 %).
+- **Implementation / evidence:** [engine](../src/minimax/engine/engine.hip), [resolver](../src/minimax/engine/mm_defaults.cpp)
+
+<a id="mm-pf-dense-o"></a>
+
+### Prefill o projection on the v4 core
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_DENSE_O`. **Default:** 1.
+
+Run the attention output projection of full 4096-row prefill pieces on the engine's v4 WMMA core, like q/k/v.
+
+- **Preconditions:** Exactly 4096-row pieces and EXL3 weights of 3, 4, 5, 6 or 8 bits (otherwise the library call).
+- **Automatic selection:** Resolver supplies 1 only when unset; explicit values win.
+- **Fallback notice:** None: other pieces silently keep the library call.
+- **Exactness evidence:** Exact: o outputs byte-identical to the library GEMM on the tested row counts (9 to 4096); prefill state, final rows and tokens identical on both ranks in every PAIR arm.
+- **Off switch:** STRIX_MM_PF_DENSE_O=0
+- **Measured gain:** o projection per 4096-row piece 7.89 -> 7.59 ms; part of the shipping set below.
+- **Implementation / evidence:** [engine site](../src/minimax/engine/engine.hip), [dense call](../src/minimax/moe/mmx_prefill.hip)
+
+<a id="mm-pf-table-ring"></a>
+### Prefill MoE table ring
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_TABLE_RING`. **Default:** 1 in `strix-minimax-rank`; 0 in `strix-minimax-serve`.
+
+Upload each prefill MoE call's item tables from a ring of pinned slots with per-slot events, so the host does not wait for the previous upload before planning the next call.
+
+- **Preconditions:** One engine per process driven by a single host thread (the ring is process-wide); qualified in the rank app only, so serve keeps it off.
+- **Automatic selection:** The rank app supplies 1 when unset and `STRIX_MM_BASELINE` is not 1; explicit values win.
+- **Fallback notice:** None.
+- **Exactness evidence:** Exact: identical table bytes; prefill state, final rows and tokens identical on both ranks at 1K and 8K (in-process A/B/A and fresh-process B A B A).
+- **Off switch:** STRIX_MM_PF_TABLE_RING=0
+- **Measured gain:** 1K TTFT -0.5 %; 8K not slower (in-process +0.7/+0.9/-1.7 %, fresh-process B 14.30/14.33 s vs A 15.03/14.33 s).
+- **Implementation / evidence:** [table ring](../src/minimax/moe/mmx_prefill.hip)
+
+<a id="mm-pf-msa-mode6"></a>
+
+### MSA prefill mode 6
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 6.
+
+Mode 5 evaluates two heads' probabilities in one packed exponential; mode 6 also computes each 16-key tile's two running-max corrections in the spare lanes of that same evaluation instead of in two separate scalar evaluations.
+
+- **Preconditions:** Supported MSA prefill shapes (as mode 5).
+- **Automatic selection:** Resolver supplies 6 only when unset; explicit values win.
+- **Fallback notice:** As mode 5.
+- **Exactness evidence:** Exact: the fused MSA unit suite compares every partial, score, index and output byte of every rework mode (over 10,000 cases, both PV paths, dense and sparse, scratch sizes, graph replay); prefill state and final rows identical on both ranks in an in-process 5-vs-6 PAIR gate.
+- **Off switch:** STRIX_MM_PF_MSA_REWORK=5 (previous default), =3, =0 (original)
+- **Measured gain:** 8K TTFT in-process A/B/A vs mode 5: -1.6 / 0.0 / 0.0 % (not slower); producer fixture within noise at small row counts.
+- **Implementation / evidence:** [kernel](../src/minimax/attn/msa_fused.hip), [tests](../src/minimax/attn/msa_fused_tests.hip)
+
+<a id="mm-rank-pfx"></a>
+
+### GPU-gated prefill exchange in the rank app
+
+**Engine:** `minimax` (`strix-minimax-rank`). **Control:** `STRIX_MM_PFX`. **Default:** on.
+
+The rank app now switches on its prefill exchange module, whose copy kernels and stream waits move each prefill partial without blocking the host (previously constructed but off).
+
+- **Preconditions:** Host-path USB4 transport (unset = on only there; other transports keep it constructed but off; not built with the GPU-direct transport). The serve app does not use the module yet: it would disable nested serving.
+- **Automatic selection:** Unset = on; `load` = constructed and off; `off` = not constructed.
+- **Fallback notice:** Startup line names the module state.
+- **Exactness evidence:** Exact: prefill state, final rows and tokens identical on both ranks in-process (1K, 8K) and across fresh processes in any order.
+- **Off switch:** STRIX_MM_PFX=load (previous default) or =off
+- **Measured gain:** TTFT 1K -3.5 %, 8K -1.5 % (in-process A/B/A, two Strix Halo nodes).
+- **Implementation / evidence:** [rank app](../apps/minimax_rank_main.cpp), [module](../src/minimax/pfx/pf_exchange.hpp)
+
+<a id="mm-pf-set-20261102"></a>
+
+### Prefill shipping set: router, MSA scratch, o projection, rank exchange
+
+Measured together on two Strix Halo nodes, fresh process per arm, previous defaults vs the five rows above (mode 6 measured separately): 8K TTFT -2.4 % (14.41 -> 14.06 s), 32K -3.0 % (68.08 -> 66.01 s); prefill state, final rows and tokens identical to the published references on both ranks in every arm.
 
 <a id="mm-moe-gu-interleave"></a>
 

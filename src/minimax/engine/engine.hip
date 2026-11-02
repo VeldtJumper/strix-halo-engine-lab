@@ -488,15 +488,17 @@ struct Engine::Impl {
     bool index_tiled = true;  // STRIX_MM_INDEX_PROJ (runtime; default tiled, =off: dense_t): index q/k projections, token-tiled, F16 weights
     bool attn_prefill_fused = true;  // STRIX_MM_ATTN_PREFILL (runtime; default fused, =off: K1-K4): prefill MSA in fused 16-row windows
     bool pf_idx_tile = false;
+    unsigned pf_msa_scratch_mb = 1152;  // STRIX_MM_PF_MSA_SCRATCH_MB: prefill MSA window scratch cap (former 512)
+    bool pf_dense_o = true;  // STRIX_MM_PF_DENSE_O (default ON): prefill o_proj on the v4 core for full 4096-row pieces; =0 library
     bool pf_dense_qkv = true;  // STRIX_MM_PF_DENSE_QKV (default ON): prefill q/k/v in one v4-core call from 1024 rows (same bits as strix_gemm); =0 library
     unsigned pf_idx_rows = 32;
-    unsigned pf_msa_rework = 5;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 5 (= 3 with packed two-head probabilities, exact); =3 the previous default, =0 original
+    unsigned pf_msa_rework = 6;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 6 (= 5 with the tile corrections in the packed exp lanes, exact); =5 / =3 previous defaults, =0 original
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
     std::uint32_t *pf_idx = nullptr, *pf_cnt = nullptr, *pf_ticket = nullptr;
     void set_prefill_msa_rework(unsigned mode) {
-        if (mode > 5) throw std::invalid_argument("prefill MSA rework must be 0, 1, 2, 3, 4 or 5");
+        if (mode > 6) throw std::invalid_argument("prefill MSA rework must be 0, 1, 2, 3, 4, 5 or 6");
         pf_msa_rework = mode;
     }
     bool pf_attend4 = true;  // STRIX_MM_PF_ATTEND4 (default ON, exact measurement): prefill windows use v4, two heads per wave
@@ -516,8 +518,8 @@ struct Engine::Impl {
     bool pf_on = false, pf_active = false, pf_interleave = true;  // interleave ON by default (measurement: exact, 8K -11.5 %)
     bool pf_force_comm = false;                // STRIX_MM_PF_INTERLEAVE=comm: the communicator backend even with the module on
     bool pf_router_batch = true;               // STRIX_MM_PF_ROUTER_BATCH: prefill only, default ON (prefill measurement exact); =0 off
-    unsigned pf_router_rows = 8;                // STRIX_MM_PF_ROUTER_ROWS: 4 or 8 (default), 32 = tiled scores (opt-in: bitwise, not faster yet); same bits
-    float* router_scratch = nullptr;           // tiled router scores [T][2][128]
+    unsigned pf_router_rows = 32;               // STRIX_MM_PF_ROUTER_ROWS: 32 (default: tiled scores, weights read once per 16 rows), 4 or 8; same bits
+    float* router_scratch = nullptr;           // tiled router scores [2][128][rows] (STRIX_MM_PF_ROUTER_ROWS=32)
     bool pf_tx_uncached = false;              // STRIX_MM_PF_TX_UNCACHED: prefill producers write uncached TX
     bool pf_inplace = false;                   // STRIX_MM_PFX_INPLACE: o_proj / FFN outputs written straight into the TX slot
     bool pf_async_start = true, pf_late_src_fence = true;
@@ -637,9 +639,9 @@ struct Engine::Impl {
         attn_prefill_fused = apf == nullptr || std::string(apf) != "off";  // ON by default (measurement: bitwise, TTFT -5.5 %); =off
         if (const char* rework = std::getenv("STRIX_MM_PF_MSA_REWORK")) {
             const std::string mode = rework;
-            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4" && mode != "5")
-                throw std::invalid_argument("STRIX_MM_PF_MSA_REWORK must be 0, 1, 2, 3, 4 or 5");
-            set_prefill_msa_rework(mode == "5" ? 5U : mode == "4" ? 4U : mode == "3" ? 3U : mode == "2" ? 2U : mode == "1" ? 1U : 0U);
+            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4" && mode != "5" && mode != "6")
+                throw std::invalid_argument("STRIX_MM_PF_MSA_REWORK must be 0, 1, 2, 3, 4, 5 or 6");
+            set_prefill_msa_rework(mode == "6" ? 6U : mode == "5" ? 5U : mode == "4" ? 4U : mode == "3" ? 3U : mode == "2" ? 2U : mode == "1" ? 1U : 0U);
         }
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
@@ -653,6 +655,12 @@ struct Engine::Impl {
         if (pf_kv_tile != -1) (void)kv_tile_available();
         pf_idx_tile = env_flag("STRIX_MM_PF_IDX_TILE", false);
         pf_dense_qkv = env_flag("STRIX_MM_PF_DENSE_QKV", true);
+        pf_dense_o = env_flag("STRIX_MM_PF_DENSE_O", true);
+        if (const char* sm = std::getenv("STRIX_MM_PF_MSA_SCRATCH_MB"); sm != nullptr && *sm != '\0') {
+            const unsigned long mb = std::strtoul(sm, nullptr, 10);
+            if (mb < 64 || mb > 8192) throw std::invalid_argument("STRIX_MM_PF_MSA_SCRATCH_MB must be 64..8192");
+            pf_msa_scratch_mb = static_cast<unsigned>(mb);
+        }
         if (const char* ir = std::getenv("STRIX_MM_PF_IDX_ROWS")) {
             const std::string value(ir);
             if (value != "16" && value != "32" && value != "64")
@@ -928,7 +936,7 @@ struct Engine::Impl {
         hip_ok(hipHostMalloc(reinterpret_cast<void**>(&pack_h), 2 * T * kTopE * 4, hipHostMallocDefault), "pack host");
         ids_d = route_d;
         wts4_d = reinterpret_cast<float*>(route_d + T * kTopE);
-        if (pf_router_batch && pf_router_rows == 32) router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));
+        router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));  // any router form can be selected later
         part = dalloc<float>(T * kHidden);
         remote = dalloc<float>(T * kHidden);
         if (pf != nullptr && pf->options().depth < pf_group)
@@ -961,9 +969,20 @@ struct Engine::Impl {
         partial = dalloc<float>(16ULL * 32 * msa::kMaxChunks * 130);
         {
             const std::size_t per_window = mfused::prefill_window_bytes(static_cast<std::uint32_t>(max_blocks));
-            constexpr std::size_t limit = 512ULL * 1024 * 1024;
+            // STRIX_MM_PF_MSA_SCRATCH_MB (default 1152: every window of a 4096-row piece in one batch; =512 the former cap).
+            // Windows are independent, so the batch size changes only launches, never bits. Below 4 GiB of headroom
+            // after the request the former 512 MiB cap is kept.
+            constexpr std::size_t former = 512ULL * 1024 * 1024;
+            std::size_t limit = std::size_t{pf_msa_scratch_mb} * 1024 * 1024;
+            if (limit > former) {
+                std::size_t free_b = 0, total_b = 0;
+                if (hipMemGetInfo(&free_b, &total_b) != hipSuccess || free_b < limit + (4ULL << 30)) {
+                    std::fprintf(stderr, "prefill MSA scratch: %u MiB requested, keeping 512 MiB (device headroom)\n", pf_msa_scratch_mb);
+                    limit = former;
+                }
+            }
             const std::size_t wanted = (std::size_t{opt.max_rows} + 15) / 16;
-            if (per_window > limit) throw std::invalid_argument("prefill MSA scratch window exceeds 512 MiB");
+            if (per_window > limit) throw std::invalid_argument("prefill MSA scratch window exceeds the scratch cap");
             pf_msa_windows = static_cast<unsigned>(std::min(wanted, limit / per_window));
             const std::size_t scratch_rows = std::size_t{pf_msa_windows} * 16;
             pf_scores = dalloc<float>(scratch_rows * 2 * max_blocks);
@@ -1132,7 +1151,8 @@ struct Engine::Impl {
             const float* router_w = view.router_w;
             view.router_w = nullptr;
             moe::hip::enqueue_post_exchange(view, stream);
-            if (pf_router_rows == 32 && router_scratch != nullptr)
+            // Tiled scores only on the measured piece sizes (1024..4096 rows); other piece sizes keep the 8-row form.
+            if (pf_router_rows == 32 && router_scratch != nullptr && view.rows >= 1024 && view.rows <= 4096)
                 moe::hip::enqueue_router_tiled(view.rows, view.y, router_w, view.bias, view.ids, view.weights, router_scratch, stream);
             else
                 moe::hip::enqueue_router_batch(view.rows, view.y, router_w, view.bias, view.ids, view.weights, pf_router_rows == 4 ? 4U : 8U, stream);
@@ -1383,6 +1403,15 @@ struct Engine::Impl {
         return mmoe::prefill_dense_workspace_bytes(jobs, 3, static_cast<unsigned>(n)) <= pf_ws_bytes;
     }
 
+    // Prefill o_proj on the v4 core only for exactly 4096-row pieces (bench pfdv4 o: 0.96 at 4096 rows, 1.10 at 1024 rows;
+    // larger --max-rows pieces are not qualified).
+    static constexpr std::size_t kDenseORows = 4096;
+    bool dense_o(std::size_t n, const mmoe::PrefillDenseJob (&job)[1]) const {
+        return pf_dense_o && n == kDenseORows && pf_ws != nullptr && job[0].w.trellis != nullptr &&
+               mmoe::prefill_dense_supported(job[0].w) &&
+               mmoe::prefill_dense_workspace_bytes(job, 1, static_cast<unsigned>(n)) <= pf_ws_bytes;
+    }
+
     // Layer L up to the attention partial: q/k/v + index projections, MSA, o_proj -> out (n rows; h / hn: the rows').
     void stage_attn(unsigned L, std::size_t n, std::span<const Row> rows, std::uint32_t slot, std::uint64_t pos0, float* out) {
         if (tl) tl->context(task.c + pf_idx_member, L);
@@ -1611,6 +1640,8 @@ struct Engine::Impl {
                 } else {
                     mmoe::enqueue_linears(&j, 1, static_cast<unsigned>(n), lin_ws, nullptr);
                 }
+            } else if (const mmoe::PrefillDenseJob o1[1] = {{y.ro, out}}; dense_o(n, o1)) {
+                mmoe::enqueue_prefill_dense(o1, 1, attn, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);  // STRIX_MM_PF_DENSE_O
             } else {
                 lib.mm(y.o, attn, out, n, gemv);
             }
@@ -2975,6 +3006,12 @@ void Engine::set_prefill_router_batch(bool on) {
     impl_->pf_router_batch = on;
 }
 bool Engine::prefill_router_batch() const { return impl_->pf_router_batch; }
+void Engine::set_prefill_router_rows(unsigned rows) {
+    impl_->no_task("set_prefill_router_rows");
+    if (rows != 4 && rows != 8 && rows != 32) throw std::invalid_argument("set_prefill_router_rows: 4, 8 or 32");
+    impl_->pf_router_rows = rows;
+}
+unsigned Engine::prefill_router_rows() const { return impl_->pf_router_rows; }
 void Engine::set_prefill_interleave(bool on) {
     impl_->no_task("set_prefill_interleave");
     impl_->pf_interleave = on;

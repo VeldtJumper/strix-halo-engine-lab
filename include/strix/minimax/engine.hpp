@@ -200,7 +200,7 @@ public:
     [[nodiscard]] bool prefill_index_tile() const;
     void set_prefill_msa_batch(bool on);  // STRIX_MM_PF_MSA_BATCH, default off; prefill only
     [[nodiscard]] bool prefill_msa_batch() const;
-    void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0|1|2|3|4|5; prefill only, default 3
+    void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0..6; prefill only, default 6
     [[nodiscard]] unsigned prefill_msa_rework() const;
     void set_prefill_attend4(bool on);  // STRIX_MM_PF_ATTEND4, default off; prefill only
     [[nodiscard]] bool prefill_attend4() const;
@@ -278,6 +278,8 @@ public:
     // STRIX_MM_PF_ROUTER_BATCH=1: split routing for n > 8; STRIX_MM_PF_ROUTER_ROWS=4|8 (default 8).
     void set_prefill_router_batch(bool on);
     [[nodiscard]] bool prefill_router_batch() const;
+    void set_prefill_router_rows(unsigned rows);  // batch router form: 4, 8 or 32 (tiled scores); same bits
+    [[nodiscard]] unsigned prefill_router_rows() const;
     // STRIX_MM_PF_INTERLEAVE=1 (runtime; needs the module on): the max_rows chunks of a prompt run layer-interleaved in
     // groups of STRIX_MM_PF_GROUP (default 2): each chunk's exchange overlaps the other chunk's compute (same kernel
     // calls). =comm: the same schedule over the communicator's start()/finish() (module off; attribution arm).
