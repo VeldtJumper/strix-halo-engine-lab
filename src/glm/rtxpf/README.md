@@ -80,7 +80,9 @@ BUILD_DIR/glm_unit_file.exe verify  --model MODEL_DIR --out OUT_DIR/glm-units.bi
 
 `glm_native_service.exe` is a persistent worker that reads commands on stdin.
 `decode_qualification_window.py` starts it, runs a fixed qualification plan
-and writes a JSON receipt. CUDA execution always requires `--allow-gpu`.
+and writes a JSON receipt. CUDA execution always requires `--allow-gpu` (with
+`CUDA_VISIBLE_DEVICES` set to the PRO's full UUID) or the service's `--dgpu` switch (see
+[Service and wire](producer/README.md#service-and-wire)).
 
 ```powershell
 python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DIR `

@@ -95,6 +95,11 @@ python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DI
 Para una tarjeta menor sustituya `--full-card` por `--vram-total-gib 24 --ram-total-gib 32` (o sus propios límites).
 El archivo de unidades, todas las opciones y las filas medidas: [guía de GLM RTX](../src/glm/rtxpf/README.md).
 
+El servicio de GLM (`glm_native_service`) acepta además `--dgpu auto|<uuid>`: comprueba mediante NVML, antes de
+cualquier llamada CUDA, que la tarjeta es una RTX PRO `sm_120` (`auto` elige la tarjeta válida con más memoria) y la
+fija; `--dgpu off` se rechaza (esta ruta no tiene camino por CPU). El arnés de la ejecución medida de arriba selecciona
+la tarjeta con `CUDA_VISIBLE_DEVICES`, como se describe en [Fije la GPU correcta](#fije-la-gpu-correcta).
+
 ## Solución de problemas
 
 - **Un plan no cabe.** Los planificadores de DeepSeek y GLM lo rechazan antes de cargar e indican la memoria que

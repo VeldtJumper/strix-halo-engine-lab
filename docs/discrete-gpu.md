@@ -89,6 +89,11 @@ python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DI
 For a smaller card replace `--full-card` with `--vram-total-gib 24 --ram-total-gib 32` (or your own caps). The unit
 file, every option and the measured rows: [GLM RTX guide](../src/glm/rtxpf/README.md).
 
+The GLM service (`glm_native_service`) also takes `--dgpu auto|<uuid>`: it checks through NVML, before any CUDA call,
+that the card is an `sm_120` RTX PRO (`auto` picks the eligible card with the most memory) and pins it; `--dgpu off` is
+refused (this route has no CPU path). The measured-run harness above selects the card with `CUDA_VISIBLE_DEVICES` as
+described in [Pin the right GPU](#pin-the-right-gpu).
+
 ## Troubleshooting
 
 - **A plan does not fit.** The DeepSeek and GLM planners refuse before loading and print the memory they need; lower the
