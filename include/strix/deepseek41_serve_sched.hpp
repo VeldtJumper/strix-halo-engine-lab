@@ -139,19 +139,31 @@ inline Options options_from_env(bool device_prefill) {
 // --prefill-rows auto (serve): the device prefill's piece size. Each piece re-reads every routed expert and replays the
 // decoder cone, so fewer, larger pieces are faster (pieces are bitwise-exact for any size).
 // prefill_piece_bytes: the device prefill's row scratch for pieces of `rows` rows at `context` positions (DevicePrefill's
-// T-sized buffers, deepseek41 shapes, row split: ~0.4 MB per row + the context's candidate bits per row, rounded up;
-// measured 6.95 GiB at 16384 rows, context 49152).
+// T-sized buffers, deepseek41 shapes, row split: 352 KiB per row + the context's candidate bits per row + 1.2 GiB of
+// row-independent buffers, rounded up; measured 6.37 GiB at 16384 rows and 11.69 GiB at 32768 rows, context 49152).
 [[nodiscard]] constexpr std::uint64_t prefill_piece_bytes(std::uint32_t rows, std::uint32_t context) noexcept {
-    return (std::uint64_t{rows} + 32U) * ((std::uint64_t{448} << 10U) + (std::uint64_t{context} + 8U) / 8U);
+    return (std::uint64_t{rows} + 32U) * ((std::uint64_t{352} << 10U) + (std::uint64_t{context} + 8U) / 8U) + (std::uint64_t{1229} << 20U);
 }
 struct AutoPrefillRoom {
     std::uint64_t device_free = 0, mem_available = 0;  // after the batch forward's weights (mem_available 0: unknown)
     std::uint64_t own_weights = 0;                     // DevicePrefill::owned_weight_bytes
-    std::uint64_t drafter = 0;                         // the drafter's peak still to come on this rank (device + host copy)
+    std::uint64_t drafter = 0;                         // a drafter still to load on this rank (its peak: device + host copy); the serve loads it first
     std::uint64_t margin = std::uint64_t{3} << 30U;
+    // the 32768-row candidate: only where prefill_piece_bytes was measured (context <= 65536, the default attention
+    // window rows, no large slabs); elsewhere other row buffers can exceed the estimate
+    bool wide_pieces = false;
 };
-inline constexpr std::uint32_t kAutoPrefillRows[] = {16384U, 8192U, 4096U};
+inline constexpr std::uint32_t kAutoPrefillRows[] = {32768U, 16384U, 8192U, 4096U};
 inline constexpr std::uint32_t kAutoPrefillFallback = 2048U;
+// AutoPrefillRoom::wide_pieces for a serve configuration: the context and prefill switches prefill_piece_bytes was
+// measured with (context <= 65536, the default attention window rows, no large slabs, and none of the opt-in prefill
+// forms that keep their own buffers outside the estimate: FP16 dense, BF16 attention, a prefill expert-TP override that
+// loads its own expert copies). env(name): the value or "".
+template <class Env>
+[[nodiscard]] bool auto_wide_pieces(std::uint32_t context, Env env) {
+    return context <= 65536U && env("STRIX_DS41_PREFILL_WINDOW").empty() && env("STRIX_DS41_PREFILL_SLABS") != "1" &&
+           env("STRIX_DS41_PREFILL_FP16_DENSE") != "1" && env("STRIX_DS41_PREFILL_BF16_ATTN") != "1" && env("STRIX_DS41_PREFILL_EXPERT_TP").empty();
+}
 // The largest candidate (at most the context) whose scratch fits in min(device free, MemAvailable) less the prefill's
 // own weights, the drafter's peak and the margin; else min(2048, the context) (at least 32 rows, a multiple of 8) when that
 // fits too; else 0: no piece size fits (the serve refuses before READY instead of overcommitting into the margin).
@@ -160,7 +172,7 @@ inline constexpr std::uint32_t kAutoPrefillFallback = 2048U;
     const std::uint64_t reserve = r.own_weights + r.drafter + r.margin;
     room = room > reserve ? room - reserve : 0U;
     for (const auto rows : kAutoPrefillRows)
-        if (rows <= context && prefill_piece_bytes(rows, context) <= room) return rows;
+        if (rows <= context && (rows <= 16384U || r.wide_pieces) && prefill_piece_bytes(rows, context) <= room) return rows;
     const std::uint32_t fallback = std::max<std::uint32_t>(32U, std::min(kAutoPrefillFallback, context / 8U * 8U));
     return prefill_piece_bytes(fallback, context) <= room ? fallback : 0U;
 }

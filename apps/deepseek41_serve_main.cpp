@@ -142,6 +142,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -1212,8 +1213,11 @@ std::optional<SessionCheckpoint> session_operation(const Args &a, BatchForward &
     return {};
 }
 
+// The device prefill of a rank, created after the drafter (run_rank): the piece rows it was sized for into `rows`.
+using PrefillFactory = std::function<std::unique_ptr<SlotPrefill>(std::uint32_t& rows)>;
+
 // ---- rank 1: no API; runs what rank 0 sends ----
-void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* prefill, strix::ds41::hetero::Stage* stage) {
+void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
     Args a = initial;
     const auto mine = hello(a);
     const auto first = exchange(fwd, mine);
@@ -1243,6 +1247,8 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* 
         log_dspark_memory(1U, w->weights, a, free_before, fwd.device_memory().first);
     }
     if (dspark_free_before != 0U) log_dspark_resident(1U, dspark_free_before, fwd.device_memory().first);
+    const auto prefill_owner = make_prefill(a.prefill_rows);  // after the drafter (lead() does the same)
+    SlotPrefill* const prefill = prefill_owner.get();
     serve::Json ready = serve::Json::object();
     ready.set("event", serve::Json("READY"));
     ready.set("rank", serve::Json(1));
@@ -1743,7 +1749,7 @@ void frames_import_session(const Args& a, ServeState& state, ImportBox& box, str
     s.reply(0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
 }
 
-void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, SlotPrefill* prefill, strix::ds41::hetero::Stage* stage) {
+void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
     Args a = initial;
     const auto mine = hello(a);
     const auto peer = exchange(fwd, mine);
@@ -1754,10 +1760,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     auto sessions = make_sessions(a, 0U);
     agree_session_startup(a, fwd, sessions);
     dog.pause(false);
-    if (prefill) prefill->reconcile(fwd, 0U);
-    const auto sched = strix::deepseek41::sched::options_from_env(prefill != nullptr);  // STRIX_DS41_SERVE_SCHED (device: interleave unless =off)
+    const auto sched = strix::deepseek41::sched::options_from_env(a.device_prefill);  // STRIX_DS41_SERVE_SCHED (device: interleave unless =off)
     if (sched.mode != strix::deepseek41::sched::Mode::off) {
-        if (!prefill) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED needs --prefill-path device");
+        if (!a.device_prefill) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED needs --prefill-path device");
         std::fprintf(stderr, "sched: %s (starvation %.1f s, T_dev = %.3f + %.5f P s, unit %u rows, budget %u units / %.0f ms, MoE chunk %u, tasks from %u rows)\n", strix::deepseek41::sched::mode_name(sched.mode),
                      sched.starve_seconds, sched.tdev_a, sched.tdev_b, sched.unit_rows, sched.unit_budget, sched.target_ms(), sched.moe_chunk_rows, sched.min_rows);
     }
@@ -1792,6 +1797,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         std::cerr << "strix serve: DSpark windows in the batch steps (drafter " << a.dspark << ", window " << a.dspark_window << ", ranks "
                   << a.dspark_ranks << ", drafting while <= " << a.dspark_max_inflight << " requests in flight (0: always))" << std::endl;
     }
+    const auto prefill_owner = make_prefill(a.prefill_rows);  // after the drafter (follow() does the same)
+    SlotPrefill* const prefill = prefill_owner.get();
+    if (prefill) prefill->reconcile(fwd, 0U);
     warm_up(a, fwd, prefill, stage, dog, 0U);
     serve::ApiConfig config;
     config.model_id = a.model_id;
@@ -3260,7 +3268,7 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
     throw std::invalid_argument("unknown or unavailable transport " + spec);
 }
 
-// --prefill-rows auto (the pair default): the largest piece of 16384 / 8192 / 4096 rows (at most the context) that both
+// --prefill-rows auto (the pair default): the largest piece of 32768 / 16384 / 8192 / 4096 rows (at most the context) that both
 // ranks admit after the batch forward's weights (sched::auto_prefill_rows: the piece's scratch, the prefill's own weights
 // from the tensor inventory, the drafter's peak on a drafting rank and a margin, against min(device free, MemAvailable)),
 // else 2048 when that fits; both ranks take the smaller choice, and when either rank fits no piece both refuse before
@@ -3277,7 +3285,11 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
         auto o = slot_prefill_options(a, fwd, comm, rank);
         o.max_rows = std::min(sc::kAutoPrefillRows[0], a.context);
         room.own_weights = strix::deepseek41::DevicePrefill::owned_weight_bytes(a.model, o);
-        if (!a.dspark.empty() && (rank == 0U || a.dspark_ranks == 2U)) room.drafter = sc::drafter_peak_bytes(std::filesystem::file_size(a.dspark));
+        // the drafter is already loaded (its host copy freed): device free and MemAvailable include it, no reservation
+        room.wide_pieces = sc::auto_wide_pieces(a.context, [](const char* k) {
+            const char* v = std::getenv(k);
+            return v ? std::string(v) : std::string();
+        });
         rows = sc::auto_prefill_rows(a.context, room);
     }
     std::array<std::uint32_t, 1> mine{rows}, peer{};
@@ -3313,17 +3325,24 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
     if (const auto id = fwd.trellis_identity(); !id.empty())
         std::fprintf(stderr, "rank %u: trellis %s, %.1f MiB (+ %.1f MiB library workspaces)\n", rank, id.c_str(),
                      static_cast<double>(fwd.trellis_bytes()) / 1048576.0, static_cast<double>(fwd.trellis_library_bytes()) / 1048576.0);
-    std::unique_ptr<SlotPrefill> prefill;
-    if (a.device_prefill && a.prefill_rows_auto) a.prefill_rows = auto_prefill_rows(a, fwd, comm, rank);
-    if (a.device_prefill) {
+    // the device prefill is sized and created by lead() / follow() after the drafter (both ranks at the same point), so
+    // --prefill-rows auto sees the memory the drafter keeps instead of reserving its load peak
+    const PrefillFactory make_prefill = [&](std::uint32_t& rows) {
+        std::unique_ptr<SlotPrefill> prefill;
+        if (!a.device_prefill) return prefill;
+        dog.pause(true);
+        if (a.prefill_rows_auto) a.prefill_rows = auto_prefill_rows(a, fwd, comm, rank);
         const auto before = fwd.device_memory().first;
         prefill = std::make_unique<SlotPrefill>(a, fwd, comm, rank);
         std::fprintf(stderr, "rank %u: device prefill of %u-row pieces: device free %.2f GiB lower (scratch estimate %.2f GiB + own weights %.2f GiB)\n", rank, a.prefill_rows,
                      (static_cast<double>(before) - static_cast<double>(fwd.device_memory().first)) / 1073741824.0,
                      static_cast<double>(strix::deepseek41::sched::prefill_piece_bytes(a.prefill_rows, a.context)) / 1073741824.0,
                      static_cast<double>(prefill->weight_bytes()) / 1073741824.0);
-    }
-    if (prefill) prefill->set_moe_chunk_rows(strix::deepseek41::sched::options_from_env(true).moe_chunk_rows);  // phase B tasks (both ranks)
+        prefill->set_moe_chunk_rows(strix::deepseek41::sched::options_from_env(true).moe_chunk_rows);  // phase B tasks (both ranks)
+        dog.pause(false);
+        rows = a.prefill_rows;
+        return prefill;
+    };
     dog.pause(false);
     std::unique_ptr<strix::ds41::hetero::Stage> stage;
     std::uint64_t hetero_exchanges = 0;
@@ -3346,8 +3365,8 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
                                         std::to_string(a.context));
         dog.pause(false);
     }
-    if (rank == 0U) lead(a, fwd, comm, dog, prefill.get(), stage.get());
-    else follow(a, fwd, dog, prefill.get(), stage.get());
+    if (rank == 0U) lead(a, fwd, comm, dog, make_prefill, stage.get());
+    else follow(a, fwd, dog, make_prefill, stage.get());
     if (stage) stage->close();
     std::fprintf(stderr, "rank %u: %s\n", rank, plans_since_ready().c_str());
     serve::Json stopped = serve::Json::object();

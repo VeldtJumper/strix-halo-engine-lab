@@ -269,23 +269,44 @@ void auto_rows() {
     constexpr std::uint64_t GiB = std::uint64_t{1} << 30U;
     const auto gib = [&](double v) { return static_cast<std::uint64_t>(v * static_cast<double>(GiB)); };
     sc::AutoPrefillRoom r;
+    r.wide_pieces = true;  // the serve's default envelope (context 49152, default window, no slabs)
     r.device_free = gib(34.4);
     r.mem_available = gib(38.7);
     r.own_weights = gib(7.62);
     r.drafter = sc::drafter_peak_bytes(7966294016ULL);
     expect(sc::auto_prefill_rows(49152, r) == 16384U, "auto rows: measured pair point -> 16384");
-    expect(sc::prefill_piece_bytes(16384, 49152) > gib(6.95), "auto rows: scratch estimate covers the measured 6.95 GiB");
+    expect(sc::prefill_piece_bytes(16384, 49152) > gib(6.37), "auto rows: scratch estimate covers the measured 6.37 GiB at 16384 rows");
+    expect(sc::prefill_piece_bytes(32768, 49152) > gib(11.69), "auto rows: scratch estimate covers the measured 11.69 GiB at 32768 rows");
     expect(sc::drafter_peak_bytes(7966294016ULL) > gib(15.1), "auto rows: drafter peak covers the measured 15.1 GiB");
     auto t = r;
     t.mem_available = gib(31.0);  // the smaller of device free and MemAvailable limits
     expect(sc::auto_prefill_rows(49152, t) == 8192U, "auto rows: MemAvailable limits");
     t = r;
-    t.drafter = 0;  // rank 1 without a drafter: more room, same top candidate
-    expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no drafter");
+    t.drafter = 0;  // rank 1 without a drafter: room for 32768-row pieces
+    expect(sc::auto_prefill_rows(49152, t) == 32768U, "auto rows: no drafter -> 32768");
+    t = r;
+    t.drafter = 0;  // the serve loads the drafter first: free memory already without its resident 10.4 GiB
+    t.device_free = gib(24.0);
+    t.mem_available = gib(27.8);
+    expect(sc::auto_prefill_rows(49152, t) == 32768U, "auto rows: drafter loaded first -> 32768");
+    t.wide_pieces = false;  // outside the measured envelope (large context, other window / slabs): at most 16384
+    expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no 32768 outside the measured envelope");
+    {
+        std::map<std::string, std::string> env;
+        const auto look = [&](const char* k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };
+        expect(sc::auto_wide_pieces(49152, look), "auto rows: the serve default is inside the envelope");
+        expect(!sc::auto_wide_pieces(131072, look), "auto rows: a larger context is outside");
+        for (const char* k : {"STRIX_DS41_PREFILL_WINDOW", "STRIX_DS41_PREFILL_SLABS", "STRIX_DS41_PREFILL_FP16_DENSE", "STRIX_DS41_PREFILL_BF16_ATTN", "STRIX_DS41_PREFILL_EXPERT_TP"}) {
+            env = {{k, k == std::string("STRIX_DS41_PREFILL_WINDOW") ? "64" : "1"}};
+            expect(!sc::auto_wide_pieces(49152, look), std::string("auto rows: outside with ") + k);
+        }
+        env = {{"STRIX_DS41_PREFILL_SLABS", "0"}};
+        expect(sc::auto_wide_pieces(49152, look), "auto rows: SLABS=0 stays inside");
+    }
     t = r;
     t.device_free = gib(20.0);
     expect(sc::auto_prefill_rows(49152, t) == 0U, "auto rows: nothing fits -> 0 (refuse, no unchecked 2048 floor)");
-    t.device_free = gib(26.46 + 0.95);  // reserve 26.46 GiB + the 2048-row piece (0.90 GiB at 49152): only the floor fits
+    t.device_free = gib(26.46 + 2.0);  // reserve 26.46 GiB + the 2048-row piece (1.91 GiB at 49152): only the floor fits
     expect(sc::auto_prefill_rows(49152, t) == 2048U, "auto rows: only the 2048 floor fits -> 2048");
     t.mem_available = 0;  // unknown MemAvailable: device free alone
     t.device_free = gib(34.4);
