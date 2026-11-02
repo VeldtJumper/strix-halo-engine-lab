@@ -73,7 +73,7 @@ decode de una petición también propone tokens por búsqueda en el prompt (la c
 más larga de los últimos tokens en el prompt y la salida), verificada token a token, así que la salida es idéntica a
 la de drafting desactivado. Junto al drafter, un selector por petición la usa solo con una coincidencia fuerte (igual al
 drafter solo dentro del ruido); sin drafter, los prompts de tipo agente que copian de su contexto son los que más ganan
-(C1 `default`: 114.9 frente a 48.2 tok/s). `STRIX_G4_LOOKUP=0` la desactiva.
+(C1 `default`: 115.6 frente a 48.0 tok/s). `STRIX_G4_LOOKUP=0` la desactiva.
 `--print-effective-config` (decode) imprime el perfil resuelto y los interruptores sin cargar ninguna petición.
 
 <a id="how-fast"></a>
@@ -81,32 +81,51 @@ drafter solo dentro del ruido); sin drafter, los prompts de tipo agente que copi
 ## Resultados medidos
 
 Un nodo Strix Halo (gfx1151, 128 GB), GGUF Q4_K_M oficial para `default` y `fast`, paquete EXL3 para `quality`;
-decode de chat en inglés de 256 tokens, greedy. C4 y C8 son tok/s agregados entre peticiones concurrentes. Cada valor
-de llama.cpp procede de la misma sesión de medida que la fila con la que se compara.
+decode de chat en inglés de 256 tokens, greedy. C4 y C8 son tok/s agregados entre peticiones concurrentes. Salvo que
+una celda esté marcada, todos los números de esta sección proceden de una misma sesión de medida con una misma
+compilación del motor, y cada valor de llama.cpp se midió en el mismo turno que la fila con la que se compara.
 
-| Perfil | C1 con el [drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) (configuración publicada) | C1, sin drafter | C4 | C8 |
-|---|---:|---:|---:|---:|
-| `default` (exacto, `g4-v1`) | **92.9** | 56.0 | 169.3 | 238.5 |
-| `fast` (`g4-a8-v1`, cualificado) | **100.6** | 54.1 | 206.7 | 340.2 |
-| `quality` ([paquete EXL3 M4](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **83.8** | 44.4 | 153.1 | 258.3 |
-| llama.cpp `74a4fb00`, mismo Q4_K_M | — | 55.5 | 193.8 | 283.4 |
+| Perfil | C1 publicado ([drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) + prompt lookup) | C1, sin draft | C4 | C8 | Prefill 512 / 2K / 8K |
+|---|---:|---:|---:|---:|---:|
+| `default` (exacto, `g4-v1`) | **91.9** | 55.8 | 169.8 | 237.9 | 532 / 535 / 509 |
+| `fast` (`g4-a8-v1`, cualificado) | **99.5** | 54.0 | 206.5 | 340.6 | 551 / 538 / 509 |
+| `quality` ([paquete EXL3 M4](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **96.4** | 50.2 | 184.8 | 303.0 | 794 / 815 / 746 |
+| llama.cpp `74a4fb00`, mismo Q4_K_M | — | 55.5 | 193.3 | 279.9 | 2,077 / 2,062 / 1,881 |
 
-Con el drafter, los ids de los tokens son iguales a los obtenidos sin draft (verificado en inglés, español, japonés y
-código en C1, y en C4). Con una petición, el motor verifica solo los tokens propuestos de los que el drafter está
-seguro (una ventana de probabilidad acumulada, con umbral guardado por drafter), lo que subió C1 con drafter de
-85.1 / 92.2 / 72.1 a 92.9 / 100.6 / 83.8 tok/s (`default` / `fast` / `quality`, misma máquina);
-`STRIX_G4_MTP_CONF=0` restaura la política de ventana anterior.
+C1 publicado es la configuración que se obtiene por defecto: el drafter MTP encontrado en `MODEL_DIR/drafter-mtp/` más
+prompt lookup, medido en tres rondas intercaladas frente a la ejecución sin draft, con los ids de los tokens y el
+estado confirmado iguales en todas las rondas. C1 sin draft, C4 y C8 son decode simple (sin draft). Todos los perfiles
+usan prefill exacto.
+
+Frente a la tabla publicada anteriormente (misma máquina): C1 publicado de `quality` 83.8 -> **96.4** tok/s,
+decode simple 44.4 / 153.1 / 258.3 -> **50.2 / 184.8 / 303.0** (C1 / C4 / C8); prefill exacto con 2K tokens
+466 / 458 / 769 -> **535 / 538 / 815** tok/s (`default` / `fast` / `quality`); el decode de `default`
+y `fast` no cambia dentro del ruido entre ejecuciones.
+
+Con una petición, el motor verifica solo los tokens propuestos de los que el drafter está seguro (una ventana de
+probabilidad acumulada, con umbral guardado por drafter), lo que subió C1 con drafter de 85.1 / 92.2 / 72.1 a
+92.9 / 100.6 / 83.8 tok/s (`default` / `fast` / `quality`, medido cuando se incorporó); `STRIX_G4_MTP_CONF=0` restaura
+la política de ventana anterior.
 
 El decode de una petición también propone tokens a partir del propio texto (prompt lookup): propone la continuación
 de la coincidencia anterior más larga de los últimos tokens del prompt y de la salida, y el modelo principal verifica
-cada token, así que los ids de los tokens son iguales a los obtenidos sin draft. Sin drafter gana mucho (C1,
-`default`, 256 tokens): prompt de agente con edición (2.2K tokens) **114.9** tok/s frente a 48.2 sin draft, prompt de
-herramienta JSON (1.2K) **122.9** frente a 49.3, documento de 29.5K tokens **35.0** frente a 28.1, código **55.8**
-frente a 51.9; chat en inglés, español y japonés +1 a 2 %. Junto al drafter MTP, un selector por petición solo propone
-una ventana de lookup ante una coincidencia fuerte y se retira tras los fallos, así que no estorba: igual que el
-drafter solo dentro del ruido en chat, código, prompts de agente y 32K (agente con edición 146.8 frente a 146.2,
-herramienta JSON 172.2 frente a 171.6, código 112.6 frente a 112.5, 29.5K 50.5 frente a 50.4, chat en inglés 92.8 frente
-a 92.8). `STRIX_G4_LOOKUP=0` lo desactiva.
+cada token, así que los ids de los tokens son iguales a los obtenidos sin draft. Compensa cuando la salida copia del
+contexto. Prompt de agente que edita código (un fichero Python de 2.2K tokens más una petición de edición, `default`,
+256 tokens, ids de token iguales a los obtenidos sin draft en todos los casos):
+
+| Prompt de agente que edita código, C1 | tok/s |
+|---|---:|
+| Sin draft | 48.0 |
+| Solo prompt lookup (sin drafter) | **115.6** |
+| Solo el drafter MTP (`STRIX_G4_LOOKUP=0`) | 149.0 |
+| Configuración publicada: drafter MTP + prompt lookup | **149.1** |
+
+Junto al drafter MTP, un selector por petición solo propone una ventana de lookup ante una coincidencia fuerte y se
+retira tras los fallos, así que no estorba: igual que el drafter solo dentro del ruido (chat en inglés 91.9
+frente a 91.9, agente con edición 149.1 frente a 149.0). Sin drafter gana mucho; en la sesión en que
+se incorporó, un prompt de herramienta JSON (1.2K tokens) alcanzó 122.9 frente a 49.3 tok/s, un documento de 29.5K
+tokens 35.0 frente a 28.1 y código 55.8 frente a 51.9. `STRIX_G4_LOOKUP=0` lo desactiva; `--dflash off` desactiva todo
+el draft.
 
 El servidor HTTP agrupa las peticiones de chat concurrentes: hasta ocho peticiones (`STRIX_G4_SERVE_SLOTS`) comparten
 un planificador y se decodifican en la misma pasada del modelo, las peticiones nuevas entran entre pasos y los ids de
@@ -119,15 +138,13 @@ ranuras (ocho), así que un paquete M5 selecciona `g4-exl3-v3` en lugar de `v1`;
 
 | `default`, streaming, 128 tokens por petición | 1 cliente | 4 clientes | 8 clientes |
 |---|---:|---:|---:|
-| Prompts mixtos (chat, código, un documento de ~1.3K tokens): batching activado, tok/s agregados | 70.1 | **87.9** | **73.1** |
-| Igual, una petición cada vez (`STRIX_G4_SERVE_BATCH=0`) | 70.0 | 62.8 | 63.0 |
-| Igual, tiempo hasta el primer token p50, activado / desactivado | 0.10 / 0.10 s | **0.26** / 4.6 s | **0.60** / 13.8 s |
-| servidor de llama.cpp `74a4fb00` (`-np 8`, mismo Q4_K_M, misma sesión) | 50.1 | 124.4 | 239.7 |
-| Prompts de chat cortos, 256 tokens: batching activado / servidor de llama.cpp | — | — | **172.4** / 245.9 |
+| Prompts mixtos (chat, código, un documento de ~1.3K tokens): batching activado, tok/s agregados | 72.6 | **76.7** | **76.1** |
+| Igual, una petición cada vez (`STRIX_G4_SERVE_BATCH=0`) | — | 65.4 | 66.9 |
+| Igual, tiempo hasta el primer token p50, activado / desactivado | 0.1 s | **0.3** / 5.1 s | **0.6** / 13.8 s |
+| servidor de llama.cpp `74a4fb00` (`-np 8`, mismo Q4_K_M, mismo turno) | 52.5 | 123.0 | 227.1 |
+| Prompts de chat cortos, 256 tokens: batching activado / servidor de llama.cpp | — | — | **160.4** / 244.1 |
 
-El paso de decode con ocho peticiones iguala el paso C8 del propio motor. Con prompts largos en la mezcla, el
-procesamiento exacto del prompt (unos 435 tok/s) todavía pausa a las demás peticiones mientras corre un fragmento del
-prompt.
+La tabla anterior se midió antes de los dos cambios de servicio que siguen (fragmentos de prompt mientras otras peticiones decodifican y la caché de prefijos de prompt).
 
 Mientras otras peticiones decodifican, un prompt se procesa en fragmentos de como mucho 64 filas
 (`STRIX_G4_SERVE_PREFILL_ROWS`, `0` = fragmentos completos de 512 filas), así que un prompt largo las pausa durante
@@ -150,13 +167,13 @@ después todavía no lo comparten.
 **Drafter MTP** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). Un modelo asistente pequeño (el asistente MTP
 de Gemma-4-E4B-it de Google, 78.8M parámetros) propone los siguientes tokens y el modelo principal los verifica, así
 que la salida es idéntica a la del decode sin él; solo cambia la velocidad. La aceleración procede de la arquitectura
-del asistente MTP y del decode especulativo exacto del motor: el decode en C1 pasa de 52.0 a 92.9 tok/s en inglés
-(`default`, con y sin drafter en la misma sesión, x1.79); el [asistente de Google sin ajustar](https://huggingface.co/google/gemma-4-E4B-it-assistant) es casi igual de rápido
+del asistente MTP y del decode especulativo exacto del motor: el decode en C1 pasa de 51.8 a 91.9 tok/s en
+inglés (`default`, con y sin draft intercalados en el mismo turno, x1.78); el [asistente de Google sin ajustar](https://huggingface.co/google/gemma-4-E4B-it-assistant) es casi igual de rápido
 en este motor (véase la comparación más abajo). Lo ajustamos ligeramente (fine-tuning) con unos 6.3M tokens generados
 por Nemotron 3.5 Bolt E4B a partir de 17,865 prompts en ocho idiomas, más código, llamadas a herramientas y
 razonamiento; en un conjunto reservado de 697 prompts eso añade alrededor de un 1.5 % de tokens esperados por ciclo
-(inglés 3.61 -> 3.65, japonés 2.52 -> 2.60); con la ventana de confianza es más rápido que el asistente sin ajustar
-en español, japonés y código y más lento en inglés (+1.4 % de media geométrica en los cuatro). Descárguelo en
+(inglés 3.61 -> 3.65, japonés 2.52 -> 2.60); con la ventana de confianza es un 1.4 % más rápido que el asistente sin
+ajustar (media geométrica en inglés, español, japonés y código). Descárguelo en
 `MODEL_DIR/drafter-mtp/`; el motor lo usa automáticamente.
 
 **Paquete EXL3 M4 (perfil `quality`)** - [hyukudan/Nemotron-3.5-Bolt-E4B-EXL3](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3). Una cuantización EXL3
@@ -166,30 +183,33 @@ a 6, embedding y tablas por capa en BF16; 4.65 bits por peso en las capas lineal
 conjunto reservado de 40 documentos en 8 idiomas, su salida está más cerca del modelo BF16 original que la del Q4_K_M
 estándar: coincidencia top-1 del 92.94 % frente al 87.0 % y KL media de 0.0367 frente a 0.141. Elíjalo
 (`--profile quality --exl3-arm DIR`) cuando quiera una salida más cercana a BF16; quédese en `default` o `fast` con
-Q4_K_M para obtener la máxima velocidad. `quality` decodifica a 83.8 tok/s con el drafter (44.4 sin él, mismos ids de
-token); su prefill y su decode se siguen optimizando.
+Q4_K_M para obtener la máxima velocidad. `quality` decodifica a 96.4 tok/s en la configuración publicada
+(50.2 sin draft, mismos ids de token) y hace prefill a 815 tok/s con 2K tokens; su prefill y su decode se
+siguen optimizando.
 
 **Comparación con las versiones oficiales de NVIDIA.** NVIDIA publica el modelo principal en [BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16) y en
 una sola cuantización, el [GGUF Q4_K_M](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB), además de un [drafter DFlash](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash). Solo celdas medidas; una celda vacía
 no se midió. Misma máquina, greedy, decode de chat de 256 tokens, tok/s.
 
-| Modelo (perfil del motor) | Descarga GB | Bytes de pesos leídos por token | Top-1 frente a BF16 | KL media frente a BF16 | C1 con drafter MTP | C1 simple | C4 | C8 | Prefill 2K | Prefill 8K |
+| Modelo (perfil del motor) | Descarga GB | Bytes de pesos leídos por token | Top-1 frente a BF16 | KL media frente a BF16 | C1 publicado | C1 simple | C4 | C8 | Prefill 2K | Prefill 8K |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| BF16 oficial, referencia | 16.06 | 9.29 GB | 100 % | 0 | 38.1 ¹ | 19.8 | 72.4 | 156.7 | 565 | 534 |
-| Q4_K_M oficial, `default` | 6.18 | 3.13 GB | 87.0 % | 0.141 | 92.9 | 56.0 | 169.3 | 238.5 | 466 | 429 |
-| Q4_K_M oficial, `fast` | 6.18 | 3.13 GB | 86.7 % | 0.150 | 100.6 | 54.1 | 206.7 | 340.2 | 458 | 414 |
-| **EXL3 M4**, `quality` | 9.71 | **2.70 GB** | **92.94 %** | **0.0367** | 83.8 | 44.4 | 153.1 | 258.3 | 769 | 701 |
-| llama.cpp `74a4fb00`, Q4_K_M oficial | 6.18 | 3.13 GB | | | | 55.5 | 193.8 | 283.4 | 2,052 | 1,873 |
+| BF16 oficial, referencia ¹ | 16.06 | 9.29 GB | 100 % | 0 | 38.1 | 19.8 | 72.4 | 156.7 | 565 | 534 |
+| Q4_K_M oficial, `default` | 6.18 | 3.13 GB | 87.0 % | 0.141 | 91.9 | 55.8 | 169.8 | 237.9 | 535 | 509 |
+| Q4_K_M oficial, `fast` | 6.18 | 3.13 GB | 86.7 % | 0.150 | 99.5 | 54.0 | 206.5 | 340.6 | 538 | 509 |
+| **EXL3 M4**, `quality` | 9.71 | **2.70 GB** | **92.94 %** | **0.0367** | 96.4 | 50.2 | 184.8 | 303.0 | 815 | 746 |
+| llama.cpp `74a4fb00`, Q4_K_M oficial | 6.18 | 3.13 GB | | | | 55.5 | 193.3 | 279.9 | 2,062 | 1,881 |
 
 Bytes de pesos por token: todas las capas lineales más una fila de las tablas de embedding y por capa (la descarga EXL3
 es mayor porque lleva esas tablas en BF16). Fidelidad: el conjunto reservado de 40 documentos en 8 idiomas frente a los
 logits del BF16 oficial; la fila `fast` procede de la evaluación de activaciones int8, que midió `default` en
-86.95 % / 0.144 en paralelo. C4 y C8 se ejecutan sin draft. Las celdas de prefill de EXL3 proceden de una sesión
-posterior, en la que llama.cpp midió 2,053 / 1,875 tok/s. ¹ Fila BF16 medida antes de la ventana de confianza; las celdas de decode de
-Q4_K_M, EXL3 y llama.cpp proceden de una misma sesión posterior.
+86.95 % / 0.144 en paralelo. C1 publicado = drafter MTP + prompt lookup; C4 y C8 se ejecutan sin draft. ¹ Fila BF16
+de una sesión anterior (drafter MTP anterior a la ventana de confianza, prefill anterior a los kernels actuales de
+prefill exacto); todas las demás celdas de velocidad proceden de la sesión de las tablas anteriores.
 
-Drafters sobre el Q4_K_M oficial (`default`, C1, ids de token idénticos a los obtenidos sin draft con todos los drafters; drafters MTP con la ventana
-de confianza en su propio umbral, 0.4 el nuestro y 0.6 el de Google; DFlash de una sesión anterior):
+Drafters sobre el Q4_K_M oficial (`default`, C1, ids de token idénticos a los obtenidos sin draft con todos los
+drafters; drafters MTP con la ventana de confianza en su propio umbral, 0.4 el nuestro y 0.6 el de Google). Esta tabla
+procede de una sesión anterior a las tablas de arriba (antes de prompt lookup); las columnas DFlash, de una sesión
+anterior aún:
 
 | Prompt | Nuestro drafter MTP: tokens / paso | tok/s | Asistente de Google sin ajustar: tokens / paso | tok/s | DFlash de NVIDIA (360M): tokens / paso | tok/s | Sin draft: tok/s |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -201,8 +221,8 @@ de confianza en su propio umbral, 0.4 el nuestro y 0.6 el de Google; DFlash de u
 DFlash obtiene más tokens por paso en inglés, pero cada uno de sus pasos de draft cuesta unos 10 ms en esta máquina
 frente a ~1 ms del asistente MTP, así que su aceleración es menor (x1.12-1.41 frente a x1.60-2.18).
 
-Decode con contexto largo (`default`, una petición, Q4_K_M, tok/s con la profundidad de contexto indicada; la
-atención de las capas globales lee cada fragmento K/V una vez por pasada, idéntico byte a byte,
+Decode con contexto largo (`default`, una petición, Q4_K_M, tok/s con la profundidad de contexto indicada; sesión
+anterior; la atención de las capas globales lee cada fragmento K/V una vez por pasada, idéntico byte a byte,
 `STRIX_G4_ATTN_KV_SHARED=0` restaura el kernel anterior):
 
 | Contexto | Antes | Ahora | llama.cpp `74a4fb00`, misma profundidad |
@@ -215,19 +235,21 @@ Prefill (tok/s; todos los perfiles usan prefill exacto):
 
 | Prompt | `default` | `fast` | `quality` | llama.cpp |
 |---|---:|---:|---:|---:|
-| 512 | 471 | 474 | 768 | 2,065 |
-| 2K | 466 | 458 | 769 | 2,052 |
-| 8K | 429 | 414 | 701 | 1,873 |
+| 512 | 532 | 551 | 794 | 2,077 |
+| 2K | 535 | 538 | 815 | 2,062 |
+| 8K | 509 | 509 | 746 | 1,881 |
 | 16K | 404 | 403 | 618 | 1,684 |
 | 32K | 358 | 355 | 520 | 1,373 |
 
-El prefill exacto usa aritmética FP32 sin contracción; `quality` usa el prefill exacto de muchas filas de EXL3. La columna `quality` se midió en una sesión posterior, en la que llama.cpp dio
-2,048 / 2,053 / 1,875 / 1,664 / 1,371 tok/s; `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura las pasadas de ocho filas
-con los mismos bytes. El prefill WMMA del perfil `fast` está pendiente de cualificación y no se aplica.
+Las filas de 16K y 32K proceden de una sesión anterior; las demás, de esta sesión. El prefill exacto usa aritmética FP32 sin contracción, así que los ids de token y el estado son idénticos en todas
+las longitudes; `quality` usa el prefill exacto de muchas filas de EXL3. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura
+las pasadas de ocho filas con los mismos bytes. El prefill WMMA del perfil `fast` está pendiente de cualificación y no
+se aplica.
 
 Comandos de llama.cpp: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
-`llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 0 -r 2 -p 512,2048,8192` y `-r 1 -p 8192,16384,32768`.
+`llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 0 -r 2 -p 512,2048,8192` y `-r 1 -p 16384,32768`; el servidor de llama.cpp `74a4fb00` con
+`-m Q4_K_M.gguf -ngl 99 -fa on -c 16384 -np 8 --jinja`.
 
 Las cifras varían con la carga del nodo (ancho de banda LPDDR5X compartido); compare solo ejecuciones de la misma sesión.
 
