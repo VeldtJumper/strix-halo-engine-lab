@@ -154,6 +154,11 @@ private:
         return have_last_ && last_position_ == position && last_token_ == anchor;
     }
     // Best lookup cap by lower-bound tokens/ms against the alternative's upper bound; 0 = do not use lookup.
+    // Survival through depth k is the product of the bucket's per-depth acceptance rates (censor-aware: a candidate
+    // shorter than k is not counted at k), bounded ONCE per depth on its own evidence: Beta(1,2) on S_k with the
+    // candidates that reached depth k, minus one posterior SD, non-increasing in k. Bounding every factor separately
+    // compounded the prior and the SD seven times (a perfect bucket with 15 candidates predicted 4.4 tokens per cycle
+    // instead of 8), so lookup could never be chosen beside a strong drafter.
     [[nodiscard]] std::uint32_t choose(const Match& m, std::uint32_t kmax) const {
         if (m.length < config_.min_length || !m.available) return 0;
         const auto b = bucket_of(m.length);
@@ -161,13 +166,15 @@ private:
         const double base = base_ms();
         const double alternative = alternative_rate(base);
         if (!(base > 0) || !(alternative > 0)) return 0;
-        double best = alternative * config_.margin, survival = 1, yield = 1;
+        double best = alternative * config_.margin, survival = 1, bound = 1, yield = 1;
         std::uint32_t cap = 0;
         for (std::uint32_t k = 1; k <= m.available && k <= kmax; ++k) {
-            // Beta(1,2) minus one posterior SD per depth (the AutoPolicy estimator)
-            const double n = eligible_[b][k - 1] + 3, p = (accepted_[b][k - 1] + 1) / n;
-            survival *= std::max(0.0, p - std::sqrt(p * (1 - p) / (n + 1)));
-            yield += survival;
+            const double n = eligible_[b][k - 1];
+            if (!(n > 0)) break; // no candidate reached this depth yet
+            survival *= accepted_[b][k - 1] / n;
+            const double q = (survival * n + 1) / (n + 3);
+            bound = std::min(bound, std::max(0.0, q - std::sqrt(q * (1 - q) / (n + 4))));
+            yield += bound;
             const double rate = yield / (base * (1 + extra_rows[k]));
             if (rate > best) { best = rate; cap = k; }
         }
