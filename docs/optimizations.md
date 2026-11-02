@@ -1652,14 +1652,14 @@ The FAST relaxed MoE down kernel takes row groups of up to 32 rows of one expert
 
 **Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_HC_FUSE`. **Default:** on.
 
-Prefill moved the 4-copy FP32 hyper-connection stream through separate passes: the expansion after each sublayer, the next site's mixes, the collapse into a row buffer and the RMSNorm of that buffer. Now the attention's expansion also computes the ffn site's mixes from the values it stores (the hyper-connection site kernel), and each site's RMSNorm reads the collapse straight from the stream. Every value is formed by the same operations in the same order.
+Prefill moved the 4-copy FP32 hyper-connection stream through separate passes: the expansion after each sublayer, the next site's mixes, the collapse into a row buffer and the RMSNorm of that buffer. Now each expansion also computes the next site's mixes from the values it stores (the hyper-connection site kernel), and each site's RMSNorm reads the collapse straight from the stream. Every value is formed by the same operations in the same order.
 
 - **Preconditions:** Device prefill path.
 - **Automatic selection:** On for every prefill call.
 - **Fallback notice:** None.
-- **Exactness evidence:** Same kernels' arithmetic: the expanded stream, the ffn site's mixes, the collapsed and normalised rows and their A8 / FP16 copies are bitwise identical to the separate expansion, mix, collapse and RMSNorm passes. Two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens.
+- **Exactness evidence:** Same kernels' arithmetic: the expanded stream, the next site's mixes, the collapsed and normalised rows and their A8 / FP16 copies are bitwise identical to the separate expansion, mix, collapse and RMSNorm passes. Two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens.
 - **Off switch:** STRIX_DS41_PREFILL_HC_FUSE=0
-- **Measured gain:** Removes one read of the 4-copy FP32 stream per layer and the collapsed-row write + read at both sites. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order): 8.185 / 29.078 s with STRIX_DS41_PREFILL_HC_FUSE=0 vs 8.096 / 28.805 s default (-1.1 / -0.9 %).
+- **Measured gain:** Removes a read of the 4-copy FP32 stream at each sublayer boundary (not across an Engram layer's inject or a change of the output rows) and the collapsed-row write + read at both sites. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order): 8.238 / 29.481 s with STRIX_DS41_PREFILL_HC_FUSE=0 vs 8.009 / 28.000 s default (-2.8 / -5.0 %).
 - **Public evidence:** [Prefill hyper-connection sites](../src/hip_deepseek41_prefill.hip)
 
 <a id="ds-fast-moe-order"></a>

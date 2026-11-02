@@ -1933,7 +1933,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
 
     std::vector<std::uint32_t> trace_router;  // options.trace: this layer's router ids until the layer's end
     const bool hc_fuse = prefill_hc_fuse();
-    bool ffn_mixed = false;  // hc_fuse: the ffn site's mixes came with the attention's expansion
+    bool hc_mixed = false;  // hc_fuse: the next site's mixes came with the expansion before it
     // the collapse's mixes of a site from row r0 (attn: the previous layer's ffn mixes, identity before the first)
     const auto collapse_mixes = [&](const std::string& site, std::uint32_t r0) -> const ds41::HcMix* {
         return site == "attn" ? (m.identity_pre ? nullptr : m.mix_ffn.p + r0) : m.mix_attn.p + r0;
@@ -2008,8 +2008,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         case Op::hc_mix: {
             if (no == 0U) break;  // row_split: none of this layer's output rows is this rank's
-            if (s.site == "ffn" && ffn_mixed) {  // computed with the attention's expansion
-                ffn_mixed = false;
+            if (hc_mixed) {  // computed with the expansion before it
+                hc_mixed = false;
                 break;
             }
             ds41::HcMixView v;
@@ -2605,29 +2605,37 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         case Op::hc_post: {
             const int next = 1 - m.cur;
-            if (no > 0U && hc_fuse && s.site == "attn") {
-                // the expansion + the ffn site's mixes (its hc_mix is skipped), as enqueue_hc_expand + enqueue_hc_mixes
+            // hc_fuse: the expansion + the next site's mixes when the next step is that site's hc_mix over the same rows
+            // (attn: the ffn site; ffn: layer + 1's attention unless an Engram inject or the ULP diagnostic comes between)
+            const auto* nx = &s + 1;
+            const bool attn = s.site == "attn";
+            const bool next_mix = hc_fuse && no > 0U && nx != m.plan.steps.data() + m.plan.steps.size() && nx->op == Op::hc_mix &&
+                                  nx->site == (attn ? "ffn" : "attn") && nx->layer == s.layer + (attn ? 0 : 1) &&
+                                  (attn || (layer + 1U < m.options.layers && lrows[layer + 1U].o0 == o0 &&
+                                            m.options.null_ulp_layer != static_cast<int>(layer)));
+            if (next_mix) {
+                // as enqueue_hc_expand + enqueue_hc_mixes (the next hc_mix is skipped)
                 ds41::HcSiteView v;
                 v.rows = no;
                 v.hidden = H;
                 v.sub = m.y.p + std::size_t{o0} * H;
                 v.residual = stream_now() + std::size_t{o0} * stream_row;
-                v.expand_mixes = m.mix_attn.p + o0;
+                v.expand_mixes = (attn ? m.mix_attn.p : m.mix_ffn.p) + o0;
                 v.stream = m.streams[next].p + std::size_t{o0} * stream_row;
-                v.fn = m.devh(p + "hc_ffn_fn.weight");
-                v.base = m.devf(p + "hc_ffn_base.weight");
-                v.scale = m.devf(p + "hc_ffn_scale.weight");
+                v.fn = m.devh(nx->weights[0]);
+                v.base = m.devf(nx->weights[1]);
+                v.scale = m.devf(nx->weights[2]);
                 v.iters = c.hc_sinkhorn_iters;
                 v.hc_eps = static_cast<float>(c.hc_eps);
                 v.mix_norm_eps = 1e-20F;
-                v.mixes_out = m.mix_ffn.p + o0;
+                v.mixes_out = (attn ? m.mix_ffn.p : m.mix_attn.p) + o0;
                 v.partial = m.mix_partial.p;
                 v.counters = m.hc_counters.p;
                 v.launches = 1;
                 v.form = 2;
                 v.tile = no >= 8U ? 8U : 0U;  // 0: by the row count (1, 2 or 4)
                 ds41::enqueue_hc_site(v, st);
-                ffn_mixed = true;
+                hc_mixed = true;
             } else if (no > 0U)
                 ds41::enqueue_hc_expand(m.y.p + std::size_t{o0} * H, stream_now() + std::size_t{o0} * stream_row,
                                         (s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p) + o0, no, H, m.streams[next].p + std::size_t{o0} * stream_row,
