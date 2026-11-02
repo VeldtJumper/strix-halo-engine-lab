@@ -2766,12 +2766,15 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
     const auto queue = static_cast<hipStream_t>(stream);
     if (fast_moe() && format == WeightFormat::q2_k && view.width % 256U == 0U && view.outputs % 256U == 0U &&
         view.routes.batch_rows <= relaxed_rows) {
-        if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true>), dim3(view.outputs / 256U, view.routes.max_batches),
-                               dim3(relaxed_threads), 0, queue, view);
-        else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false>), dim3(view.routes.max_batches, view.outputs / 256U),
-                               dim3(relaxed_threads), 0, queue, view);
+        // STRIX_DS41_FAST_MOE_DOWN_ROWS (read per call; default 32, =64 the previous row groups): the same bits either way
+        const char* rows_env = std::getenv("STRIX_DS41_FAST_MOE_DOWN_ROWS");
+        const bool rows32 = !(rows_env && std::strcmp(rows_env, "64") == 0) && view.routes.batch_rows <= 32U;
+        const bool swap = fast_moe_order() && view.routes.max_batches <= 65535U;  // grid y limit
+        const dim3 grid = swap ? dim3(view.outputs / 256U, view.routes.max_batches) : dim3(view.routes.max_batches, view.outputs / 256U);
+        if (swap && rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
+        else if (swap) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
+        else if (rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
         check(hipGetLastError(), "prefill down launch (relaxed)");
         return;
     }

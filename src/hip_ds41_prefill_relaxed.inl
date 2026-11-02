@@ -21,6 +21,7 @@ constexpr unsigned relaxed_down_lds_bytes = relaxed_stage_bytes + relaxed_tile_w
 // batches as fit in 64 rows; block i (batch i) runs the group that starts at batch i, else it has no work. Any batch
 // layout the views accept is covered exactly once (no assumption that batches are full or contiguous).
 struct RelaxedRows { unsigned expert, first, batches, count; };
+template <unsigned R = relaxed_rows>
 __device__ __forceinline__ bool relaxed_rows_of(const PrefillRoutesView& routes, RelaxedRows& b, unsigned i) {
     const unsigned total = *routes.batch_total;
     if (i >= total) return false;
@@ -29,9 +30,9 @@ __device__ __forceinline__ bool relaxed_rows_of(const PrefillRoutesView& routes,
     while (start > 0U && routes.batch_expert[start - 1U] == e) --start;
     for (;;) {
         unsigned c = 0, j = start;
-        while (j < total && routes.batch_expert[j] == e && c + routes.batch_count[j] <= relaxed_rows) c += routes.batch_count[j++];
+        while (j < total && routes.batch_expert[j] == e && c + routes.batch_count[j] <= R) c += routes.batch_count[j++];
         if (j == start) c = routes.batch_count[j++];   // a batch above 64 rows (not produced by the builders: <= 32)
-        if (start == i) { b = RelaxedRows{e, i, j - i, c > relaxed_rows ? relaxed_rows : c}; return true; }
+        if (start == i) { b = RelaxedRows{e, i, j - i, c > R ? R : c}; return true; }
         if (j > i) return false;
         start = j;
     }
@@ -45,15 +46,17 @@ __device__ __forceinline__ unsigned relaxed_entry(const PrefillRoutesView& route
     return routes.batch_begin[b.first];   // unreachable for r < count
 }
 // Activation items of one chunk (8 groups x 2 halves x 64 rows = 1024; 4 per thread) in registers, then into LDS.
-struct RelaxedItems { v4i v[4]; float d[4]; };
-__device__ __forceinline__ RelaxedItems relaxed_load(unsigned chunk, unsigned width, const unsigned* row_of, unsigned count,
-                                                     const signed char* codes, const float* deltas) {
+// R rows: 8 groups x 2 halves x R rows = 16 R items, R / 16 per thread
+template <unsigned R = relaxed_rows> struct RelaxedItems { v4i v[R / 16U]; float d[R / 16U]; };
+template <unsigned R = relaxed_rows>
+__device__ __forceinline__ RelaxedItems<R> relaxed_load(unsigned chunk, unsigned width, const unsigned* row_of, unsigned count,
+                                                        const signed char* codes, const float* deltas) {
     const unsigned groups = width / 32U;
-    RelaxedItems x{};
+    RelaxedItems<R> x{};
 #pragma unroll
-    for (unsigned i = 0; i < 4U; ++i) {
+    for (unsigned i = 0; i < R / 16U; ++i) {
         const unsigned item = threadIdx.x + relaxed_threads * i;
-        const unsigned r = item % relaxed_rows, kh = (item / relaxed_rows) % 2U, gg = item / (2U * relaxed_rows);
+        const unsigned r = item % R, kh = (item / R) % 2U, gg = item / (2U * R);
         const unsigned g = relaxed_chunk_groups * chunk + gg;
         x.v[i] = v4i{0, 0, 0, 0};
         if (r < count) x.v[i] = *reinterpret_cast<const v4i*>(codes + static_cast<unsigned long long>(row_of[r]) * width + 32U * g + 16U * kh);
@@ -61,19 +64,19 @@ __device__ __forceinline__ RelaxedItems relaxed_load(unsigned chunk, unsigned wi
     }
     return x;
 }
-template <bool Q2>
-__device__ __forceinline__ void relaxed_store(unsigned char* lds, const RelaxedItems& x) {
+template <bool Q2, unsigned R = relaxed_rows>
+__device__ __forceinline__ void relaxed_store(unsigned char* lds, const RelaxedItems<R>& x) {
     auto* a = reinterpret_cast<v4i*>(lds);
     auto* d = reinterpret_cast<float*>(lds + relaxed_code_bytes);
     auto* sums = reinterpret_cast<short*>(lds + relaxed_code_bytes + relaxed_delta_bytes);
 #pragma unroll
-    for (unsigned i = 0; i < 4U; ++i) {
+    for (unsigned i = 0; i < R / 16U; ++i) {
         const unsigned item = threadIdx.x + relaxed_threads * i;
-        const unsigned r = item % relaxed_rows, kh = (item / relaxed_rows) % 2U, gg = item / (2U * relaxed_rows);
+        const unsigned r = item % R, kh = (item / R) % 2U, gg = item / (2U * R);
         const v4i v = x.v[i];
-        a[(2U * gg + kh) * relaxed_rows + r] = v;
+        a[(2U * gg + kh) * R + r] = v;
         const unsigned at = tile_position(r);
-        if (kh == 0U) d[gg * relaxed_rows + at] = x.d[i];
+        if (kh == 0U) d[gg * R + at] = x.d[i];
         if constexpr (Q2) {
             const int ones = 0x01010101;
             int sum = 0;
@@ -81,16 +84,16 @@ __device__ __forceinline__ void relaxed_store(unsigned char* lds, const RelaxedI
             sum = __builtin_amdgcn_sudot4(false, ones, true, v.y, sum, false);
             sum = __builtin_amdgcn_sudot4(false, ones, true, v.z, sum, false);
             sum = __builtin_amdgcn_sudot4(false, ones, true, v.w, sum, false);
-            sums[2U * (gg * relaxed_rows + at) + kh] = static_cast<short>(sum);
+            sums[2U * (gg * R + at) + kh] = static_cast<short>(sum);
         }
     }
 }
 // One wave: its 32 weight rows (lane l decodes row l; the halves trade operands) x the block's row tiles over the whole
 // width; acc[mt][t][e] = (row 16 mt + 2 e + h, output 16 t + lane % 16).
-template <WeightFormat Format>
+template <WeightFormat Format, unsigned R = relaxed_rows>
 __device__ __forceinline__ void relaxed_products(unsigned char* lds, const unsigned char* weights_row, unsigned width, const unsigned* row_of,
                                                  unsigned count, const signed char* codes, const float* deltas, const unsigned long long* grid,
-                                                 float (&acc)[relaxed_tiles][2][8], const unsigned char* tile_base = nullptr,
+                                                 float (&acc)[R / 16U][2][8], const unsigned char* tile_base = nullptr,
                                                  std::uint64_t row_bytes = 0) {
     constexpr bool q2 = Format == WeightFormat::q2_k;
     constexpr bool wl = q2;   // weight tile in LDS
@@ -109,7 +112,7 @@ __device__ __forceinline__ void relaxed_products(unsigned char* lds, const unsig
     const bool upper = h != 0U;
     const unsigned tiles = (count + 15U) / 16U;
 #pragma unroll
-    for (unsigned mt = 0; mt < relaxed_tiles; ++mt)
+    for (unsigned mt = 0; mt < R / 16U; ++mt)
 #pragma unroll
         for (unsigned t = 0; t < 2U; ++t)
 #pragma unroll
@@ -122,21 +125,21 @@ __device__ __forceinline__ void relaxed_products(unsigned char* lds, const unsig
         w_lo = load_chunk<Format>(weights_row, 0U);
         w_hi = load_chunk<Format>(weights_row, 4U);
     }
-    RelaxedItems items = relaxed_load(0U, width, row_of, count, codes, deltas);
+    RelaxedItems<R> items = relaxed_load<R>(0U, width, row_of, count, codes, deltas);
     const auto* a = reinterpret_cast<const v4i*>(lds);
     const auto* d = reinterpret_cast<const float*>(lds + relaxed_code_bytes);
     const auto* sums = reinterpret_cast<const int*>(lds + relaxed_code_bytes + relaxed_delta_bytes);
 #pragma unroll 1
     for (unsigned chunk = 0; chunk < chunks; ++chunk) {
         split_sync<6>();   // the previous chunk's readers are done
-        relaxed_store<q2>(lds, items);
+        relaxed_store<q2, R>(lds, items);
         if constexpr (wl)
 #pragma unroll
             for (unsigned i = 0; i < relaxed_tile_loads; ++i) tile[threadIdx.x + relaxed_threads * i] = tile_next[i];
         split_sync<6>();
         const ChunkRaw<Format> c_lo = w_lo, c_hi = w_hi;
         if (chunk + 1U < chunks) {
-            items = relaxed_load(chunk + 1U, width, row_of, count, codes, deltas);
+            items = relaxed_load<R>(chunk + 1U, width, row_of, count, codes, deltas);
             if constexpr (wl) load_tile(chunk + 1U);
             else {
                 w_lo = load_chunk<Format>(weights_row, 8U * (chunk + 1U));
@@ -155,11 +158,11 @@ __device__ __forceinline__ void relaxed_products(unsigned char* lds, const unsig
             const unsigned x_sc = q2 ? static_cast<unsigned>(other_half(static_cast<int>(own.sc_bits))) : 0U;
             const float x_scale = q2 ? 0.0F : other_half(own.scale);
 #pragma unroll
-            for (unsigned mt = 0; mt < relaxed_tiles; ++mt) {
+            for (unsigned mt = 0; mt < R / 16U; ++mt) {
                 if (mt >= tiles) break;
-                const v4i a0 = a[(2U * gg) * relaxed_rows + 16U * mt + i16];
-                const v4i a1 = a[(2U * gg + 1U) * relaxed_rows + 16U * mt + i16];
-                const float* dt = d + gg * relaxed_rows + 16U * mt + 8U * h;
+                const v4i a0 = a[(2U * gg) * R + 16U * mt + i16];
+                const v4i a1 = a[(2U * gg + 1U) * R + 16U * mt + i16];
+                const float* dt = d + gg * R + 16U * mt + 8U * h;
 #pragma unroll
                 for (unsigned t = 0; t < 2U; ++t) {
                     const bool mine = (t == 1U) == upper;
@@ -169,7 +172,7 @@ __device__ __forceinline__ void relaxed_products(unsigned char* lds, const unsig
                         const float dd = half_bits(static_cast<unsigned short>(dmb & 0xffffU));
                         const float dm = half_bits(static_cast<unsigned short>(dmb >> 16U));
                         const int m0 = static_cast<int>((scb & 0xffU) >> 4U), m1 = static_cast<int>((scb >> 8U) >> 4U);
-                        const int* sp = sums + gg * relaxed_rows + 16U * mt + 8U * h;
+                        const int* sp = sums + gg * R + 16U * mt + 8U * h;
 #pragma unroll
                         for (unsigned e = 0; e < 8U; ++e) {
                             const int packed = sp[e];
@@ -265,25 +268,27 @@ __global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(Prefil
 }
 
 // Down: wave w: outputs 32 w .. of the block's 256.
-template <WeightFormat Format, bool Swap>
+// R: row groups of up to R rows; 32 (the default, STRIX_DS41_FAST_MOE_DOWN_ROWS=64 keeps 64) holds half the accumulators
+// and staged items of 64 and compiles without register spills. Each output's terms keep their order: the same bits.
+template <WeightFormat Format, bool Swap, unsigned R = relaxed_rows>
 __global__ __launch_bounds__(relaxed_threads) void relaxed_down_kernel(PrefillDownView view) {
     const unsigned bx = Swap ? blockIdx.y : blockIdx.x, by = Swap ? blockIdx.x : blockIdx.y;
     __shared__ __attribute__((aligned(16))) unsigned char lds[relaxed_down_lds_bytes];
-    __shared__ unsigned slot_of[relaxed_rows];
+    __shared__ unsigned slot_of[R];
     RelaxedRows b;
-    if (!relaxed_rows_of(view.routes, b, bx)) return;
+    if (!relaxed_rows_of<R>(view.routes, b, bx)) return;
     if (threadIdx.x < b.count) slot_of[threadIdx.x] = view.routes.entry_slots[relaxed_entry(view.routes, b, threadIdx.x)];
     __syncthreads();
     const unsigned wave = threadIdx.x / 32U, lane = threadIdx.x % 32U, h = lane >> 4U, i16 = lane & 15U;
     const unsigned first = by * 256U + 32U * wave;
     const auto* weights = static_cast<const unsigned char*>(view.weights) + b.expert * view.expert_stride_bytes +
         static_cast<unsigned long long>(first + lane) * view.row_bytes;
-    float acc[relaxed_tiles][2][8];
+    float acc[R / 16U][2][8];
     const auto* tile_base = static_cast<const unsigned char*>(view.weights) + b.expert * view.expert_stride_bytes +
         static_cast<unsigned long long>(by) * 256U * view.row_bytes;
-    relaxed_products<Format>(lds, weights, view.width, slot_of, b.count, view.codes, view.deltas, nullptr, acc, tile_base, view.row_bytes);
+    relaxed_products<Format, R>(lds, weights, view.width, slot_of, b.count, view.codes, view.deltas, nullptr, acc, tile_base, view.row_bytes);
 #pragma unroll
-    for (unsigned mt = 0; mt < relaxed_tiles; ++mt)
+    for (unsigned mt = 0; mt < R / 16U; ++mt)
 #pragma unroll
         for (unsigned t = 0; t < 2U; ++t)
 #pragma unroll
