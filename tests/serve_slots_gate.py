@@ -15,8 +15,14 @@ step (counters cannot name the requests of a wider round); EXACT needs every pro
 Coverage per engine (declared by the adapter, reported in summary.json):
   qwen      tokens+state  ids: strix.token_ids; state: final frontier + the full committed target
                           manifest (kv.L*, index.L*, recurrent/conv, ...; mtp.* excluded), 64-hex,
-                          key set equal to the reference; witness: 'batch cycle sessions=2
-                          groups>=1' on the default 8-row cohort path (STRIX_MTP_BATCH_LOG=1);
+                          key set equal to the reference; witness: the shared-execution witness
+                          when the build has it ('batch cycle ... shared_windows=W ...' with
+                          STRIX_MTP_BATCH_LOG=1, plus strix.shared_execution per request): a
+                          sessions=2 cycle with a shared verification window (joint/budget paths:
+                          in a cycle that ran chunks), and with STRIX_MTP_DRAFT_BATCH=1 one with a
+                          batched draft launch of two or more rows; every request's receipt must
+                          show a shared window (and a shared draft step). Older builds: 'batch
+                          cycle sessions=2 groups>=1' on the default 8-row cohort path;
                           budget/joint cohort paths -> UNQUALIFIED (no shared-chunk counter)
   nemotron  tokens+state  text prompt on /v1/chat/completions; ids: strix.generated_ids; state:
                           per-phase state_digest (64-hex) + integer frontier; identity fields
@@ -226,6 +232,7 @@ class Adapter:
     # counters before/after one round; witness() returns True/False, or None when the engine exposes no
     # counter that proves it (the verdict is then UNQUALIFIED). ctx: command, env of the server.
     witness_gap = None           # why witness() cannot prove shared execution (reported)
+    last_detail = None           # witness() may leave the counts it judged here (reported per round)
     def probe(self, port):
         return None
 
@@ -245,8 +252,8 @@ class Qwen(Adapter):
                     STRIX_PREFIX_CACHE_DIGEST_COMPONENTS="1", STRIX_FINAL_STATE_DIGEST="0",
                     STRIX_MTP_BATCH_LOG="1", STRIX_HTTP_EAGER_SLOTS="4")
     forbidden = ("--http-serve", "--http-port", "--http-batch")
-    witness_gap = ("budget/joint cohort paths count groups whose chunks may run alone; a per-cycle shared-chunk "
-                   "counter (cohort_sessions - cohort_chunks) in the 'batch cycle' line would prove them")
+    witness_gap = ("budget/joint cohort paths count groups whose chunks may run alone; this build predates the "
+                   "shared-execution witness ('batch cycle ... shared_windows=' and strix.shared_execution)")
 
     def serve_args(self, port, mode):
         return ["--http-serve", "--http-port", str(port)] + ([] if mode == "auto" else ["--http-batch", mode])
@@ -279,16 +286,102 @@ class Qwen(Adapter):
         return None if mode == "auto" else max(1, int(mode))
 
     def witness(self, before, after, responses, log_delta, ctx):
-        # 'batch cycle sessions=N groups=G ...' (src/hip_mtp_greedy_runtime.hip): on the default 8-row cohort path
-        # every counted group verifies >= 2 sessions on one shared primary (verify_cohort), so G >= 1 with N == 2 is
-        # shared target execution of both requests. The budget path (STRIX_COHORT_ROWS=16|32) and the joint path
-        # (STRIX_MTP_BATCH_JOINT=1, 'joint cycle' lines) count groups whose chunks may all run alone: unprovable.
+        # Shared execution only; the full committed-logit comparison is the TODO(full-logit gate) in run_gate.check.
         env = ctx.get("env", {})
-        if env.get("STRIX_COHORT_ROWS", "").strip() in ("16", "32") or str(env.get("STRIX_MTP_BATCH_JOINT", "")).startswith("1") \
-                or "joint cycle sessions=" in log_delta:
+        arms = qwen_arms(env, log_delta)
+        cycles = parse_batch_cycles(log_delta)
+        witnessed = [c for c in cycles if "shared_windows" in c]
+        receipts = [find_key(r.get("strix"), "shared_execution") for r in responses]
+        receipts = receipts if receipts and all(isinstance(x, dict) for x in receipts) else None
+        if witnessed or receipts:
+            self.last_detail = shared_execution_detail(arms, witnessed, receipts)
+            return self.last_detail["shared"]
+        # Builds without the shared-execution witness. 'batch cycle sessions=N groups=G ...': on the default 8-row
+        # cohort path every counted group verifies >= 2 sessions on one shared primary (verify_cohort), so G >= 1
+        # with N == 2 is shared target execution of both requests. The budget path (STRIX_COHORT_ROWS=16|32) and
+        # the joint path (STRIX_MTP_BATCH_JOINT=1, 'joint cycle' lines) count groups whose chunks may all run
+        # alone: unprovable. (The draft batch is not judged without the witness.)
+        if arms["joint"] or arms["budget"]:
             return None
-        cycles = re.findall(r"batch cycle sessions=(\d+) groups=(\d+)", log_delta)
-        return any(int(n) == 2 and int(g) >= 1 for n, g in cycles)
+        return any(c.get("sessions") == 2 and c.get("groups", 0) >= 1 for c in cycles)
+
+
+QWEN_DECLINE = re.compile(r"([a-z_]+):(\d+)")
+
+
+def qwen_arms(env, log_delta=""):
+    """The Qwen batched-serving arms a server runs: joint verification, a 16/32-row budget, the draft batch."""
+    return dict(joint=str(env.get("STRIX_MTP_BATCH_JOINT") or "").startswith("1") or "joint cycle sessions=" in log_delta,
+                budget=str(env.get("STRIX_COHORT_ROWS") or "").strip() in ("16", "32"),
+                draft_batch=str(env.get("STRIX_MTP_DRAFT_BATCH") or "").startswith("1"))
+
+
+def parse_batch_cycles(log):
+    """'batch cycle ...' lines (src/hip_mtp_greedy_runtime.hip; the witness suffix is
+    include/strix/mtp_shared_execution_witness.hpp mtp_shared_execution_log) -> one dict per cycle: integers, and
+    draft_declines / verify_declines as {reason: count} ('none' -> {})."""
+    out = []
+    for line in re.findall(r"^.*?batch cycle (sessions=.*)$", log, re.M):
+        cycle = {}
+        for key, value in re.findall(r"(\w+)=(\S+)", line):
+            if key in ("draft_declines", "verify_declines"):
+                cycle[key] = {k: int(n) for k, n in QWEN_DECLINE.findall(value)}
+            elif re.fullmatch(r"\d+", value):
+                cycle[key] = int(value)
+        out.append(cycle)
+    return out
+
+
+def shared_execution_detail(arms, cycles, receipts):
+    """Judges one two-request round from its witnessed 'batch cycle' lines and the requests' strix.shared_execution.
+
+    Shared verification: a sessions=2 cycle with a shared window of two or more sessions (shared_windows >= 1); on
+    the joint/budget paths in a cycle that ran budget chunks (chunks >= 1: not the ordinary-cohort fallback), and
+    every receipt with verify_shared_cycles >= 1. Draft batch (STRIX_MTP_DRAFT_BATCH=1): a sessions=2 cycle with a
+    batched draft launch of two or more rows (draft_shared_launches >= 1), and every receipt with
+    draft_shared_steps >= 1. Grouped-but-separate execution (chunks alone, declined drafts) is not shared."""
+    pair = [c for c in cycles if c.get("sessions") == 2]
+    chunked = arms["joint"] or arms["budget"]
+
+    def total(key):
+        return sum(c.get(key, 0) for c in cycles)
+
+    def declines(key):
+        merged = {}
+        for c in cycles:
+            for reason, n in c.get(key, {}).items():
+                merged[reason] = merged.get(reason, 0) + n
+        for r in receipts or ():
+            for reason, n in (r.get(key) or {}).items():
+                merged["request." + reason] = merged.get("request." + reason, 0) + n
+        return merged
+
+    verify_log = any(c.get("shared_windows", 0) >= 1 and (c.get("chunks", 0) >= 1 or not chunked) for c in pair) if cycles else None
+    draft_log = any(c.get("draft_shared_launches", 0) >= 1 for c in pair) if cycles else None
+    verify_receipts = all(int(r.get("verify_shared_cycles") or 0) >= 1 for r in receipts) if receipts else None
+    draft_receipts = all(int(r.get("draft_shared_steps") or 0) >= 1 for r in receipts) if receipts else None
+
+    def judge(log, receipt, log_required):
+        if log is None and (log_required or receipt is None):
+            return None  # the cycle lines are missing (STRIX_MTP_BATCH_LOG off): nothing proves the path
+        return all(x for x in (log, receipt) if x is not None)
+
+    verify = judge(verify_log, verify_receipts, chunked)
+    draft = judge(draft_log, draft_receipts, False) if arms["draft_batch"] else True
+    shared = None if verify is None or draft is None else verify and draft
+    return dict(arms=sorted(k for k, on in arms.items() if on), shared=shared, verify_shared=verify,
+                draft_shared=draft if arms["draft_batch"] else None,
+                cycles=len(cycles), pair_cycles=len(pair), chunks=total("chunks"),
+                shared_windows=total("shared_windows"), shared_sessions=total("shared_sessions"),
+                shared_rows=total("shared_rows"), max_members=max([c.get("max_members", 0) for c in cycles] or [0]),
+                draft_batches=total("draft_batches"), draft_batch_sessions=total("draft_batch_sessions"),
+                draft_launches=total("draft_launches"), draft_shared_launches=total("draft_shared_launches"),
+                draft_max_rows=max([c.get("draft_max_rows", 0) for c in cycles] or [0]),
+                joint_fallbacks=total("joint_fallbacks"),
+                draft_declines=declines("draft_declines"), verify_declines=declines("verify_declines"),
+                receipts=[{k: r.get(k) for k in ("cohort_cycles", "verify_shared_cycles", "verify_max_members",
+                                                 "draft_steps", "draft_shared_steps", "draft_max_rows")}
+                          for r in receipts] if receipts else None)
 
 
 class DeepSeek(Adapter):
@@ -695,6 +788,9 @@ def run_gate(args, adapter, prompts, record):
         require(got["token_ids"] == want["token_ids"], "MISMATCH",
                 where + ": token IDs differ from the serial reference", index)
         require(got["state"] == want["state"], "MISMATCH", where + ": committed state digests differ", index)
+        # TODO(full-logit gate): promoting the batched Qwen serving defaults (draft batch + joint verification)
+        # also needs every request's full committed FP32 logits equal to its C1 reference. That comparison is the
+        # qualification kit's extension of this gate and plugs in here, per request, next to the IDs and state.
 
     for mode in args.modes.split(","):
         name = "slots-" + mode
@@ -735,7 +831,15 @@ def run_gate(args, adapter, prompts, record):
                     # Counters cannot say WHICH requests shared a step; with exactly two requests in the round a
                     # shared step involves both, so only two-request rounds can cover their prompts.
                     pair = len(batch) == 2 and slots != 1
+                    adapter.last_detail = None
                     witness = adapter.witness(before, after, results, log_delta, ctx) if pair else None
+                    detail = adapter.last_detail if pair else None
+                    if detail:
+                        print(f"WITNESS {adapter.name} {name} clients {clients} round {r + 1}: shared={detail['shared']} "
+                              f"arms={','.join(detail['arms']) or 'cohort'} shared_windows={detail['shared_windows']} "
+                              f"max_members={detail['max_members']} chunks={detail['chunks']} "
+                              f"draft_shared_launches={detail['draft_shared_launches']} "
+                              f"draft_max_rows={detail['draft_max_rows']}", flush=True)
                     if pair:
                         pair_rounds += 1
                         unreadable += witness is None
@@ -743,7 +847,8 @@ def run_gate(args, adapter, prompts, record):
                             witnessed += 1
                             covered.update(batch)
                     rounds_log.append(dict(mode=mode, clients=clients, round=r + 1, prompts=[i + 1 for i in batch],
-                                           slots=slots, pair_round=pair, witness=witness, counters=[before, after]))
+                                           slots=slots, pair_round=pair, witness=witness, counters=[before, after],
+                                           witness_detail=detail))
                 (args.out / f"{name}-clients-{clients}.json").write_text(json.dumps(cell, indent=2))
                 print(f"EQUAL {adapter.name} {name} clients {clients}", flush=True)
     record["rows"] = [dict(prompt_id=f"http-slots-p{i + 1}", mode="http-slots", generate_length=args.generate,

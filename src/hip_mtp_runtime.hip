@@ -805,20 +805,37 @@ bool same_draft_model(const ModelContract& a,const ModelContract& b) {
 }
 }
 bool HipMtpRuntime::draft_batch_open() const noexcept {
-    const auto& p=*impl_;
-    // A keep callback (cost-model chain cut, ordinary cycles only) is never batched.
-    return p.active && p.draft && !p.draft_exact && !p.sampler && !p.cs.device_draft && !p.cs.keep && !p.cs.stop &&
-        p.cs.k<p.cs.requested && !p.batch_stream && !p.broken;
+    return draft_batch_decline()==MtpDraftBatchDecline::none;
 }
-std::optional<std::uint32_t> HipMtpRuntime::draft_batch_compatible(std::span<HipMtpRuntime* const> members) {
-    if(members.size()<2U || members.size()>hip_mtp_draft_batch_rows || !draft_batch_env_branches()) return std::nullopt;
+MtpDraftBatchDecline HipMtpRuntime::draft_batch_decline() const noexcept {
+    const auto& p=*impl_;
+    using D=MtpDraftBatchDecline;
+    if(!p.active || !p.draft) return D::inactive;
+    if(p.draft_exact) return D::exact;
+    if(p.sampler) return D::sampled;
+    if(p.cs.device_draft) return D::device_draft;
+    // A keep callback (cost-model chain cut, ordinary cycles only) is never batched.
+    if(p.cs.keep) return D::keep;
+    if(p.cs.stop) return D::stopped;
+    if(p.cs.k>=p.cs.requested) return D::depth;
+    if(p.batch_stream) return D::busy;
+    if(p.broken) return D::broken;
+    return D::none;
+}
+std::optional<std::uint32_t> HipMtpRuntime::draft_batch_compatible(std::span<HipMtpRuntime* const> members,MtpDraftBatchDecline* why) {
+    // The reason every member of a declined set records (shared-execution witness).
+    const auto decline=[why](MtpDraftBatchDecline d)->std::optional<std::uint32_t> {if(why) *why=d;return std::nullopt;};
+    if(members.size()<2U) return decline(MtpDraftBatchDecline::alone);
+    if(members.size()>hip_mtp_draft_batch_rows) return decline(MtpDraftBatchDecline::capacity);
+    if(!draft_batch_env_branches()) return decline(MtpDraftBatchDecline::unsupported_branch);
     const auto& a=*members.front()->impl_;
     const auto& ta=a.owner->tensors();
     std::vector<HipMtpDraftHead*> heads;
     for(auto* m:members) {
-        if(!m || !m->draft_batch_open()) return std::nullopt;
+        if(!m) return decline(MtpDraftBatchDecline::inactive);
+        if(const auto d=m->draft_batch_decline();d!=MtpDraftBatchDecline::none) return decline(d);
         const auto& p=*m->impl_;const auto& t=p.owner->tensors();
-        for(std::size_t o=0;o<heads.size();++o) if(heads[o]==p.draft.get()) return std::nullopt;
+        for(std::size_t o=0;o<heads.size();++o) if(heads[o]==p.draft.get()) return decline(MtpDraftBatchDecline::incompatible_owner);
         // One model, plan, profile and weights (the shared sidecar residency); every buffer stays per owner.
         if(!same_draft_model(p.owner->model(),a.owner->model()) || p.owner->plan().plan_identity!=a.owner->plan().plan_identity ||
            p.profile!=a.profile || p.cs.k!=a.cs.k ||
@@ -827,18 +844,18 @@ std::optional<std::uint32_t> HipMtpRuntime::draft_batch_compatible(std::span<Hip
            t.mlp_hc_inject.runtime->address!=ta.mlp_hc_inject.runtime->address || t.router.runtime->address!=ta.router.runtime->address ||
            t.expert_gate.runtime->address!=ta.expert_gate.runtime->address || t.shared_gate.runtime->address!=ta.shared_gate.runtime->address ||
            !p.hc_inject || !p.fast_workspace)
-            return std::nullopt;
+            return decline(MtpDraftBatchDecline::incompatible_owner);
         // The batched launchers' alignment requirements (staged router, HC rows workspaces, 16-byte state copy):
         // a member that the one-token chain would run on another branch stays out of the batch.
         if(p.owner->view(HipMtpBuffer::hidden0).address%16U || t.router.runtime->address%16U ||
            p.owner->view(HipMtpBuffer::hyper_workspace).address%16U || p.owner->view(HipMtpBuffer::wide_current).address%16U ||
            p.owner->view(HipMtpBuffer::wide_next).address%16U || reinterpret_cast<std::uintptr_t>(p.hc_inject.get())%16U)
-            return std::nullopt;
+            return decline(MtpDraftBatchDecline::unsupported_branch);
         // The batched launchers run only the Q4-copy branch: every draft weight they read must have its copy, and
         // every member reads the same tensors.
         for(const auto* v:{&t.eh_projection,&t.query,&t.key,&t.value,&t.attention_output,&t.expert_gate,&t.expert_up,&t.expert_down,
                            &t.shared_gate,&t.shared_up,&t.shared_down})
-            if(!hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address))) return std::nullopt;
+            if(!hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address))) return decline(MtpDraftBatchDecline::unsupported_branch);
         if(t.query.runtime->address!=ta.query.runtime->address || t.key.runtime->address!=ta.key.runtime->address ||
            t.value.runtime->address!=ta.value.runtime->address || t.attention_output.runtime->address!=ta.attention_output.runtime->address ||
            t.index_query.runtime->address!=ta.index_query.runtime->address || t.index_key.runtime->address!=ta.index_key.runtime->address ||
@@ -855,11 +872,11 @@ std::optional<std::uint32_t> HipMtpRuntime::draft_batch_compatible(std::span<Hip
            t.query_norm.runtime->address!=ta.query_norm.runtime->address || t.key_norm.runtime->address!=ta.key_norm.runtime->address ||
            t.index_query_norm.runtime->address!=ta.index_query_norm.runtime->address ||
            t.index_key_norm.runtime->address!=ta.index_key_norm.runtime->address)
-            return std::nullopt;
+            return decline(MtpDraftBatchDecline::incompatible_owner);
         heads.push_back(p.draft.get());
     }
     const auto shared=HipMtpDraftHead::shared_rows(heads);
-    if(shared==UINT32_MAX) return std::nullopt;
+    if(shared==UINT32_MAX) return decline(MtpDraftBatchDecline::incompatible_owner);
     return shared;
 }
 void HipMtpRuntime::draft_batch_enter(std::span<HipMtpRuntime* const> members,void* stream) {

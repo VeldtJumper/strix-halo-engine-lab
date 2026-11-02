@@ -35,6 +35,25 @@ Diagnostics (off unless explicitly enabled):
 - `STRIX_WINDOW_ROUTE_LOG=1`: per-session routes, including shared cohort steps.
   This synchronizes and must not be used for throughput measurements.
 
+Shared-execution witness (host counters, no synchronization, always counted):
+grouping requests does not prove that they shared work, since a group's chunks
+may verify alone and a batched draft may decline. With `STRIX_MTP_BATCH_LOG=1`
+every `batch cycle` line ends with the cycle's `chunks` (budget/joint chunks),
+`shared_windows` / `shared_sessions` / `shared_rows` / `max_members` (windows
+of two or more sessions on one primary), `draft_batches` /
+`draft_batch_sessions` / `draft_launches` / `draft_shared_launches` /
+`draft_shared_rows` / `draft_max_rows` (`STRIX_MTP_DRAFT_BATCH=1` launch chains
+and launches of two or more rows), `joint_fallbacks` (context/budget tails that
+ran the ordinary cohort cycle) and the reasons a session drafted alone
+(`draft_declines=`: `sampled`, `exact`, `device_draft`, `keep`, `stopped`,
+`depth`, `busy`, `broken`, `unsupported_branch`, `incompatible_owner`, `alone`,
+`capacity`, `ab_off`, `inactive`) or verified alone (`verify_declines=`:
+`no_rows`, `wide`, `padding`, `alone`, `no_owner`). Each HTTP batch request's
+`strix.shared_execution` holds the same per request (`verify_shared_cycles`,
+`draft_shared_steps`, maxima and declines). `tests/serve_slots_gate.py` qualifies
+the joint, budget and draft-batch arms only when this witness shows shared
+windows (joint/budget: in a cycle that ran chunks) and shared draft launches.
+
 Logical weight sharing is not a hardware DRAM-byte measurement. Expert kernels
 may tile assignments, caches may reread weights, and state/KV traffic grows with
 the independent requests. End-to-end qualification must measure C1 and multiple
