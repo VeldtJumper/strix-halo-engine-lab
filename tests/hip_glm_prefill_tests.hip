@@ -38,9 +38,9 @@ namespace P = strix::glm::pf;
 
 namespace {
 // Explicit MLA {scores, o-bar, gemm} versions gated bitwise against the 3/5/1 reference (intermediates, decode outputs).
-constexpr unsigned kMlaPairs = 9;
+constexpr unsigned kMlaPairs = 11;
 constexpr unsigned kMlaPair[kMlaPairs][3] = {{4, 5, 1}, {3, 6, 1}, {4, 6, 1}, {5, 5, 1}, {4, 7, 1}, {5, 7, 1},
-                                             {5, 7, 2}, {4, 5, 2}, {4, 6, 2}};
+                                             {5, 7, 2}, {4, 5, 2}, {4, 6, 2}, {6, 7, 2}, {6, 5, 1}};
 
 int failures = 0, checks = 0;
 void check(bool ok, const std::string& what) {
@@ -226,41 +226,45 @@ void kda_case(const KdaW& kw, const std::vector<unsigned>& chunks, std::mt19937&
             rconv_at.push_back(cv);
         }
     }
-    // prefill
-    const unsigned CMAX = *std::max_element(chunks.begin(), chunks.end());
-    float *pS = zalloc<float>(SN), *pconv = zalloc<float>(CN);
-    float *pscr = poison<float>(static_cast<std::size_t>(CMAX) * SCR), *pbeta = poison<float>(static_cast<std::size_t>(CMAX) * H);
-    float *pO = poison<float>(static_cast<std::size_t>(CMAX) * CH), *pY = poison<float>(static_cast<std::size_t>(T) * CH);
-    unsigned* pflag = zalloc<unsigned>(1);
-    bool states = true, inter = true;
-    unsigned t0 = 0;
-    for (std::size_t k = 0; k < chunks.size(); ++k) {
-        const unsigned C = chunks[k];
-        P::kda_prefill(kd, dq + static_cast<std::size_t>(t0) * 3 * CH, df + static_cast<std::size_t>(t0) * CH, dg + static_cast<std::size_t>(t0) * CH,
-                       db + static_cast<std::size_t>(t0) * H, pS, pconv, pscr, pbeta, pO, pY + static_cast<std::size_t>(t0) * CH, pflag, C, nullptr);
-        if (!inf_test) {
-            const auto s1 = down(pS, SN), s2 = down(rS_at[k], SN);
-            const auto c1 = down(pconv, CN);
-            states &= bits_eq(s1, s2) && all_finite(s1) && bits_eq(c1, down(rconv_at[k], CN)) && all_finite(c1);
-            const auto a1 = down(pscr, static_cast<std::size_t>(C) * SCR), a2 = down(rSCR + static_cast<std::size_t>(t0) * SCR, static_cast<std::size_t>(C) * SCR);
-            const auto b1 = down(pbeta, static_cast<std::size_t>(C) * H), b2 = down(rB + static_cast<std::size_t>(t0) * H, static_cast<std::size_t>(C) * H);
-            const auto o1 = down(pO, static_cast<std::size_t>(C) * CH), o2 = down(rOall + static_cast<std::size_t>(t0) * CH, static_cast<std::size_t>(C) * CH);
-            inter &= bits_eq(a1, a2) && bits_eq(b1, b2) && bits_eq(o1, o2) && all_finite(a1) && all_finite(b1) && all_finite(o1);
+    // prefill, every scan version (same bits)
+    for (unsigned sv : {1U, 3U}) {
+        P::set_kda_scan_version(sv);
+        const unsigned CMAX = *std::max_element(chunks.begin(), chunks.end());
+        float *pS = zalloc<float>(SN), *pconv = zalloc<float>(CN);
+        float *pscr = poison<float>(static_cast<std::size_t>(CMAX) * SCR), *pbeta = poison<float>(static_cast<std::size_t>(CMAX) * H);
+        float *pO = poison<float>(static_cast<std::size_t>(CMAX) * CH), *pY = poison<float>(static_cast<std::size_t>(T) * CH);
+        unsigned* pflag = zalloc<unsigned>(1);
+        bool states = true, inter = true;
+        unsigned t0 = 0;
+        for (std::size_t k = 0; k < chunks.size(); ++k) {
+            const unsigned C = chunks[k];
+            P::kda_prefill(kd, dq + static_cast<std::size_t>(t0) * 3 * CH, df + static_cast<std::size_t>(t0) * CH, dg + static_cast<std::size_t>(t0) * CH,
+                           db + static_cast<std::size_t>(t0) * H, pS, pconv, pscr, pbeta, pO, pY + static_cast<std::size_t>(t0) * CH, pflag, C, nullptr);
+            if (!inf_test) {
+                const auto s1 = down(pS, SN), s2 = down(rS_at[k], SN);
+                const auto c1 = down(pconv, CN);
+                states &= bits_eq(s1, s2) && all_finite(s1) && bits_eq(c1, down(rconv_at[k], CN)) && all_finite(c1);
+                const auto a1 = down(pscr, static_cast<std::size_t>(C) * SCR), a2 = down(rSCR + static_cast<std::size_t>(t0) * SCR, static_cast<std::size_t>(C) * SCR);
+                const auto b1 = down(pbeta, static_cast<std::size_t>(C) * H), b2 = down(rB + static_cast<std::size_t>(t0) * H, static_cast<std::size_t>(C) * H);
+                const auto o1 = down(pO, static_cast<std::size_t>(C) * CH), o2 = down(rOall + static_cast<std::size_t>(t0) * CH, static_cast<std::size_t>(C) * CH);
+                inter &= bits_eq(a1, a2) && bits_eq(b1, b2) && bits_eq(o1, o2) && all_finite(a1) && all_finite(b1) && all_finite(o1);
+            }
+            t0 += C;
         }
-        t0 += C;
+        std::string cl;
+        for (unsigned x : chunks) cl += (cl.empty() ? "" : "/") + std::to_string(x);
+        const std::string tag = "KDA " + kw.label + " H=" + std::to_string(H) + " T=" + std::to_string(T) + " chunks " + cl + " scan v" + std::to_string(sv);
+        if (inf_test) {
+            check(down(rflag, 1)[0] != 0 && down(pflag, 1)[0] != 0, tag + ": positive C2 (+inf v input sets the flag on decode and prefill)");
+            continue;
+        }
+        const auto y1 = down(pY, static_cast<std::size_t>(T) * CH), y2 = down(rY, static_cast<std::size_t>(T) * CH);
+        check(bits_eq(y1, y2) && all_finite(y1), tag + ": outputs y of every row == decode, finite");
+        check(inter, tag + ": prep scratch (q, k, v, g) + beta and raw scan output o of every row == decode");
+        check(states, tag + ": S + conv state after every chunk == decode (incl. the first), finite");
+        check(down(rflag, 1)[0] == 0 && down(pflag, 1)[0] == 0, tag + ": no C2 flag on either path");
     }
-    std::string cl;
-    for (unsigned x : chunks) cl += (cl.empty() ? "" : "/") + std::to_string(x);
-    const std::string tag = "KDA " + kw.label + " H=" + std::to_string(H) + " T=" + std::to_string(T) + " chunks " + cl;
-    if (inf_test) {
-        check(down(rflag, 1)[0] != 0 && down(pflag, 1)[0] != 0, tag + ": positive C2 (+inf v input sets the flag on decode and prefill)");
-        return;
-    }
-    const auto y1 = down(pY, static_cast<std::size_t>(T) * CH), y2 = down(rY, static_cast<std::size_t>(T) * CH);
-    check(bits_eq(y1, y2) && all_finite(y1), tag + ": outputs y of every row == decode, finite");
-    check(inter, tag + ": prep scratch (q, k, v, g) + beta and raw scan output o of every row == decode");
-    check(states, tag + ": S + conv state after every chunk == decode (incl. the first), finite");
-    check(down(rflag, 1)[0] == 0 && down(pflag, 1)[0] == 0, tag + ": no C2 flag on either path");
+    P::set_kda_scan_version(0);
 }
 
 void test_kda(const std::string& cases, std::mt19937& g) {

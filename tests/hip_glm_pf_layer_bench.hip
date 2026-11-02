@@ -441,27 +441,34 @@ int main(int argc, char** argv) {
         {  // KDA split (extra calls; the state S / conv advance, timing only)
             hipEvent_t ke[5];
             for (auto& ev : ke) hok(hipEventCreate(&ev), "ev");
-            float us[3][4]{};
-            for (unsigned rep = 0; rep < 4; ++rep) {
-                P::set_kda_profile(ke);
-                P::kda_prefill(kd, qkvb, fb, gb, bb, S, conv, scr, beta, o, y, flag, C, g_hs);
-                P::set_kda_profile(nullptr);
-                hok(hipEventSynchronize(ke[4]), "ev");
-                if (!rep) continue;
-                for (unsigned j = 0; j < 4; ++j) {
-                    float ms = 0;
-                    hok(hipEventElapsedTime(&ms, ke[j], ke[j + 1]), "ev");
-                    us[rep - 1][j] = ms * 1000.0F;
+            // scan versions 1 / 3 interleaved per repetition (same bits)
+            constexpr unsigned kSv[2] = {1, 3};
+            float us[2][3][4]{};
+            for (unsigned rep = 0; rep < 4; ++rep)
+                for (unsigned vi = 0; vi < 2; ++vi) {
+                    P::set_kda_scan_version(kSv[vi]);
+                    P::set_kda_profile(ke);
+                    P::kda_prefill(kd, qkvb, fb, gb, bb, S, conv, scr, beta, o, y, flag, C, g_hs);
+                    P::set_kda_profile(nullptr);
+                    P::set_kda_scan_version(0);
+                    hok(hipEventSynchronize(ke[4]), "ev");
+                    if (!rep) continue;
+                    for (unsigned j = 0; j < 4; ++j) {
+                        float ms = 0;
+                        hok(hipEventElapsedTime(&ms, ke[j], ke[j + 1]), "ev");
+                        us[vi][rep - 1][j] = ms * 1000.0F;
+                    }
                 }
-            }
             const char* nm[4] = {"prep", "conv", "scan", "out"};
-            std::printf("   KDA split C=%u (us/row, median of 3):", C);
-            for (unsigned j = 0; j < 4; ++j) {
-                float m[3] = {us[0][j], us[1][j], us[2][j]};
-                std::sort(m, m + 3);
-                std::printf(" %s %.3f", nm[j], m[1] / C);
+            for (unsigned vi = 0; vi < 2; ++vi) {
+                std::printf("   KDA split C=%u scan v%u (us/row, median of 3):", C, kSv[vi]);
+                for (unsigned j = 0; j < 4; ++j) {
+                    float m[3] = {us[vi][0][j], us[vi][1][j], us[vi][2][j]};
+                    std::sort(m, m + 3);
+                    std::printf(" %s %.3f", nm[j], m[1] / C);
+                }
+                std::printf("\n");
             }
-            std::printf("\n");
             for (auto& ev : ke) hok(hipEventDestroy(ev), "ev");
         }
         {  // indexer split: scores vs select, select v1 vs v2 (paired, alternating; wh recomputed before each call since
@@ -502,7 +509,7 @@ int main(int argc, char** argv) {
             for (auto& ev : pe) hok(hipEventCreate(&ev), "ev");
             // Paired stage timings, independent of environment selection. Run with
             // 2048 0 2048 6144 2048 30720 to cover the three qualification positions.
-            const unsigned sv[4] = {4, 5, 4, 5}, ov[4] = {5, 7, 5, 7}, gv[4] = {1, 1, 2, 2};
+            const unsigned sv[4] = {5, 6, 5, 6}, ov[4] = {7, 7, 7, 7}, gv[4] = {2, 2, 2, 2};  // scores v5 vs v6 (VOPD), defaults otherwise
             float stage_us[4][3][5]{};
             for (unsigned rep = 0; rep < 4; ++rep) {
                 // Alternate pair order to limit systematic warm-cache/clock bias.

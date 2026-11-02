@@ -2029,14 +2029,25 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill MLA scores v5",
+    "name": "Prefill MLA scores v6",
     "flag_or_env": "STRIX_GLM_PF_SCORES",
-    "default": "5",
-    "exact": "Bitwise equal to v4/v3 and the decode kernel on the prefill gate.",
-    "gain": "8.6-11.5 vs 14.0 us/row per DSA layer at chunk positions 4096..28672",
-    "preconditions": "Exact chunked prefill and supported score geometry.",
-    "off_switch": "STRIX_GLM_PF_SCORES=4 (or 3, 2)",
+    "default": "6",
+    "exact": "Bitwise equal to v5/v4/v3 and the decode kernel on the prefill gate.",
+    "gain": "3.40 / 8.27 / 10.38 vs v5 4.57 / 9.27 / 11.39 us/row per DSA layer at chunk positions 0 / 4096 / 28672; with KDA scan v3, 32K pair TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
+    "preconditions": "Exact chunked prefill and supported score geometry (heads 32; heads 64 keep v5).",
+    "off_switch": "STRIX_GLM_PF_SCORES=5 (or 4, 3, 2)",
     "doc_anchor": "docs/optimizations.md#glm-pf-scores-v3"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill KDA scan v3",
+    "flag_or_env": "STRIX_GLM_PF_KDA_SCAN",
+    "default": "3",
+    "exact": "Raw scan outputs, outputs and states bitwise equal to v1 and the decode kernel on the prefill gate.",
+    "gain": "1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0..28672 (-33 %); 8K pair TTFT 16.63 -> 16.34 s (-1.7 %); with MLA scores v6, 32K 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
+    "preconditions": "Exact chunked prefill.",
+    "off_switch": "STRIX_GLM_PF_KDA_SCAN=1",
+    "doc_anchor": "docs/optimizations.md#glm-pf-kda-scan-v3"
   },
   {
     "engine": "glm",

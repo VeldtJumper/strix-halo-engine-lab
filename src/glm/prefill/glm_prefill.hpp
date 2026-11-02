@@ -18,6 +18,9 @@ void kda_prefill(const dev::KdaDev& k, const float* qkv, const float* f, const f
                  hipStream_t s);
 // Profiling hook (bench only): when set, kda_prefill records 5 events (before prep, conv commit, scan, out, after).
 void set_kda_profile(hipEvent_t* ev5);
+// Explicit KDA scan version for bitwise gates and paired timing (same bits): 1 = v1 (shuffle tree), 3 = v3 (quad-DPP
+// tree); 0 = the default (v3; STRIX_GLM_PF_KDA_SCAN=1 restores v1).
+void set_kda_scan_version(unsigned v);
 
 // ---- DSA indexer + MLA. The slot holds positions [0, t0) on entry.
 // Cache writes for rows t0 .. t0 + C - 1 (latent [C][512] normed, key / gate [C][128] = the R1 wk / gate outputs of
@@ -51,10 +54,10 @@ void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, c
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s);
 
-// Scores v5 and o-bar v7 are the defaults (STRIX_GLM_PF_SCORES=4 / STRIX_GLM_PF_OBAR=5 restore the previous ones);
-// STRIX_GLM_PF_OBAR=6 opts into o-bar v6 (exact, slower: not a default).
+// Scores v6 (heads 32; heads 64 runs v5) and o-bar v7 are the defaults (STRIX_GLM_PF_SCORES=5 / STRIX_GLM_PF_OBAR=5
+// restore the previous ones); STRIX_GLM_PF_OBAR=6 opts into o-bar v6 (exact, slower: not a default).
 // Explicit selectors for bitwise gates and paired stage timing, independent of cached environment values.
-// scores: 2/3/4/5; o-bar: 2/4/5/6/7 (5 and 7 fall back to 2 for heads=64); legacy pair: 1/1.
+// scores: 2/3/4/5/6; o-bar: 2/4/5/6/7 (5 and 7 fall back to 2 for heads=64); legacy pair: 1/1.
 // o-bar 5 or 7 with heads=32 uses lane-major e; all other pairs use token-order e. gemm (absorb / out): 1 / 2 (same
 // bits; the legacy pair has its own); the default entry point runs 2 unless STRIX_GLM_PF_MLA_GEMM=1.
 void mla_attention_rows_versions(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
