@@ -2128,14 +2128,14 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill KDA scan v3",
+    "name": "Prefill KDA scan v5",
     "flag_or_env": "STRIX_GLM_PF_KDA_SCAN",
-    "default": "3",
-    "exact": "Raw scan outputs, outputs and states bitwise equal to v1 and the decode kernel on the prefill gate.",
-    "gain": "1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0..28672 (-33 %); 8K pair TTFT 16.63 -> 16.34 s (-1.7 %); with MLA scores v6, 32K 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
+    "default": "5",
+    "exact": "Raw scan outputs, outputs and states bitwise equal to v3, v1 and the decode kernel on the prefill gate.",
+    "gain": "v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %), 8K pair TTFT neutral (16.60 vs 16.60 s, 8 arms); v3: 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0..28672 (-33 %); 8K pair TTFT 16.63 -> 16.34 s (-1.7 %); with MLA scores v6, 32K 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
     "preconditions": "Exact chunked prefill.",
-    "off_switch": "STRIX_GLM_PF_KDA_SCAN=1",
-    "doc_anchor": "docs/optimizations.md#glm-pf-kda-scan-v3"
+    "off_switch": "STRIX_GLM_PF_KDA_SCAN=3 (or 1)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-kda-scan-v5"
   },
   {
     "engine": "glm",

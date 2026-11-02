@@ -441,11 +441,11 @@ int main(int argc, char** argv) {
         {  // KDA split (extra calls; the state S / conv advance, timing only)
             hipEvent_t ke[5];
             for (auto& ev : ke) hok(hipEventCreate(&ev), "ev");
-            // scan versions 1 / 3 interleaved per repetition (same bits)
-            constexpr unsigned kSv[2] = {1, 3};
-            float us[2][3][4]{};
+            // scan versions 1 / 3 / 5 interleaved per repetition (same bits)
+            constexpr unsigned kSv[3] = {1, 3, 5};
+            float us[3][3][4]{};
             for (unsigned rep = 0; rep < 4; ++rep)
-                for (unsigned vi = 0; vi < 2; ++vi) {
+                for (unsigned vi = 0; vi < 3; ++vi) {
                     P::set_kda_scan_version(kSv[vi]);
                     P::set_kda_profile(ke);
                     P::kda_prefill(kd, qkvb, fb, gb, bb, S, conv, scr, beta, o, y, flag, C, g_hs);
@@ -460,7 +460,7 @@ int main(int argc, char** argv) {
                     }
                 }
             const char* nm[4] = {"prep", "conv", "scan", "out"};
-            for (unsigned vi = 0; vi < 2; ++vi) {
+            for (unsigned vi = 0; vi < 3; ++vi) {
                 std::printf("   KDA split C=%u scan v%u (us/row, median of 3):", C, kSv[vi]);
                 for (unsigned j = 0; j < 4; ++j) {
                     float m[3] = {us[vi][0][j], us[vi][1][j], us[vi][2][j]};

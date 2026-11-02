@@ -224,6 +224,74 @@ __global__ __launch_bounds__(kScanLanes * kScanV) void kda_scan_v3_kernel(unsign
     if (bad && flag) atomicOr(flag, 1U);
 }
 
+// Scan v5: v3's per-token work with the batch fill off the serial path: the next batch's q / k / g are loaded into
+// registers before the current batch's tokens run and stored (decay widened) into the other half of a double LDS
+// buffer after them, so one barrier per batch remains and the global latency hides behind the token loop. 8 tokens per
+// buffer keep LDS at v3's 24 KB. Same values and expressions as v3. Measured 1.23-1.25 -> 1.18-1.20 us/row per KDA layer
+// at t0 0 / 4096 / 28672 (-3.7 %). (Staging v and beta in LDS instead was slower: 1.41-2.24.)
+constexpr unsigned kScan5TB = 8, kScan5Per = kScan5TB * kKdaDim / (kScanLanes * kScanV);  // 4 elements per thread
+__global__ __launch_bounds__(kScanLanes * kScanV) void kda_scan_v5_kernel(unsigned H, float* S, const float* scratch,
+                                                                          const float* beta, float* o, unsigned* flag, unsigned C) {
+    __shared__ float sq[2][kScan5TB][kKdaDim], sk[2][kScan5TB][kKdaDim], sd[2][kScan5TB][kKdaDim];
+    const unsigned h = blockIdx.x, tid = threadIdx.x, q = tid % kScanLanes, v = blockIdx.y * kScanV + tid / kScanLanes;
+    float* Sh = S + static_cast<std::size_t>(h) * kKdaDim * kKdaDim;
+    float st[kOwn];
+#pragma unroll
+    for (unsigned i = 0; i < kOwn; ++i) st[i] = Sh[scan_key(q, i) * kKdaDim + v];
+    float rq[kScan5Per] = {}, rk[kScan5Per] = {}, rg[kScan5Per] = {};
+    auto load = [&](unsigned b0) {
+#pragma unroll
+        for (unsigned m = 0; m < kScan5Per; ++m) {
+            const unsigned idx = tid + kScanLanes * kScanV * m, j = idx / kKdaDim, kk = idx % kKdaDim;
+            if (b0 + j < C) {
+                const float* sc = scratch + (static_cast<std::size_t>(b0 + j) * H + h) * 4 * kKdaDim;
+                rq[m] = sc[kk];
+                rk[m] = sc[kKdaDim + kk];
+                rg[m] = sc[3 * kKdaDim + kk];
+            }
+        }
+    };
+    auto store = [&](unsigned buf) {  // entries past C hold stale values and are never read
+#pragma unroll
+        for (unsigned m = 0; m < kScan5Per; ++m) {
+            const unsigned idx = tid + kScanLanes * kScanV * m, j = idx / kKdaDim, kk = idx % kKdaDim;
+            sq[buf][j][kk] = rq[m];
+            sk[buf][j][kk] = rk[m];
+            sd[buf][j][kk] = declared_exp(rg[m]);
+        }
+    };
+    load(0);
+    store(0);
+    __syncthreads();
+    bool bad = false;
+    unsigned cur = 0;
+    for (unsigned b0 = 0; b0 < C; b0 += kScan5TB, cur ^= 1U) {
+        const unsigned nb = C - b0 < kScan5TB ? C - b0 : kScan5TB;
+        const bool next = b0 + kScan5TB < C;
+        if (next) load(b0 + kScan5TB);
+        for (unsigned j = 0; j < nb; ++j) {
+            const std::size_t rh = static_cast<std::size_t>(b0 + j) * H + h;
+            const float vv = scratch[rh * 4 * kKdaDim + 2 * kKdaDim + v];
+            const float bt = beta[rh];
+#pragma unroll
+            for (unsigned i = 0; i < kOwn; ++i) st[i] = st[i] * sd[cur][j][scan_key(q, i)];
+            const float dlt = (vv - scan_tree_dpp(st, sk[cur][j], q)) * bt;
+#pragma unroll
+            for (unsigned i = 0; i < kOwn; ++i) {
+                st[i] = __builtin_fmaf(sk[cur][j][scan_key(q, i)], dlt, st[i]);
+                bad = bad || !is_finite(st[i]);
+            }
+            const float ov = scan_tree_dpp(st, sq[cur][j], q);
+            if (q == 0) o[rh * kKdaDim + v] = ov;
+        }
+        if (next) store(cur ^ 1U);
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned i = 0; i < kOwn; ++i) Sh[scan_key(q, i) * kKdaDim + v] = st[i];
+    if (bad && flag) atomicOr(flag, 1U);
+}
+
 // 4c: = kda_out_kernel (row-parallel already).
 __global__ __launch_bounds__(128) void kda_out_rows_kernel(KdaDev k, const float* o, const float* gate, float* y) {
     __shared__ float s[128];
@@ -2036,10 +2104,11 @@ void kda_mark(unsigned i, hipStream_t s) {
 void set_kda_profile(hipEvent_t* ev5) { g_kda_prof = ev5; }
 namespace {
 unsigned g_kda_scan_v = 0;  // explicit selector (gates / bench); 0 = kda_scan_version()
-unsigned kda_scan_version() {  // default v3 (quad-DPP tree, same bits, -33 % per scan); STRIX_GLM_PF_KDA_SCAN=1: v1
+unsigned kda_scan_version() {  // default v5 (v3 + fill off the serial path, same bits, -3.7 % vs v3); STRIX_GLM_PF_KDA_SCAN=3 / 1: v3 / v1
     static const unsigned v = [] {
         const char* e = std::getenv("STRIX_GLM_PF_KDA_SCAN");
-        return e && std::string(e) == "1" ? 1U : 3U;
+        if (e && std::string(e) == "3") return 3U;
+        return e && std::string(e) == "1" ? 1U : 5U;
     }();
     return v;
 }
@@ -2060,7 +2129,8 @@ void kda_prefill(const KdaDev& k, const float* qkv, const float* f, const float*
     kda_mark(2, s);
     const unsigned sv = g_kda_scan_v ? g_kda_scan_v : kda_scan_version();
     if (sv == 1) kda_scan_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
-    else kda_scan_v3_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
+    else if (sv == 3) kda_scan_v3_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
+    else kda_scan_v5_kernel<<<dim3(k.heads, kKdaDim / kScanV), kScanLanes * kScanV, 0, s>>>(k.heads, S, scratch, beta, o, flag, C);
     ok(hipGetLastError(), "glm pf kda_scan");
     kda_mark(3, s);
     kda_out_rows_kernel<<<dim3(k.heads, C), 128, 0, s>>>(k, o, gate, y);
