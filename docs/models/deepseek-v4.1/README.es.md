@@ -23,7 +23,9 @@ el par en sí: [dos nodos por USB4](../../pair.es.md).
 **Hardware:** dos nodos Strix Halo de 128 GB cada uno, unidos por dos cables USB4 (también funciona con uno), con el
 módulo de [strix-halo-usb4-driver](https://github.com/hyukudan/strix-halo-usb4-driver) compilado para el kernel en uso.
 
-Ejecute un rank en cada nodo con assets y entorno coincidentes; establezca `R` en 0 o 1 localmente:
+Desde un checkout limpio, [`scripts/pair/ds41-pair`](../../pair-setup.es.md) configura los dos nodos (comprobación
+previa, controlador USB4, compilación, pesos verificados, arranque y prueba exacta). A mano: ejecute un rank en cada
+nodo con assets y entorno coincidentes; establezca `R` en 0 o 1 localmente:
 
 ```sh
 ./build/strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto

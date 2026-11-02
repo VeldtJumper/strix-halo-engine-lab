@@ -40,6 +40,8 @@ flowchart LR
 Two Strix Halo nodes with 128 GB each, two direct USB4 cables, the USB4 driver series, and for MiniMax and GLM the
 trellis library; the full requirement table is in [getting started](getting-started/README.md#what-you-need).
 Configure and build both ranks identically, run the same profile on both ranks, and give both the same assets.
+For DeepSeek, [`scripts/pair/ds41-pair`](pair-setup.md) does all of this from a fresh checkout: preflight, driver,
+build, verified weights, launch and an exact smoke test.
 
 Kernel/IOMMU settings belong to the machine owner. Keep USB4 controllers translated; never disable
 IOMMU for speed. Record the running kernel and `amdgpu.iommu_perfopt` in timing receipts and compare

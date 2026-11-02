@@ -22,7 +22,9 @@ profiles. How the tables are read and what "exact" covers: [methodology](../../m
 **Hardware:** two Strix Halo nodes with 128 GB each, linked by two USB4 cables (one also works), with the
 [strix-halo-usb4-driver](https://github.com/hyukudan/strix-halo-usb4-driver) module built for the running kernel.
 
-Run one rank on each node with matching assets and environment; set `R` to 0 or 1 locally:
+From a fresh checkout, [`scripts/pair/ds41-pair`](../../pair-setup.md) sets up both nodes (preflight, USB4 driver,
+build, verified weights, launch, exact smoke test). By hand: run one rank on each node with matching assets and
+environment; set `R` to 0 or 1 locally:
 
 ```sh
 ./build/strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto

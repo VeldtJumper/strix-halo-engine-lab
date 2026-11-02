@@ -131,6 +131,20 @@ El comando produce un recibo JSON con los IDs de token y los tiempos. Los ficher
 Requisitos, la compilación completa de cada motor y el comando de lanzamiento de cada uno:
 [primeros pasos](docs/getting-started/README.es.md). Rutas opcionales con GPU NVIDIA: [uso de una GPU discreta](#discrete-gpu).
 
+## Configuración rápida del par DeepSeek
+
+Dos máquinas Strix Halo con 128 GB cada una y dos cables USB4 entre ellas: un solo script comprueba cada nodo, compila
+los módulos del controlador USB4 y el motor, descarga y verifica los pesos, arranca los dos ranks y ejecuta una prueba
+exacta. Ejecútelo en ambos nodos (en el segundo, con `--rank 1` y la dirección del otro):
+
+```bash
+scripts/pair/ds41-pair init --rank 0 --peer user@node-b --model-dir /path/to/models
+scripts/pair/ds41-pair check && scripts/pair/ds41-pair driver && scripts/pair/ds41-pair build && scripts/pair/ds41-pair fetch
+```
+
+y después `scripts/pair/ds41-pair run --both` y `scripts/pair/ds41-pair smoke` en el nodo del rank 0. Los pasos que
+requieren root se imprimen; nunca se ejecutan sin avisar. Todos los subcomandos: [docs/pair-setup.es.md](docs/pair-setup.es.md).
+
 ## Perfiles: `default`, `fast`, `quality`
 
 Qwen (CLI, `--http-serve` y el runner MTP), todas las aplicaciones del par DeepSeek y Nemotron aceptan
@@ -195,7 +209,8 @@ no ayuda una ruta y solución de problemas: [uso de una GPU discreta](docs/discr
   [Nemotron 3.5 Bolt E4B](docs/models/nemotron-3.5-bolt-e4b/README.es.md) · [familias de modelos](docs/models/model-families.md).
 - **[Metodología](docs/methodology.es.md):** cómo se leen las tablas, exactitud, fidelidad del modelo, valores
   predeterminados e interruptores de desactivación, decisiones de diseño.
-- **[Dos nodos por USB4](docs/pair.es.md):** el par, qué necesita y cómo DeepSeek, MiniMax y GLM se ejecutan en él.
+- **[Dos nodos por USB4](docs/pair.es.md):** el par, qué necesita y cómo DeepSeek, MiniMax y GLM se ejecutan en él;
+  [configuración del par DeepSeek](docs/pair-setup.es.md) con un solo script.
 - **[Servicio](docs/serving.es.md):** servidores HTTP, contratos de petición, batching, cachés de prefijo, exposición y
   seguridad.
 - **[Ganancias medidas](docs/measured-gains.es.md):** cada valor predeterminado incorporado con su ganancia medida, su
