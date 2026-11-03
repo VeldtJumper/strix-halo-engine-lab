@@ -57,12 +57,18 @@ add_test(NAME producer_receiver_host COMMAND glm_native_receiver)
 add_test(NAME producer_shard_sources COMMAND python -B "${REPO}/tests/glm_native/test_shards.py" --build "${CMAKE_BINARY_DIR}")
 # The tierstream descriptor test compiles the real desc-v1 parser from a
 # read-only tierstream source tree; absent -> the test reports SKIP for that part.
-set(GLM_TIERSTREAM_SRC "${REPO}/../tierstream-f3fa6cf" CACHE PATH "private tierstream snapshot (git archive of tierstream f3fa6cf + STAMP): cache library, budget planner/ledger, desc parser")
+set(GLM_TIERSTREAM_SRC "${REPO}/../tierstream-d2569df" CACHE PATH "private tierstream snapshot (git archive of tierstream d2569df + STAMP): cache library, budget planner/ledger, desc parser")
 # The tierstream commit this producer is qualified against (bound opens with
 # expected source identities, ss_budget_plan / ss_budget_ledger). The source is a
 # `git archive` export of that commit (not a moving checkout); its STAMP
 # file names the exported commit and must match the pin, or configuration fails.
-set(GLM_TIERSTREAM_PIN "f3fa6cf" CACHE STRING "required tierstream commit (prefix)")
+# GLM_TIERSTREAM_QUALIFIED_PIN is not a cache entry: an existing build tree keeps its cached
+# GLM_TIERSTREAM_PIN/SRC across a pin bump, so configuration warns whenever they differ from it.
+set(GLM_TIERSTREAM_QUALIFIED_PIN "d2569df")
+set(GLM_TIERSTREAM_PIN "${GLM_TIERSTREAM_QUALIFIED_PIN}" CACHE STRING "required tierstream commit (prefix)")
+if(NOT GLM_TIERSTREAM_PIN STREQUAL GLM_TIERSTREAM_QUALIFIED_PIN)
+  message(WARNING "GLM_TIERSTREAM_PIN is ${GLM_TIERSTREAM_PIN}, not the qualified ${GLM_TIERSTREAM_QUALIFIED_PIN}: an override (A/B) or a stale cache from an older tree - reconfigure with -DGLM_TIERSTREAM_PIN=${GLM_TIERSTREAM_QUALIFIED_PIN} -DGLM_TIERSTREAM_SRC=<its snapshot> (or a fresh build) for a qualified binary")
+endif()
 # The host test publishes the service-shaped receipt arm (fresh each run) that the
 # Python test reads: an explicit fixture pair, never a stale or racing artifact.
 set(GLM_DECODE_RECEIPT "${CMAKE_BINARY_DIR}/ctest-fixtures/decode-receipt-arm.json")

@@ -455,6 +455,12 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(c['source_share'], dict(device=1256/1376, pinned=39/1376, file=40/1376))
         self.assertEqual(c['writeback_bytes_per_token'], 21 / 4 * dw.UNIT_BYTES)
         self.assertAlmostEqual(c['file_read_s_per_token'], 123456789 / 4 / 1e9)
+        self.assertIsNone(c['file_gb_per_s_elapsed'])  # no loop wall time given: no elapsed rate
+        self.assertIsNone(c['file_read_concurrency'])
+        self.assertIsNone(dw.cache_summary(dict(expert_totals=totals), 4, 0)['file_gb_per_s_elapsed'])  # zero loop: none, no division
+        # Concurrent reads: summed read time (8 s) exceeds the 2 s loop; the elapsed rate and concurrency come from the wall.
+        q = dw.cache_summary(dict(expert_totals=dict(file_bytes=6 * 10**9, file_read_ns=8 * 10**9, file_wait_ns=10**9)), 4, 2.0)
+        self.assertEqual((q['file_gb_per_s_elapsed'], q['file_read_concurrency'], q['file_wait_s_per_token']), (3.0, 4.0, 0.25))
         self.assertEqual(dw.cache_summary(dict(expert_totals={}), 0)['source_share'], {})
         self.assertIsNone(c['landing_used'])  # no landing reads: no share
         h = dw.cache_summary(dict(expert_totals=dict(landing_issued=8, landing_promoted=6, landing_wait_ns=4000000, landing_read_bytes=8 * dw.UNIT_BYTES)), 2)
