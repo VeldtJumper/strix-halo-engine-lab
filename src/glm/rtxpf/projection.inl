@@ -106,15 +106,15 @@ cudaError_t gemm(const U16* a,const U16* w,float* y,unsigned rows,unsigned in,un
     return cudaGetLastError();
 }
 template<class Arena>
-// row: the few-row strips (or, with r2 = row-kernels round 2, the FP32 row chains for rows <= 4).
-cudaError_t project(Matrix w,const float* x,float* y,unsigned rows,Arena& a,cudaStream_t s,bool ref,bool tiled=false,bool row=false,bool r2=false) {
+// row: the few-row strips (or, with r2 & r2_idx, the FP32 row chains for rows <= 4); r2 & r2_pre: early A loads.
+cudaError_t project(Matrix w,const float* x,float* y,unsigned rows,Arena& a,cudaStream_t s,bool ref,bool tiled=false,bool row=false,unsigned r2=0) {
     // qkv has 24576 columns, beyond the FFN diagnostic decoder's public bound.
     // Its format and decode kernel are identical; use the layer-local decoder below.
     input_transform<<<(rows*(w.input/128)+7)/8,256,0,s>>>(x,a.operand,w.suh,rows,w.input);
-    if(ref&&tiled&&row&&r2&&rows<=4&&w.input%256==0)projection_fp32_row<<<dim3((w.output+255)/256,rows),256,0,s>>>(nullptr,a.operand,a.decoded,a.raw,w.input,w.output,false);
+    if(ref&&tiled&&row&&(r2&r2_idx)&&rows<=4&&w.input%256==0)projection_fp32_row<<<dim3((w.output+255)/256,rows),256,0,s>>>(nullptr,a.operand,a.decoded,a.raw,w.input,w.output,false);
     else if(ref&&tiled)projection_fp32_tiled<<<dim3((w.output+31)/32,(rows+7)/8),128,0,s>>>(nullptr,a.operand,a.decoded,a.raw,rows,w.input,w.output,false);
     else if(ref)projection_reference<<<unsigned((std::size_t(rows)*w.output+255)/256),256,0,s>>>(nullptr,a.operand,a.decoded,a.raw,rows,w.input,w.output,false);
-    else if(row)launch_row_project(w,a.operand,a.raw,rows,s,r2); // the caller skipped the layer decode
+    else if(row)launch_row_project(w,a.operand,a.raw,rows,s,(r2&r2_pre)!=0); // the caller skipped the layer decode
     else {auto e=gemm<Row>(a.operand,a.decoded,a.raw,rows,w.input,w.output,a.problem,s);if(e!=cudaSuccess)return e;}
     output_transform<<<(rows*(w.output/128)+7)/8,256,0,s>>>(a.raw,y,w.svh,rows,w.output);
     return cudaGetLastError();

@@ -637,7 +637,7 @@ struct Runtime::Impl {
     std::string session_key(unsigned P)const{return in_session?":s"+std::to_string(kda_block_start(P))+"/"+std::to_string(kda_open_rows(P)):"";}
     void zero_state(){for(Buffer* b:{&state,&conv,&latent,&key,&gate,&pooled})ck(cudaMemsetAsync(b->p,0,b->bytes,compute.s));}
     void pre(const Hc& hc,const U16* weight,const float* x,float* normalized_out,unsigned n){
-        if(n==1&&dopt.row_hc&&!dopt.row_r2)hc_pre_staged<false><<<1,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
+        if(n==1&&dopt.row_hc&&!(dopt.row_r2&r2_hc))hc_pre_staged<false><<<1,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
         else if(n<=4&&dopt.row_hc)hc_pre_staged<true><<<n,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
         else hc_pre_kernel<<<n,256,0,compute.s>>>(x,hc.fn,hc.base,hc.scale,F.as<float>(),mix.as<float>(),collapsed.as<float>());
         norm<<<n,256,0,compute.s>>>(collapsed.as<float>(),weight,normalized_out,n);
@@ -1528,7 +1528,7 @@ struct Runtime::Impl {
     std::vector<Buffer*> session_buffers(){return {&kda_s,&kda_c,&ck_s,&ck_c,&tail,&dlat,&dkey,&dgate,&dpool};}
     void snapshot_session(){need(decode_mode&&sess.open(),"no open session");ck(cudaStreamSynchronize(compute.s));snapshot.clear();
         for(auto* b:session_buffers()){snapshot.emplace_back(b->bytes);ck(cudaMemcpy(snapshot.back().data(),b->p,b->bytes,cudaMemcpyDeviceToHost));}snapshot_tokens=sess.tokens();}
-    void restore_session(){need(decode_mode&&!snapshot.empty(),"no session snapshot");have_draft=false;ck(cudaStreamSynchronize(compute.s));std::size_t j=0;
+    void restore_session(){need(decode_mode&&!snapshot.empty(),"no session snapshot");have_draft=false;spec_ctl=SpecControl{};ck(cudaStreamSynchronize(compute.s));std::size_t j=0;
         for(auto* b:session_buffers())ck(cudaMemcpy(b->p,snapshot[j++].data(),b->bytes,cudaMemcpyHostToDevice));sess.reset();sess.begin(snapshot_tokens);}
 };
 Runtime::Runtime(const std::string& path,unsigned cap,unsigned rows,bool source,bool graphs,unsigned floor_gib,bool legacy,bool serial,const VerifiedManifest* verified,unsigned max_device,unsigned max_pinned,bool require_file,bool decode,const DecodeOptions& dopts):p_(std::make_unique<Impl>(path,cap,rows,source,graphs,floor_gib,verified,max_device,max_pinned,require_file,decode,dopts)){

@@ -169,7 +169,7 @@ __global__ __launch_bounds__(128) void row_gemv(const Expert* ex,const U32* offs
 }
 
 __global__ void compact_serial(const U32* counts,U32* act,unsigned e){if(threadIdx.x==0&&blockIdx.x==0)c1_compact(counts,act,e);}
-// Row-kernels round 2 (opt-in, Call::row_r2): prefix and c1_compact with one thread per expert, same results.
+// Row-kernels round 2 (opt-in, Call::row_r2 & r2_par): prefix and c1_compact with one thread per expert, same results.
 // prefix's offsets/cursor (exclusive sums of counts, offsets[e] = total), one thread per expert (e <= 288).
 __global__ __launch_bounds__(288) void prefix_par(const U32* counts,U32* offsets,U32* cursor,unsigned e){
     __shared__ U32 c[288];const unsigned j=threadIdx.x;
@@ -205,12 +205,12 @@ cudaError_t launch_cutlass(const Call& v,void* ws,std::size_t bytes,cudaStream_t
     cudaError_t err;
     #define C1_CHECK(call) do { err=(call); if(err!=cudaSuccess)return err; } while(0)
     C1_CHECK(cudaMemsetAsync(l.counts,0,v.experts*4,s));
-    auto compact=[&](const U32* counts,U32* act){if(v.row_r2)compact_active<<<1,288,0,s>>>(counts,act,v.experts);else compact_serial<<<1,1,0,s>>>(counts,act,v.experts);};
+    auto compact=[&](const U32* counts,U32* act){if(v.row_r2&r2_par)compact_active<<<1,288,0,s>>>(counts,act,v.experts);else compact_serial<<<1,1,0,s>>>(counts,act,v.experts);};
     unsigned entries=v.rows*routes;
     if(routes==1) dense_dispatch<<<(entries+255)/256,256,0,s>>>(l.counts,l.offsets,l.map,entries);
     else {
         histogram<<<(entries+255)/256,256,0,s>>>(v.ids,l.counts,entries,v.experts);
-        if(v.row_r2)prefix_par<<<1,288,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);else prefix<<<1,1,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);
+        if(v.row_r2&r2_par)prefix_par<<<1,288,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);else prefix<<<1,1,0,s>>>(l.counts,l.offsets,l.cursor,v.experts);
         scatter<<<(entries+255)/256,256,0,s>>>(v.ids,l.cursor,l.map,entries,v.experts);
     }
     if(v.row_gemv&&v.rows<=4&&v.hidden%64==0&&v.inter%64==0) {
@@ -221,7 +221,7 @@ cudaError_t launch_cutlass(const Call& v,void* ws,std::size_t bytes,cudaStream_t
         auto ctas=[&](unsigned width){return (v.rows*(width/128)+7)/8;};
         transform<<<dim3(ctas(v.hidden),count),256,0,s>>>(v.matrices,v.x,l.activation,l.offsets,l.map,l.ag,l.au,l.ad,0,count,v.hidden,routes,false,act);
         unsigned warps=count*2*(v.inter/16);
-        auto gemv=[&](auto... args){if(v.row_r2)row_gemv<true><<<(warps+3)/4,128,0,s>>>(args...);else row_gemv<false><<<(warps+3)/4,128,0,s>>>(args...);};
+        auto gemv=[&](auto... args){if(v.row_r2&r2_pre)row_gemv<true><<<(warps+3)/4,128,0,s>>>(args...);else row_gemv<false><<<(warps+3)/4,128,0,s>>>(args...);};
         gemv(v.matrices,l.offsets,l.ag,l.au,l.scratch_g,l.scratch_u,count,v.hidden,v.inter,true,act);
         c1_epilogue<true><<<dim3(ctas(v.inter),count),256,0,s>>>(v.matrices,l.offsets,l.map,l.scratch_g,l.scratch_u,l.ad,l.contribution,0,count,v.inter,act);
         c1_down_transform<<<dim3(ctas(v.inter),count),256,0,s>>>(l.ad,l.offsets,0,count,v.inter,act);

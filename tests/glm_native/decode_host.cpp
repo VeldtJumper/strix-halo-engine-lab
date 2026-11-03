@@ -876,9 +876,14 @@ void profile_tests(){
      DecodeOptions d;set_row_kernels_value(d,"moe+router");check(d.row_moe&&!d.row_hc&&d.row_router&&row_kernels_name(d)=="moe+router","row kernel subset");
      set_row_kernels_value(d,"1");check(d.row_moe&&d.row_hc&&d.row_router&&row_kernels_name(d)=="1","row kernels all");
      set_row_kernels_value(d,"0");check(!d.row_moe&&!d.row_hc&&!d.row_router&&row_kernels_name(d)=="0","row kernels none");
-     set_row_kernels_value(d,"1");check(!d.row_r2,"row kernels 1 = round one");
+     set_row_kernels_value(d,"1");check(d.row_r2==strix::glm::rtxpf::r2_pre,"row kernels 1 = round one + r2pre");
+     set_row_kernels_value(d,"moe+hc+router+kda+dsa");check(d.row_moe&&d.row_dsa&&d.row_r2==0&&row_kernels_name(d)=="moe+hc+router+kda+dsa","the five kernels alone = round one exactly");
      set_row_kernels_value(d,"2");check(d.row_moe&&d.row_dsa&&d.row_r2&&row_kernels_name(d)=="2","row kernels 2 = round two");
-     set_row_kernels_value(d,"moe+r2");check(d.row_moe&&!d.row_kda&&d.row_r2&&row_kernels_name(d)=="moe+r2","row kernel subset with r2");
+     set_row_kernels_value(d,"moe+r2");check(d.row_moe&&!d.row_kda&&d.row_r2==strix::glm::rtxpf::r2_all&&row_kernels_name(d)=="moe+r2","row kernel subset with r2");
+     set_row_kernels_value(d,"1+r2pre");check(d.row_moe&&d.row_dsa&&d.row_r2==strix::glm::rtxpf::r2_pre&&row_kernels_name(d)=="1","1+r2pre = 1");
+     set_row_kernels_value(d,"1+r2dense");check(d.row_r2==(strix::glm::rtxpf::r2_pre|strix::glm::rtxpf::r2_dense)&&row_kernels_name(d)=="1+r2dense","1 + another round-2 bit");
+     set_row_kernels_value(d,"kda+r2dense+r2hc");check(d.row_kda&&!d.row_moe&&d.row_r2==(strix::glm::rtxpf::r2_dense|strix::glm::rtxpf::r2_hc)&&row_kernels_name(d)=="kda+r2dense+r2hc","round-2 bits named");
+     {bool bad=false;try{set_row_kernels_value(d,"1+r2x");}catch(const std::exception&){bad=true;}check(bad&&d.row_r2==(strix::glm::rtxpf::r2_dense|strix::glm::rtxpf::r2_hc),"unknown round-2 token refused, nothing changed");}
      bool threw=false;try{set_row_kernels_value(d,"moe+gemm");}catch(const std::exception&){threw=true;}check(threw,"unknown row kernel refused");}
     // restore_decode_residency: placement only, on in every profile; CLI / environment override
     check(def.find("restore_decode_residency")->value=="on"&&fast.find("restore_decode_residency")->value=="on"&&def.find("restore_decode_residency")->status==rp::Status::profile,"restore_decode_residency on");

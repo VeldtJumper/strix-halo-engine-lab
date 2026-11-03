@@ -576,7 +576,7 @@ cudaError_t enqueue_dsa(const DsaCall& v,void* workspace,std::size_t bytes,cudaS
         for(unsigned j=0;j<5;++j)widen<<<(sizes[j]+255)/256,256,0,s>>>(src[j],a.accurate_weights[j],sizes[j]);
     }
     DSA_TRY(mark(0,0,true));
-    auto proj=[&](unsigned j,const float* x,float* y,unsigned rows,bool f32=false){a.decoded=a.weights[j];return project(matrices[j],x,y,rows,a,s,ref||f32,!ref&&f32&&!v.legacy_fp32_index,rowk&&(!f32||v.row_r2),v.row_r2);}; // rowk: strips (non-FP32), with row_r2 also the FP32 row chains
+    auto proj=[&](unsigned j,const float* x,float* y,unsigned rows,bool f32=false){a.decoded=a.weights[j];return project(matrices[j],x,y,rows,a,s,ref||f32,!ref&&f32&&!v.legacy_fp32_index,rowk&&(!f32||(v.row_r2&r2_idx)),v.row_r2);}; // rowk: strips (non-FP32), with r2_idx also the FP32 row chains
     auto index_project=[&](unsigned j,const float* x,float* y,unsigned n){
         if(v.node_mimic){
             input_transform<<<(n*(matrices[j].input/128)+7)/8,256,0,s>>>(x,a.operand,matrices[j].suh,n,matrices[j].input);
@@ -593,7 +593,7 @@ cudaError_t enqueue_dsa(const DsaCall& v,void* workspace,std::size_t bytes,cudaS
         return cudaGetLastError();
     };
     auto index_ordinary=[&](const float* x,const U16* w,float* y,unsigned n,unsigned out,unsigned slot){
-        return accurate?accurate_gemm<Col>(x,a.accurate_weights[slot],y,n,4096,out,a.accurate_problem,s):ordinary(x,w,y,n,4096,out,a,s,index_fp32,!ref&&index_fp32&&!v.legacy_fp32_index,rowk&&v.row_r2);
+        return accurate?accurate_gemm<Col>(x,a.accurate_weights[slot],y,n,4096,out,a.accurate_problem,s):ordinary(x,w,y,n,4096,out,a,s,index_fp32,!ref&&index_fp32&&!v.legacy_fp32_index,rowk&&(v.row_r2&(index_fp32?r2_idx:r2_dense)));
     };
     for(unsigned base=0,window=0;base<v.rows;base+=dsa_tile,++window){unsigned n=std::min(dsa_tile,v.rows-base);const float* x=v.x+std::size_t(base)*4096;
         DSA_TRY(mark(1,window,false));if(!v.index_only){DSA_TRY(proj(2,x,a.lat,n));rms<<<n,256,0,s>>>(a.lat,w.kv_norm,a.lat,512);}

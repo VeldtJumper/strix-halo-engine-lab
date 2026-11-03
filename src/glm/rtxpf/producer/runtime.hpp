@@ -1,4 +1,5 @@
 #pragma once
+#include "../row_r2.hpp"
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -61,9 +62,9 @@ struct DecodeOptions {
     // mix chains from shared memory (row_hc), the router over 9 CTAs + a parallel top 8 (row_router),
     // the KDA qkv/out and DSA kva/qb/out trellis projections as the same MMA chains (row_kda, row_dsa).
     bool row_moe=false,row_hc=false,row_router=false,row_kda=false,row_dsa=false;
-    // Round 2 of those kernels (subset token r2, opt-in; same values): A loads before the weight decode, dense FP16
-    // strips for the KDA ordinary projections, FP32 index row chains, 4-wide hc reads, parallel prefix/compaction.
-    bool row_r2=false;
+    // Round 2 of those kernels (opt-in, same values), RowR2 bits: r2pre A loads before the weight decode, r2dense
+    // dense FP16 ordinary strips, r2idx FP32 index row chains, r2hc 4-wide hc reads, r2par parallel prefix/compaction.
+    unsigned row_r2=0;
     // MTP self-speculation (profile row mtp_self_spec, pending until a window shows equal digests): the service
     // opens with 2-row decode buffers and 16 exported ids per layer; decode_spec verifies [pending, MTP draft]
     // in one 2-row step and commits 1 or 2 tokens. Plain decode_one stays available on the same load.
@@ -85,22 +86,32 @@ struct DecodeOptions {
     bool reference_compare=false;        // tierstream: also keep the uncached reference tier for same-window comparison
     std::string unit_manifest_sha256;    // pinned digest of PRIMARY.units.json (trusted manifest)
 };
-// decode_row_kernels value: 0/off, 1/on (all five), 2 (all five + r2), or a '+'-separated subset of moe, hc, router,
-// kda, dsa, r2 (r2 alone changes nothing: it selects round 2 of the listed kernels).
+// decode_row_kernels value: 0/off, 1/on (all five + r2pre, the measured round-2 gain), 2 (all five + every round-2
+// bit), or a '+'-separated subset of 1 (all five + r2pre), moe, hc, router, kda, dsa and the round-2 tokens r2 (all
+// bits), r2pre, r2dense, r2idx, r2hc, r2par (round-2 tokens alone change nothing: they select round 2 of the listed
+// kernels), e.g. 1+r2dense. moe+hc+router+kda+dsa is round one exactly.
+inline constexpr const char* row_kernel_keys[]={"moe","hc","router","kda","dsa"};
+inline constexpr struct {const char* key;unsigned bit;} row_r2_keys[]={{"r2pre",r2_pre},{"r2dense",r2_dense},{"r2idx",r2_idx},{"r2hc",r2_hc},{"r2par",r2_par}};
 inline void set_row_kernels_value(DecodeOptions& d,const std::string& v){
-    bool* f[]={&d.row_moe,&d.row_hc,&d.row_router,&d.row_kda,&d.row_dsa,&d.row_r2};const char* k[]={"moe","hc","router","kda","dsa","r2"};
-    const bool two=v=="2",all=v=="1"||v=="on"||two,none=v=="0"||v=="off";bool on[6]={all,all,all,all,all,two};
+    bool* f[]={&d.row_moe,&d.row_hc,&d.row_router,&d.row_kda,&d.row_dsa};
+    const bool two=v=="2",all=v=="1"||v=="on"||two,none=v=="0"||v=="off";bool on[5]={all,all,all,all,all};unsigned r2=two?r2_all:all?unsigned(r2_pre):0u;
     if(!all&&!none)for(std::size_t b=0;b<=v.size();){auto e=v.find('+',b);if(e==std::string::npos)e=v.size();const auto name=v.substr(b,e-b);bool known=false;
-        for(unsigned j=0;j<6;++j)if(name==k[j]){on[j]=true;known=true;}
-        if(!known)throw std::runtime_error("--decode-row-kernels: 0, 1, 2 or a '+'-separated subset of moe, hc, router, kda, dsa, r2");b=e+1;}
-    for(unsigned j=0;j<6;++j)*f[j]=on[j]; // all or nothing: a refused value changes no switch
+        for(unsigned j=0;j<5;++j)if(name==row_kernel_keys[j]){on[j]=true;known=true;}
+        if(name=="1"){for(auto& o:on)o=true;r2|=r2_pre;known=true;}
+        if(name=="r2"){r2=r2_all;known=true;}
+        for(const auto& t:row_r2_keys)if(name==t.key){r2|=t.bit;known=true;}
+        if(!known)throw std::runtime_error("--decode-row-kernels: 0, 1, 2 or a '+'-separated subset of moe, hc, router, kda, dsa (also 1 = all five, r2, r2pre, r2dense, r2idx, r2hc, r2par)");b=e+1;}
+    for(unsigned j=0;j<5;++j)*f[j]=on[j]; // all or nothing: a refused value changes no switch
+    d.row_r2=r2;
 }
 inline std::string row_kernels_name(const DecodeOptions& d){
-    const bool f[]={d.row_moe,d.row_hc,d.row_router,d.row_kda,d.row_dsa};const char* k[]={"moe","hc","router","kda","dsa"};
-    std::string s;unsigned n=0;for(unsigned j=0;j<5;++j)if(f[j]){s+=(s.empty()?"":"+")+std::string(k[j]);++n;}
-    if(n==5)return d.row_r2?"2":"1";
-    if(d.row_r2)s+=(s.empty()?"":"+")+std::string("r2");
-    return n==0&&!d.row_r2?"0":s;
+    const bool f[]={d.row_moe,d.row_hc,d.row_router,d.row_kda,d.row_dsa};
+    std::string s;unsigned n=0;for(unsigned j=0;j<5;++j)if(f[j]){s+=(s.empty()?"":"+")+std::string(row_kernel_keys[j]);++n;}
+    if(n==5&&(d.row_r2==r2_pre||d.row_r2==r2_all))return d.row_r2==r2_all?"2":"1";
+    unsigned rest=d.row_r2;if(n==5&&(rest&r2_pre)){s="1";rest&=~unsigned(r2_pre);}
+    if(d.row_r2==r2_all)s+=(s.empty()?"":"+")+std::string("r2");
+    else for(const auto& t:row_r2_keys)if(rest&t.bit)s+=(s.empty()?"":"+")+std::string(t.key);
+    return s.empty()?"0":s;
 }
 // The library's disk readers that each hold a bounce buffer beyond its own one (none at queue 1).
 inline unsigned disk_bounce_readers(const DecodeOptions& d){return d.tier_disk_queue>1?d.tier_disk_queue:0;}

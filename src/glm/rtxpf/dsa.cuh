@@ -46,7 +46,7 @@ struct DsaCall {
     // rows <= 32 (decode): the CUTLASS trellis projections (kva, qb, out; qa outside the FP32 index) as
     // row_mma.cuh strips from the packed tiles, without their layer decode; the same bits.
     bool row_kernels=false;
-    bool row_r2=false; // row-kernels round 2 (opt-in): A loads before the decode, FP32 index row chains
+    unsigned row_r2=0; // RowR2 bits (opt-in): r2_pre A loads before the decode, r2_idx FP32 index row chains, r2_dense ordinary strips
     float near_tie_abs=1.e-3f,near_tie_rel=1.e-3f;
 };
 // Caller creates timing events for phase*dsa_max_windows+window. decode/pool

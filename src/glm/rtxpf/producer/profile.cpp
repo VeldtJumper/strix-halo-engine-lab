@@ -73,16 +73,19 @@ constexpr Lever kTable[] = {
                "register-decoded m16n8k16 chains in the CUTLASS K order (no per-token FP16 decode), hyper-connection and "
                "router chains from shared memory, the router's top 8 by rank. Full card, 1K/8K: tokens, every logits "
                "digest and the final state equal with it off; qualify PASS; decode 2.4 -> 6.0-6.2 tok/s warm. OFF: 0; "
-               "a subset such as moe+hc+router+kda+dsa selects kernels; 2 (or +r2) adds round two, opt-in: bitwise equal "
-               "but not faster in one-load A/Bs (full card -3 % warm)"},
+               "a subset such as moe+hc+router+kda+dsa (round one exactly) selects kernels; 1 includes r2pre (A loads before "
+               "the weight decode: same bits, +8 % warm decode at 1K in an ABBA pair); 2 (or +r2, or one of "
+               "+r2dense/r2idx/r2hc/r2par) adds the rest of round two, opt-in: bitwise equal "
+               "but not faster in one-load A/Bs (dense strips -8 %)"},
     {.name = "mtp_self_spec", .env = "STRIX_GLM_RTX_MTP_SPEC", .options = {{{"--mtp-self-spec", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
-     .source = "pending (default until the adaptive form is timed in both configurations): greedy verify of [pending, MTP draft] with the plain step's per-row kernels; rejected "
-               "rows rebuilt from the KDA block checkpoint / rewritten in DSA; up to 32 exported ids per layer. Tokens, "
-               "every logits digest and the final state equal to plain decode (full card and 24 GiB VRAM + 32 GiB RAM, "
-               "1K/8K prompts). Decode 1K warm: full card 5.2 -> 7.1 tok/s, 24+32 0.80 -> 1.10. Adaptive: measured ms "
-               "per emitted token picks verify cycles or plain steps (runs of 32, probes of 4); always = every step. "
-               "Tierstream only and not with --routes-out (otherwise off). OFF: 0"},
+     .source = "pending (not faster at every length): greedy verify of [pending, MTP draft] with the plain step's per-row "
+               "kernels; rejected rows rebuilt from the KDA block checkpoint / rewritten in DSA; up to 32 exported ids "
+               "per layer. Tokens, every logits digest and the final state equal to plain decode (full card and 24 GiB "
+               "VRAM + 32 GiB RAM, 1K/8K prompts). Full card, 24-step benches: 8K +27 % warm / +15 % cold, a cold "
+               "48-token generate +16 %, 1K warm about equal and cold -6 %. Adaptive: measured ms per emitted token picks "
+               "verify cycles or plain steps (runs of 32, probes of 4); always = every step. Tierstream only and not "
+               "with --routes-out (otherwise off)"},
     {.name = "lookup_drafts", .env = "STRIX_GLM_RTX_SPEC_LOOKUP", .options = {{{"--spec-lookup", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "0", .ready = none, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "pending: exact (tokens and every logits digest equal to plain decode in PRO windows; prompt-lookup "

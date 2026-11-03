@@ -19,7 +19,7 @@ struct KdaCall {
     // rows <= 32 (decode replay): the qkv/out trellis projections as row_mma.cuh strips from the
     // packed tiles (no FP16 layer decode); the same bits as the CUTLASS projection.
     bool row_kernels=false;
-    bool row_r2=false; // row-kernels round 2 (opt-in): A loads before the decode, dense FP16 strips for the ordinary projections
+    unsigned row_r2=0; // RowR2 bits (opt-in): r2_pre A loads before the decode, r2_dense dense FP16 strips for the ordinary projections
 };
 // No allocation, device discovery or synchronization. Single caller-owned
 // stream, nonaliasing buffers; initial state/conv may be nonzero.
