@@ -166,11 +166,14 @@ void window_out_group_fixture(hipStream_t stream) {
     for(const unsigned window:{2U,4U,8U}) for(const auto& count:counts) for(const bool a8:{true,false}) {
         std::vector<std::uint32_t> ref_image(rows*heads*dim);std::vector<std::int8_t> ref_codes(rows*heads*dim);
         std::vector<float> ref_deltas(heads*dim/32U*64U);
-        for(const unsigned group:{0U,2U,3U,4U,6U,12U}) {
+        // {group, split}: the per-head reference, the groups, and the production table shapes (R8 G4S2, R4 G2S4).
+        const unsigned arms[][2]={{0U,1U},{2U,1U},{3U,1U},{4U,1U},{6U,1U},{12U,1U},{4U,2U},{2U,4U},{2U,2U}};
+        for(const auto& arm:arms) {
+            const unsigned group=arm[0],split=arm[1];
             strix::HipQsaWindowOutGroupProbe p;
             p.query=query.as<float>();p.kv=kv.as<std::uint16_t>();p.selected=selected.as<std::uint32_t>();p.scores=scores.as<float>();
             p.image=image.as<float>();p.codes=a8?codes.as<std::int8_t>():nullptr;p.deltas=a8?deltas.as<float>():nullptr;
-            p.rows=window;p.group=group;p.maximum_selected=maximum;std::memcpy(p.count,count,sizeof(p.count));
+            p.rows=window;p.group=group;p.split=split;p.maximum_selected=maximum;std::memcpy(p.count,count,sizeof(p.count));
             check(hipMemsetAsync(image.data,0xa5,rows*heads*dim*4U,stream));check(hipMemsetAsync(codes.data,0x5a,rows*heads*dim,stream));
             check(hipMemsetAsync(deltas.data,0xa5,heads*dim/32U*64U*4U,stream));
             strix::launch_hip_qsa_window_out_group_probe(p,stream);check(hipStreamSynchronize(stream));
@@ -186,7 +189,7 @@ void window_out_group_fixture(hipStream_t stream) {
             check(hipEventRecord(start,stream));
             for(int i=0;i<reps;++i) strix::launch_hip_qsa_window_out_group_probe(p,stream);
             check(hipEventRecord(stop,stream));check(hipEventSynchronize(stop));check(hipEventElapsedTime(&ms,start,stop));
-            std::printf("window R%u count %u a8 %u G%u %s %.1f us\n",window,count[0],a8?1U:0U,group,group?"EXACT":"ref",ms*1000.0F/reps);
+            std::printf("window R%u count %u a8 %u G%u S%u %s %.1f us\n",window,count[0],a8?1U:0U,group,split,group?"EXACT":"ref",ms*1000.0F/reps);
         }
     }
     check(hipEventDestroy(start));check(hipEventDestroy(stop));

@@ -4756,13 +4756,14 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_prefetch_kern
 // when a8_codes is set, attention_output_rows_dense_a8_kernel's epilogue run for each of the G heads. Per
 // (row, head, feature) the chain is attention_output_body's: the same `sum += score * value` expression per slot in
 // ascending slot order (so it takes this file's contraction exactly as the body does), the same BF16 roundings and
-// gate; the quantizer is wave-local (32 features of one head).
+// gate; the quantizer is wave-local (32 features of one head). A launch may split each head's features over
+// gridDim.z blocks of head_dim / gridDim.z threads (a multiple of 32); each feature keeps its own chain.
 template <unsigned Rows, unsigned G, bool Int8 = false>
 __global__ __launch_bounds__(256) void attention_output_rows_window_group_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::int8_t* a8_codes, float* a8_deltas) {
     const auto head0 = static_cast<std::uint32_t>(blockIdx.x) * G, r = static_cast<std::uint32_t>(blockIdx.y);
-    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
+    const auto feature = static_cast<std::uint32_t>(blockIdx.z * blockDim.x + threadIdx.x);
     if (head0 >= attention_heads || feature >= head_dim) return;
     const auto count = views.count[r];
     const auto kv_head = head0 / (attention_heads / kv_heads);
@@ -6724,9 +6725,18 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         // read once per G heads); 0 keeps the per-head kernel. Kernel bench (BF16, 2052 / 1031 slots): R8 186 -> 91 /
         // 99 -> 47 us at G4; 2- and 4-row windows keep the per-head kernel (G4 +9 % / +0 % there). Off under the baseline
         // and STRIX_QPF2K_DEFAULTS=0.
+        // STRIX_QSA_WINDOW_OUT_TABLE (exact, default on, needs the item above): per-window shape table on top of it -
+        // R8 G4 with each head's features over 2 blocks, R4 G2 over 4 blocks, R2 the per-head kernel. Kernel bench
+        // (2052 / 1031 slots): R8 G4 96.1 -> 95.3 / 49.5 -> 48.4 us, R4 82.6 -> 81.7 / 41.9 -> 41.6 us; R2 has no
+        // faster exact form (more groups, feature splits or 2-4 features per thread are all slower). =0 keeps R8 G4
+        // unsplit and R4 per-head.
         static const unsigned window_out_group_choice = env_choice("STRIX_QSA_WINDOW_OUT_GROUP", 4);
         static const bool window_out_group_on = qpf2k::long_context_item_enabled("STRIX_QSA_WINDOW_OUT_GROUP", false);
-        const unsigned window_out_group = Rows == 8U && verify_window && window_out_group_on ? window_out_group_choice : 0U;
+        static const bool window_out_table = window_out_group_on && qpf2k::long_context_item_enabled("STRIX_QSA_WINDOW_OUT_TABLE", false);
+        static const bool window_out_default = window_out_table && !std::getenv("STRIX_QSA_WINDOW_OUT_GROUP");
+        const unsigned window_out_group = !verify_window || !window_out_group_on ? 0U
+            : Rows == 8U ? window_out_group_choice : Rows == 4U && window_out_table ? 2U : 0U;
+        const unsigned window_out_split = Rows == 8U && window_out_default ? 2U : Rows == 4U && window_out_table ? 4U : 1U;
         // STRIX_QSA_WINDOW_ATTN_V2 (default on): the operand-pinned grouped score for single-session verify windows
         // (see window_attn_v2_route).
         const bool window_v2 = window_attn_v2_route(qsa_window_attn_v2_enabled(), verify_window, Rows, Int8, fast,
@@ -6834,9 +6844,10 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             }
         } else if (window_out_group && !Int8 && per_kv % (window_out_group ? window_out_group : 1U) == 0U && a.head_dim <= kThreads) {
             if constexpr (Rows <= 8U && !Int8) {
+            const auto split = a.head_dim % (32U * window_out_split) == 0U ? window_out_split : 1U;
             const auto output = [&]<unsigned G>() {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows),
-                    dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows, split),
+                    dim3(a.head_dim / split), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
                     output_slot.codes, output_slot.deltas);
             };
             switch (window_out_group) {
@@ -8318,7 +8329,9 @@ void launch_hip_qsa_window_out_group_probe(const HipQsaWindowOutGroupProbe& p, v
             v.output[r]=p.image+static_cast<std::uint64_t>(r)*heads*dim;v.count[r]=p.count[r];
         }
         const auto group=[&]<unsigned G>() {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows,G>),dim3(heads/G,Rows),dim3(dim),0,stream,
+            const unsigned split=p.split?p.split:1U;
+            if((split!=1U && split!=2U && split!=4U && split!=8U) || dim%(32U*split)) throw std::invalid_argument("window out-group probe: split must be 1|2|4|8 and leave whole waves");
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows,G>),dim3(heads/G,Rows,split),dim3(dim/split),0,stream,
                 v,p.kv,p.maximum_selected,heads,kv_heads,dim,p.codes,p.deltas);
         };
         switch(p.group) {
