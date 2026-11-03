@@ -43,7 +43,14 @@ prefix cache are in [docs/engine/serving/serving.md](../../engine/serving/servin
 Qwen's [prefix-state cache](../../engine/serving/prefix-state-cache.md) restores complete attention/GDN
 state at admitted boundaries and reads only the suffix. Configure `--prefix-cache-host-bytes N` and
 optionally `--prefix-cache-dir DIR`; fair retention is default (`--prefix-cache-retention lru` restores
-LRU). Captures reserve memory before pinned copies. `"state_cache":{"retain":false}` permits reads
+LRU). Fair retention also reclaims idle certified groups with a newer private-prefix successor by default.
+The rule requires no reuse in the retained lifetime and more than 32 global epochs
+of recency separation (one capture or validated touch across all conversations).
+Pair-exclusive sub-block boilerplate in other workloads can create a false successor.
+`/v1/cache/stats` counts these removals in `evictions_superseded`.
+`STRIX_PREFIX_FAIR_RECLAIM_IDLE=0` restores its previous victim order. This is exact
+(retention choice only); restore validation and numerical identity are unchanged.
+Captures reserve memory before pinned copies. `"state_cache":{"retain":false}` permits reads
 without storing new prefixes; `GET /v1/cache/stats` reports retention and eviction reasons.
 `--prefix-cache off` / `STRIX_PREFIX_CACHE=0` disables it. Certified caching is on by default only for
 single tiled-MTP HTTP (`--http-batch 0`, or automatic capacity resolving to the single runner) at T=2048 with

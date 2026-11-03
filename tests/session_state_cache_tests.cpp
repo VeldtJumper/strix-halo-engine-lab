@@ -475,7 +475,7 @@ int main() {
             set(nullptr); check(!one.starts_with(strix::session_numerical_config("cli")),"removed runtime env accepted as prefix");
             set(saved ? saved->c_str() : nullptr);
         }
-        for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE",
+        for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE","STRIX_PREFIX_FAIR_RECLAIM_IDLE",
                 "STRIX_SESSION_DIRECT_IO","STRIX_SESSION_READAHEAD","STRIX_SESSION_CHUNKED"}) {
             const char* previous=std::getenv(key);
             const std::optional<std::string> saved=previous?std::optional<std::string>{previous}:std::nullopt;

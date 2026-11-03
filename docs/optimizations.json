@@ -145,12 +145,12 @@
   {
     "engine": "qwen",
     "name": "Prefix cache retention, per-request no-store and cache statistics",
-    "flag_or_env": "--prefix-cache on|off; STRIX_PREFIX_CACHE; --prefix-cache-retention fair|lru; STRIX_PREFIX_CACHE_RETENTION; state_cache.retain; GET /v1/cache/stats",
-    "default": "ON on the qualified single tiled-MTP HTTP family after post-residency fit; fair retention; other automatic families decline",
-    "exact": "Complete certified boundaries only; qualified single-family results are gated bitwise identical to cache-off. No-store preserves hits while suppressing new storage. Batch and session automatic reuse remain unqualified.",
+    "flag_or_env": "--prefix-cache on|off; STRIX_PREFIX_CACHE; --prefix-cache-retention fair|lru; STRIX_PREFIX_CACHE_RETENTION; STRIX_PREFIX_FAIR_RECLAIM_IDLE; state_cache.retain; GET /v1/cache/stats",
+    "default": "ON on the qualified single tiled-MTP HTTP family after post-residency fit; fair retention with idle certified conversation-group reclamation ON; other automatic families decline",
+    "exact": "Exact retention choice only: idle-group reclamation requires no validated reuse during the retained lifetime, a newer group sharing an exact partial first-block prefix beyond every rival's overlap, and a 32-global-epoch guard. Common headers, ambiguous roots, parked sessions and uncertified entries decline. Payload arithmetic, numerical identity and restore validation are unchanged. Complete certified boundaries only; qualified single-family results are gated bitwise identical to cache-off. No-store preserves hits while suppressing new storage. Batch and session automatic reuse remain unqualified.",
     "gain": "No measured throughput claim.",
     "preconditions": "Qualified single tiled-MTP HTTP family as above, or the existing explicit host-budget contract. No-store permits hits but suppresses capture, disk-hit promotion and new named-frontier publication. Startup qwen cache policy, --print-effective-config and /v1/capabilities report requested/effective/source/reason/phase including declines/OFF; /v1/cache/stats includes policy only while storage is active; inspection is pending without device work. Statistics are immutable last-boundary samples.",
-    "off_switch": "--prefix-cache off / STRIX_PREFIX_CACHE=0 disables prefix caching; --prefix-cache-retention lru / STRIX_PREFIX_CACHE_RETENTION=lru selects legacy eviction. --baseline / STRIX_BASELINE=1 selects lru and disables automatic budgeting.",
+    "off_switch": "STRIX_PREFIX_FAIR_RECLAIM_IDLE=0 restores the original fair victim order after server restart; --prefix-cache off / STRIX_PREFIX_CACHE=0 disables prefix caching; --prefix-cache-retention lru / STRIX_PREFIX_CACHE_RETENTION=lru selects legacy eviction. --baseline / STRIX_BASELINE=1 selects lru and disables automatic budgeting.",
     "doc_anchor": "docs/engine/serving/prefix-state-cache.md#prefix-retention-policy"
   },
   {

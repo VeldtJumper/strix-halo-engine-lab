@@ -428,6 +428,7 @@ struct Options {
     unsigned prefix_batch_cert = 0; // 0 off, 1 strict L0, 2 capture-only, 3 unqualified L1 (capture only)
     bool prefix_cache = true;
     bool prefix_cache_inflight = true, prefix_cache_disk = true, prefix_cache_durable = true;
+    bool prefix_fair_reclaim_idle = true; // Retention policy only; excluded from execution records.
     // Where the in-flight joining policy came from: default, cli, env, baseline or prefix-cache-off.
     std::string prefix_cache_inflight_source = "default";
     std::string prefix_cache_retention = "fair", prefix_cache_source = "off", prefix_cache_reason = "not-serving";
@@ -1745,6 +1746,7 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
     toggle(o.prefix_cache_inflight,"--prefix-cache-inflight","STRIX_PREFIX_CACHE_INFLIGHT",&o.prefix_cache_inflight_source);
     toggle(o.prefix_cache_disk,"--prefix-cache-disk","STRIX_PREFIX_CACHE_DISK");
     toggle(o.prefix_cache_durable,"--prefix-cache-durable","STRIX_PREFIX_CACHE_DURABLE");
+    if (const auto v=lookup("STRIX_PREFIX_FAIR_RECLAIM_IDLE")) o.prefix_fair_reclaim_idle=*v!="0";
     const auto batch_mode=[](std::string_view v) -> unsigned {
         if(v=="0" || v=="off") return 0;
         if(v=="1" || v=="l0") return 1;

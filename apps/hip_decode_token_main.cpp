@@ -3528,7 +3528,7 @@ static int run_decode_entry(
                 prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
                     options.prefix_cache_host_bytes, options.prefix_cache_disk ? options.prefix_cache_dir : "", options.prefix_cache_disk_bytes,
                     options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline,
-                    !options.baseline, options.prefix_cache_durable},
+                    !options.baseline, options.prefix_cache_durable, options.prefix_fair_reclaim_idle},
                     options.baseline ? strix::decode_cli::hip_pinned_prefix_buffer : strix::decode_cli::hip_pinned_prefix_capture_buffer);
                 options.state_cache_stats->publish(strix::decode_cli::prefix_snapshot(*prefix_store));
                 prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
@@ -3591,7 +3591,7 @@ static int run_decode_entry(
                             prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
                                 options.prefix_cache_host_bytes, options.prefix_cache_disk ? options.prefix_cache_dir : "", options.prefix_cache_disk_bytes,
                                 options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline,
-                                !options.baseline, options.prefix_cache_durable},
+                                !options.baseline, options.prefix_cache_durable, options.prefix_fair_reclaim_idle},
                                 options.baseline ? strix::decode_cli::hip_pinned_prefix_buffer : strix::decode_cli::hip_pinned_prefix_capture_buffer);
                             options.state_cache_stats->publish(strix::decode_cli::prefix_snapshot(*prefix_store));
                             prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,

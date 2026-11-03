@@ -117,7 +117,8 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
         // their consumers can flush pending windows or synchronize a device readback.
         if (family && value.starts_with("STRIX_PREFILL_LOGITS_DIGEST=")) continue;
         if (value.starts_with("STRIX_PREFIX_CACHE_INFLIGHT=") || value.starts_with("STRIX_PREFIX_CACHE_DISK=") ||
-            value.starts_with("STRIX_PREFIX_CACHE_DURABLE=")) continue;
+            value.starts_with("STRIX_PREFIX_CACHE_DURABLE=") ||
+            value.starts_with("STRIX_PREFIX_FAIR_RECLAIM_IDLE=")) continue;
         // State-file I/O mode (page cache, read-ahead, streamed verification): same bytes.
         if (value.starts_with("STRIX_SESSION_DIRECT_IO=") || value.starts_with("STRIX_SESSION_READAHEAD=") ||
             value.starts_with("STRIX_SESSION_CHUNKED=")) continue;
