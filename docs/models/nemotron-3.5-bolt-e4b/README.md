@@ -102,6 +102,13 @@ window, threshold stored per drafter), which lifted C1 with the drafter from 85.
 tok/s (`default` / `fast` / `quality`, measured when it shipped); `STRIX_G4_MTP_CONF=0` restores the previous window
 policy.
 
+At long contexts each drafted depth costs more relative to a target pass, so the window follows the stream's own
+measured costs: when a draft depth costs at least 0.04 of a one-row pass it drafts one depth at a time, extends while the
+cumulative probability is >= 0.6 and verifies the prefix at >= 0.15. Decode at 16K / 32K tokens (`default`, 512 tokens,
+mean of two runs per arm): +0.3 / +1.6 % code, +0.8 / +1.2 % English, +3.1 / +2.4 % Spanish, +0.6 / +3.5 % Japanese,
+token ids unchanged; code and Japanese at 16K are within the run-to-run spread;
+`STRIX_G4_MTP_CONF_LONG=0` keeps the short-context window at every length.
+
 Decode passes return the device's greedy token per row and copy logits and hidden-state taps to the host only when a
 request or drafter reads them: +1.9 / +4.6 / +5.9 % at C1 / C4 / C8 with the drafter off and +3.3 / +8.3 / +9.3 % with
 the MTP drafter on (`default`, short prompts, same bytes); `STRIX_G4_DECODE_EXPORT=0` restores the full copies.

@@ -204,6 +204,8 @@ ConfidenceConfig ConfidenceConfig::from_environment() {
     c.first = integer("STRIX_G4_MTP_CONF_FIRST",c.first);
     c.step = integer("STRIX_G4_MTP_CONF_STEP",c.step);
     c.min1 = env_number("STRIX_G4_MTP_CONF_MIN1",c.min1,0,1);
+    if (const auto* l = std::getenv("STRIX_G4_MTP_CONF_LONG"); l && *l && std::string(l) != "auto")
+        c.long_ratio = std::string(l) == "off" ? 0 : env_number("STRIX_G4_MTP_CONF_LONG",c.long_ratio,0,1);
     return c;
 }
 const char* ConfidenceConfig::source_name(Source s) {
@@ -217,7 +219,7 @@ const char* ConfidenceConfig::source_name(Source s) {
 strix::serve::Json ConfidenceConfig::json() const {
     return strix::serve::Json(strix::serve::Json::Object{{"enabled",enabled()},{"tau",tau},{"max_k",std::uint64_t(max_k)},
         {"first",std::uint64_t(first)},{"step",std::uint64_t(step)},{"min1",min1},{"source",source_name(source)},
-        {"per_drafter",per_drafter}});
+        {"per_drafter",per_drafter},{"long_ratio",long_ratio},{"long_extend",long_extend},{"long_verify",long_verify}});
 }
 MultiStreamPolicy::MultiStreamPolicy(MultiStreamConfig config) : config_(config) {
     if (config_.max_k < 1 || config_.max_k > 7 || !(config_.max_draft_share >= 0) || !(config_.min_gain >= 1))

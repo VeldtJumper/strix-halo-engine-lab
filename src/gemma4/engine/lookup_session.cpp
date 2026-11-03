@@ -82,7 +82,7 @@ public:
         Confident out;
         if (cap) {
             for (std::uint32_t i = 0; i < cap; ++i) out.tokens[i] = m.next[i];
-            out.window = out.drafted = cap;
+            out.window = out.drafted = cap; out.rule = false;
             kind_ = Kind::lookup; window_ = cap;
             ++lookup_cycles_; lookup_proposed_ += cap;
         } else if (inner_) {

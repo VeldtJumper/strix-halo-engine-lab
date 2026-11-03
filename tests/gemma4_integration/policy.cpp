@@ -206,7 +206,7 @@ void multi_stream() {
 // Drafter-confidence window config (STRIX_G4_MTP_CONF*): default ON per drafter, OFF switch, bounds, resolution
 // precedence (env > drafter config > drafter builtin > builtin_tau), and the chunked window rule.
 void confidence() {
-    const char* names[] = {"STRIX_G4_MTP_CONF","STRIX_G4_MTP_CONF_K","STRIX_G4_MTP_CONF_FIRST","STRIX_G4_MTP_CONF_STEP","STRIX_G4_MTP_CONF_MIN1"};
+    const char* names[] = {"STRIX_G4_MTP_CONF","STRIX_G4_MTP_CONF_K","STRIX_G4_MTP_CONF_FIRST","STRIX_G4_MTP_CONF_STEP","STRIX_G4_MTP_CONF_MIN1","STRIX_G4_MTP_CONF_LONG"};
     for (const auto* n : names) set_env(n,nullptr);
     const auto rejected = [] { try { (void)e::ConfidenceConfig::from_environment(); } catch (const std::invalid_argument&) { return true; } return false; };
     const auto dflt = e::ConfidenceConfig::from_environment();
@@ -252,6 +252,48 @@ void confidence() {
     set_env("STRIX_G4_MTP_CONF","x"); CHECK(rejected());
     set_env("STRIX_G4_MTP_CONF","1"); CHECK(e::ConfidenceConfig::from_environment().tau == 1);
     for (const auto* n : names) set_env(n,nullptr);
+    {   // Long-context rule switch (STRIX_G4_MTP_CONF_LONG): unset / empty / auto = 0.04; 0 / 0.0 / off = OFF; other
+        // values must be numbers in [0,1]; ignored while the window itself is off; kept through per-drafter resolution.
+        const auto ratio = [] { return e::ConfidenceConfig::from_environment().long_ratio; };
+        CHECK(ratio() == 0.04);
+        for (const char* v : {"","auto"}) { set_env("STRIX_G4_MTP_CONF_LONG",v); CHECK(ratio() == 0.04); }
+        for (const char* v : {"0","0.0","off"}) { set_env("STRIX_G4_MTP_CONF_LONG",v); CHECK(ratio() == 0); }
+        set_env("STRIX_G4_MTP_CONF_LONG","0.1"); CHECK(ratio() == 0.1);
+        CHECK(std::fabs(e::ConfidenceConfig::from_environment().json().find("long_ratio")->as_double() - 0.1) < 1e-12);
+        for (const char* v : {"1.5","-0.1","x"}) { set_env("STRIX_G4_MTP_CONF_LONG",v); CHECK(rejected()); }
+        set_env("STRIX_G4_MTP_CONF","0"); CHECK(!e::ConfidenceConfig::from_environment().enabled()); // not parsed
+        set_env("STRIX_G4_MTP_CONF",nullptr);
+        for (const char* v : {"0","0.2"}) {
+            set_env("STRIX_G4_MTP_CONF_LONG",v);
+            const auto env = e::ConfidenceConfig::from_environment();
+            CHECK(env.per_drafter && env.resolved(0.3,5,1,0.6).long_ratio == env.long_ratio &&
+                  env.resolved(0,0,0,0.4).long_ratio == env.long_ratio);
+        }
+        set_env("STRIX_G4_MTP_CONF_LONG",nullptr);
+        // long_context(): one depth first, extend while P >= 0.6, verify P >= 0.15; the base config is not changed.
+        e::ConfidenceConfig b; b.tau = 0.4;
+        const auto l = b.long_context();
+        CHECK(l.first == 1 && l.step == 1 && l.tau == 0.6 && l.verify_tau == 0.15 && b.verify_tau == 0 && b.first == 2);
+        const std::vector<float> q{0.9F,0.8F,0.5F,0.5F}; // P = 0.9, 0.72, 0.36, 0.18
+        const auto qs = [&](std::uint32_t n) { return std::span<const float>(q.data(),n); };
+        CHECK(l.next_depth({},7) == 1 && l.next_depth(qs(1),7) == 2 && l.next_depth(qs(2),7) == 3 && l.next_depth(qs(3),7) == 3);
+        CHECK(l.window(qs(4)) == 4 && b.window(qs(4)) == 2); // verify at 0.15 vs tau 0.4
+        const std::vector<float> lo{0.1F};
+        CHECK(l.window(lo) == 1); // at least one verified depth
+    }
+    {   // Measured cost ratio: none before four observations (n >= 3 at decay 0.95), crossing up and down, k == 0 rows.
+        e::DraftCostRatio m;
+        e::ConfidenceConfig c; // long_ratio 0.04
+        const double r3 = 10.0 * (1 + 5.74 / 17.89); // a 4-row verify whose one-row estimate is 10 ms
+        for (int i = 0; i < 3; ++i) { m.observe(2.0,2,r3,3); CHECK(m.ratio() == 0 && !m.long_rule(c)); }
+        m.observe(1.0,1,10.0,0);                     // k == 0: the verify is the one-row pass
+        CHECK(std::fabs(m.ratio() - 0.1) < 1e-12 && m.long_rule(c));
+        for (int i = 0; i < 80; ++i) m.observe(0.1,1,10.0,0); // cheap drafting: the ratio decays toward 0.01
+        CHECK(m.ratio() < 0.04 && !m.long_rule(c));
+        for (int i = 0; i < 80; ++i) m.observe(3.0,1,10.0,0); // dear drafting again: back on
+        CHECK(m.long_rule(c));
+        c.long_ratio = 0; CHECK(!m.long_rule(c));     // the OFF switch
+    }
     // Rule: tau 0.5, first 2, step 1. P = 0.9, 0.72, 0.504, 0.252 -> extend while P(last) >= 0.5, window = 3.
     e::ConfidenceConfig c; c.tau = 0.5;
     const std::vector<float> p{0.9F,0.8F,0.7F,0.5F,0.9F,0.9F,0.9F};

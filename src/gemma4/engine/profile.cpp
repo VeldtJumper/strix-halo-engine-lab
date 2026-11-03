@@ -32,6 +32,12 @@ constexpr Lever table[] = {
      .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = engine, .off = "0",
      .source = "gemma4/e4b-mtp2: confidence-gated C1 MTP window, ids == OFF; gate EN untuned 85.6 -> 97.6 tok/s"},
+    // Cost-aware long-context window: when the stream's measured draft cost per depth is >= 0.04 x its measured one-row
+    // pass (long contexts), start at one depth, extend while P >= 0.6, verify P >= 0.15. Exact. 0 = off.
+    {.name = "draft_window_long", .env = "STRIX_G4_MTP_CONF_LONG", .value = {"auto", "auto", "auto"}, .builtin = "auto",
+     .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
+     .kind = Kind::exact, .apps = engine, .off = "0",
+     .source = "cost-aware long-context MTP window (measured draft cost per depth vs one-row pass), ids == OFF"},
     // Prompt lookup (n-gram) drafting, exact: auto = per-request selector beside the MTP drafter (drafts only on a strong
     // match, backs off on misses; measured equal to the drafter alone) and lookup drafting when no drafter is loaded
     // (agent prompts 48.2 -> 114.9, 49.3 -> 122.9 tok/s); 0 = off.

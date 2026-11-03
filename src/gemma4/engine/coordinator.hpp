@@ -119,6 +119,7 @@ public:
     struct Confident {
         std::array<std::uint32_t, 7> tokens{};
         std::uint32_t window = 0, drafted = 0;
+        bool rule = true; // false: the window did not come from the confidence rule (prompt-lookup proposal)
     };
     [[nodiscard]] virtual bool confidence_capable() const { return false; }
     // The window configuration this session runs with: an env-explicit config as is, a per-drafter (default ON) one
@@ -208,6 +209,9 @@ struct Result {
     std::uint64_t prefill_frontier = 0; // rows [0, prefill_frontier) were all written by prefill_rows
     // Drafter-confidence-gated C1 cycles (STRIX_G4_MTP_CONF): cycles, depths drafted, drafted depths not verified.
     std::uint64_t confidence_cycles = 0, confidence_drafted = 0, confidence_unverified = 0;
+    // Cycles that ran the cost-aware long-context rule, and the stream's last measured draft-ms-per-depth / one-row ratio.
+    std::uint64_t confidence_long_cycles = 0;
+    double confidence_draft_ratio = 0;
     // Prompt prefill chunks per engaged prefill lever (receipt "prefill_levers", only when any ran).
     std::map<std::string, std::uint64_t> prefill_levers;
     // PINNED_TAPS: how the last prompt chunk delivered target taps ("skipped (no consumer)" or "pinned-async").
