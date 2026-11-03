@@ -77,7 +77,7 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)"},
         // =7 restores the previous large-call core (X2), =3 v3 for every call; the baseline restores v1.
         {"pf-exact-moe-auto", "STRIX_GLM_PF_EXACTMOE_V", "auto", "1", true, true,
-         "Measurement: exact MoE auto (v11 through the X3 core with row-bucketed tiles for calls >= 128 rows, v3 with row buckets below), outputs bitwise; 8K TTFT -19.5 % and 1K -15 % vs the X2 core"},
+         "Measurement: exact MoE auto (v14 through the X3 core with row-bucketed tiles and folded remainders for calls >= 128 rows, v3 with row buckets below), outputs bitwise; 8K TTFT -19.5 % and 1K -15 % vs the X2 core; MoE call -3..-6 % vs v11"},
         {"pf-exact-moe-plan", "STRIX_GLM_PF_EXACTMOE_PLAN", "device", "host", false, true,
          "Measurement: exact MoE device plan (pairs/tiles/groups built on the GPU, byte-equal to the host plan; no route download or host sync per MoE call)"},
         {"pf-exact-x", "STRIX_GLM_PF_EXACT_X", "auto", "0", true, true,
