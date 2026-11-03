@@ -91,6 +91,17 @@ struct ConfidenceConfig {
     std::uint32_t first = 2;       // STRIX_G4_MTP_CONF_FIRST (1..7): depths drafted before the first check
     std::uint32_t step = 1;        // STRIX_G4_MTP_CONF_STEP (1..7): depths drafted per extension
     double min1 = 0;               // STRIX_G4_MTP_CONF_MIN1 [0..1]: depth-1 probability below this verifies no draft
+    double verify_tau = 0;         // > 0: verify the leading depths with P_d >= verify_tau instead of tau
+    // Cost-aware long-context rule (STRIX_G4_MTP_CONF_LONG, default 0.04; 0/off = OFF switch): when this stream's
+    // MEASURED draft cost per depth is at least long_ratio x its measured one-row pass, drafting depths is expensive
+    // relative to verifying them, so the window starts at one depth, extends while P >= long_extend and verifies the
+    // drafted prefix with P >= long_verify (at least one). Below the ratio the rule above is unchanged.
+    double long_ratio = 0.04, long_extend = 0.6, long_verify = 0.15;
+    [[nodiscard]] ConfidenceConfig long_context() const {
+        auto c = *this;
+        c.first = 1; c.step = 1; c.tau = long_extend; c.verify_tau = long_verify;
+        return c;
+    }
     Source source = Source::off;   // where tau came from (receipts)
     bool per_drafter = false;      // env unset: resolved() takes the drafter's values
     bool max_k_env = false, first_env = false;
@@ -125,9 +136,10 @@ struct ConfidenceConfig {
         if (prob.empty() || double(prob[0]) < min1) return 0;
         std::uint32_t k = 0;
         double cumulative = 1;
+        const double threshold = verify_tau > 0 ? verify_tau : tau;
         for (const auto p : prob) {
             cumulative *= double(p);
-            if (!(cumulative >= tau)) break;
+            if (!(cumulative >= threshold)) break;
             ++k;
         }
         return k ? k : 1;
@@ -135,6 +147,21 @@ struct ConfidenceConfig {
     [[nodiscard]] static ConfidenceConfig from_environment();
     [[nodiscard]] static const char* source_name(Source source);
     [[nodiscard]] strix::serve::Json json() const;
+};
+// Measured draft-vs-pass cost of one stream's confidence cycles (decayed), the input of the long-context rule. The
+// one-row pass is estimated from each cycle's (k+1)-row verify time with the release-bench row-cost shape. The ratio
+// needs n >= 3, i.e. four observed cycles at decay 0.95.
+struct DraftCostRatio {
+    static constexpr double decay = 0.95;
+    double draft_ms = 0, depths = 0, row_ms = 0, n = 0;
+    void observe(double cycle_draft_ms, std::uint32_t drafted, double verify_ms, std::uint32_t k) {
+        static constexpr std::array<double,8> rows{0.0,1.08,3.41,5.74,8.24,10.74,13.24,15.74};
+        draft_ms = draft_ms*decay+cycle_draft_ms; depths = depths*decay+drafted;
+        row_ms = row_ms*decay+verify_ms/(1+rows[k < 7 ? k : 7]/17.89);
+        n = n*decay+1;
+    }
+    [[nodiscard]] double ratio() const { return n >= 3 && depths > 0 && row_ms > 0 ? (draft_ms/depths)/(row_ms/n) : 0; }
+    [[nodiscard]] bool long_rule(const ConfidenceConfig& c) const { return c.long_ratio > 0 && ratio() >= c.long_ratio; }
 };
 // One live decode stream as seen by the batch planner, in slot order.
 struct StreamCandidate {

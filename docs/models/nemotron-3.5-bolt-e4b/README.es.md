@@ -107,6 +107,14 @@ probabilidad acumulada, con umbral guardado por drafter), lo que subió C1 con d
 92.9 / 100.6 / 83.8 tok/s (`default` / `fast` / `quality`, medido cuando se incorporó); `STRIX_G4_MTP_CONF=0` restaura
 la política de ventana anterior.
 
+En contextos largos cada profundidad propuesta cuesta más en relación con una pasada del modelo, así que la ventana sigue
+los costes medidos del propio flujo: cuando una profundidad de draft cuesta al menos 0.04 de una pasada de una fila, propone
+una profundidad cada vez, sigue mientras la probabilidad acumulada es >= 0.6 y verifica el prefijo con >= 0.15. Decode con
+16K / 32K tokens (`default`, 512 tokens, media de dos ejecuciones por brazo): +0.3 / +1.6 % código, +0.8 / +1.2 % inglés,
++3.1 / +2.4 % español, +0.6 / +3.5 % japonés, mismos ids de tokens; código y japonés con 16K quedan dentro de la
+variación entre ejecuciones; `STRIX_G4_MTP_CONF_LONG=0` mantiene la ventana de contexto corto en
+cualquier longitud.
+
 Las pasadas de decode devuelven el token greedy calculado en el dispositivo para cada fila y copian logits y taps de
 estado oculto al host solo cuando una petición o el drafter los lee: +1.9 / +4.6 / +5.9 % en C1 / C4 / C8 sin drafter y
 +3.3 / +8.3 / +9.3 % con el drafter MTP (`default`, prompts cortos, mismos bytes); `STRIX_G4_DECODE_EXPORT=0` restaura

@@ -114,12 +114,17 @@ struct ScriptedMtp final : mt::Drafter {
 };
 struct ConfidentRecord {
     std::array<float, 7> prob{};
-    std::uint32_t kmax = 0, window = 0, drafted = 0;
+    std::uint32_t kmax = 0, window = 0, drafted = 0, first = 0;
+    double tau = 0, verify_tau = 0;
+    bool rule = true;
 };
 // Forwards to an mtp::Session and records each confident proposal with the drafter's probabilities.
 struct Recording final : en::DraftSession {
     std::unique_ptr<mt::Session> inner;
     std::vector<ConfidentRecord>* records;
+    // > 0: every lookup_every-th proposal is reported as not chosen by the confidence rule (as a prompt-lookup
+    // proposal is), so it must not feed the measured cost ratio nor count as a long-context cycle.
+    std::uint32_t lookup_every = 0, calls = 0;
     Recording(std::unique_ptr<mt::Session> s, std::vector<ConfidentRecord>* r) : inner(std::move(s)), records(r) {}
     std::array<std::uint32_t, 7> propose(std::uint32_t a, std::uint64_t p) override { return inner->propose(a, p); }
     std::array<std::uint32_t, 7> propose_window(std::uint32_t a, std::uint64_t p, std::uint32_t k) override {
@@ -136,9 +141,12 @@ struct Recording final : en::DraftSession {
     bool multi_stream_candidate() const override { return inner->multi_stream_candidate(); }
     bool confidence_capable() const override { return inner->confidence_capable(); }
     Confident propose_confident(std::uint32_t a, std::uint64_t p, std::uint32_t kmax, const en::ConfidenceConfig& c) override {
-        const auto out = inner->propose_confident(a, p, kmax, c);
+        auto out = inner->propose_confident(a, p, kmax, c);
+        if (lookup_every && ++calls % lookup_every == 0) out.rule = false;
         ConfidentRecord r;
+        r.rule = out.rule;
         r.kmax = kmax; r.window = out.window; r.drafted = out.drafted;
+        r.first = c.first; r.tau = c.tau; r.verify_tau = c.verify_tau;
         for (std::uint32_t i = 0; i < out.drafted; ++i) r.prob[i] = inner->last_draft().prob[i];
         records->push_back(r);
         return out;
@@ -263,6 +271,7 @@ int main() {
         // recorded probabilities), drafting starts with the first chunk and extends one depth at a time.
         // Unset = DEFAULT ON per drafter (scripted weights: no config key, unknown hash -> builtin tau 0.6, max_k 7).
         // OFF ("0"/"off"): the confident hook is never called, no confidence counters/receipt fields; ids == OFF.
+        set_env("STRIX_G4_MTP_CONF_LONG", "0"); // the long-context rule is checked separately below
         for (const char* tau : {"0.5", static_cast<const char*>(nullptr), "off", "0"}) {
             set_env("STRIX_G4_MTP_CONF", tau);
             std::vector<ConfidentRecord> records;
@@ -349,6 +358,89 @@ int main() {
                         tau ? tau : "unset (builtin 0.6)", (unsigned long long)cycles, (unsigned long long)windows[1], (unsigned long long)windows[2],
                         (unsigned long long)windows[3], (unsigned long long)windows[4], (unsigned long long)windows[5],
                         (unsigned long long)drafted, (unsigned long long)unverified, (unsigned long long)extends);
+        }
+        // Cost-aware long-context rule (STRIX_G4_MTP_CONF_LONG): with a threshold of ~0 the rule starts once the
+        // measured ratio exists (four rule-chosen cycles at decay 0.95) and stays on: first chunk 1, extend while
+        // P >= 0.6, verify P >= 0.15 (>= 1); ids == OFF; the receipt counts the long cycles. Pass 2 reports every third
+        // proposal as not chosen by the rule (prompt lookup): those neither feed the ratio nor count as long cycles.
+        for (const std::uint32_t lookup_every : {0U, 3U}) {
+            set_env("STRIX_G4_MTP_CONF", nullptr);
+            set_env("STRIX_G4_MTP_CONF_LONG", "0.000000001");
+            std::vector<ConfidentRecord> records;
+            std::uint64_t long_cycles = 0;
+            for (std::size_t i = 0; i < prompts.size(); ++i) {
+                Backend b9;
+                const auto first_record = records.size();
+                en::DraftFactory f = [&b9, &records, lookup_every]() -> std::unique_ptr<en::DraftSession> {
+                    auto recording = std::make_unique<Recording>(
+                        std::make_unique<mt::Session>(std::make_unique<ScriptedMtp>(b9.target, b9.last->s, nullptr),
+                                                      std::pair<std::uint32_t, std::uint32_t>{22, 23}), &records);
+                    recording->lookup_every = lookup_every;
+                    return recording;
+                };
+                en::Coordinator coordinator(b9, f);
+                en::Request req;
+                req.prompt = prompts[i]; req.max_tokens = 150; req.dflash = en::DraftMode::automatic;
+                const auto slot = coordinator.submit(req);
+                coordinator.run();
+                const auto& res = coordinator.result(slot);
+                EAGLE_CHECK(res.ids == off[i], "long-context rule prompt %zu ids differ from OFF", i);
+                long_cycles += res.confidence_long_cycles;
+                const auto receipt = coordinator.receipt(slot);
+                const auto* acc = receipt.find("acceptance");
+                EAGLE_CHECK(acc && acc->find("confidence_long_cycles") && acc->find("confidence_draft_ratio") &&
+                            receipt.find("mtp_confidence_resolved")->find("long_ratio"), "long-context receipt fields");
+                // The ratio needs four cycles with a measurable draft time; the scripted host drafter can take less
+                // than one timer tick, so a request may finish without one (then it ran no long cycle).
+                EAGLE_CHECK(std::uint64_t(acc->find("confidence_long_cycles")->as_int()) == res.confidence_long_cycles &&
+                            acc->find("confidence_draft_ratio")->as_double() == res.confidence_draft_ratio,
+                            "prompt %zu receipt long cycles %lld / ratio %.17g, result %llu / %.17g", i,
+                            (long long)acc->find("confidence_long_cycles")->as_int(),
+                            acc->find("confidence_draft_ratio")->as_double(),
+                            (unsigned long long)res.confidence_long_cycles, res.confidence_draft_ratio);
+                EAGLE_CHECK(res.confidence_long_cycles == 0 || res.confidence_draft_ratio > 0,
+                            "prompt %zu: %llu long cycles without a measured ratio", i,
+                            (unsigned long long)res.confidence_long_cycles);
+                // Per request: rule-chosen cycles 1..4 run the shipped rule (no ratio yet); once the long rule starts it
+                // stays on (threshold ~0); not-rule cycles never count and never advance the warm-up.
+                std::uint64_t rule_cycles = 0, request_long = 0;
+                bool started = false;
+                for (std::size_t record_index = first_record; record_index < records.size(); ++record_index) {
+                    const auto& rec = records[record_index];
+                    const bool is_long = rec.first == 1;
+                    if (rec.rule) {
+                        EAGLE_CHECK(!is_long || rule_cycles >= 4, "long rule before four measured cycles (prompt %zu)", i);
+                        EAGLE_CHECK(!started || is_long, "long rule left at threshold ~0 (prompt %zu)", i);
+                        request_long += is_long ? 1 : 0;
+                        ++rule_cycles;
+                    }
+                    started = started || is_long;
+                }
+                EAGLE_CHECK(request_long == res.confidence_long_cycles, "prompt %zu long cycles %llu, recorded %llu", i,
+                            (unsigned long long)res.confidence_long_cycles, (unsigned long long)request_long);
+            }
+            std::uint64_t long_records = 0;
+            for (const auto& rec : records) {
+                const bool is_long = rec.first == 1;
+                long_records += is_long && rec.rule ? 1 : 0;
+                const double ext = is_long ? 0.6 : 0.6, ver = is_long ? 0.15 : 0.6; // builtin tau 0.6 (scripted drafter)
+                EAGLE_CHECK(is_long ? (rec.tau == 0.6 && rec.verify_tau == 0.15) : (rec.first == 2 && rec.verify_tau == 0),
+                            "rule parameters");
+                if (!rec.drafted) continue;
+                const auto cum = [&](std::uint32_t n) { double p = 1; for (std::uint32_t j = 0; j < n; ++j) p *= double(rec.prob[j]); return p; };
+                std::uint32_t d = std::min(rec.first, rec.kmax), wnd = 0;
+                while (d < rec.kmax && cum(d) >= ext) ++d;
+                while (wnd < d && cum(wnd + 1) >= ver) ++wnd;
+                wnd = std::max(wnd, 1U);
+                EAGLE_CHECK(rec.drafted == d && rec.window == wnd, "%s rule: drafted %u (want %u) window %u (want %u)",
+                            is_long ? "long" : "shipped", rec.drafted, d, rec.window, wnd);
+            }
+            EAGLE_CHECK(long_records > 0 && long_records == long_cycles, "long cycles %llu records %llu",
+                        (unsigned long long)long_cycles, (unsigned long long)long_records);
+            std::printf("coordinator: STRIX_G4_MTP_CONF_LONG~0%s: ids == OFF, %llu of %zu cycles on the long-context rule (first 1, extend 0.6, verify 0.15)\n",
+                        lookup_every ? " (every 3rd proposal not rule-chosen)" : "", (unsigned long long)long_cycles, records.size());
+            set_env("STRIX_G4_MTP_CONF_LONG", nullptr);
+            set_env("STRIX_G4_MTP_CONF", "0");
         }
         {   // Enabled, but DraftMode::on and non-capable (eagle) sessions keep their paths.
             set_env("STRIX_G4_MTP_CONF", "0.5");

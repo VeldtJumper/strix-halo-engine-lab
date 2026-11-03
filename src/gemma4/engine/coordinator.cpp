@@ -211,6 +211,9 @@ struct Coordinator::Slot {
     std::array<std::uint64_t,8> admitted{};
     double minimum_gain = 0;
     ConfidenceConfig confidence; // resolved per session (env, drafter config or builtin); disabled when not capable
+    // Measured confidence-window costs of this stream (decayed): drafting ms, drafted depths, one-row pass ms.
+    // Only cycles whose window the confidence rule chose feed it (not prompt-lookup proposals).
+    DraftCostRatio conf_cost;
     std::vector<float> last_hidden; // final hidden row of the last committed position (drafters that read it)
 };
 Coordinator::Coordinator(Backend& backend, DraftFactory drafts, std::shared_ptr<CostModel> costs)
@@ -306,7 +309,8 @@ bool Coordinator::step() {
         bool prefill = false;
         std::uint32_t k = 0;
         WindowDecision decision;
-        bool confident = false;
+        bool confident = false, confidence_rule = false; // confidence_rule: the session's rule chose the window
+        std::uint32_t drafted = 0;
         dflash::Acceptance delta;
         double draft_ms = 0, context_ms = 0;
         std::array<std::uint32_t,7> proposals{};
@@ -465,8 +469,14 @@ bool Coordinator::step() {
                         if (w.confident) {
                             // Exactness: the window only selects how many drafted tokens are verified; the greedy
                             // verdict decides every emitted token. No probes, no plain refresh on this path.
-                            const auto c = s.draft->propose_confident(anchor,position,k,s.confidence);
+                            // Cost-aware long-context rule: this stream's measured draft cost per depth against its
+                            // measured one-row pass (both from its own confidence cycles); the rule above otherwise.
+                            const bool long_rule = s.conf_cost.long_rule(s.confidence);
+                            const auto c = s.draft->propose_confident(anchor,position,k,
+                                long_rule ? s.confidence.long_context() : s.confidence);
                             require(c.window <= c.drafted && c.drafted <= k, "invalid confidence window");
+                            w.drafted = c.drafted; w.confidence_rule = c.rule;
+                            s.out.confidence_long_cycles += long_rule && c.rule ? 1 : 0;
                             w.k = c.window; w.rows = w.k+1;
                             for (std::uint32_t d = 0; d < w.k; ++d) w.proposals[d] = c.tokens[d];
                             w.decision = {w.k,false,w.k ? s.policy.expected_tokens(position,w.k) : 1,0,0};
@@ -594,6 +604,10 @@ bool Coordinator::step() {
             const auto& w = work[0]; auto& s = *slots_[w.slot];
             costs_->observe(1,w.k,ms,std::size_t(s.out.frontier-plans[w.start].position),plans[w.start].position,s.workload);
             if (s.draft) s.policy.observe(plans[w.start].position,w.k,ms,w.draft_ms,verify_ms,w.context_ms,w.delta,w.k && w.decision.probe);
+            if (w.confident && w.confidence_rule && w.drafted && w.draft_ms > 0) {
+                s.conf_cost.observe(w.draft_ms,w.drafted,verify_ms,w.k);
+                s.out.confidence_draft_ratio = s.conf_cost.ratio();
+            }
         }
         // Multi-stream: complete all-decode C>1 steps are whole-batch evidence; drafted streams add acceptance/draft cost.
         if (batch && work.size() == live) {
@@ -645,6 +659,8 @@ Json Coordinator::receipt(std::size_t slot) const {
     if (s.confidence.enabled()) {
         acceptance.set("confidence_cycles",r.confidence_cycles); acceptance.set("confidence_drafted",r.confidence_drafted);
         acceptance.set("confidence_unverified",r.confidence_unverified);
+        acceptance.set("confidence_long_cycles",r.confidence_long_cycles);
+        acceptance.set("confidence_draft_ratio",r.confidence_draft_ratio);
         j.set("mtp_confidence_resolved",s.confidence.json()); // tau + source (env, drafter-config or builtin)
     }
     j.set("minimum_admitted_gain_estimate",s.minimum_gain);
