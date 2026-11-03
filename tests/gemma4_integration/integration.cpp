@@ -4,6 +4,8 @@
 #include "../gemma4_dflash/fixture.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <numeric>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -309,6 +311,34 @@ void host_tests(bool off) {
     const float uniform[] = {1,1,1,1}; const unsigned known[] = {3,1,0,3,0,1,0,3};
     e::Sampling policy; policy.temperature = 1;
     for (const auto expected : known) CHECK(e::select_token(uniform,policy,draws) == expected);
+    // candidate_order == the comparator sort it replaced (descending logit, low id on ties, -0 == +0), full and top-k.
+    {
+        std::uint64_t z = 7;
+        const auto next = [&] { z = z*6364136223846793005ULL+1442695040888963407ULL; return std::uint32_t(z >> 33U); };
+        for (const std::size_t n : {std::size_t(1),std::size_t(3),std::size_t(1000),std::size_t(65537),std::size_t(262144)}) {
+            std::vector<float> l(n);
+            for (auto& x : l) {
+                const auto kind = next() % 8;
+                x = kind == 0 ? 0.0F : kind == 1 ? -0.0F : kind == 2 ? float(int(next() % 5)) - 2.0F : // heavy ties
+                    (float(next()) / 4294967296.0F - 0.5F) * 60.0F;
+            }
+            std::vector<std::uint32_t> comparator(n);
+            std::iota(comparator.begin(),comparator.end(),0U);
+            const auto t0 = std::chrono::steady_clock::now();
+            std::sort(comparator.begin(),comparator.end(),[&](auto a, auto b) { return g4::better(l[a],a,l[b],b); });
+            const auto t1 = std::chrono::steady_clock::now();
+            CHECK(e::candidate_order(l) == comparator);
+            const auto t2 = std::chrono::steady_clock::now();
+            for (const std::uint32_t k : {1U,40U,1000U}) {
+                const auto top = e::candidate_order(l,k);
+                CHECK(top.size() == std::min<std::size_t>(k,n) && std::equal(top.begin(),top.end(),comparator.begin()));
+            }
+            if (n == 262144)
+                std::cout << "candidate order over 262144 ids: comparator sort "
+                          << std::chrono::duration<double,std::milli>(t1-t0).count() << " ms, keyed radix "
+                          << std::chrono::duration<double,std::milli>(t2-t1).count() << " ms\n";
+        }
+    }
     e::Coordinator failed(backend); const auto failure_slot = failed.submit(r);
     const auto before_failure = failed.result(failure_slot).digest;
     backend.fail = true; CHECK(failed.step()); backend.fail = false;

@@ -166,6 +166,9 @@ struct Sampling {
 // per sampled token. Descending capped logit, low-ID ties; top-k then top-p;
 // declared FP32 exp weights, FP64 ordered CDF. Greedy consumes no random draws.
 std::uint32_t select_token(std::span<const float> logits, const Sampling& sampling, std::uint64_t& draws);
+// Ids in select_token's candidate order (descending capped logit, low-ID ties; the first top_k when set), via
+// distinct integer keys instead of a comparator sort over the whole vocabulary.
+std::vector<std::uint32_t> candidate_order(std::span<const float> logits, std::uint32_t top_k = 0);
 
 struct Request {
     std::vector<std::uint32_t> prompt, stop_ids{1, 106};
