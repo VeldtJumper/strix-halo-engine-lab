@@ -119,6 +119,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Engine: speculative decoding
 
 - [Decode defaults (D-055)](engine/speculative/decode-defaults.md): MTP draft profiles, min-p and window switches chosen from final campaign.
+- [Persisted MTP window-cost tables](engine/speculative/mtp-cost-tables.md): Window-cost tables that give the Qwen min-p MTP controller a bootstrap prior across processes (key, OFF).
 - [Depth-aware MTP policy (draft)](engine/speculative/mtp-depth-controller.md): Draft depth-aware MTP controller (STRIX_MTP_CONTROLLER=depth) using measured costs and acceptance.
 - [Independent MTP forward golden file](engine/speculative/mtp-forward-golden-file.md): Binary format and reader for independent MTP forward golden reference files.
 - [Native MTP fixture runner](engine/speculative/mtp-model-qualification.md): Native MTP fixture runner and target-input export for independent reference producers.

@@ -1,4 +1,6 @@
 #pragma once
+#include <memory>
+#include <string>
 #include "strix/hip_mtp_target_hidden.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
 #include "strix/hip_mtp_target_window.hpp"
@@ -15,6 +17,10 @@ struct HipMtpWindowVerificationPolicy {
     // Owner choice and draft continuation from draft probabilities only (no measured
     // cycle times), so a sampled run is reproducible from its seed.
     bool timing_independent_schedule=false;
+    // With STRIX_COST_TABLE_DIR set: the resolved configuration (route, slots, numerical identities) that keys the
+    // min-p controller's persisted cost tables (mtp_cost_table_session.hpp); read at the first decode cycle, empty or
+    // null = no table. Controller input only.
+    std::shared_ptr<const std::string> cost_table_configuration;
 };
 struct HipMtpVerifiedTargetRows {
     std::vector<HipMtpTargetHiddenTicket> committed_rows;
@@ -100,6 +106,9 @@ public:
     [[nodiscard]] std::vector<MtpDepthWindowController::CostStats> draft_depth_stats() const;
     // Min-p controller cost model: robust estimates with re-probes (default) or the legacy EMA.
     [[nodiscard]] bool robust_cost_model() const noexcept;
+    // Start of a decode cycle, before its first draft decision (worth_drafting): resolves the persisted cost prior
+    // of this session (sampled or greedy, context bucket). No effect without STRIX_COST_TABLE_DIR.
+    void prepare_cycle(const SerialSessionContext& session);
     // The current cycle's draft chain (steps, host wall ms), recorded before verify for the cost split.
     void note_draft(std::uint32_t steps,double ms) noexcept;
     [[nodiscard]] std::vector<HipMtpWindowOptionStats> option_stats() const;

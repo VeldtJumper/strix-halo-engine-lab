@@ -442,6 +442,9 @@ struct Options {
     bool session_live_control = false, session_validate_only = false, session_options_requested = false;
     std::uint64_t session_first_generate = 0, session_capture_host_bytes = 8ULL << 30;
     std::string session_effective_cli;
+    // session_effective_cli without per-run outputs, prompts and HTTP front-end settings: the policy part of the
+    // persisted window-cost table key (STRIX_COST_TABLE_DIR).
+    std::string cost_table_cli;
     std::string session_dir;
     bool session_management_requested = false;
     bool session_cache = true, session_disk = true;

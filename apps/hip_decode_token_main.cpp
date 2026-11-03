@@ -1,4 +1,5 @@
 #include "strix/startup_markers.hpp"
+#include "strix/mtp_cost_table_session.hpp"
 #include "http_slot_capacity.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "qwen_prefill_plan.hpp"
@@ -1287,6 +1288,11 @@ static int run_decode_entry(
         "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
         "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file",
         "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable"};
+    // Not part of the window-cost table key: prompts, per-run outputs and HTTP front-end settings.
+    const std::set<std::string_view> cost_table_skip{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
+        "--state-out", "--logprob-token", "--chat-logits", "--http-api-key-file", "--http-bind", "--http-model-id",
+        "--http-max-connections", "--http-max-queue", "--http-sse-keepalive", "--http-sse-progress-interval",
+        "--http-stream-receipts"};
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (!arg.starts_with("--")) continue; // positional token IDs
@@ -1298,9 +1304,12 @@ static int run_decode_entry(
         if (arg == "--session-live-control" || arg == "--session-validate-only") continue;
         if (session_io_options.count(arg)) { ++i; continue; }
         options.session_effective_cli += std::to_string(arg.size()) + ":" + std::string(arg);
+        const bool cost_key = !cost_table_skip.count(arg.substr(0, arg.find('=')));
+        if (cost_key) options.cost_table_cli += std::to_string(arg.size()) + ":" + std::string(arg);
         if (i + 1 < argc && !std::string_view(argv[i + 1]).starts_with("--")) {
             const std::string_view value = argv[++i];
             options.session_effective_cli += std::to_string(value.size()) + ":" + std::string(value);
+            if (cost_key) options.cost_table_cli += std::to_string(value.size()) + ":" + std::string(value);
         }
     }
     bool session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control;
@@ -3786,6 +3795,8 @@ static int run_decode_entry(
               }
               return pool_reservation;
         };
+        // Key of the persisted window-cost tables: filled after the HTTP slot capacity is final.
+        const auto cost_table_config = std::make_shared<std::string>();
         const auto window_factory_for = [&](std::shared_ptr<strix::decode_cli::MtpDecodeTargetParents> request_parents,
             std::shared_ptr<const SharedWindowStream> window_stream) -> strix::decode_cli::MtpDecodeWindowFactory {
             if (!options.mtp.window_rows || (options.session_mtp_fixed && !options.http_serve)) return {};
@@ -3842,6 +3853,9 @@ static int run_decode_entry(
                 policy.min_probability = strix::decode_cli::mtp_draft_min_probability(options.mtp);
                 policy.timing_independent_schedule =
                     strix::decode_cli::mtp_sampling(options.mtp) && !options.mtp.sample_timing_schedule;
+                // Persisted window costs (off unless STRIX_COST_TABLE_DIR is set; the verifier checks it): the
+                // configuration is filled once the route and HTTP capacity are resolved (below).
+                policy.cost_table_configuration = cost_table_config;
                 auto verifier = std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(owners),
                     request_parents->resources, request_parents, policy, generations);
                 request_parents->window_setup = {union_steps, union_total, union_generation, retained_total};
@@ -4163,6 +4177,26 @@ static int run_decode_entry(
             eager_slots = strix::decode_cli::http_eager_slots(static_cast<std::uint32_t>(batch_slots), count);
             // The measurement probe is retained only if it belongs to the eager part.
             if (eager_slots == 1U) batch_stacks.clear();
+        }
+        {
+            // Resolved route and numerical identities of the persisted window-cost tables (verifiers read it at their
+            // first decode cycle). The automatic slot capacity depends on free memory at startup and is not keyed
+            // (mtp_cost_table_configuration). The device key adds the HIP runtime and driver versions.
+            const auto profiles = strix::decode_cli::numerical_profile_pair(options);
+            strix::MtpCostTableRoute route;
+            route.tiled = tiled_route;
+            route.http = options.http_serve;
+            route.batched = batch_slots != 0U;
+            route.batch_explicit = options.http_batch_explicit;
+            route.batch_cap = options.http_batch_cap;
+            route.cohort = options.mtp.cohort.size();
+            route.kernel_plan = compiled.kernel_plan_identity;
+            route.execution = compiled.execution_identity;
+            route.profiles = strix::numerical_profile_pair_identity(profiles);
+            route.optimization = optimization_profile.selected;
+            route.cli = options.cost_table_cli;
+            route.observed_slots = batch_slots;
+            *cost_table_config = strix::mtp_cost_table_configuration(route);
         }
         using strix::decode_cli::prefill_checked_add;
         using strix::decode_cli::prefill_checked_mul;

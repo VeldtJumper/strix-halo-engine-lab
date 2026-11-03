@@ -227,6 +227,8 @@ std::uint32_t HipMtpGreedyRuntime::draft_begin(const HipMtpTargetHiddenTicket& i
         i.mtp->begin_cycle(pending,initial);
         begin_draft_proposal(i.draft,*i.session);
         host_phase_mark("1 begin cycle");
+        // Persisted window costs: resolved before the first draft decision of the cycle (sampled sessions stay cold).
+        if(i.window) i.window->prepare_cycle(*i.session);
         // STRIX_MTP_DRAFT_WORTH=0: draft until min_probability only, without asking the window cost model.
         static const bool worth=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_WORTH");return !v || v[0]!='0';}();
         // The survival controller owns the chain cut (no min-p stop) and sees runner-up probabilities.
