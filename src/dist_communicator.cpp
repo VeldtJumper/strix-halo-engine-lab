@@ -2912,6 +2912,7 @@ void Communicator::flush_trace() {
 }
 
 void Communicator::exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag) {
+    if (!terminal_.empty()) throw std::runtime_error("dist exchange: the communicator stopped earlier: " + terminal_);
     if (started_ || direct_started_) throw std::logic_error("dist exchange: exchange_host() while an exchange is in flight");
     const std::size_t bytes = local.size();
     if (bytes == 0U || bytes > max_bytes_ || (!remote.empty() && remote.size() != bytes))
@@ -2931,17 +2932,23 @@ void Communicator::exchange_host(std::span<const std::byte> local, std::span<std
     trailer.bytes = bytes; trailer.rank = group_.rank; trailer.tag = tag.kind; trailer.layer = tag.layer;
     trailer.crc32c = crc32c(std::span<const std::byte>(send_host_, bytes));
     std::memcpy(send_host_ + bytes, &trailer, sizeof(trailer));
-    stats_.last_staged = std::chrono::steady_clock::now();
-    transport_->exchange(std::span<const std::byte>(send_host_, bytes + sizeof(Trailer)), std::span<std::byte>(receive_host_, bytes + sizeof(Trailer)));
-    const auto received = std::chrono::steady_clock::now();
-    stats_.last_received = received;
-    Trailer peer;
-    std::memcpy(&peer, receive_host_ + bytes, sizeof(peer));
-    if (peer.magic != trailer_magic || peer.epoch != group_.epoch || peer.plan != group_.plan || peer.sequence != sequence_ ||
-        peer.request != tag.request || peer.bytes != bytes || peer.rank != 1U - group_.rank || peer.tag != tag.kind || peer.layer != tag.layer)
-        throw std::runtime_error("dist exchange: the peer's trailer does not match this collective");
-    if (peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes)))
-        throw std::runtime_error("dist exchange: payload CRC mismatch");
+    // A failed control exchange poisons the communicator (later calls throw "stopped earlier") and wakes the peer.
+    std::chrono::steady_clock::time_point received{};
+    try {
+        stats_.last_staged = std::chrono::steady_clock::now();
+        transport_->exchange(std::span<const std::byte>(send_host_, bytes + sizeof(Trailer)), std::span<std::byte>(receive_host_, bytes + sizeof(Trailer)));
+        received = std::chrono::steady_clock::now();
+        stats_.last_received = received;
+        Trailer peer;
+        std::memcpy(&peer, receive_host_ + bytes, sizeof(peer));
+        if (peer.magic != trailer_magic || peer.epoch != group_.epoch || peer.plan != group_.plan || peer.sequence != sequence_ ||
+            peer.request != tag.request || peer.bytes != bytes || peer.rank != 1U - group_.rank || peer.tag != tag.kind || peer.layer != tag.layer)
+            throw std::runtime_error("dist exchange: the peer's trailer does not match this collective");
+        if (peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes)))
+            throw std::runtime_error("dist exchange: payload CRC mismatch");
+    } catch (const std::exception& e) {
+        stop(std::string("control exchange: ") + e.what());
+    }
     if (!remote.empty()) std::memcpy(remote.data(), receive_host_, bytes);
     ++sequence_;
     ++stats_.exchanges;
