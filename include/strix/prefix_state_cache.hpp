@@ -92,6 +92,7 @@ struct PrefixStateCachePolicy {
     bool legacy = false; // Baseline preserves the original explicit-cache path.
     bool certified_disk = true; // Certificate envelope in existing v1 checkpoint metadata.
     bool durable = true; // Sync files and directory before publishing a checkpoint.
+    bool fair_reclaim_idle_groups = true; // Unreused certified groups with a private-prefix successor; false = old fair.
 };
 
 // Allocators may mark non-resource failures that opportunistic capture must propagate.
@@ -234,7 +235,7 @@ struct PrefixStateCacheStats {
     std::uint64_t lookup_tokens = 0, hit_tokens = 0, restored_tokens = 0;
     std::uint64_t captures = 0, no_store_skips = 0, budget_skips = 0, capture_failures = 0;
     std::uint64_t evictions_space = 0, evictions_conversation_cap = 0, evictions_branch_cap = 0;
-    std::uint64_t evictions_explicit = 0, evictions_invalid = 0;
+    std::uint64_t evictions_explicit = 0, evictions_invalid = 0, evictions_superseded = 0;
     std::uint64_t staging_budget_bytes=0, staging_bytes=0, staging_peak_bytes=0, capture_busy_skips=0, staging_cap_skips=0, row_prefetches=0;
     std::uint64_t capture_skips_cross_stream=0;
     std::array<std::uint64_t,prefix_certificate_decline_names.size()> certificate_declines{};
@@ -359,8 +360,30 @@ private:
     std::shared_ptr<Ledger> ledger_ = std::make_shared<Ledger>();
     mutable std::map<const std::byte*, std::weak_ptr<Receipt>> receipts_;
     void register_buffer_locked(const PrefixCacheBuffer&, bool segment);
+    // Bounded by retained associations; forget reuse when the last member leaves.
+    struct GroupActivity {
+        std::size_t members = 0;
+        bool reused = false;
+        std::uint64_t born_epoch = 0;
+        std::weak_ptr<const PrefixCacheSegment> root;
+        std::string_view key;
+        std::list<GroupActivity*>::iterator prefix_order;
+        std::size_t prefix_lcp = 0;
+        bool private_successor = false;
+    };
+    std::map<std::string, GroupActivity> group_activity_;
+    // Exact first-block order/LCPs are maintained at group insertion/removal.
+    // Weak roots add no payload leases. Ambiguous multi-root groups decline.
+    std::list<GroupActivity*> group_prefix_order_;
+    bool group_prefix_order_valid_ = true;
+    void update_group_root_locked(const std::string&, const std::shared_ptr<const PrefixCacheSegment>&);
+    void mark_private_prefix_successors_locked(const PrefixCacheCheckpoint*, std::uint64_t);
+    void associate_locked(Entry&, const std::string&, bool reused = false);
     void add_locked(std::shared_ptr<const PrefixCacheCheckpoint>);
     void erase_locked(const ModelContentIdentity&);
+    friend struct PrefixStateCacheTestAccess;
+    // Global store activity: one insertion/duplicate capture or validated touch
+    // across ALL conversations, not wall time or per-conversation turns.
     std::uint64_t epoch_ = 0, metadata_bytes_ = 0;
     std::uint64_t host_bytes_locked();
     std::uint64_t retained_bytes_locked();
@@ -379,6 +402,7 @@ private:
     void sweep_disk(std::chrono::seconds min_age);
     void writer_loop();
 
+    bool named_session_parking_ = false; // Parking stores preserve the original fair ranking.
     std::map<std::string, ModelContentIdentity> named_sessions_;
     std::map<const std::byte*, std::pair<std::weak_ptr<std::byte>, std::uint64_t>> session_buffers_;
     PrefixStateCachePolicy policy_;

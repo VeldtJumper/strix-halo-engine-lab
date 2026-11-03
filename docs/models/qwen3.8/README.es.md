@@ -43,7 +43,15 @@ caché de prefijos están en [docs/engine/serving/serving.md](../../engine/servi
 La [caché de estado de prefijos](../../engine/serving/prefix-state-cache.md) de Qwen restaura el estado completo de atención/GDN
 en los límites admitidos y solo lee el sufijo. Configure `--prefix-cache-host-bytes N` y,
 opcionalmente, `--prefix-cache-dir DIR`; la retención equitativa es la predeterminada (`--prefix-cache-retention lru` restaura
-LRU). Las capturas reservan memoria antes de las copias fijadas. `"state_cache":{"retain":false}` permite lecturas
+LRU). La retención equitativa también recupera grupos certificados inactivos con un sucesor más nuevo que comparte historia propia.
+La regla está activada por defecto: exige ausencia de reutilización durante la vida
+retenida y más de 32 épocas globales de separación (una captura o acceso validado
+entre todas las conversaciones por época). Texto común exclusivo de una pareja,
+menor que un bloque, puede crear un falso sucesor en otras cargas.
+`/v1/cache/stats` cuenta estas expulsiones en `evictions_superseded`.
+`STRIX_PREFIX_FAIR_RECLAIM_IDLE=0` restaura el orden de expulsión anterior. Es exacto
+(solo cambia la retención); la validación de restauración y la identidad numérica no cambian.
+Las capturas reservan memoria antes de las copias fijadas. `"state_cache":{"retain":false}` permite lecturas
 sin almacenar prefijos nuevos; `GET /v1/cache/stats` informa de la retención y de los motivos de expulsión.
 `--prefix-cache off` / `STRIX_PREFIX_CACHE=0` la desactiva. La caché certificada solo está activada por defecto
 en HTTP MTP en tiles con un único ejecutor (`--http-batch 0`, o capacidad automática que resuelve a un solo

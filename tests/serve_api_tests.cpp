@@ -1072,7 +1072,7 @@ int main() try {
     config.engine_progress = true;
     config.sse_progress_seconds = 0.15;
     auto mirror=std::make_shared<strix::decode_cli::StateCacheStatsMirror>();
-    strix::StateCacheSnapshotV1 snap; snap.prefix_enabled=true; snap.prefix.no_store_skips=7;
+    strix::StateCacheSnapshotV1 snap; snap.prefix_enabled=true; snap.prefix.no_store_skips=7; snap.prefix.evictions_superseded=3;
     mirror->publish(snap);
     config.state_cache_stats=[mirror] { return mirror->read(); };
     ApiService api(config, tokenizer, queue, engine.context_tokens(), false);
@@ -2076,6 +2076,7 @@ int main() try {
         check(reply.status==200 && at(state,"schema").as_int()==1 && at(state,"prefix_enabled").as_bool() &&
             !at(state,"session_enabled").as_bool() && !at(state,"pool_present").as_bool(),"cache snapshot schema and flags");
         check(at(at(state,"prefix"),"no_store_skips").as_int()==7 && at(stats,"parked").as_int()==0,"cache snapshot counters");
+        check(at(at(state,"prefix"),"evictions_superseded").as_int()==3,"cache successor eviction counter");
         const auto startup=http(port,"GET","/v1/cache/stats","",auth+"x-test-sessions: 1\r\n");
         const auto session_stats=parse_json(startup.body);
         const auto& session_engine=at(session_stats,"engine");

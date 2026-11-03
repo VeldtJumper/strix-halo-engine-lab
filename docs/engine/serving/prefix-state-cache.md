@@ -471,8 +471,55 @@ conversation/branch caps order victims and never force eviction with spare capac
 Under pressure, competing conversations reclaim borrowing first. Over-cap branches,
 then over-cap conversations, then other entries supply victims. Victim score is
 `marginal bytes * (1 + age epochs) / (1 + successful reuse count)`; larger scores
-leave first. Ties use older access epoch, then digest. Epochs are deterministic,
-without per-token clock reads. Marginal bytes are recomputed after every removal.
+leave first. Ties use older access epoch, then digest. One epoch is one capture
+(including a duplicate insertion) or validated touch across **all conversations in
+the store**. It is neither wall time nor a per-conversation turn count. Misses,
+rejected eligibility, directory probes and segment lookups do not advance it.
+Epochs are deterministic, without per-token clock reads. Marginal bytes are recomputed after every removal.
+
+Idle conversation groups also supply rank-2 victims alongside over-cap
+conversations. This requires **no validated reuse during the current retained
+lifetime**, a newer private-prefix successor, and a newest retained insertion or
+touch more than 32 epochs behind the newest group member. An incoming capture
+contributes the next epoch. Age alone never establishes eligibility.
+
+A successor must have begun its retained lifetime later than the target. Their
+first blocks must share an exact, partial token prefix longer than the target's
+overlap with every other retained group, excluding that proposed successor.
+At least one other group is required to establish this private-history boundary.
+Equal complete first blocks decline: a common multi-block system/tools header
+does not establish supersession. The boundary can fall inside the first block;
+requiring a shared complete first block would identify the same unnamed group.
+This is a content relationship, not proof that an older branch will never return.
+
+Group birth and recency use unsigned elapsed ages from a common reference across
+epoch rollover. Touching an old group does not make it a newly born successor.
+A validated hit protects the entire group even if that hit checkpoint leaves
+before its siblings. Birth, reuse and prefix-order metadata disappear with the last
+retained association. Weak root references add no payload leases. Exact lexical
+neighbors and cached prefix overlaps avoid a pairwise group comparison in eviction;
+an incoming group is merged in one linear scan at the configured block size.
+An expired root or a group containing inconsistent first blocks conservatively
+declines reclamation; inconsistent ordering stays declined until the store empties.
+There is no history of departed groups, new capture, wait or per-token clock read.
+Branch ranks, marginal-byte scores, leases and byte admission remain unchanged.
+Idle-group reclamation is default ON for stores containing only certified prefix
+checkpoints. A fair store using named-session parking keeps its complete original fair ranking,
+including during its first park. Any resident or incoming uncertified checkpoint
+also suppresses idle demotion. HTTP named-session parking continues to use its separate LRU store.
+`STRIX_PREFIX_FAIR_RECLAIM_IDLE=0` restores the original fair victim order when the
+application builds the store policy; unset or `1` selects idle-group reclamation.
+The default ON rule requires a private-prefix successor, no reuse in the retained
+lifetime, and more than 32 global epochs of recency separation; one epoch is one
+capture or validated touch across all conversations. Pair-exclusive sub-block
+boilerplate in other workloads can create a false successor. `/v1/cache/stats`
+reports `evictions_superseded` for removals whose rank was raised by this rule
+(excluding already over-cap conversations or higher-priority branch-cap victims).
+The library takes an explicit policy and never reads the process environment;
+changing the application control requires a server restart. This is exact
+(retention choice only), with no change to payload arithmetic or certificates. The
+switch preserves automatic cache routing, numerical identity and restore validation. LRU is
+unaffected. GPU performance qualification of this retention revision is pending.
 
 Removing a directory entry never invalidates a shared handle or frees another
 checkpoint's segments. Physical host gauges include registered payloads kept alive

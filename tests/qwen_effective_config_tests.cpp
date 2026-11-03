@@ -4803,6 +4803,23 @@ int main(int argc, char** arguments) {
         try {(void)parse({"decoder","MODEL","1",flag,"maybe"});} catch(const std::invalid_argument&) {invalid_cli=true;}
         expect(invalid_cli,"invalid prefix reuse CLI refused");
     }
+    {
+        const auto env=requested_prefill_environment([](const char* name)->const char* {
+            return std::string_view(name)=="STRIX_PREFIX_FAIR_RECLAIM_IDLE"?"0":nullptr;
+        });
+        for (const auto value : {"0", "1"}) {
+            Options options;
+            apply_prefix_cache_environment(options,[&](const char* name)->std::optional<std::string_view> {
+                return std::string_view(name)=="STRIX_PREFIX_FAIR_RECLAIM_IDLE" ?
+                    std::optional<std::string_view>{value} : std::nullopt;
+            });
+            expect(options.prefix_fair_reclaim_idle==(std::string_view(value)!="0"),
+                "app resolves fair retention policy before store construction");
+        }
+        expect(env.contains("STRIX_PREFIX_FAIR_RECLAIM_IDLE"),"inspection collects fair retention rollback");
+        expect(!explicit_cache_configuration(Options{},env),"fair rollback preserves automatic cache routing");
+        expect(yarn_environment_refusal(env,2).empty(),"fair retention rollback performs no rotary work");
+    }
     for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE"}) {
         expect(yarn_environment_refusal(Environment{{key,"0"}},2).empty(),"reuse switch performs no rotary work");
         Options invalid;

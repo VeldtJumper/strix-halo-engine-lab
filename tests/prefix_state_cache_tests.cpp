@@ -23,7 +23,9 @@
 
 // Test-only host pressure, independent of HIP allocation fault injection.
 thread_local bool prefix_test_fail_host_allocations=false;
+thread_local int prefix_test_fail_after=-1;
 void* operator new(std::size_t bytes) {
+    if(prefix_test_fail_after>=0 && prefix_test_fail_after--==0) throw std::bad_alloc();
     if(prefix_test_fail_host_allocations) throw std::bad_alloc();
     if(auto* p=std::malloc(bytes?bytes:1)) return p;
     throw std::bad_alloc();
@@ -50,6 +52,47 @@ struct PrefixStateCacheTestAccess {
         cache.record_certificate_decline(PrefixCertificateDecline::prefix_no_compatible_checkpoint);
         cache.record_certificate_decline(PrefixCertificateDecline::batch_suffix_not_solo);
         prefix_test_fail_host_allocations=false;
+    }
+    static std::string publication(PrefixStateCache& cache) {
+        std::string result=cache.group_prefix_order_valid_?"valid":"invalid";
+        for(const auto& [key,activity]:cache.group_activity_) result+="|"+key+":"+std::to_string(activity.members);
+        for(const auto* activity:cache.group_prefix_order_) result+="/"+std::string(activity->key)+":"+std::to_string(activity->prefix_lcp);
+        for(const auto& [digest,entry]:cache.entries_) {
+            result+=";"+model_content_identity_hex(digest);
+            for(const auto& key:entry.conversations) result+=","+key;
+        }
+        for(const auto& digest:cache.lru_) result+="~"+model_content_identity_hex(digest);
+        for(const auto& [digest,segment]:cache.segments_) {
+            result+="^"+model_content_identity_hex(digest)+":"+std::to_string(reinterpret_cast<std::uintptr_t>(segment.lock().get()));
+            // Include weak ownership even for expired nodes.
+            result+=segment.expired()?":expired":":live";
+        }
+        return result;
+    }
+    static void add(PrefixStateCache& cache, std::shared_ptr<const PrefixCacheCheckpoint> checkpoint) {cache.add_locked(std::move(checkpoint));}
+    static bool association_state(PrefixStateCache& cache, std::size_t members, bool order) {
+        std::size_t total=0;
+        for (const auto& [key, activity] : cache.group_activity_) {
+            if (!activity.members) return false;
+            total+=activity.members;
+        }
+        return total==members && cache.group_prefix_order_.size()==(order?cache.group_activity_.size():0);
+    }
+    static bool reused(PrefixStateCache& cache, const std::string& key) {return cache.group_activity_.at(key).reused;}
+    static auto clock(PrefixStateCache& cache) {return cache.epoch_;}
+    static auto reuse(PrefixStateCache& cache, const ModelContentIdentity& digest) {return cache.entries_.at(digest).reuse;}
+    static void retire(PrefixStateCache& cache, const ModelContentIdentity& digest) {cache.erase_locked(digest);}
+    static void move_clock(PrefixStateCache& cache, std::uint64_t now) {
+        const auto delta = now - cache.epoch_;
+        for (auto& [digest, entry] : cache.entries_) entry.epoch += delta;
+        for (auto& [key, activity] : cache.group_activity_) activity.born_epoch += delta;
+        cache.epoch_ = now;
+    }
+    static std::set<std::string> successors(PrefixStateCache& cache) {
+        cache.mark_private_prefix_successors_locked(nullptr, cache.epoch_ + 1);
+        std::set<std::string> result;
+        for (const auto& [key, activity] : cache.group_activity_) if (activity.private_successor) result.insert(key);
+        return result;
     }
 };
 }
@@ -481,6 +524,304 @@ int main(int argc, char** argv) {
             require(cache.insert(quiet),"new conversation admitted");
             require(cache.contains(quiet->digest) && cache.counters().evictions_conversation_cap==1 && !cache.contains(noisy.front()),"borrowed bytes reclaimed first");
             require(cache.counters().host_bytes==cache.stats().host_bytes,"cheap gauges reconcile without leases");
+        }
+        for (bool fair : {false,true}) for (bool legacy : {false,true}) for (bool replacement : {false,true}) {
+            // Sweep every allocation, including partial multi-segment staging.
+            // Repeated failures must preserve both weak-index values and gauges.
+            unsigned failures=0;
+            for (int fail=0; fail<64; ++fail) {
+                strix::PrefixStateCachePolicy policy{1ULL<<20,{},0};
+                policy.fair_reclaim_idle_groups=fair;policy.legacy=legacy;
+                strix::PrefixStateCache cache(policy,heap);
+                auto checkpoints=build(cache,id,{1,2,3,4,5,6,7,8});
+                if(replacement) require(cache.insert(checkpoints.front()),"segment replacement baseline");
+                auto candidate=std::make_shared<strix::PrefixCacheCheckpoint>(*checkpoints.back());
+                candidate->conversation="candidate";
+                auto segment=std::make_shared<strix::PrefixCacheSegment>(*candidate->segments.front());
+                candidate->segments.front()=segment;
+                const auto before=cache.find_segment(segment->digest);
+                const auto publication=strix::PrefixStateCacheTestAccess::publication(cache);
+                const auto gauges=cache.counters();
+                const auto epoch=strix::PrefixStateCacheTestAccess::clock(cache);
+                bool failed=false;
+                for(unsigned repeat=0;repeat<3;++repeat) {
+                    prefix_test_fail_after=fail;
+                    try {strix::PrefixStateCacheTestAccess::add(cache,candidate);}
+                    catch(const std::bad_alloc&) {failed=true;}
+                    prefix_test_fail_after=-1;
+                    if(!failed) break;
+                    require(strix::PrefixStateCacheTestAccess::publication(cache)==publication,"failed add restores complete segment index and publication");
+                    require(cache.find_segment(segment->digest)==before && !cache.find_segment(candidate->segments.back()->digest),"failed add preserves segment lookups");
+                    const auto after=cache.counters();
+                    require(after.host_bytes==gauges.host_bytes && after.host_segments==gauges.host_segments && after.host_checkpoints==gauges.host_checkpoints,
+                        "failed add preserves ordinary and legacy gauges");
+                    require(strix::PrefixStateCacheTestAccess::clock(cache)==epoch,"failed add preserves epoch");
+                }
+                if(!failed) break;
+                ++failures;
+                // Release the rejected objects before checking for expired residue.
+                const auto digest=candidate->segments.back()->digest;
+                candidate.reset();segment.reset();checkpoints.clear();
+                require(strix::PrefixStateCacheTestAccess::publication(cache)==publication && !cache.find_segment(digest),"repeated failed adds leave no expired weak nodes");
+            }
+            require(failures>=4,"segment staging allocation failures exercised");
+        }
+        for (bool fair : {false,true}) for (unsigned path=0; path<3; ++path) {
+            // Fail each allocation in duplicate capture, host-hit alias and new
+            // entry publication. Retry and force eviction before the next insert.
+            unsigned failures=0;
+            for (int fail=0; fail<64; ++fail) {
+                strix::PrefixStateCachePolicy policy{1ULL<<20,{},0};policy.fair_reclaim_idle_groups=fair;
+                strix::PrefixStateCache cache(policy,heap);
+                const std::vector<std::uint32_t> prompt{7,7,20,20};
+                auto base=std::make_shared<strix::PrefixCacheCheckpoint>(*build(cache,id,prompt).front());
+                base->conversation="base";base->producer_certificate={17,29};
+                if(path!=2) require(cache.insert(base),"allocation baseline");
+                auto alias=std::make_shared<strix::PrefixCacheCheckpoint>(*base);alias->conversation="alias";
+                const auto publication=strix::PrefixStateCacheTestAccess::publication(cache);
+                bool failed=false;
+                prefix_test_fail_after=fail;
+                try {
+                    if(path==1) (void)cache.find_longest(id,prompt,T,T,true,"alias");
+                    else (void)cache.insert(alias);
+                } catch(const std::bad_alloc&) {failed=true;}
+                prefix_test_fail_after=-1;
+                if(failed) {
+                    ++failures;
+                    require(strix::PrefixStateCacheTestAccess::publication(cache)==publication,"failed publication exactly restores membership, links and overlaps");
+                    require(strix::PrefixStateCacheTestAccess::association_state(cache,path==2?0:1,fair),
+                        "failed publication preserves membership and lexical order");
+                    require(cache.counters().host_checkpoints==(path==2?0:1),"failed new entry rolls back directory");
+                }
+                if(path==1) require(bool(cache.find_longest(id,prompt,T,T,true,"alias")),"host alias retry");
+                else require(cache.insert(alias),"capture publication retry");
+                require(strix::PrefixStateCacheTestAccess::association_state(cache,path==2?1:2,fair),"retry creates exactly one lexical link");
+                alias.reset();base.reset();
+                {auto pressure=cache.reserve(1ULL<<20);require(bool(pressure),"allocation retry pressure");}
+                require(strix::PrefixStateCacheTestAccess::association_state(cache,0,fair),"pressure removes every lexical link");
+                require(cache.insert(build(cache,id,{7,7,20,21}).front()),"next insertion after failed publication");
+                if(!failed) break;
+            }
+            require(failures>0 && failures<64,"all publication allocation sites traversed");
+        }
+        for(bool fair:{false,true}) for(bool promote:{false,true}) for(bool named:{false,true}) {
+            // An accepted certified disk hit protects resident siblings, including
+            // no-store reads and retirement of a promoted hit checkpoint.
+            const auto diskdir=dir/("reuse-"+std::to_string(fair)+std::to_string(promote)+std::to_string(named));
+            const std::vector<std::uint32_t> prompt{7,7,20,20,40,41,42,43};
+            {
+                strix::PrefixStateCache writer({1ULL<<20,diskdir,0},heap);
+                auto c=std::make_shared<strix::PrefixCacheCheckpoint>(*build(writer,id,prompt).back());
+                c->producer_certificate={17,29};require(writer.insert(c),"reuse disk seed");writer.flush();
+            }
+            strix::PrefixStateCachePolicy policy{1ULL<<20,diskdir,0};policy.fair_reclaim_idle_groups=fair;
+            strix::PrefixStateCache cache(policy,heap);
+            auto sibling=std::make_shared<strix::PrefixCacheCheckpoint>(*build(cache,id,prompt).front());
+            sibling->producer_certificate={17,29};if(named)sibling->conversation="resident";
+            const auto key=named?std::string("resident"):strix::model_content_identity_hex(sibling->digest);
+            require(cache.insert(sibling),"resident sibling");cache.flush();
+            const auto before=strix::PrefixStateCacheTestAccess::clock(cache);
+            auto hit=cache.find_longest(id,prompt,T,2*T,promote,named?"resident":"",[](const auto&){return true;});
+            require(hit && hit->position==2*T && cache.counters().disk_hits==1,"accepted disk reuse");
+            require(strix::PrefixStateCacheTestAccess::reused(cache,key),"disk reuse protects resident group");
+            require(strix::PrefixStateCacheTestAccess::clock(cache)==before+(promote?1:0),"disk hit adds only promotion epoch");
+            require(strix::PrefixStateCacheTestAccess::reuse(cache,sibling->digest)==0,"disk hit leaves sibling entry reuse unchanged");
+            if(promote) {
+                require(strix::PrefixStateCacheTestAccess::reuse(cache,hit->digest)==1,"promoted entry reuse remains one");
+                strix::PrefixStateCacheTestAccess::retire(cache,hit->digest);
+                require(strix::PrefixStateCacheTestAccess::reused(cache,key),"reuse survives retirement of disk-hit checkpoint");
+            }
+            require(cache.counters().host_checkpoints==1,"no-store never publishes disk entry");
+            (void)cache.find_longest(id,prompt,T,2*T,false,"unpublished",[](const auto&){return true;});
+            require(strix::PrefixStateCacheTestAccess::association_state(cache,1,fair),"no-store never publishes an alias");
+        }
+        {
+            // Pair privacy is about exact tokens past every rival, not a common
+            // header or a recent touch of an older group. Deletion repairs LCPs.
+            strix::PrefixStateCache cache({1ULL<<20,{},0},heap);
+            const auto root=[&](std::vector<std::uint32_t> ids) {
+                auto c=std::make_shared<strix::PrefixCacheCheckpoint>(*build(cache,id,ids).front());
+                c->producer_certificate={17,29};require(cache.insert(c),"prefix-order root");
+                return c->digest;
+            };
+            const auto a=root({7,7,10,10});
+            const auto b=root({7,7,20,20});
+            const auto c=root({7,7,20,21});
+            auto selected=strix::PrefixStateCacheTestAccess::successors(cache);
+            require(selected==std::set<std::string>{strix::model_content_identity_hex(b)},"only the private predecessor is superseded");
+            strix::PrefixStateCacheTestAccess::retire(cache,b);
+            require(strix::PrefixStateCacheTestAccess::successors(cache).empty(),"two groups cannot establish private ancestry");
+            (void)root({7,7,20,22});
+            require(strix::PrefixStateCacheTestAccess::successors(cache)==std::set<std::string>{strix::model_content_identity_hex(c)},
+                "neighbor repair preserves the remaining exact private-prefix relation");
+            require(cache.contains(a),"unrelated rival is retained");
+        }
+        {
+            // Eight live agents share three blocks and diverge afterwards. Shared
+            // system/tools tokens do not make any older live group a successor.
+            strix::PrefixStateCache cache({1ULL<<20,{},0},heap);
+            for(std::uint32_t session=0;session<8;++session) {
+                auto chain=build(cache,id,{1,2,3,4,5,6,7,8,9,10,11,12,100+session,20,21,22});
+                auto c=std::make_shared<strix::PrefixCacheCheckpoint>(*chain.back());
+                c->conversation="live-"+std::to_string(session);c->producer_certificate={17,29};
+                require(cache.insert(c),"shared-header live agent");
+            }
+            require(strix::PrefixStateCacheTestAccess::successors(cache).empty(),"a multi-block shared header is not private history");
+        }
+        {
+            // Even a pair-exclusive complete first block can be a shared header.
+            strix::PrefixStateCache cache({1ULL<<20,{},0},heap);
+            for(const auto& name: {"agent-a","agent-b"}) {
+                auto c=std::make_shared<strix::PrefixCacheCheckpoint>(*build(cache,id,
+                    {1,2,3,4,static_cast<std::uint32_t>(name[6]),20,21,22}).back());
+                c->conversation=name;c->producer_certificate={17,29};require(cache.insert(c),"paired header agent");
+            }
+            auto rival=build(cache,id,{8,9,10,11}).front();require(cache.insert(rival),"different header rival");
+            require(strix::PrefixStateCacheTestAccess::successors(cache).empty(),"complete first-block sharing still declines");
+        }
+        for (const bool reclaim_idle : {false, true})
+        for (const bool certified_kind : {false,true})
+        for (const bool reuse_idle : {false,true})
+        for (const bool lease_idle : {false,true})
+        for (const bool retire_hit : {false,true})
+        for (const auto clock : {std::uint64_t{0}, UINT64_MAX-257, UINT64_MAX-128}) {
+            // An early history rewrite changes the unnamed conversation's first block.
+            // The second root has a newer private-history successor, while the
+            // first shares only their common header. Live interiors exceed the cap.
+            constexpr auto certificate_bytes = 2 * sizeof(std::uint64_t);
+            constexpr auto budget = 5 * (fixed_bytes + 3 + certificate_bytes) + 6 * segment_bytes;
+            strix::PrefixStateCachePolicy policy{budget, {}, 0};
+            policy.fair_reclaim_idle_groups = reclaim_idle;
+            strix::PrefixStateCache cache(policy, heap);
+            const auto certified = [certified_kind](const auto& c) {
+                auto copy = std::make_shared<strix::PrefixCacheCheckpoint>(*c);
+                if (certified_kind) copy->producer_certificate = {17, 29};
+                return copy;
+            };
+            std::vector<strix::ModelContentIdentity> dead;
+            std::shared_ptr<const strix::PrefixCacheCheckpoint> idle_lease;
+            const std::vector<std::vector<std::uint32_t>> roots{{7,7,10,10},{7,7,20,20}};
+            for (const auto& root : roots) {
+                auto c = certified(build(cache, id, root).front());
+                dead.push_back(c->digest);
+                require(cache.insert(c), "idle root admitted");
+                if (lease_idle && root == roots.back()) idle_lease = c;
+                require(cache.counters().host_bytes <= budget, "idle roots stay within budget");
+            }
+            if (reuse_idle) for (const auto& root : roots) {
+                auto prompt = root;
+                if (retire_hit) prompt.insert(prompt.end(), root.begin(), root.end());
+                std::shared_ptr<strix::PrefixCacheCheckpoint> tail;
+                if (retire_hit) {
+                    tail=certified(build(cache,id,prompt).back());
+                    require(cache.insert(tail),"temporary returning tail");
+                }
+                require(cache.find_longest(id,prompt,T,prompt.size())!=nullptr,
+                    "a returning group earns reuse protection");
+                if (retire_hit) strix::PrefixStateCacheTestAccess::retire(cache,tail->digest);
+            }
+            const std::vector<std::uint32_t> live{7,7,20,21,104,105,106,107,108,109,110,111,112,113,114,115};
+            auto chain = build(cache, id, live);
+            const auto interior = chain.front()->digest;
+            for (std::size_t k = 0; k < 3; ++k)
+                require(cache.insert(certified(chain[k])), "live interior admitted");
+            auto next = certified(chain.back());
+            chain.clear(); // No checkpoint leases may dictate the victim.
+            if (clock) strix::PrefixStateCacheTestAccess::move_clock(cache, clock);
+            require(cache.policy().fair_reclaim_idle_groups == reclaim_idle,
+                "explicit library policy is independent of process environment");
+            for (unsigned k = 0; k < 257; ++k) {
+                require(cache.find_longest(id, live, T, 3*T)->position == 3*T, "live tail touched");
+                require(cache.counters().host_bytes <= budget, "touch stays within budget");
+            }
+            require(cache.insert(next), "live extension admitted under pressure");
+            next.reset();
+            require(cache.counters().host_bytes <= budget && cache.counters().evicted == 1,
+                "one pressure victim preserves the byte budget");
+            const bool refined = reclaim_idle && certified_kind && !reuse_idle && !lease_idle;
+            require(cache.contains(interior) == refined, "idle reclamation keeps the live interior; OFF preserves old fair");
+            require(cache.contains(dead.back()) != refined, "private predecessor supplies capacity first");
+            require(cache.counters().evictions_superseded==(refined?1U:0U),"superseded removal counter");
+            if (refined) {
+                auto restored = cache.find_longest(id, live, T, T);
+                strix::PrefixStateCache fresh({1ULL << 20, {}, 0}, heap);
+                auto captured = certified(build(fresh, id, live).front());
+                require(restored && same_payloads(*restored, *captured),
+                    "post-eviction restore equals fresh capture bytes, metadata and certificate");
+            }
+        }
+        for (const bool reclaim_idle : {false, true}) {
+            // Mixed fair store: parked envelopes must preserve the complete old
+            // victim order, even when certified checkpoints are also present.
+            constexpr std::uint64_t budget = 1759;
+            strix::PrefixStateCachePolicy policy{budget, {}, 0};
+            policy.fair_reclaim_idle_groups = reclaim_idle;
+            strix::PrefixStateCache cache(policy, heap);
+            auto a=heap(339), b=heap(339);
+            a.data.get()[0]=std::byte{1}; b.data.get()[0]=std::byte{2};
+            require(cache.park_session("parked_a",std::move(a),8),"park a in fair store");
+            require(cache.park_session("parked_b",std::move(b),8),"park b in fair store");
+            const std::vector<std::uint32_t> live{100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115};
+            auto chain=build(cache,id,live);
+            const auto interior=chain.front()->digest;
+            for (std::size_t k=0;k<3;++k) {
+                auto c=std::make_shared<strix::PrefixCacheCheckpoint>(*chain[k]);
+                c->producer_certificate={17,29};
+                require(cache.insert(c),"mixed certified checkpoint");
+            }
+            auto next=std::make_shared<strix::PrefixCacheCheckpoint>(*chain.back());
+            next->producer_certificate={17,29}; chain.clear();
+            for(unsigned k=0;k<65;++k)
+                require(cache.find_longest(id,live,T,3*T)->position==3*T,"mixed live touch");
+            require(cache.insert(next),"mixed pressure capture"); next.reset();
+            require(cache.list_sessions().size()==2 && !cache.contains(interior) &&
+                cache.counters().host_bytes==budget && cache.counters().evicted==1,
+                "mixed fair store preserves old victim and byte accounting");
+            auto resumed=cache.resume_session("parked_a");
+            require(resumed.data && resumed.data.get()[0]==std::byte{1},"parked session remains resumable");
+        }
+        {
+            using namespace strix;
+            const auto check=[](bool ok) {require(ok,"pooled idle threshold, leases and accounting");};
+            for(bool idle:{false,true}) for(unsigned touches:{29,30,33}) for(bool lease_dead:{false,true}) {
+                PrefixStateCachePolicy p{32768,{},0};p.fair_reclaim_idle_groups=idle;
+                PrefixStateCache cache(p,heap);
+                auto pool=std::make_shared<PrefixPayloadPool>(heap(28672));cache.attach_payload_pool(pool,4096);
+                auto capture=[&](std::vector<uint32_t> capture_tokens,uint64_t fixed,uint64_t last) {
+                    auto c=std::make_shared<PrefixCacheCheckpoint>();c->identity=id;c->block_rows=T;c->position=capture_tokens.size();c->fixed.bytes=fixed;
+                    c->metadata.resize(248);c->producer_certificate={17,29};auto prev=id;
+                    std::shared_ptr<PrefixCacheSegment> missing;
+                    for(size_t k=0;k<capture_tokens.size()/T;++k) {
+                        const auto block=std::span(capture_tokens.data()+k*T,T);
+                        const auto d=prefix_cache_block_digest(prev,block);
+                        auto s=cache.find_segment(d);
+                        if(!s) {missing=std::make_shared<PrefixCacheSegment>();missing->identity=id;missing->parent=prev;missing->digest=d;
+                            missing->tokens.assign(block.begin(),block.end());missing->block_rows=T;missing->block_index=k;missing->payload.bytes=last;s=missing;}
+                        c->segments.push_back(s);prev=d;
+                    }
+                    c->digest=prev;
+                    auto r=cache.reserve(cache.incremental_bytes(*c),c.get());check(bool(r));
+                    if(fixed)c->fixed=cache.allocate(fixed,r);
+                    if(missing && last)missing->payload=cache.allocate(last,r,true);
+                    check(cache.insert(c,&r));return c;
+                };
+                auto rival=capture({7,7,10,10},0,0);rival.reset();
+                auto dead=capture({7,7,20,20},0,12288);auto dead_digest=dead->digest;dead.reset();
+                auto one=capture({7,7,20,21},4096,4096);auto interior=one->digest;one.reset();
+                auto two=capture({7,7,20,21,100,101,102,103},4096,4096);auto chain=two->segments;two.reset();
+                check(pool->free_bytes()==0);
+                for(unsigned i=0;i<touches;++i)check(bool(cache.find_longest(id,std::vector<uint32_t>{7,7,20,21,100,101,102,103},T,2*T)));
+                std::shared_ptr<const PrefixCacheCheckpoint> held;
+                if(lease_dead)held=cache.find_longest(id,std::vector<uint32_t>{7,7,20,20},T,T);
+                auto three=capture({7,7,20,21,100,101,102,103,104,105,106,107},512,0);three.reset();
+                const auto stats=cache.counters();
+                check(stats.host_bytes==32768 && stats.pool_bytes+stats.pool_metadata_reserved==32768);
+                check(stats.evicted==1);check(!held || cache.contains(dead_digest));
+                const bool expected_dead_eviction=idle && touches>=30 && !lease_dead;
+                check(cache.contains(dead_digest)!=expected_dead_eviction);
+                check(cache.contains(interior)==expected_dead_eviction);
+                check(chain[0]->payload.data && chain[1]->payload.data);
+            }
         }
         {
             // Different conversations share a physical trunk without sharing their fixed state.

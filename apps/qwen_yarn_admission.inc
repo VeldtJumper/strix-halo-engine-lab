@@ -52,6 +52,7 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_INFLIGHT", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DISK", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DURABLE", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_PREFIX_FAIR_RECLAIM_IDLE", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_EXACT_FP16", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_HC_OUTPUT_WMMA", YarnEnvironmentClass::nonrotary, ""},
     // These controls perform no rotation. MOE_DEFAULTED is a two-bit

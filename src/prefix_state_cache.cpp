@@ -376,16 +376,159 @@ void PrefixStateCache::register_buffer_locked(const PrefixCacheBuffer& buffer, b
         if (segment) ++ledger_->segments;
     }
 }
+namespace {
+std::size_t group_prefix_lcp(const PrefixCacheSegment& a, const PrefixCacheSegment& b) {
+    if (a.identity != b.identity || a.block_rows != b.block_rows) return 0;
+    std::size_t n = 0;
+    while (n < std::min(a.tokens.size(), b.tokens.size()) && a.tokens[n] == b.tokens[n]) ++n;
+    return n;
+}
+bool group_prefix_before(const PrefixCacheSegment& a, std::string_view ak,
+                         const PrefixCacheSegment& b, std::string_view bk) {
+    if (a.identity != b.identity) return a.identity.bytes < b.identity.bytes;
+    if (a.block_rows != b.block_rows) return a.block_rows < b.block_rows;
+    if (a.tokens != b.tokens) return a.tokens < b.tokens;
+    return ak < bk;
+}
+}
+void PrefixStateCache::update_group_root_locked(const std::string& key,
+    const std::shared_ptr<const PrefixCacheSegment>& root) {
+    auto& activity = group_activity_.at(key);
+    if (!activity.members) activity.born_epoch = epoch_;
+    if (!policy_.fair_reclaim_idle_groups || policy_.retention != PrefixCacheRetention::fair) return;
+    if (activity.members) {
+        const auto previous = activity.root.lock();
+        if (!previous || !root || previous->identity != root->identity || previous->block_rows != root->block_rows ||
+            previous->tokens != root->tokens) group_prefix_order_valid_ = false;
+        activity.root = root;
+        return;
+    }
+    // Compute the link and overlaps before the final throwing allocation. Nothing
+    // visible (including validity and the following LCP) changes on failure.
+    auto next = group_prefix_order_.end();
+    bool valid = group_prefix_order_valid_ && bool(root);
+    if (valid) {
+        for (auto it = group_prefix_order_.begin(); it != group_prefix_order_.end(); ++it) {
+            const auto other = (*it)->root.lock();
+            if (!other) { valid = false; break; }
+            if (group_prefix_before(*root, key, *other, (*it)->key)) { next = it; break; }
+        }
+    }
+    std::size_t previous_lcp = 0, next_lcp = 0;
+    if (valid) {
+        if (next != group_prefix_order_.begin())
+            previous_lcp = group_prefix_lcp(*(*std::prev(next))->root.lock(), *root);
+        if (next != group_prefix_order_.end())
+            next_lcp = group_prefix_lcp(*root, *(*next)->root.lock());
+    }
+    const auto link = group_prefix_order_.insert(next, &activity);
+    activity.root = root;
+    activity.key = group_activity_.find(key)->first;
+    activity.prefix_order = link;
+    activity.prefix_lcp = previous_lcp;
+    group_prefix_order_valid_ = valid;
+    if (valid && next != group_prefix_order_.end()) (*next)->prefix_lcp = next_lcp;
+}
+void PrefixStateCache::mark_private_prefix_successors_locked(
+    const PrefixCacheCheckpoint* incoming, std::uint64_t newest) {
+    for (auto* activity : group_prefix_order_) activity->private_successor = false;
+    if (!policy_.fair_reclaim_idle_groups || !group_prefix_order_valid_ || named_session_parking_) return;
+    struct Leaf { std::string_view key; GroupActivity* activity; const PrefixCacheSegment* root; std::size_t lcp; std::uint64_t birth_age; };
+    std::vector<Leaf> leaves;
+    leaves.reserve(group_prefix_order_.size() + 1);
+    for (auto* activity : group_prefix_order_) {
+        const auto root = activity->root.lock();
+        if (!root) return;
+        leaves.push_back({activity->key, activity, root.get(), activity->prefix_lcp, newest - activity->born_epoch});
+    }
+    std::string incoming_key;
+    if (incoming) {
+        if (incoming->segments.empty()) return;
+        const auto& root = *incoming->segments.front();
+        incoming_key = incoming->conversation.empty() ? hex(root.digest) : incoming->conversation;
+        const auto& key = incoming_key;
+        if (const auto a = group_activity_.find(key); a != group_activity_.end()) {
+            const auto previous = a->second.root.lock();
+            if (!previous || previous->identity != root.identity || previous->block_rows != root.block_rows ||
+                previous->tokens != root.tokens) return;
+        } else {
+            // One linear merge of the arriving group; no sorting or group-pair scan.
+            const auto at = std::find_if(leaves.begin(), leaves.end(), [&](const auto& leaf) {
+                return group_prefix_before(root, key, *leaf.root, leaf.key);
+            });
+            const auto offset = static_cast<std::size_t>(at - leaves.begin());
+            const auto before = offset ? group_prefix_lcp(*leaves[offset - 1].root, root) : 0;
+            if (at != leaves.end()) at->lcp = group_prefix_lcp(root, *at->root);
+            leaves.insert(at, Leaf{key, nullptr, &root, before, 0});
+        }
+    }
+    if (leaves.size() < 3) return; // No rival history with which to establish exclusivity.
+    std::vector<std::size_t> adjacent(leaves.size() + 1, 0);
+    for (std::size_t i = 1; i < leaves.size(); ++i) adjacent[i] = leaves[i].lcp;
+    for (std::size_t i = 0; i < leaves.size(); ++i) {
+        // Lexicographic neighbors give the exact maximum LCP with every other
+        // retained group. Remove the proposed successor before testing privacy.
+        if (i && adjacent[i] < leaves[i].root->tokens.size() && adjacent[i] < leaves[i - 1].root->tokens.size() &&
+            adjacent[i] > std::max(adjacent[i + 1], std::min(adjacent[i], adjacent[i - 1])) &&
+            leaves[i].birth_age > leaves[i - 1].birth_age && leaves[i].activity) leaves[i].activity->private_successor = true;
+        if (i + 1 < leaves.size() && adjacent[i + 1] < leaves[i].root->tokens.size() && adjacent[i + 1] < leaves[i + 1].root->tokens.size() &&
+            adjacent[i + 1] > std::max(adjacent[i], std::min(adjacent[i + 1], adjacent[i + 2])) &&
+            leaves[i].birth_age > leaves[i + 1].birth_age && leaves[i].activity) leaves[i].activity->private_successor = true;
+    }
+}
+void PrefixStateCache::associate_locked(Entry& entry, const std::string& key, bool reused) {
+    if (entry.conversations.contains(key) || entry.conversations.size() >= 16) return;
+    // Roll back both allocating containers before publishing members or links.
+    const auto membership = entry.conversations.insert(key).first;
+    try {
+        const auto [group, created] = group_activity_.try_emplace(key);
+        try {
+            update_group_root_locked(key, entry.checkpoint->segments.empty() ? nullptr : entry.checkpoint->segments.front());
+        } catch (...) {
+            if (created) group_activity_.erase(group);
+            throw;
+        }
+        ++group->second.members;
+        group->second.reused = group->second.reused || reused || entry.reuse != 0;
+    } catch (...) {
+        entry.conversations.erase(membership);
+        throw;
+    }
+}
 void PrefixStateCache::add_locked(std::shared_ptr<const PrefixCacheCheckpoint> checkpoint) {
+    const auto key = checkpoint->conversation.empty() ?
+        hex(checkpoint->segments.empty() ? checkpoint->digest : checkpoint->segments.front()->digest) : checkpoint->conversation;
+    // Allocate missing index nodes privately. Keep existing weak values observable
+    // until all directory/LRU/association allocations have succeeded.
+    decltype(segments_) staged_segments;
+    for (const auto& segment : checkpoint->segments)
+        if (!segments_.contains(segment->digest)) staged_segments.try_emplace(segment->digest, segment);
+    lru_.push_back(checkpoint->digest);
+    const auto link = std::prev(lru_.end());
+    try {
+        const auto [entry, inserted] = entries_.emplace(checkpoint->digest, Entry{checkpoint, link, epoch_ + 1, 0, {}});
+        if (!inserted) { lru_.erase(link); return; }
+        ++epoch_;
+        try {
+            associate_locked(entry->second, key);
+        } catch (...) {
+            --epoch_;
+            entries_.erase(entry);
+            throw;
+        }
+    } catch (...) {
+        lru_.erase(link);
+        throw;
+    }
+    // Node transfer and weak-pointer assignment allocate nothing; DigestLess is
+    // noexcept. Repeated digests retain the same last-value-wins behavior.
+    segments_.merge(staged_segments);
+    for (const auto& segment : checkpoint->segments) segments_.find(segment->digest)->second = segment;
     for (auto it = receipts_.begin(); it != receipts_.end();)
         if (it->second.expired()) it = receipts_.erase(it); else ++it;
-    lru_.push_back(checkpoint->digest);
-    entries_.emplace(checkpoint->digest, Entry{checkpoint, std::prev(lru_.end()), ++epoch_, 0, {checkpoint->conversation.empty() ?
-        hex(checkpoint->segments.empty() ? checkpoint->digest : checkpoint->segments.front()->digest) : checkpoint->conversation}});
     metadata_bytes_ += checkpoint->metadata.size() + checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
     register_buffer_locked(checkpoint->fixed, false);
     for (const auto& segment : checkpoint->segments) {
-        segments_[segment->digest] = segment;
         register_buffer_locked(segment->payload, true);
     }
 }
@@ -393,12 +536,37 @@ void PrefixStateCache::erase_locked(const ModelContentIdentity& digest) {
     const auto it = entries_.find(digest);
     if (it == entries_.end()) return;
     metadata_bytes_ -= it->second.checkpoint->metadata.size() + it->second.checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
+    for (const auto& key : it->second.conversations) {
+        const auto group = group_activity_.find(key);
+        if (--group->second.members == 0) {
+            if (policy_.fair_reclaim_idle_groups && policy_.retention == PrefixCacheRetention::fair) {
+                const auto next = std::next(group->second.prefix_order);
+                if (next != group_prefix_order_.end()) (*next)->prefix_lcp =
+                    std::min(group->second.prefix_lcp, (*next)->prefix_lcp);
+                group_prefix_order_.erase(group->second.prefix_order);
+            }
+            group_activity_.erase(group);
+            if (group_activity_.empty()) group_prefix_order_valid_ = true;
+        } else if (policy_.fair_reclaim_idle_groups && policy_.retention == PrefixCacheRetention::fair) {
+            // Keep the weak representative backed by a retained entry even when
+            // callers supplied equal prefixes in distinct segment objects.
+            for (const auto& [other_digest, other] : entries_) {
+                if (other_digest == digest || !other.conversations.contains(key)) continue;
+                if (other.checkpoint->segments.empty()) group_prefix_order_valid_ = false;
+                group->second.root = other.checkpoint->segments.empty() ? nullptr : other.checkpoint->segments.front();
+                break;
+            }
+        }
+    }
     lru_.erase(it->second.lru);
     entries_.erase(it);
 }
 void PrefixStateCache::touch_locked(Entry& entry, bool reused) {
     entry.epoch = ++epoch_;
-    if (reused) ++entry.reuse;
+    if (reused) {
+        ++entry.reuse;
+        for (const auto& key : entry.conversations) group_activity_.at(key).reused = true;
+    }
     lru_.splice(lru_.end(), lru_, entry.lru);
 }
 
@@ -420,11 +588,15 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             victim=entries_.find(*oldest);
         }
         unsigned victim_rank = 0;
+        bool victim_superseded = false;
         long double best = -1;
         if (policy_.retention == PrefixCacheRetention::fair) {
             struct Group {
                 long double bytes = 0;
                 std::uint64_t largest = 0;
+                std::uint64_t age = UINT64_MAX;
+                bool reused = false;
+                const GroupActivity* activity = nullptr;
                 std::map<ModelContentIdentity, long double, DigestLess> branches;
                 std::map<ModelContentIdentity, std::uint64_t, DigestLess> branch_largest;
             };
@@ -433,10 +605,17 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             std::map<ModelContentIdentity, std::map<std::string, std::size_t>, DigestLess> owners;
             // Include a would-be capture in fairness accounting before allocating its payload.
             Entry estimate;
+            // One epoch is one capture or validated touch anywhere in this store,
+            // across all conversations; neither wall time nor per-conversation turns.
+            // Compare modular ages from a common reference, never raw epoch maxima.
+            const auto newest = epoch_ + (incoming ? 1U : 0U);
+            std::uint64_t newest_age = UINT64_MAX;
+            bool certified_only = true;
             std::vector<std::pair<ModelContentIdentity, const Entry*>> ranking;
             ranking.reserve(entries_.size() + (incoming ? 1U : 0U));
             for (const auto& [d,e] : entries_) ranking.emplace_back(d, &e);
             if (incoming) {
+                estimate.epoch = epoch_ + 1;
                 estimate.checkpoint = std::shared_ptr<const PrefixCacheCheckpoint>(incoming, [](const auto*) {});
                 estimate.conversations.insert(incoming->conversation.empty() ?
                     hex(incoming->segments.empty() ? incoming->digest : incoming->segments.front()->digest) : incoming->conversation);
@@ -452,6 +631,8 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             std::map<ModelContentIdentity, std::map<std::string, ModelContentIdentity>, DigestLess> branches;
             for (const auto& [d,ep] : ranking) {
               const auto& e = *ep;
+              certified_only = certified_only && !e.checkpoint->producer_certificate.empty() &&
+                  !e.checkpoint->segments.empty();
               for (const auto& key : e.conversations) {
                 const auto& c = *e.checkpoint;
                 // Branch = first block after the deepest retained shared ancestor.
@@ -467,21 +648,35 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
                     charge += static_cast<long double>(seg->payload.bytes) / (owners[seg->digest].at(key) * owners[seg->digest].size());
                 }
                 auto& g = groups[key]; g.bytes += charge; g.largest = std::max(g.largest,full);
+                g.age = std::min(g.age, newest - e.epoch);
+                if (const auto activity = group_activity_.find(key); activity != group_activity_.end()) {
+                    g.reused = activity->second.reused;
+                    g.activity = &activity->second;
+                }
+                newest_age = std::min(newest_age, g.age);
                 g.branches[branch] += charge;
                 g.branch_largest[branch] = std::max(g.branch_largest[branch],full);
               }
             }
+            if (certified_only) mark_private_prefix_successors_locked(incoming, newest);
             for (auto it = entries_.begin(); it != entries_.end(); ++it) {
                 if (it->second.checkpoint.use_count() != 1) continue;
                 const auto& c = *it->second.checkpoint;
                 unsigned rank = 0;
+                unsigned ordinary_rank = 0;
                 for (const auto& key : it->second.conversations) {
                     const auto& g = groups.at(key);
                     const auto cap = std::min(policy_.host_byte_budget, std::max(g.largest,policy_.host_byte_budget/3));
                     const auto branch = branches.at(it->first).at(key);
                     const auto branch_cap = std::min(cap,std::max(g.branch_largest.at(branch),cap/g.branches.size()));
                     const bool borrowed = groups.size()>1 && g.bytes>cap;
-                    rank = std::max(rank, g.branches.at(branch)>branch_cap ? 3U : borrowed ? 2U : 0U);
+                    // Age alone cannot establish abandonment. Require a newer group
+                    // sharing a prefix private to this pair, beyond every rival's
+                    // divergence. Common headers and reused groups cannot qualify.
+                    const bool idle = policy_.fair_reclaim_idle_groups && !named_session_parking_ && certified_only &&
+                        !g.reused && g.activity && g.activity->private_successor && g.age - newest_age > 32;
+                    ordinary_rank = std::max(ordinary_rank, g.branches.at(branch)>branch_cap ? 3U : borrowed ? 2U : 0U);
+                    rank = std::max(rank, g.branches.at(branch)>branch_cap ? 3U : borrowed || idle ? 2U : 0U);
                 }
                 const bool unleased = it->second.checkpoint.use_count()==1;
                 std::uint64_t marginal = unleased ? c.metadata.size() + c.producer_certificate.size()*sizeof(std::uint64_t) : 0;
@@ -493,6 +688,7 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
                     (score == best && (it->second.epoch < victim->second.epoch ||
                         (it->second.epoch == victim->second.epoch && DigestLess{}(it->first,victim->first))))))) {
                     victim = it; victim_rank = rank; best = score;
+                    victim_superseded = rank > ordinary_rank;
                 }
             }
         }
@@ -500,7 +696,8 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
         const auto digest = victim->first;
         erase_locked(digest);
         ++stats_.evicted;
-        if (victim_rank == 2) ++stats_.evictions_conversation_cap;
+        if (victim_superseded) ++stats_.evictions_superseded;
+        else if (victim_rank == 2) ++stats_.evictions_conversation_cap;
         else if (victim_rank == 3) ++stats_.evictions_branch_cap;
         else ++stats_.evictions_space;
     }
@@ -514,7 +711,7 @@ bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> check
         std::lock_guard lock(mutex_);
         if (const auto found = entries_.find(checkpoint->digest); found != entries_.end()) {
             if (!checkpoint->conversation.empty() && checkpoint->conversation.size()<=128 && found->second.conversations.size()<16)
-                found->second.conversations.insert(checkpoint->conversation);
+                associate_locked(found->second, checkpoint->conversation);
             touch_locked(found->second);
             return true;
         }
@@ -602,7 +799,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
                 if (auto it=entries_.find(digest); it!=entries_.end()) {
                     touch_locked(it->second,true);
                     if (promote && !conversation.empty() && conversation.size()<=128 && it->second.conversations.size()<16)
-                        it->second.conversations.emplace(conversation);
+                        associate_locked(it->second, std::string(conversation), true);
                 }
                 ++stats_.host_hits; stats_.hit_tokens += position; stats_.restored_tokens += position;
                 return found;
@@ -626,6 +823,11 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
                 }
                 {
                     std::lock_guard lock(mutex_);
+                    // No-store hits protect existing retained groups without creating
+                    // associations or ticking the capture/touch clock.
+                    const auto key = conversation.empty() ?
+                        hex(loaded->segments.empty() ? loaded->digest : loaded->segments.front()->digest) : std::string(conversation);
+                    if (auto group = group_activity_.find(key); group != group_activity_.end()) group->second.reused = true;
                     ++stats_.disk_hits; stats_.hit_tokens += loaded->position; stats_.restored_tokens += loaded->position;
                 }
                 // Into the host tier without writing it back.
@@ -640,7 +842,9 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
                         if ((policy_.retention != PrefixCacheRetention::fair || entries_.size()<256) &&
                             (policy_.legacy || retained_bytes_locked() <= policy_.host_byte_budget - need)) {
                             add_locked(promoted);
-                            entries_.at(promoted->digest).reuse=1;
+                            auto& entry = entries_.at(promoted->digest);
+                            entry.reuse=1;
+                            for (const auto& key : entry.conversations) group_activity_.at(key).reused=true;
                         }
                     }
                 }
@@ -1050,6 +1254,7 @@ bool PrefixStateCache::park_session(const std::string& id, PrefixCacheBuffer env
     checkpoint->conversation=id;
     checkpoint->digest=digest; checkpoint->block_rows=1; checkpoint->fixed=std::move(envelope);
     std::lock_guard lock(mutex_);
+    named_session_parking_ = true;
     for(auto it=named_sessions_.begin();it!=named_sessions_.end();) {
         if(!entries_.count(it->second)) it=named_sessions_.erase(it); else ++it;
     }

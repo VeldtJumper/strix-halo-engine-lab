@@ -36,7 +36,7 @@ inline serve::Json state_cache_json(const StateCacheSnapshotV1& s) {
         STRIX_PREFIX(capture_skips_batch_config);
     }
     STRIX_PREFIX(evicted); STRIX_PREFIX(rejected_over_budget);
-    STRIX_PREFIX(evictions_space); STRIX_PREFIX(evictions_conversation_cap); STRIX_PREFIX(evictions_branch_cap);
+    STRIX_PREFIX(evictions_superseded); STRIX_PREFIX(evictions_space); STRIX_PREFIX(evictions_conversation_cap); STRIX_PREFIX(evictions_branch_cap);
     STRIX_PREFIX(evictions_explicit); STRIX_PREFIX(evictions_invalid);
     STRIX_PREFIX(host_bytes); STRIX_PREFIX(host_segments); STRIX_PREFIX(host_checkpoints);
     STRIX_PREFIX(disk_writes); STRIX_PREFIX(disk_write_bytes); STRIX_PREFIX(disk_write_failures); STRIX_PREFIX(disk_evictions);
