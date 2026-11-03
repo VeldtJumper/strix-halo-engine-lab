@@ -494,9 +494,25 @@ Uses the exact recurrence forms, batches gates and feeds eligible dense output d
 - **Automatic selection:** The initializer enables GDN, gates batching and core16; the GDN reader defaults PARTS to 55. Shape, check-mode and consumer guards retain the older forms.
 - **Fallback notice:** Ineligible forms fall back without a general decline line. Check modes retain FP32 core rows. Diagnostic output is QPF2K GDN check: ... differ ... or GDN prefill check: ... differ ....
 - **Exactness evidence:** STRIX_QPF2K_GDN_CHECK=1 and STRIX_GDN_PREFILL_CHECK=1 compare written bytes; require zero differences. Whole-engine receipts and operand-identity checks cover the qualified special-value/NaN order.
-- **Off switch:** STRIX_QPF2K_GDN=0; independently STRIX_QPF2K_GDN_GATES_BATCH=0 or STRIX_QPF2K_GDN_CORE16=0 (one at a time)
+- **Off switch:** STRIX_QPF2K_GDN=0; independently STRIX_QPF2K_GDN_GATES_BATCH=0 or STRIX_QPF2K_GDN_CORE16=0 (one at a time); STRIX_QPF2K_GDN_CHUNK16=0 keeps the 8-row core ([Chunk-16 core](#qwen-gdn-chunk16))
 - **Measured gain:** -
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults)
+
+<a id="qwen-gdn-chunk16"></a>
+
+### GDN Chunk-16 core (length-gated)
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN_CHUNK16` (unset = auto, `1` = every eligible call, `0` = off); `STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS`. **Default:** auto (calls of at most 4,096 rows).
+
+The decay-NaN dispatch block pairs of the fused GDN core run 16-row chunks with one key / query / value stage instead of 8-row chunks with two: half the barriers and norm exchanges per row, five blocks per WGP. The next chunk's rows are committed after a barrier that follows every wave's last read, and its v conv is formed after every wave has read its outputs into registers. The selection is per call (bit-identical either way).
+
+- **Preconditions:** STRIX_QPF2K_GDN fused lean core on the decay-NaN dispatch route (PARTS bits 4|16|32, not the 4-column core, not the witness core), call rows a multiple of 16 and at most kQpf2kChunk16MaxRows (4,096; STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS overrides it for crossover measurements), and both padded Chunk-16 kernels (Nan 2 pinned, Nan 1 paired; Opt 6, 25,600 B LDS) co-resident, else the 8-row kernels. The unpadded rows (Opt 2054, 24,064 B) measured slower than the 8-row kernels and run only when forced (=1). The norm ring grows to 16 rows only once such a call runs.
+- **Automatic selection:** Auto when unset (or any value other than `0` / `1`); `=1` takes every eligible call whatever its length; `=0`, `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile run the 8-row kernels; `--print-effective-config` reports it under `long_context_items`. Read once per process.
+- **Fallback notice:** Calls that are not a multiple of 16 rows, longer than the limit, or whose padded Chunk-16 kernels are not co-resident run the 8-row kernels; the residency line names the variant (`chunk 16 single stage`, `... unpadded` when forced, `not this variant`).
+- **Exactness evidence:** Bit-identical by construction (same per-row arithmetic, norm order, conv values and FP32/CORE16 stores; only the chunk length, stage count and barrier placement change). STRIX_QPF2K_GDN_CHECK byte compare of every layer: auto T 2048, forced T 4096 and T 8192, all differ 0 (FP32 outputs); CORE16 (FP16) route at T 4096: terminal-logits fnv64 digest and 32 generated tokens equal to STRIX_QPF2K_GDN_CHUNK16=0 (T 1024 digest equal on the FP32 route).
+- **Off switch:** STRIX_QPF2K_GDN_CHUNK16=0
+- **Measured gain:** gdn_core per call (rocprofv3, fresh process per run, ABBA, one node): T 1024 37.46 -> 35.75 ms (-4.6 %), T 2048 -1.1 %, T 4096 -0.8 %, T 8192 +0.4 %; 8192- and 16384-row calls of 17.7K / 32K prompts +2 / +5 %. Hence the default takes calls of at most 4,096 rows (kQpf2kChunk16MaxRows), the last measured winning point. About 1-2 ms of core time per short prompt; no resolved TTFT change
+- **Implementation / evidence:** [GDN core kernel](../src/hip_gdn_qpf2k_prefill.inc), [launcher](../src/hip_gdn_launcher.hip)
 
 <a id="qwen-gdn-chunk"></a>
 

@@ -180,6 +180,7 @@ An unlisted variable keeps refusing by name, whatever its value.
 | OFF switch | `STRIX_QPF2K_WMMA_PIN`, `STRIX_QPF2K_HC_UPCOPY`, `STRIX_PREFILL_ROUTER_SELECT` | `0`, `1` | Dense register pins, HC up-weight copy and router selection; no rotary work |
 | OFF switch | `STRIX_ROUTER_STAGE_ACT` | `0` | Unset is stage mode 2; `1` is another split and stays unclassified |
 | OFF switch | `STRIX_QSA_WINDOW_ATTN_V2` | `0`, `1` | Verify-window score over already rotated queries and keys |
+| OFF switch | `STRIX_QPF2K_GDN_CHUNK16` | `0`, `1` | GDN core chunk length (unset auto by call length); linear-attention layers only, no rotary work |
 | OFF switch | `STRIX_PREFIX_CACHE` | `0` | Caching itself remains refused by the route guard |
 | Diagnostic | `STRIX_PREFILL_TIMING`, `STRIX_QSA_FAST_STATS`, `STRIX_QPF2K_DENSE_TRACE`, `STRIX_QPF2K_HC_VERBOSE`, `STRIX_PREFLIGHT`, `STRIX_STARTUP_MARKERS`, `STRIX_RELEASE_EVENTS` | `0`, `1` | Host clocks, stderr lines and host counters only |
 | Refused | `STRIX_HCW_OUTPUT`, `STRIX_HCW_NORM16`, `STRIX_QSA_FAST_SPLITS` | none | Change HC output/norm or QSA split arithmetic |

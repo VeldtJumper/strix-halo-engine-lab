@@ -131,6 +131,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_PREFILL_EXACT_FP16", "STRIX_QPF2K_T16K", "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY",
+            "STRIX_QPF2K_GDN_CHUNK16", "STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS",
             "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE",
             "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
@@ -1924,6 +1925,8 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     item("STRIX_QSA_DECODE_SELECT", select_off, true);
     item("STRIX_QSA_DECODE_POOL_BF16", bf16_off, true);
     item("STRIX_QSA_CACHE_ONLY", qpf2k::long_context_item_suppression("STRIX_QSA_CACHE_ONLY", config.gsq_owner), true);
+    // Chunk-16 GDN core: enabled = auto by call length (or "1": every eligible call); same suppressions.
+    item("STRIX_QPF2K_GDN_CHUNK16", qpf2k::long_context_item_suppression("STRIX_QPF2K_GDN_CHUNK16", config.gsq_owner), true);
     item("STRIX_PREFILL_MOE_MERGE_VEC", qpf2k::long_context_item_suppression("STRIX_PREFILL_MOE_MERGE_VEC", config.gsq_owner), false);
     out << "},\"qsa_decode_pool_key_bytes\":" << (pool_off ? 0U : qsa_decode_pool_key_bytes(o, config.gsq_owner));
     if (config.t16k_policy_source)
