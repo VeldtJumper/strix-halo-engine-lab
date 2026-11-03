@@ -278,7 +278,7 @@ __global__ __launch_bounds__(threads) void canonical_softmax(float* scores, floa
         m = x > m ? x : m;
     }
     for (unsigned d = 16; d; d >>= 1U) {
-        const float other = __shfl_xor(m, d, 32);
+        const float other = __shfl_xor(m, int(d), 32);
         m = other > m ? other : m;
     }
     const auto first_chunk = first / attention_chunk, last_chunk = position / attention_chunk;
@@ -295,7 +295,7 @@ __global__ __launch_bounds__(threads) void canonical_softmax(float* scores, floa
             }
         }
         const auto n = unsigned(min(last_chunk - c0 + 1U, std::uint64_t(32)));
-        for (unsigned l = 0; l < n; ++l) denominator = denominator + __shfl(partial, l, 32);
+        for (unsigned l = 0; l < n; ++l) denominator = denominator + __shfl(partial, int(l), 32);
     }
     if (!lane) denominators[rh] = denominator;
 }
@@ -422,10 +422,10 @@ __global__ __launch_bounds__(threads) void canonical_values(const float* scores,
     const auto row = row0 + tq;
 #pragma unroll
     for (unsigned a = 0; a < 4; ++a) {
-        const float denominator = Fused ? merged[4U * tq + a] : denominators[std::size_t(row) * heads + head0 + a];
+        const float total = Fused ? merged[4U * tq + a] : denominators[std::size_t(row) * heads + head0 + a];
 #pragma unroll
         for (unsigned b = 0; b < 8; ++b) {
-            const float value = numerator[a][b] / denominator;
+            const float value = numerator[a][b] / total;
             flag_finite(value, failure);
             out[(std::size_t(row) * heads + head0 + a) * Dim + c0 + 8U * cg + b] = value;
         }
@@ -475,7 +475,7 @@ bool canonical_attention(const float* q, std::span<const gpu::KvRead> reads, uns
                          std::uint32_t* failure, gpu::Queue queue, const CanonicalScratch& scratch, int pack,
                          float* phase_ms, int fuse) {
     const auto rows = unsigned(reads.size());
-    if (!rows || rows > chunk_rows || !heads || heads % group || !q || !out || !failure || !scratch.scores ||
+    if (!rows || rows > max_chunk_rows || !heads || heads % group || !q || !out || !failure || !scratch.scores ||
         !scratch.denominators)
         throw std::invalid_argument("canonical attention geometry");
     if (dim != 256U && dim != 512U) return false;

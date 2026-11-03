@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cfenv>
+#include <cmath>
 #include <stdexcept>
 
 namespace strix::gemma4::prefill {
@@ -94,6 +95,46 @@ std::vector<float> emulate_linear(LinearView w, std::span<const float> input, un
                 sum = instruction(a, b, sum);
             }
             out[std::size_t(r) * w.outputs + n] = sum;
+        }
+    }
+    return out;
+}
+std::vector<float> emulate_linear_v2(LinearView w, std::span<const float> input, unsigned rows, bool blocked) {
+    if (!rows || rows > chunk_rows || !w.data || !w.inputs || w.inputs > 10752 || !w.outputs || w.outputs > vocab ||
+        w.format == WeightFormat::exl3_mul1 || w.row_bytes < packed_row_bytes(w.format, w.inputs) ||
+        input.size() != std::size_t(rows) * w.inputs || std::fegetround() != FE_TONEAREST)
+        throw std::invalid_argument("WMMA v2 emulator geometry or rounding environment");
+    const unsigned stride = ((w.inputs + 15U) / 16U) * 16U;
+    std::vector<std::uint16_t> high(std::size_t(rows) * stride), low(high.size()), weight(stride);
+    for (unsigned r = 0; r < rows; ++r)
+        for (unsigned i = 0; i < w.inputs; ++i) {
+            const float x = input[std::size_t(r) * w.inputs + i];
+            auto& h = high[std::size_t(r) * stride + i];
+            if (!half_bits(x, h)) throw std::runtime_error("WMMA v2 emulator activation overflow");
+            const float rest = (x - fp16_value(h)) * v2_low_scale;
+            if (!half_bits(rest, low[std::size_t(r) * stride + i])) throw std::runtime_error("WMMA v2 emulator low overflow");
+        }
+    std::vector<float> out(std::size_t(rows) * w.outputs);
+    const unsigned block = blocked ? v2_block : stride;
+    for (unsigned n = 0; n < w.outputs; ++n) {
+        for (unsigned i = 0; i < w.inputs; ++i)
+            if (!half_bits(weight_at(w, n, i), weight[i])) throw std::runtime_error("WMMA v2 emulator weight overflow");
+        for (unsigned r = 0; r < rows; ++r) {
+            float s = 0.0F;
+            for (unsigned k0 = 0; k0 < stride; k0 += block) {
+                float h = 0.0F, l = 0.0F;
+                for (unsigned k = k0; k < std::min(stride, k0 + block); k += 16) {
+                    std::array<std::uint16_t, 16> ah{}, al{}, b{};
+                    std::copy_n(high.data() + std::size_t(r) * stride + k, 16, ah.data());
+                    std::copy_n(low.data() + std::size_t(r) * stride + k, 16, al.data());
+                    std::copy_n(weight.data() + k, 16, b.data());
+                    h = instruction(ah, b, h); l = instruction(al, b, l);
+                }
+                const float scaled = l * v2_low_unscale;
+                const float part = h + scaled;
+                s = blocked ? s + part : part;
+            }
+            out[std::size_t(r) * w.outputs + n] = s;
         }
     }
     return out;

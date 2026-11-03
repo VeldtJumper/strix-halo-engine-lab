@@ -190,15 +190,32 @@ void product_table() {
         check(r.qualification() == "qualified", "fast without --allow-pending is qualified");
     }
     r = pr::resolve(pr::Name::fast, pr::App::engine, in());
-    check(status(r, "prefill_route") == pr::Status::pending && value(r, "prefill_route") == "exact" &&
-          r.find("prefill_route")->target == "g4-wmma-pf-v2" && !r.active("prefill_route"), "fast prefill pending, exact runs");
-    check(r.json().find("{\"lever\":\"prefill_route\",\"target\":\"g4-wmma-pf-v2\",\"runs\":\"exact\"}") != std::string::npos,
-          "receipt lists the pending prefill row with its target");
+    // The fast prompt prefill follows its receipt (profile.cpp): named -> the Q4_K_M-gated v1 route; empty -> pending,
+    // prefill-exact runs and the receipt names the target. Qualified either way.
+    const bool fast_prefill_ready = [] {
+        for (const auto& lever : pr::levers()) if (lever.name == "prefill_route") return lever.ready[1];
+        return false;
+    }();
+    if (fast_prefill_ready)
+        check(status(r, "prefill_route") == pr::Status::set && value(r, "prefill_route") == "fast" && r.active("prefill_route") &&
+              r.qualification() == "qualified", "fast runs the qualified v1 prefill");
+    else
+        check(status(r, "prefill_route") == pr::Status::pending && value(r, "prefill_route") == "exact" && !r.active("prefill_route") &&
+              r.qualification() == "qualified", "fast prefill pending: prefill-exact runs");
+    // The fast value runs v1 only on the Q4_K_M pack its receipt covers; other packs keep prefill-exact.
+    check(pr::prefill_route("fast", 15, false) == "v1", "fast prefill: a MOSTLY_Q4_K_M GGUF runs v1");
+    check(pr::prefill_route("fast", 14, false) == "exact", "fast prefill: a Q4_K_S GGUF runs prefill-exact");
+    check(pr::prefill_route("fast", 7, false) == "exact" && pr::prefill_route("fast", 1, false) == "exact",
+          "fast prefill: Q8_0 / F16 GGUF run prefill-exact");
+    check(pr::prefill_route("fast", -1, false) == "exact", "fast prefill: a BF16 checkpoint runs prefill-exact");
+    check(pr::prefill_route("fast", 15, true) == "exact" && pr::prefill_route("v1", -1, true) == "exact",
+          "EXL3 packs keep their own prefill route");
+    check(pr::prefill_route("v1", -1, false) == "v1" && pr::prefill_route("v2", 14, false) == "v2",
+          "explicit v1/v2 select the route on any non-EXL3 pack");
+    check(pr::prefill_route("", 15, false) == "exact" && pr::prefill_route("exact", 15, false) == "exact", "exact prefill");
+    refuses([] { (void)pr::prefill_route("wmma", 15, false); }, "STRIX_G4_PREFILL_IDENTITY", "unknown prefill route refused");
     {
         const auto lines = r.notices();
-        unsigned prefill = 0;
-        for (const auto& line : lines) prefill += line == "profile fast: prefill_route pending g4-wmma-pf-v2 (exact runs)";
-        check(prefill == 1, "one stderr line for the pending prefill row");
         unsigned pending = 0;
         for (const auto& e : r.entries) pending += e.status == pr::Status::pending;
         check(lines.size() == pending, "one stderr line per pending row, no more");
@@ -215,13 +232,13 @@ void product_table() {
     check(r.qualification() == "unqualified: prefill_linears,prefill_attention", "qualification stamp");
     check(r.json().find("\"qualification\":\"unqualified: prefill_linears,prefill_attention\"") != std::string::npos,
           "receipt stamped unqualified");
-    // In the engine the WMMA prefill code does not exist: --allow-pending leaves the row pending (exact runs).
+    // --allow-pending changes nothing for a qualified row.
     r = pr::resolve(pr::Name::fast, pr::App::engine, allow);
-    check(status(r, "prefill_route") == pr::Status::pending && value(r, "prefill_route") == "exact",
-          "allow-pending cannot apply a row whose code is not in the build");
-    // An explicit request for something not in the build is refused.
-    refuses([] { (void)pr::resolve(pr::Name::standard, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_PREFILL", "wmma"}}))); },
-            "not in this build", "explicit engine WMMA prefill refused");
+    check(value(r, "prefill_route") == "fast" && status(r, "prefill_route") ==
+          (fast_prefill_ready ? pr::Status::set : pr::Status::unqualified), "allow-pending runs the fast v1 route");
+    // OFF: STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact under fast.
+    r = pr::resolve(pr::Name::fast, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_PREFILL_IDENTITY", "exact"}})));
+    check(status(r, "prefill_route") == pr::Status::explicit_env && value(r, "prefill_route") == "exact", "explicit exact prefill");
     refuses([] { (void)pr::resolve(pr::Name::fast, pr::App::prefill_bench, in({}, {}, lookup({{"STRIX_G4_PREFILL", "exact"}}))); },
             "not in this build", "explicit exact route in the WMMA-only bench refused");
     // DEFAULT engine: prefill-exact, qualified, nothing pending for prefill.

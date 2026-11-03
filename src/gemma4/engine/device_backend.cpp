@@ -65,15 +65,27 @@ public:
             throw std::invalid_argument("STRIX_G4_EXL3_PREFILL must be exact or wmma");
         const bool exl3_wmma = many_row && exl3_route && std::string(exl3_route) == "wmma" &&
                                bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1;
-        metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : many_row ? "many-row" : "rows8");
+        // Non-EXL3 packs: STRIX_G4_PREFILL_IDENTITY=v1|v2 runs a WMMA prefill identity with canonical
+        // attention: g4-wmma-pf-v1 (FP16 operands) or g4-wmma-pf-v2 (the declared hilo policy); "fast"
+        // (the fast profile's value) runs v1 on Q4_K_M packs, the pack its qualification covers, and
+        // prefill-exact on others; exact (or unset) keeps prefill-exact.
+        const auto* identity = std::getenv("STRIX_G4_PREFILL_IDENTITY");
+        const std::string route{profile::prefill_route(identity ? identity : "",model.gguf_file_type,
+                                                       bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1)};
+        const bool wmma_route = many_row && !exl3_wmma && route != "exact";
+        const bool v2 = wmma_route && route == "v2";
+        metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : v2 ? prefill::v2_identity : wmma_route ? prefill::identity
+                                       : many_row ? "many-row" : "rows8");
         // The prefill linears decide whether prefill rows equal decode rows: any WMMA route never does.
-        const auto linears = exl3_wmma ? prefill::Linears::wmma : prefill::Linears::exact;
+        const auto linears = exl3_wmma || wmma_route ? prefill::Linears::wmma : prefill::Linears::exact;
         // Read-only inspection must never initialize HIP or upload weights.
         if (!inspect) {
             target_ = std::make_unique<gpu::DeviceTarget>(bind_host_weights(model),tables);
             if (many_row)
                 prefill_ = std::make_unique<prefill::DevicePrefill>(target_->borrow_device_weights(),tables,
                     prefill::Residency::device,false,prefill::AttentionMode::canonical,linears);
+            // v1: no policy (every WMMA linear on FP16 operands), also over a STRIX_G4_PREFILL_LINEAR_POLICY.
+            if (wmma_route) prefill_->set_linear_policy(v2 ? prefill::LinearPolicy::parse(prefill::v2_policy) : prefill::LinearPolicy{});
         }
         // Report the identity the device resolved (STRIX_G4_IDENTITY may select g4-a8-v1), not the static model one.
         if (target_) metadata_.set("identity",target_->stats().identity);

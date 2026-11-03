@@ -137,7 +137,8 @@ __global__ __launch_bounds__(128) void flash(const float* q, const gpu::KvRead* 
         Half16 a;
 #pragma unroll
         for (unsigned j = 0; j < 16; ++j) a[j] = probability[j * 16 + lane % 16];
-#pragma unroll (Dim == 256 ? 1 : 8)
+        constexpr unsigned tile_unroll = Dim == 256 ? 1 : 8;
+#pragma unroll tile_unroll
         for (unsigned t = 0; t < tiles; ++t) {
             const unsigned d = (wave * tiles + t) * 16 + lane % 16;
             Half16 b;
@@ -327,7 +328,7 @@ __global__ __launch_bounds__(256) void flash_split(const float* q, const gpu::Kv
             // of its eight keys and takes the other eight from its partner lane.
             // The denominator still adds all sixteen in key order.
             const unsigned half_wave = lane / 16;
-            float mine[8];
+            float own[8];
 #pragma unroll
             for (unsigned i = 0; i < 8; ++i) {
                 const unsigned j = 8 * half_wave + i;
@@ -337,7 +338,7 @@ __global__ __launch_bounds__(256) void flash_split(const float* q, const gpu::Kv
                 // Two roundings, as declared: never fold the exponential's last
                 // multiply into the FP16 conversion (v_fma_mix).
                 asm volatile("" : "+v"(p));
-                mine[i] = p;
+                own[i] = p;
                 // Keep one exponential live at a time; interleaving them costs
                 // more registers than the accumulators leave.
                 __builtin_amdgcn_sched_barrier(0);
@@ -345,8 +346,8 @@ __global__ __launch_bounds__(256) void flash_split(const float* q, const gpu::Kv
             Half16 a;
 #pragma unroll
             for (unsigned j = 0; j < 16; ++j) {
-                const float other = __shfl_xor(mine[j % 8], 16, 32);
-                const float p = j / 8 == half_wave ? mine[j % 8] : other;
+                const float other = __shfl_xor(own[j % 8], 16, 32);
+                const float p = j / 8 == half_wave ? own[j % 8] : other;
                 const bool v = live_r && tile + j >= lo_r && tile + j <= position_r;
                 sum = v ? sum + p : sum;
                 a[j] = static_cast<_Float16>(p);
@@ -425,7 +426,7 @@ std::size_t attention_packed_bytes(unsigned packed_stride, unsigned width) {
 }
 void attention(const float* q, const gpu::KvRead* reads, unsigned rows, unsigned heads, unsigned dim,
                float* out, unsigned* failure, gpu::Queue queue, void* packed, unsigned packed_stride, unsigned key_capacity, bool repack) {
-    if (!rows || rows > chunk_rows || !heads || heads % group || !q || !reads || !out || !failure)
+    if (!rows || rows > max_chunk_rows || !heads || heads % group || !q || !reads || !out || !failure)
         throw std::invalid_argument("WMMA attention geometry");
     const auto stream = static_cast<hipStream_t>(queue);
     const bool split = packed && attention_split_enabled();

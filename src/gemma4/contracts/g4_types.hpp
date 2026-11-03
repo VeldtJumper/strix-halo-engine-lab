@@ -49,6 +49,7 @@ struct ModelManifest {
     ModelConfig config;
     std::vector<TensorRecord> tensors;
     std::vector<std::string> ignored_tensors;
+    std::int32_t gguf_file_type = -1; // GGUF general.file_type (llama.cpp ftype, 15 = MOSTLY_Q4_K_M); -1: not GGUF / absent
     // Keeps mapped weights alive without exposing backend globals or operating-system handles.
     std::vector<std::shared_ptr<const void>> storage;
 };

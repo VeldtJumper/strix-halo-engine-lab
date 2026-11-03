@@ -8,6 +8,10 @@ namespace strix::gemma4::profile {
 namespace {
 constexpr unsigned engine = unsigned(App::engine), decode_bench = unsigned(App::decode_bench),
                    prefill_bench = unsigned(App::prefill_bench), all_apps = engine | decode_bench | prefill_bench;
+// Held-out qualification receipt of g4-wmma-pf-v1 prompt prefill COMPOSED with fast's g4-a8-v1 decode, on the Q4_K_M
+// pack; the row's value "fast" applies v1 to GGUF packs of file type MOSTLY_Q4_K_M only (prefill_route). Empty =
+// pending: fast runs prefill-exact. (Receipt 8b681be093e689fa measured v1 with g4-v1 decode, not this pair.)
+constexpr std::string_view fast_prefill_receipt = "";
 // Profile columns: default, fast, quality. One row per lever; an owner merge (or a passed gate) flips its
 // own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
 constexpr Lever table[] = {
@@ -55,13 +59,15 @@ constexpr Lever table[] = {
      .required = {false, false, false}, .ready = {false, false, true}, .runnable = {false, false, true},
      .kind = Kind::pack, .apps = engine,
      .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1"},
-    // FAST targets WMMA prefill. g4-wmma-pf-v1 failed its frozen held-out gate, so the FAST column is pending
-    // g4-wmma-pf-v2 qualification; --allow-pending runs the v1 implementation, unqualified.
-    {.name = "prefill_route", .env = "STRIX_G4_PREFILL", .value = {"exact", "wmma", "exact"}, .builtin = "exact",
-     .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, false, true},
-     .kind = Kind::bit_changing, .apps = engine, .target = "g4-wmma-pf-v2",
-     .source = "pending: g4-wmma-pf-v2 qualification; the engine runs prefill-exact as many-row chunks "
-               "(STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes) until then"},
+    // FAST prompt prefill: g4-wmma-pf-v1 (FP16 WMMA linears, canonical attention) on Q4_K_M packs, applied once
+    // the pair v1 prefill + g4-a8-v1 decode has its held-out receipt in fast_prefill_receipt (pending: exact runs);
+    // other packs, DEFAULT and QUALITY run prefill-exact. STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact; =v1 / =v2 select a route explicitly.
+    {.name = "prefill_route", .env = "STRIX_G4_PREFILL_IDENTITY", .value = {"exact", "fast", "exact"}, .builtin = "exact",
+     .required = {false, true, false}, .ready = {true, !fast_prefill_receipt.empty(), true}, .runnable = {true, true, true},
+     .kind = Kind::bit_changing, .apps = engine, .target = "g4-wmma-pf-v1",
+     .source = "g4-wmma-pf-v1 (FP16 WMMA linears, canonical attention) on Q4_K_M packs; for fast pending: qualification "
+               "of the pair v1 prefill + g4-a8-v1 decode; other packs, default and quality run prefill-exact as many-row chunks "
+               "(STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes)"},
     // EXL3 packs: the pack's held-out bands were measured on g4-exl3-wmma-pf-v1 prompts (panel WMMA linears,
     // canonical attention); QUALITY targets that identity once its receipt lands, exact runs until then.
     {.name = "exl3_prefill", .env = "STRIX_G4_EXL3_PREFILL", .value = {"", "", "wmma"}, .builtin = "exact",
@@ -74,13 +80,14 @@ constexpr Lever table[] = {
     {.name = "prefill_linears", .env = "STRIX_G4_PREFILL", .value = {"exact", "wmma", "exact"}, .builtin = "wmma",
      .required = {true, true, true}, .ready = {false, false, false}, .runnable = {false, true, false},
      .kind = Kind::bit_changing, .apps = prefill_bench, .builtin_unqualified = true,
-     .target = "g4-wmma-pf-v2",
-     .source = "the prefill bench runs only g4-wmma-pf-v1 linears (unqualified; FAST target g4-wmma-pf-v2): measure "
-               "prefill-exact through strix-gemma4-decode prompt prefill"},
+     .target = "g4-wmma-pf-v1",
+     .source = "the prefill bench runs WMMA prefill linears (g4-wmma-pf-v1; STRIX_G4_PREFILL_LINEAR_POLICY selects "
+               "g4-wmma-pf-v2), stamped unqualified here: the engine applies the qualified identity per profile and "
+               "pack; measure prefill-exact through strix-gemma4-decode prompt prefill"},
     {.name = "prefill_attention", .env = "STRIX_G4_PREFILL_ATTN", .value = {"canonical", "wmma", "canonical"},
      .builtin = "canonical", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
-     .kind = Kind::bit_changing, .apps = prefill_bench, .target = "g4-wmma-pf-v2",
-     .source = "pending: g4-wmma-pf-v2 qualification (WMMA attention)"},
+     .kind = Kind::bit_changing, .apps = prefill_bench, .target = "g4-wmma-attn-v1",
+     .source = "pending: WMMA attention is unqualified; the qualified prefill identities use canonical attention"},
     {.name = "prefill_canonical_kernel", .env = "STRIX_G4_PREFILL_CANON_KERNEL", .value = {"1", "1", "1"},
      .builtin = "1", .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
      .kind = Kind::exact, .apps = prefill_bench,
@@ -312,6 +319,14 @@ std::vector<std::string> Resolution::notices() const {
     return out;
 }
 
+std::string_view prefill_route(std::string_view requested, std::int32_t gguf_file_type, bool exl3_pack) {
+    if (requested.empty() || requested == "exact") return "exact";
+    if (requested != "v1" && requested != "v2" && requested != "fast")
+        throw std::invalid_argument("STRIX_G4_PREFILL_IDENTITY must be exact, v1, v2 or fast");
+    if (exl3_pack) return "exact"; // EXL3 packs: STRIX_G4_EXL3_PREFILL selects their route
+    if (requested == "fast") return gguf_file_type == gguf_file_type_q4_k_m ? "v1" : "exact";
+    return requested;
+}
 void apply(const Resolution& resolution) {
     for (const auto& line : resolution.notices()) std::cerr << line << '\n';
     for (const auto& entry : resolution.entries) {

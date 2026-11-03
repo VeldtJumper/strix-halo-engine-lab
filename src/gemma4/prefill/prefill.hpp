@@ -9,6 +9,15 @@
 namespace strix::gemma4::prefill {
 inline constexpr char identity[] = "g4-wmma-pf-v1";
 inline constexpr unsigned tile = 16, chunk_rows = 512;
+// g4-wmma-pf-v2 low-panel scale and accumulator restart length (emulate_linear_v2).
+inline constexpr float v2_low_scale = 4096.0F, v2_low_unscale = 1.0F / 4096.0F;
+inline constexpr unsigned v2_block = 128;
+// The declared g4-wmma-pf-v2 prefill identity: hilo_k128 on every WMMA linear
+// except the per-layer embedding model (fp16), with canonical attention.
+inline constexpr const char* v2_identity = "g4-wmma-pf-v2";
+inline constexpr const char* v2_policy = "ple_model=fp16;.*=hilo_k128";
+// Row bound of one prefill call (the identity chunk of plan()/Prompt).
+inline constexpr unsigned max_chunk_rows = chunk_rows;
 enum class Mode { exact, wmma };
 // Empty/auto stays exact unless the coordinator supplies complete qualification
 // admission. Numerical-band helpers alone must never set wmma_admitted.
