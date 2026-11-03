@@ -2552,6 +2552,22 @@ Rework attention scheduling without changing the reference result.
 - **Measured gain:** Mode 5 (= mode 3 with packed two-head probability evaluation) vs mode 3, GPU, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, one binary, rank --ab pfmsarework (A=3, B=5; A B A B A B A prefills) in two processes: 8K TTFT B - bracketing A mean -0.129 s, 1K -0.109 s (n=6 each, intervals include 0, not slower); producers -2.9 %, attention -1 % in the kernel bench. Mode 3 vs the original: 8K B/A 0.963 / 0.957 / 0.972
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
+<a id="mm-pf-tail-stream"></a>
+
+### Prefill MoE tail classes beside the MT8 launch
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_TAIL_STREAM`. **Default:** 1.
+
+Run the small row-tile classes (MT 1-7, each with its own launch and register budget) on a side stream while the 128-row MT8 launch runs, and join them before the stage's consumer (gate/up finish, down combine).
+
+- **Preconditions:** v4 prefill MoE core with the MT-fit row tiles (the defaults); a stage forks only when it has both MT8 and tail items.
+- **Automatic selection:** Resolver supplies 1 only when unset; explicit values win.
+- **Fallback notice:** None needed: =0 launches every class on the caller's stream, as before.
+- **Exactness evidence:** Same items, kernels and split partials; each class writes its own experts' partials, and the stage consumer waits for both streams. Bench: partials, tile-major inputs and outputs byte-identical to one stream (PIPE 1 and 2, crafted row counts, synthetic 3/4/5/6/8-bit and real weights); prefill state, final rows and tokens identical on both ranks in every PAIR arm at 1K and 8K.
+- **Off switch:** STRIX_MMX_PREFILL_TAIL_STREAM=0
+- **Measured gain:** MoE call, real weights and routes of one layer, 5 interleaved runs: 4096 rows 49.31 -> 47.81 ms (-3.0 %), 2048 rows -1.9 %, 1024 rows -1.9 %. Two Strix Halo nodes over 2x USB4, in-process A B A B A B A: 1K TTFT -0.1 to -1.1 % (every B faster, two runs), 8K mean -1.6 % (5 of 6 arms faster, one +2.3 % within the 8K noise); 32K fresh process per arm (A B A, B A B): TTFT -0.8 % / -0.3 % against the bracketing arms, MoE GPU time 24.46 -> 24.21 s (mean of 3). Merging the tail classes into one launch instead is slower (+1.5 % at 4096 rows): the merged kernel takes the largest class's registers.
+- **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
 <a id="mm-pf-gather-tok"></a>
 
 ### Prefill MoE token-major gather

@@ -651,6 +651,7 @@ int g_core_override = -1;
 int g_mtfit_override = -1;
 int g_core8_override = -1;
 int g_pipe_override = -1;
+int g_tail_stream_override = -1;
 int g_gufuse_override = -1;
 int g_gather_tok_override = -1;
 bool g_gufuse_debug = false;
@@ -710,6 +711,20 @@ int prefill_pipe_default() {
     return value;
 }
 int prefill_pipe() { return g_pipe_override < 0 ? prefill_pipe_default() : g_pipe_override; }
+
+// STRIX_MMX_PREFILL_TAIL_STREAM (v4 + mtfit): 1 (default) = the tail-class launches (MT 1..7) of each stage run on a side
+// stream beside the MT8 launch, joined before the stage's consumer; 0 = every class launch on the caller's stream.
+// Same items, kernels and bits; the classes write disjoint partials.
+bool prefill_tail_stream_default() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRIX_MMX_PREFILL_TAIL_STREAM");
+        if (e == nullptr || std::string(e) == "1") return true;
+        if (std::string(e) == "0") return false;
+        throw std::invalid_argument("STRIX_MMX_PREFILL_TAIL_STREAM must be 0 or 1");
+    }();
+    return on;
+}
+bool prefill_tail_stream() { return g_tail_stream_override < 0 ? prefill_tail_stream_default() : g_tail_stream_override != 0; }
 
 bool prefill_gufuse_default() {
     static const bool on = [] {
@@ -804,6 +819,34 @@ V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, 
         append(it, true);
     }
     return v;
+}
+
+// STRIX_MMX_PREFILL_TAIL_STREAM side stream (non-blocking) and its fork / join events, created on first use.
+hipStream_t g_tail_side = nullptr;
+hipEvent_t g_tail_forked = nullptr, g_tail_joined = nullptr;
+void tail_fork(hipStream_t stream) {
+    if (g_tail_side == nullptr) {  // all three or none: a failed creation leaves nothing half-initialized
+        hipStream_t side = nullptr;
+        hipEvent_t forked = nullptr, joined = nullptr;
+        hipError_t e = hipStreamCreateWithFlags(&side, hipStreamNonBlocking);
+        if (e == hipSuccess) e = hipEventCreateWithFlags(&forked, hipEventDisableTiming);
+        if (e == hipSuccess) e = hipEventCreateWithFlags(&joined, hipEventDisableTiming);
+        if (e != hipSuccess) {
+            if (joined != nullptr) (void)hipEventDestroy(joined);
+            if (forked != nullptr) (void)hipEventDestroy(forked);
+            if (side != nullptr) (void)hipStreamDestroy(side);
+            ok(e, "tail side stream / events");
+        }
+        g_tail_side = side;
+        g_tail_forked = forked;
+        g_tail_joined = joined;
+    }
+    ok(hipEventRecord(g_tail_forked, stream), "tail fork");
+    ok(hipStreamWaitEvent(g_tail_side, g_tail_forked, 0), "tail fork wait");
+}
+void tail_join(hipStream_t stream) {
+    ok(hipEventRecord(g_tail_joined, g_tail_side), "tail join");
+    ok(hipStreamWaitEvent(stream, g_tail_joined, 0), "tail join wait");
 }
 
 constexpr const char* kGuLabel[8] = {"gate_up.mt1", "gate_up.mt2", "gate_up.mt3", "gate_up.mt4",
@@ -967,6 +1010,20 @@ void set_prefill_pipe(int value) {
     (void)prefill_pipe_default();
     g_pipe_override = value;
 }
+void set_prefill_tail_stream(int on) {
+    if (on < -1 || on > 1) throw std::invalid_argument("set_prefill_tail_stream: value must be -1, 0 or 1");
+    (void)prefill_tail_stream_default();  // capture once, including at Engine startup
+    g_tail_stream_override = on;
+}
+void cleanup_prefill_tail_stream() noexcept {
+    if (g_tail_side != nullptr) (void)hipStreamSynchronize(g_tail_side);
+    for (hipEvent_t* ev : {&g_tail_forked, &g_tail_joined}) {
+        if (*ev != nullptr) (void)hipEventDestroy(*ev);
+        *ev = nullptr;
+    }
+    if (g_tail_side != nullptr) (void)hipStreamDestroy(g_tail_side);
+    g_tail_side = nullptr;
+}
 void set_prefill_core8(int value) {
     if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_core8: value must be -1, 0, 1 or 2");
     (void)prefill_core8_default();  // capture once, including at Engine startup
@@ -1104,11 +1161,35 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     if (v2) {
         const auto* it_d = reinterpret_cast<const pfk::Item*>(ws + p.off_items);
         std::size_t at = 0;
-        for (unsigned c = 0; c < 8; ++c) {
-            launch_v2(it_d + at, v2i.gu[c], v2i.gu_ctas[c], c, core, stream);
-            at += v2i.gu[c].size();
-            if (!v2i.gu[c].empty()) mark(kGuLabel[core == 3 ? c : pfk::mt_of_class(c) - 1], stream);
-        }
+        // One stage's class launches; with the tail stream, classes 0..6 go to the side stream beside class 7.
+        const bool tail_stream = core == 3 && prefill_mtfit() && prefill_tail_stream();
+        auto stage = [&](const std::vector<pfk::Item>* lists, const unsigned* ctas, const char* const* labels) {
+            bool tails = false;
+            for (unsigned c = 0; c < 7; ++c) tails = tails || !lists[c].empty();
+            const bool side = tail_stream && tails && !lists[7].empty();
+            if (side) tail_fork(stream);
+            std::size_t c_at = at;
+            try {
+                for (unsigned c = 0; c < 7 && side; ++c) {
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, g_tail_side);
+                    c_at += lists[c].size();
+                }
+                for (unsigned c = side ? 7U : 0U; c < 8; ++c) {
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, stream);
+                    c_at += lists[c].size();
+                    if (!lists[c].empty()) mark(labels[core == 3 ? c : pfk::mt_of_class(c) - 1], stream);
+                }
+            } catch (...) {
+                if (side) tail_join(stream);  // side work stays inside the caller's completion chain
+                throw;
+            }
+            if (side) {
+                tail_join(stream);
+                mark(labels[6], stream);  // the joined tail classes (v4 only)
+            }
+            at = c_at;
+        };
+        stage(v2i.gu, v2i.gu_ctas, kGuLabel);
         for (unsigned c = 0; c < 8; ++c) {
             if (!v2i.fused[c].empty()) {
                 launch_gufuse_class(it_d + at, static_cast<unsigned>(v2i.fused[c].size() / 2), v2i.fused_ctas[c], c, t, stream);
@@ -1121,11 +1202,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
         else hipLaunchKernelGGL(gate_up_finish_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t);
         launched("gate/up finish");
         mark("finish", stream);
-        for (unsigned c = 0; c < 8; ++c) {
-            launch_v2(it_d + at, v2i.dn[c], v2i.dn_ctas[c], c, core, stream);
-            at += v2i.dn[c].size();
-            if (!v2i.dn[c].empty()) mark(kDnLabel[core == 3 ? c : pfk::mt_of_class(c) - 1], stream);
-        }
+        stage(v2i.dn, v2i.dn_ctas, kDnLabel);
         launched("down v2");
         hipLaunchKernelGGL(down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
         launched("down combine");

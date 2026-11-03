@@ -76,6 +76,10 @@ void set_prefill_gufuse_debug(bool on, float* intermediates = nullptr, bool prod
 // PIPE is opt-in; -1 restores the environment. Getter preserves explicit overrides across A/B runs.
 void set_prefill_pipe(int value);
 int prefill_pipe_override();
+// v4 + mtfit tail classes beside the MT8 launch on a side stream: -1 = STRIX_MMX_PREFILL_TAIL_STREAM (default on),
+// 0 = off, 1 = on. cleanup_ releases the side stream and its events (Engine teardown).
+void set_prefill_tail_stream(int on);
+void cleanup_prefill_tail_stream() noexcept;
 void set_prefill_core8(int value);  // -1 = environment, 0 = off (default), 1 = A LDS, 2 = shared B
 // Bench only (tests/hip_mmx_moe_bench.hip stage split): 8 / 9 = v3 without A loads / without decode, WRONG outputs,
 // timing only; never selected by the environment or by set_prefill_core.
