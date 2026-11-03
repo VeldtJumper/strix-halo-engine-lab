@@ -335,12 +335,13 @@ __device__ __forceinline__ void r6_wave(const float* z, float* m, const float* b
 }
 
 // Launch 3: per row, the 64-partial tree (offsets 32 .. 1) per chain, then R6 + collapse exactly as dev::hc_pre.
-template <bool Distributed, bool ParallelR6 = false, bool Norm = false>
-__global__ __launch_bounds__(256) void hc_fin_kernel(const float* X, const float* base, const float* scale, float* mix, float* xc,
-                                                     const std::uint16_t* norm = nullptr, float* xn = nullptr) {
+// Coherent: the partials were stored by other workgroups of the same launch (hc_site_kernel), read at agent scope.
+template <bool Distributed, bool ParallelR6 = false, bool Norm = false, bool Coherent = false>
+__device__ __forceinline__ void hc_fin_row(unsigned r, const float* X, const float* base, const float* scale, float* mix, float* xc,
+                                           const std::uint16_t* norm, float* xn) {
     __shared__ float z[kHcMix];
     __shared__ float m[kHcMix];
-    const unsigned r = blockIdx.x, l = threadIdx.x;
+    const unsigned l = threadIdx.x;
     const float* Xr = X + static_cast<std::size_t>(r) * kN;
     if constexpr (Distributed) {
         // Lane a owns indices a + 8*k. These local stages are exactly the
@@ -350,7 +351,8 @@ __global__ __launch_bounds__(256) void hc_fin_kernel(const float* X, const float
             const float* src = g_part + (static_cast<std::size_t>(r) * kHcMix + chain) * kHcBlocks;
             float p[8];
 #pragma unroll
-            for (unsigned k = 0; k < 8; ++k) p[k] = src[lane + 8 * k];
+            for (unsigned k = 0; k < 8; ++k)
+                p[k] = Coherent ? __hip_atomic_load(&src[lane + 8 * k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : src[lane + 8 * k];
 #pragma unroll
             for (unsigned h = 4; h > 0; h >>= 1U) {
 #pragma unroll
@@ -395,6 +397,80 @@ __global__ __launch_bounds__(256) void hc_fin_kernel(const float* X, const float
         float* yr = xn + static_cast<std::size_t>(r) * kHidden;
         for (unsigned i = l; i < kHidden; i += 256)
             yr[i] = norm ? (xr[i] * rr) * bf16_to_float(norm[i]) : xr[i] * rr;
+    }
+}
+template <bool Distributed, bool ParallelR6 = false, bool Norm = false>
+__global__ __launch_bounds__(256) void hc_fin_kernel(const float* X, const float* base, const float* scale, float* mix, float* xc,
+                                                     const std::uint16_t* norm = nullptr, float* xn = nullptr) {
+    hc_fin_row<Distributed, ParallelR6, Norm>(blockIdx.x, X, base, scale, mix, xc, norm, xn);
+}
+
+// One launch per decode mHC site (hc_pre_norm with STRIX_GLM_HC_SITE): launches 1 + 2 (+ 3 when Fin) of hc_pre_norm in
+// one grid of kHcBlocks workgroups. Every workgroup recomputes rr of each row exactly as hc_rr_kernel (the same 256
+// lane-strided fmaf chains and the same lds_tree pairs, one tree per row), then runs hc_part's block j with that rr; with
+// Fin the last workgroup to arrive (device-scope counter, as variant 2) runs hc_fin<true, true, true> row after row. Fin
+// is for one row: the last workgroup would run rows serially, so multi-row calls launch hc_fin<..., Norm> separately.
+__device__ unsigned g_site_cnt;
+template <unsigned Rows, bool Fin>
+__global__ __launch_bounds__(256) void hc_site_kernel(const float* X, const float* fn, float* F, const float* base, const float* scale,
+                                                      float* mix, float* xc, const std::uint16_t* norm, float* xn, unsigned rows) {
+    __shared__ float fs[kHcMix][kPad];
+    __shared__ float xs[Rows][kPad];
+    __shared__ float ss[Rows][256];
+    __shared__ float rrs[Rows];
+    __shared__ unsigned last;
+    const unsigned j = blockIdx.x, t = threadIdx.x, i0 = j * kR1bBlock;
+    for (unsigned r = 0; r < rows; ++r) {
+        // All 64 loads in flight first, then hc_rr's chain in its order (i = t, t + 256, ...).
+        const float* Xr = X + static_cast<std::size_t>(r) * kN + t;
+        float v[kN / 256];
+#pragma unroll
+        for (unsigned k = 0; k < kN / 256; ++k) v[k] = Xr[k * 256];
+        float a = 0.0F;
+#pragma unroll
+        for (unsigned k = 0; k < kN / 256; ++k) a = __builtin_fmaf(v[k], v[k], a);
+        ss[r][t] = a;
+    }
+    for (unsigned idx = t; idx < kHcMix * kR1bBlock; idx += 256) {
+        const unsigned o = idx / kR1bBlock, i = idx % kR1bBlock;
+        fs[o][i] = fn[static_cast<std::size_t>(o) * kN + i0 + i];
+    }
+    __syncthreads();
+    for (unsigned h = 128; h > 0; h >>= 1U) {
+        for (unsigned r = 0; r < rows; ++r)
+            if (t < h) ss[r][t] = ss[r][t] + ss[r][t + h];
+        __syncthreads();
+    }
+    if (t < rows) rrs[t] = inv_sqrt(ss[t][0] / static_cast<float>(kN) + kEps);
+    __syncthreads();
+    for (unsigned idx = t; idx < rows * kR1bBlock; idx += 256) {
+        const unsigned r = idx / kR1bBlock, i = idx % kR1bBlock;
+        const std::size_t g = static_cast<std::size_t>(r) * kN + i0 + i;
+        const float v = X[g] * rrs[r];
+        xs[r][i] = v;
+        F[g] = v;
+    }
+    __syncthreads();
+    const unsigned o = t % kHcMix, r = t / kHcMix;
+    if (t < kPartThreads && r < rows) {
+        float acc = 0.0F;
+        for (unsigned i = 0; i < kR1bBlock; ++i) acc = __builtin_fmaf(xs[r][i], fs[o][i], acc);
+        float* dst = &g_part[(static_cast<std::size_t>(r) * kHcMix + o) * kHcBlocks + j];
+        if constexpr (Fin) __hip_atomic_store(dst, acc, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        else *dst = acc;
+    }
+    if constexpr (Fin) {
+        __threadfence();
+        __syncthreads();
+        if (t == 0) last = atomicAdd(&g_site_cnt, 1U) == gridDim.x - 1 ? 1U : 0U;
+        __syncthreads();
+        if (last == 0) return;
+        __threadfence();
+        for (unsigned q = 0; q < rows; ++q) {
+            __syncthreads();
+            hc_fin_row<true, true, true, true>(q, X, base, scale, mix, xc, norm, xn);
+        }
+        if (t == 0) atomicExch(&g_site_cnt, 0U);
     }
 }
 
@@ -547,9 +623,32 @@ bool hc_norm_enabled() {
     return enabled;
 }
 
+int hc_site_mode() {
+    // 1 (default): one launch per site at one row, three at 2..8 rows; 2: also two launches (rr + part, fin + norm) at
+    // 2..8 rows (measured +0.7 % R8 ms/step: the per-workgroup rr recompute costs more than the saved launch); 0: three.
+    static const int mode = [] {
+        const char* v = std::getenv("STRIX_GLM_HC_SITE");
+        return v != nullptr && *v != '\0' ? std::atoi(v) : 1;
+    }();
+    return mode;
+}
+
 void hc_pre_norm(const float* X, const float* fn, const float* base, const float* scale, float* F, float* mix, float* xc,
-                 const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
+                 const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s, int site) {
     if (rows == 0 || rows > kMaxRows) throw std::invalid_argument("r1b hc_pre_norm: rows 1..8");
+    if (site < 0) site = hc_site_mode();
+    if (site == 2 || (site == 1 && rows == 1)) {
+        if (rows == 1) {
+            hc_site_kernel<1, true><<<kHcBlocks, 256, 0, s>>>(X, fn, F, base, scale, mix, xc, norm, xn, rows);
+            ok(hipGetLastError(), "hc_site");
+            return;
+        }
+        hc_site_kernel<kMaxRows, false><<<kHcBlocks, 256, 0, s>>>(X, fn, F, base, scale, mix, xc, norm, xn, rows);
+        ok(hipGetLastError(), "hc_site_part");
+        hc_fin_kernel<true, true, true><<<rows, 256, 0, s>>>(X, base, scale, mix, xc, norm, xn);
+        ok(hipGetLastError(), "hc_site_fin");
+        return;
+    }
     hc_rr_kernel<<<rows, 256, 0, s>>>(X);
     ok(hipGetLastError(), "hc_norm_rr");
     if (rows == 1) hc_part_kernel<1><<<kHcBlocks, kPartThreads, 0, s>>>(X, fn, F, rows);

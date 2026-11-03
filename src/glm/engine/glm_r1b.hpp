@@ -55,7 +55,11 @@ void hc_pre(const float* X, const float* fn, const float* base, const float* sca
 // Opt-in process option (read once, default false). Fusion uses the v4 hc finish,
 // followed by the exact dev::rmsnorm<256> BF16 arithmetic; xc remains materialized.
 bool hc_norm_enabled();
+// site: launches per call (same bits). 0: rr, partials, finish + norm (3); 1: every workgroup recomputes rr, the last one
+// to arrive finishes (1 launch) at one row, 0 at 2..8 rows; 2: as 1 at one row, rr + partials then finish + norm (2) at 2..8.
+// -1: STRIX_GLM_HC_SITE (default 1).
+int hc_site_mode();
 void hc_pre_norm(const float* X, const float* fn, const float* base, const float* scale, float* F, float* mix, float* xc,
-                 const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s);
+                 const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s, int site = -1);
 
 }  // namespace strix::glm::r1b

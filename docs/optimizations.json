@@ -2282,6 +2282,17 @@
   },
   {
     "engine": "glm",
+    "name": "Decode one-launch mHC site",
+    "flag_or_env": "STRIX_GLM_HC_SITE",
+    "default": "1 (engine default)",
+    "exact": "F / mix / xc / xn bitwise equal to the three-launch site at 1..8 rows; pair decode tokens and R8 rows equal the reference on both ranks.",
+    "gain": "Pair, fresh process per arm, --mtp 0: C1 -1.45 % (39.72 / 39.71 -> 39.12 / 39.16 ms/token); R8 unchanged",
+    "preconditions": "Fused HC norm (STRIX_GLM_HC_NORM=1, the default); one decode row (2..8 rows keep three launches).",
+    "off_switch": "STRIX_GLM_HC_SITE=0, or --baseline",
+    "doc_anchor": "docs/optimizations.md#glm-hc-site"
+  },
+  {
+    "engine": "glm",
     "name": "Server batched MTP verify",
     "flag_or_env": "STRIX_GLM_SERVE_G2",
     "default": "on (with MTP)",
