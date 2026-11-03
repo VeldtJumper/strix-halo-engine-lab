@@ -222,7 +222,10 @@ __global__ void kv_store_kernel(const float* k, const float* v, LinearView k_nor
 constexpr unsigned fused_chunks = 9;
 // Quant (g4-a8-v1): the output row (heads * Dim values) is also quantized for the output projection;
 // each wave stores whole 32-value groups in lane order.
-template <unsigned Dim, bool Quant = false>
+// Lanes (STRIX_G4_ATTN_SCAN, default on): the per-chunk maxima and the per-chunk denominator partials are
+// computed by one lane per chunk (each in its chunk's position order), and lane 0 folds them in chunk order:
+// the same comparisons and additions in the same order as the single-thread scans.
+template <unsigned Dim, bool Quant = false, bool Lanes = false>
 __global__ void __launch_bounds__(256) fused_attention_kernel(const float* q, LinearView q_norm,
                                                               const std::uint64_t* positions, const float* table,
                                                               const KvRead* reads, unsigned heads_count, float* out,
@@ -236,6 +239,7 @@ __global__ void __launch_bounds__(256) fused_attention_kernel(const float* q, Li
     __shared__ const float* keys[Span];
     __shared__ const float* values[Span];
     __shared__ float merged_maximum, merged_denominator;
+    __shared__ float chunk_value[fused_chunks];
     const auto r = reads[row];
     const auto range = visible(r.position, r.global, r.window);
     const auto origin = (range.first / attention_chunk) * attention_chunk;
@@ -298,7 +302,26 @@ __global__ void __launch_bounds__(256) fused_attention_kernel(const float* q, Li
     __syncthreads();
     const auto first_chunk = unsigned(range.first / attention_chunk);
     const auto last_chunk = unsigned(range.last / attention_chunk);
-    if (threadIdx.x == 0) {
+    if constexpr (Lanes) {
+        const auto chunks = last_chunk - first_chunk + 1U;
+        if (threadIdx.x < chunks) {
+            const auto c = first_chunk + threadIdx.x;
+            float a = bit_cast<float>(0xff800000U);
+            for (unsigned j = 0; j < attention_chunk; ++j) {
+                const auto p = std::uint64_t(c) * attention_chunk + j;
+                if (p >= range.first && p <= range.last)
+                    a = score[p - origin] > a ? score[p - origin] : a;
+            }
+            chunk_value[threadIdx.x] = a;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float m = bit_cast<float>(0xff800000U);
+            for (unsigned c = 0; c < chunks; ++c)
+                m = chunk_value[c] > m ? chunk_value[c] : m;
+            merged_maximum = m;
+        }
+    } else if (threadIdx.x == 0) {
         float m = bit_cast<float>(0xff800000U);
         for (auto c = first_chunk; c <= last_chunk; ++c) {
             float a = bit_cast<float>(0xff800000U);
@@ -317,7 +340,25 @@ __global__ void __launch_bounds__(256) fused_attention_kernel(const float* q, Li
         score[slot] = declared_exp(score[slot] - merged_maximum);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if constexpr (Lanes) {
+        const auto chunks = last_chunk - first_chunk + 1U;
+        if (threadIdx.x < chunks) {
+            const auto c = first_chunk + threadIdx.x;
+            const auto begin = max(std::uint64_t(c) * attention_chunk, range.first);
+            const auto end = min(std::uint64_t(c + 1U) * attention_chunk, range.last + 1U);
+            float partial = 0.0F;
+            for (auto p = begin; p < end; ++p)
+                partial = partial + score[p - origin];
+            chunk_value[threadIdx.x] = partial;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float denominator = 0.0F;
+            for (unsigned c = 0; c < chunks; ++c)
+                denominator = denominator + chunk_value[c];
+            merged_denominator = denominator;
+        }
+    } else if (threadIdx.x == 0) {
         float denominator = 0.0F;
         for (auto c = first_chunk; c <= last_chunk; ++c) {
             const auto begin = max(std::uint64_t(c) * attention_chunk, range.first);
@@ -399,7 +440,10 @@ __global__ void __launch_bounds__(256) fused_attention_fast_kernel(const float* 
     // denominator scans; bit 2 requests each chunk's value column and scores in
     // one batch before the ordered numerator accumulation. Values and order are
     // fused_attention_kernel's for every shape; only load batching differs.
-    constexpr bool Wide = (Shape & 1U) != 0, Window = (Shape & 2U) != 0, Batch = (Shape & 4U) != 0;
+    // Bit 3 (STRIX_G4_ATTN_SCAN, default on): one lane per chunk computes that chunk's maximum and denominator
+    // partial in position order and lane 0 folds them in chunk order (the same operations in the same order).
+    constexpr bool Wide = (Shape & 1U) != 0, Window = (Shape & 2U) != 0, Batch = (Shape & 4U) != 0,
+                   Lanes = (Shape & 8U) != 0;
     constexpr unsigned Keys = Wide ? (Dim == 512U ? 4U : 8U) : (Dim == 512U ? 2U : 4U);
     const unsigned rh = blockIdx.x, row = rh / heads_count, head = rh % heads_count;
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
@@ -409,6 +453,7 @@ __global__ void __launch_bounds__(256) fused_attention_fast_kernel(const float* 
     __shared__ const float* values[Span];
     __shared__ float merged_maximum, merged_denominator;
     __shared__ float current[Store ? 2U : 1U][Store ? kv_heads * Dim : 1U];
+    __shared__ float chunk_value[fast_chunks];
     const auto r = reads[row];
     const auto range = visible(r.position, r.global, r.window);
     const auto origin = (range.first / attention_chunk) * attention_chunk;
@@ -508,7 +553,30 @@ __global__ void __launch_bounds__(256) fused_attention_fast_kernel(const float* 
         store_scores(base);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if constexpr (Lanes) {
+        const auto chunks = last_chunk - first_chunk + 1U;
+        if (threadIdx.x < chunks) {
+            const auto c = first_chunk + threadIdx.x;
+            const auto offset = std::uint64_t(c) * attention_chunk - origin;
+            float a = bit_cast<float>(0xff800000U);
+#pragma unroll
+            for (unsigned j = 0; j < attention_chunk; ++j) {
+                const auto p = std::uint64_t(c) * attention_chunk + j;
+                if (p >= range.first && p <= range.last) {
+                    const float x = score[offset + j];
+                    a = x > a ? x : a;
+                }
+            }
+            chunk_value[threadIdx.x] = a;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float m = bit_cast<float>(0xff800000U);
+            for (unsigned c = 0; c < chunks; ++c)
+                m = chunk_value[c] > m ? chunk_value[c] : m;
+            merged_maximum = m;
+        }
+    } else if (threadIdx.x == 0) {
         float m = bit_cast<float>(0xff800000U);
         for (auto c = first_chunk; c <= last_chunk; ++c) {
             float window[attention_chunk];
@@ -537,7 +605,30 @@ __global__ void __launch_bounds__(256) fused_attention_fast_kernel(const float* 
         score[slot] = declared_exp(score[slot] - merged_maximum);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if constexpr (Lanes) {
+        const auto chunks = last_chunk - first_chunk + 1U;
+        if (threadIdx.x < chunks) {
+            const auto c = first_chunk + threadIdx.x;
+            const auto offset = std::uint64_t(c) * attention_chunk - origin;
+            const auto begin = max(std::uint64_t(c) * attention_chunk, range.first);
+            const auto end = min(std::uint64_t(c + 1U) * attention_chunk, range.last + 1U);
+            float partial = 0.0F;
+#pragma unroll
+            for (unsigned j = 0; j < attention_chunk; ++j) {
+                const auto p = std::uint64_t(c) * attention_chunk + j;
+                if (p >= begin && p < end)
+                    partial = partial + score[offset + j];
+            }
+            chunk_value[threadIdx.x] = partial;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float denominator = 0.0F;
+            for (unsigned c = 0; c < chunks; ++c)
+                denominator = denominator + chunk_value[c];
+            merged_denominator = denominator;
+        }
+    } else if (threadIdx.x == 0) {
         float denominator = 0.0F;
         for (auto c = first_chunk; c <= last_chunk; ++c) {
             float window[attention_chunk];
@@ -998,6 +1089,15 @@ void launch_fast_attention_shape(unsigned blocks, hipStream_t stream, const floa
     hipLaunchKernelGGL((fused_attention_fast_kernel<Dim, Store, Shape>), dim3(blocks), dim3(256), 0, stream, q, q_norm,
                        positions, table, reads, heads_count, out, parallel, bounded, intervals, failure, store);
 }
+// STRIX_G4_ATTN_SCAN (default on, read once per process): lane-parallel per-chunk maximum and denominator
+// scans in the decode attention kernels (same values); =0 restores the single-thread scans.
+bool attention_lane_scans() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_ATTN_SCAN");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled;
+}
 template <bool Store>
 void launch_fast_attention(bool global, unsigned blocks, hipStream_t stream, const float* q, LinearView q_norm,
                            const std::uint64_t* positions, const float* table, const KvRead* reads,
@@ -1005,7 +1105,7 @@ void launch_fast_attention(bool global, unsigned blocks, hipStream_t stream, con
                            unsigned* failure, KvStoreArgs store) {
     static const unsigned shape = [] {
         const auto* p = std::getenv("STRIX_G4_ATTN_SHAPE");
-        return p ? unsigned(std::strtoul(p, nullptr, 10)) & 7U : 6U;
+        return (p ? unsigned(std::strtoul(p, nullptr, 10)) & 7U : 6U) | (attention_lane_scans() ? 8U : 0U);
     }();
     const auto launch = [&](auto dim, auto form) {
         launch_fast_attention_shape<decltype(dim)::value, Store, decltype(form)::value>(
@@ -1023,7 +1123,15 @@ void launch_fast_attention(bool global, unsigned blocks, hipStream_t stream, con
         case 4: launch(dim, std::integral_constant<unsigned, 4>{}); break;
         case 5: launch(dim, std::integral_constant<unsigned, 5>{}); break;
         case 6: launch(dim, std::integral_constant<unsigned, 6>{}); break;
-        default: launch(dim, std::integral_constant<unsigned, 7>{}); break;
+        case 7: launch(dim, std::integral_constant<unsigned, 7>{}); break;
+        case 8: launch(dim, std::integral_constant<unsigned, 8>{}); break;
+        case 9: launch(dim, std::integral_constant<unsigned, 9>{}); break;
+        case 10: launch(dim, std::integral_constant<unsigned, 10>{}); break;
+        case 11: launch(dim, std::integral_constant<unsigned, 11>{}); break;
+        case 12: launch(dim, std::integral_constant<unsigned, 12>{}); break;
+        case 13: launch(dim, std::integral_constant<unsigned, 13>{}); break;
+        case 14: launch(dim, std::integral_constant<unsigned, 14>{}); break;
+        default: launch(dim, std::integral_constant<unsigned, 15>{}); break;
         }
     };
     if (global)
@@ -1126,18 +1234,26 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
         plain.quant = quantize ? quant : A8Rows{};
         launch_fast_attention<false>(global, rows * heads_count, stream, q, q_norm, positions, table, reads,
                                      heads_count, out, parallel, bounded, intervals, failure, plain);
-    } else if (global && quantize)
-        hipLaunchKernelGGL((fused_attention_kernel<512, true>), dim3(rows * heads_count), dim3(256), 0, stream, q, q_norm,
-                           positions, table, reads, heads_count, out, parallel, bounded, intervals, failure, quant);
-    else if (quantize)
-        hipLaunchKernelGGL((fused_attention_kernel<256, true>), dim3(rows * heads_count), dim3(256), 0, stream, q, q_norm,
-                           positions, table, reads, heads_count, out, parallel, bounded, intervals, failure, quant);
-    else if (global)
-        hipLaunchKernelGGL((fused_attention_kernel<512>), dim3(rows * heads_count), dim3(256), 0, stream, q, q_norm,
-                           positions, table, reads, heads_count, out, parallel, bounded, intervals, failure, quant);
-    else
-        hipLaunchKernelGGL((fused_attention_kernel<256>), dim3(rows * heads_count), dim3(256), 0, stream, q, q_norm,
-                           positions, table, reads, heads_count, out, parallel, bounded, intervals, failure, quant);
+    } else {
+        const auto launch = [&](auto dim, auto quantized, auto lanes) {
+            hipLaunchKernelGGL((fused_attention_kernel<decltype(dim)::value, decltype(quantized)::value,
+                                                       decltype(lanes)::value>),
+                               dim3(rows * heads_count), dim3(256), 0, stream, q, q_norm, positions, table, reads,
+                               heads_count, out, parallel, bounded, intervals, failure, quant);
+        };
+        using D256 = std::integral_constant<unsigned, 256>;
+        using D512 = std::integral_constant<unsigned, 512>;
+        const auto with_quant = [&](auto dim, auto lanes) {
+            if (quantize) launch(dim, std::true_type{}, lanes);
+            else launch(dim, std::false_type{}, lanes);
+        };
+        const auto with_dim = [&](auto lanes) {
+            if (global) with_quant(D512{}, lanes);
+            else with_quant(D256{}, lanes);
+        };
+        if (attention_lane_scans()) with_dim(std::true_type{});
+        else with_dim(std::false_type{});
+    }
     launch_checked();
     return true;
 }
