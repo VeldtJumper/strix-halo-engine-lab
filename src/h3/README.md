@@ -10,6 +10,7 @@ Each package lives in its own directory and adds one `cmake/h3_<NN>_<pkg>.cmake`
 
 | dir | package |
 |---|---|
+| `common/` | header-only fixture reader (format h3fx v1) |
 | `gemm/` | W8A8 tensorwise + convrot GEMM and the activation quantiser |
 | `attn/` | dense non-causal flash attention, head dim 128, split-KV partials and canonical merge |
 | `block/` | block glue, weight loader, single-node forward, sampler |
