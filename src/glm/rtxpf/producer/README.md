@@ -768,13 +768,15 @@ joined by `+`) or `STRIX_GLM_RTX_ROW_KERNELS` selects them; decode commands take
 (`glm_row_mma_test`, run by hand on a GPU) compares the strips with the CUTLASS paths
 on random tiles of every rate. The hyper-connection mix and the router also run for
 two to four rows (the verify step of self-speculation). Round two of the one-row
-kernels is opt-in (`--decode-row-kernels 2`, or `r2` in a subset): FP32 index
-projections for up to four rows in one ascending `fmaf` chain per output
-(`projection_fp32_row`), dense FP16 `[n][k]` strips for the KDA ordinary projections
-(`row_dense`), A operands loaded before each tile's weight decode, four-wide reads in
-the hyper-connection mix, and a parallel expert compaction and prefix sum. The
-values are the same bits, but in an A/B on one RTX PRO 6000 it was not faster than
-round one, so round one stays the default.
+kernels is opt-in (`--decode-row-kernels 2`, or `r2` in a subset), each change also on
+its own (`1+r2idx` and so on): FP32 index projections for up to four rows in one
+ascending `fmaf` chain per output (`r2idx`, `projection_fp32_row`), dense FP16 `[n][k]`
+strips for the ordinary projections (`r2dense`, `row_dense`), A operands loaded before
+each tile's weight decode (`r2pre`), four-wide reads in the hyper-connection mix
+(`r2hc`), and a parallel expert compaction and prefix sum (`r2par`). `r2pre` measured
+faster (+8 % warm decode at 1K, same bits) and is part of the default `1`; the others
+were not faster and stay opt-in (dense strips were slower). `moe+hc+router+kda+dsa`
+is round one exactly.
 
 **Self-speculation (`mtp_self_spec`, pending: `--mtp-self-spec 1`, tierstream cache only).**
 Each decode step verifies `[pending, draft 1..3]` in one trunk pass of two to four rows

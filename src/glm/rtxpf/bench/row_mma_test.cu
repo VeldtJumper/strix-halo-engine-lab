@@ -91,7 +91,7 @@ static void moe_case(unsigned experts,unsigned hidden,unsigned inter,unsigned ro
     ck(enqueue_cutlass(v,ws,bytes,s,exec),"grouped");ck(cudaStreamSynchronize(s),"sync");
     std::vector<float> a(x.size()),b(x.size());ck(cudaMemcpy(a.data(),y1,a.size()*4,cudaMemcpyDeviceToHost),"d2h");
     for(bool r2:{false,true}){
-        v.y=y2;v.row_gemv=true;v.row_r2=r2;ck(enqueue_cutlass(v,ws,bytes,s,exec),"row");ck(cudaStreamSynchronize(s),"sync");
+        v.y=y2;v.row_gemv=true;v.row_r2=r2?r2_all:0u;ck(enqueue_cutlass(v,ws,bytes,s,exec),"row");ck(cudaStreamSynchronize(s),"sync");
         ck(cudaMemcpy(b.data(),y2,b.size()*4,cudaMemcpyDeviceToHost),"d2h");
         char name[128];std::snprintf(name,sizeof name,"moe%s experts %u %ux%u rows %u",r2?" r2":"",experts,hidden,inter,rows);verdict(name,a,b);}
     for(auto& e:ex)for(const Matrix* m:{&e.gate,&e.up,&e.down}){cudaFree((void*)m->packed);cudaFree((void*)m->suh);cudaFree((void*)m->svh);}

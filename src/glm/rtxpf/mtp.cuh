@@ -25,7 +25,7 @@ struct MtpCall {
     U32* route_ids=nullptr;
     // rows <= 32 (decode): row_mma.cuh strips for the eh / attention trellis projections (row_proj)
     // and the one-row routed/shared MoE (row_moe); the same bits as the CUTLASS paths.
-    bool row_proj=false,row_moe=false,row_r2=false; // row_r2: row-kernels round 2 (opt-in)
+    bool row_proj=false,row_moe=false;unsigned row_r2=0; // row_r2: RowR2 bits (opt-in)
 };
 std::size_t mtp_workspace_bytes(unsigned rows,unsigned capacity);
 // Reuses DSA and grouped trellis MoE. prepare_dsa / prepare_cutlass first.

@@ -138,7 +138,9 @@ Main options:
   tierstream expert cache): the MTP layer drafts the next token and one verify
   step checks it with the plain step's kernels, so each step emits one to four
   tokens that are the plain greedy tokens. Tokens, every logits digest and the
-  final state equal plain decode in every measured arm. It is pending, so off by
-  default; its speed is reported with the change that turns it on.
+  final state equal plain decode in every measured arm. Full card, 24-step
+  benchmarks: +27 % warm and +15 % cold decode at 8K, +16 % on a cold 48-token
+  generate, about equal warm and -6 % cold at 1K. It stays pending (off by default)
+  because it is not faster at every length.
 - In 24 GiB VRAM + 32 GiB RAM most experts are read from the unit file, so decode
   there is bound by those reads and the kernels above barely change it.
