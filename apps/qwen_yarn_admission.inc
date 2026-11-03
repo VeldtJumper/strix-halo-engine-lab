@@ -247,7 +247,8 @@ inline std::uint64_t prefill_checked_mul(std::uint64_t a, std::uint64_t b) {
 }
 inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
-    std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
+    std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& observation) {
+    auto memory=observation;
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
     auto result = initialize_prefill_config(request);
     result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
@@ -339,8 +340,15 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
             adjustable_storage ? 2U : 0U;
         std::uint64_t fixed_credit = 0, fixed_predicted_credit = 0;
         bool fixed_credit_ready = false;
+        std::map<std::string,std::uint64_t> refusals;
         for (const auto rows : {8192U,4096U,2048U}) {
+            if (o.mtp.enabled && rows > memory.yarn_mtp_max_prefill_rows) continue;
             for (unsigned storage_step = 0; storage_step <= last_storage_step; ++storage_step) {
+                // After the tight T8192 set, shrink real call-sized owners;
+                // do not reintroduce the larger optional storage at smaller T.
+                if (o.mtp.enabled && rows < 8192U && last_storage_step && storage_step < last_storage_step) continue;
+                if (memory.yarn_registered_rotary_bytes && memory.refresh_registered)
+                    memory.refresh_registered(memory);
                 result.environment = default_environment;
                 o = default_options;
                 const auto storage_default = [&](const char* name, const char* value) {
@@ -390,10 +398,17 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                 validate_effective_options(o,model);
                 result.admission = {{"ple_credit_verification_attempted",memory.verify_ple_credit?1U:0U},{"context_capacity",o.context_tokens},{"window_capacity_rows",rows},{"mtp_enabled",o.mtp.enabled?1U:0U},
                     {"parked_session_bytes",0},{"capture_bytes",0U},{"restore_peak_bytes",0},{"host_reserve_bytes",o.known_prefill_host_headroom},{"verified_ple_credit_bytes",credit},
-                    {"uma_limit_bytes",o.known_prefill_uma_budget},{"available_bytes",*memory.available},
-                    {"gtt_limit_bytes",*memory.gtt_limit},{"gtt_used_bytes",*memory.gtt_used},{"smallest_T_tried",rows}};
+                    {"uma_limit_bytes",o.known_prefill_uma_budget},
+                    {"available_bytes",*memory.available},
+                    {"gtt_limit_bytes",*memory.gtt_limit},
+                    {"gtt_used_bytes",*memory.gtt_used},
+                    {"smallest_T_tried",rows}};
+                result.admission.insert(refusals.begin(),refusals.end());
                 if (o.mtp.enabled) {
-                    result.admission["storage_ladder_step"] = storage_step;
+                    result.admission["storage_ladder_step"] = last_storage_step && rows < 8192U
+                        ? (rows == 4096U ? 3U : 4U) : storage_step;
+                    if (memory.yarn_registered_storage_step)
+                        result.admission["storage_ladder_step"]=rows==8192U?*memory.yarn_registered_storage_step:(rows==4096U?3U:4U);
                     result.admission["ple_rolling_positions"] = result.ple_rolling_h;
                     result.admission["ple_rolling_cap_bytes"] = result.ple_rolling_cap;
                     result.admission["qsa_score_ring_rows"] = score_ring_rows;
@@ -409,7 +424,9 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                         {"serial_scratch",required.serial_scratch},{"workspace",required.workspace},{"metadata",required.metadata},
                         {"runtime_payload",required.runtime_payload},{"tails",required.tails}};
                     owners["rotary_table"] = o.rotary.table_bytes();
-                    const auto rolling_owner = prefill_rolling_owner_bytes(o,model,manifest,result.environment,memory.ple_reclaim_page);
+                    const auto rolling_owner = memory.yarn_registered_rotary_bytes && memory.yarn_registered_rolling_owner
+                        ? *memory.yarn_registered_rolling_owner
+                        : prefill_rolling_owner_bytes(o,model,manifest,result.environment,memory.ple_reclaim_page);
                     if (rolling_owner) owners["ple_rolling_owner"] = rolling_owner;
                     for(const auto& [name,bytes]:owners) result.admission["owner_"+name+"_bytes"]=bytes;
                     for(const auto& [name,cap]:required.owner_caps) {
@@ -433,6 +450,11 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                     const auto device = prefill_checked_add(required.device_base,
                         prefill_checked_add(required.workspace, prefill_checked_add(required.tails, o.rotary.table_bytes())));
                     result.admission["device_growth_bytes"] = device;
+                    if (memory.yarn_registered_rotary_bytes) {
+                        result.admission["resident_rotary_table_bytes"] = memory.yarn_registered_rotary_bytes;
+                        result.admission["remaining_incremental_bytes"] = incremental-memory.yarn_registered_rotary_bytes;
+                        result.admission["remaining_device_growth_bytes"] = device-memory.yarn_registered_rotary_bytes;
+                    }
                     if(!required.owner_error.empty()) throw std::invalid_argument(required.owner_error);
                     auto live = UmaOwnerInventory{};
                     live.reservation_upper_bound_bytes = required.model_backing;
@@ -440,12 +462,55 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                     // The runtime bridge uses this same ledger against its gross live
                     // inventory. Both checks subtract verified credit once, never from
                     // an already credited live value or physical/GTT headroom.
-                    (void)plan_known_prefill_reservation(live, incremental, 0,
-                        {o.known_prefill_uma_budget,o.known_prefill_uma_budget},credit,0);
-                    if (!prefill_physical_margin_fits(*memory.total,*memory.available,net,incremental))
+                    auto physical_retained=net;
+                    auto uma_retained=net;
+                    auto physical_incremental=incremental-memory.yarn_registered_rotary_bytes;
+                    auto physical_device=device-memory.yarn_registered_rotary_bytes;
+                    const auto observed_available=*memory.available;
+                    const auto observed_gtt=*memory.gtt_used;
+                    if (memory.yarn_registered_rotary_bytes && required.registered_plan) {
+                        auto runtime_live=live;
+                        const auto base=memory.yarn_registered_base.value_or(required.model_backing);
+                        runtime_live.reservation_upper_bound_bytes=prefill_checked_add(base,
+                            prefill_checked_add(memory.yarn_registered_base_complete?0U:required.registered_plan->base_runtime,
+                                required.registered_plan->caller_live));
+                        const auto runtime=yarn_registered_prefill_envelope(o,required,peaks,runtime_live,base,rolling_owner,credit,false);
+                        physical_retained=runtime.reservation.setup_peak_reserved_bytes;
+                        uma_retained=runtime.reservation.retained_reserved_bytes;
+                        physical_incremental=runtime.incremental;
+                        // Runtime applies its physical growth to the independent GTT observation too.
+                        physical_device=memory.yarn_registered_base_complete?physical_incremental:
+                            std::max(physical_device,physical_incremental);
+                        result.admission["registered_physical_retained_bytes"]=physical_retained;
+                        result.admission["registered_physical_incremental_bytes"]=physical_incremental;
+                    }
+                    result.admission["observed_mem_total_bytes"]=*memory.total;
+                    result.admission["observed_mem_available_bytes"]=observed_available;
+                    result.admission["physical_margin_bytes"]=prefill_physical_margin;
+                    const auto shortfall=prefill_physical_shortfall(*memory.total,observed_available,physical_retained,physical_incremental);
+                    result.admission["retained_shortfall"]=shortfall.retained;
+                    result.admission["incremental_shortfall"]=shortfall.incremental;
+                    result.admission["uma_retained_shortfall"]=uma_retained>o.known_prefill_uma_budget?uma_retained-o.known_prefill_uma_budget:0U;
+                    result.admission["uma_setup_shortfall"]=physical_retained>o.known_prefill_uma_budget?physical_retained-o.known_prefill_uma_budget:0U;
+                    const auto workspace=prefill_checked_add(required.workspace,required.tails);
+                    result.admission["workspace_shortfall"]=workspace>o.known_prefill_workspace_budget?workspace-o.known_prefill_workspace_budget:0U;
+                    result.admission["metadata_shortfall"]=required.metadata>o.known_prefill_metadata_budget?required.metadata-o.known_prefill_metadata_budget:0U;
+                    result.admission["gtt_shortfall"]=observed_gtt>*memory.gtt_limit
+                        ? prefill_checked_add(observed_gtt-*memory.gtt_limit,physical_device)
+                        : (physical_device>*memory.gtt_limit-observed_gtt?physical_device-(*memory.gtt_limit-observed_gtt):0U);
+                    if (result.admission.at("uma_retained_shortfall"))
+                        throw std::runtime_error("UMA retained reservation exceeds explicit budget");
+                    if (result.admission.at("uma_setup_shortfall"))
+                        throw std::runtime_error("UMA setup peak reservation exceeds explicit budget");
+                    if (!prefill_physical_margin_fits(*memory.total,observed_available,physical_retained,physical_incremental)) {
+                        // The refusal listing prints every admission field: record the observation it failed on.
+                        result.admission["observed_mem_total_bytes"] = *memory.total;
+                        result.admission["observed_mem_available_bytes"] =
+                            *memory.available;
+                        result.admission["physical_margin_bytes"] = prefill_physical_margin;
                         throw std::runtime_error("YaRN physical admission must retain 4 GiB margin");
-                    if (incremental > *memory.available || *memory.gtt_used > *memory.gtt_limit ||
-                        device > *memory.gtt_limit - *memory.gtt_used || !required.workspace ||
+                    }
+                    if (physical_incremental > observed_available || result.admission.at("gtt_shortfall") || !required.workspace ||
                         prefill_checked_add(required.workspace,required.tails) > o.known_prefill_workspace_budget ||
                         required.metadata > o.known_prefill_metadata_budget)
                         throw std::runtime_error("owner payload exceeds available/workspace/metadata/GTT limit");
@@ -463,6 +528,19 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                   catch (const std::exception& error) { failure = error.what(); }
                 if (!result.tile_fallback.empty()) result.tile_fallback += ',';
                 result.tile_fallback += "T" + std::to_string(rows) + ":insufficient-memory";
+                const auto step=result.admission.contains("storage_ladder_step")?result.admission.at("storage_ladder_step"):0U;
+                const auto prefix="refused_step_"+std::to_string(step)+"_T"+std::to_string(rows)+"_";
+                for (const auto* field:{"observed_mem_total_bytes","observed_mem_available_bytes","retained_shortfall",
+                        "incremental_shortfall","gtt_shortfall","uma_retained_shortfall","uma_setup_shortfall","workspace_shortfall","metadata_shortfall",
+                        "registered_physical_retained_bytes","registered_physical_incremental_bytes"})
+                    if (result.admission.contains(field)) refusals[prefix+field]=result.admission.at(field);
+                result.admission.insert(refusals.begin(),refusals.end());
+                if (memory.yarn_registered_rotary_bytes) {
+                    result.tile_fallback += "[step="+std::to_string(step)+";"+failure;
+                    for (const auto* field:{"retained_shortfall","incremental_shortfall","gtt_shortfall","uma_retained_shortfall","uma_setup_shortfall","workspace_shortfall","metadata_shortfall"})
+                        if (result.admission.contains(field)) result.tile_fallback += ';'+std::string(field)+'='+std::to_string(result.admission.at(field));
+                    result.tile_fallback += ']';
+                }
                 const bool memory_refusal = failure == "UMA retained reservation exceeds explicit budget" ||
                     failure == "UMA setup peak reservation exceeds explicit budget" ||
                     failure == "YaRN physical admission must retain 4 GiB margin" ||

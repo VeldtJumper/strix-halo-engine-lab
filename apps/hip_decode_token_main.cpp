@@ -3,6 +3,7 @@
 #include "http_slot_capacity.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "qwen_prefill_plan.hpp"
+#include "qwen_yarn_registered_admission.hpp"
 #include "ple_resident_fallback.hpp"
 #include "qwen_http_memory.hpp"
 #include "strix/preflight.hpp"
@@ -1568,6 +1569,12 @@ static int run_decode_entry(
         }
     }
 #endif
+    std::optional<strix::decode_cli::RequestedOptions> yarn_mtp_request;
+    if (yarn && options.mtp.enabled) {
+        yarn_mtp_request.emplace(strix::decode_cli::RequestedOptions{options, requested_environment, !target_input_export});
+        // Retain scalar request provenance, never another full prompt owner.
+        std::vector<std::uint32_t>{}.swap(yarn_mtp_request->options.tokens);
+    }
     auto effective = strix::decode_cli::resolve_effective_config(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
@@ -1750,7 +1757,6 @@ static int run_decode_entry(
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
     if (yarn) optimization_profile_receipt += "  \"rotary\":" + model.rotary_identity().json() + ",\n";
-    optimization_profile_receipt += strix::decode_cli::yarn_mtp_storage_receipt(effective);
     if (options.ple_cache_rows)
         optimization_profile_receipt += "  \"ple_row_cache_requested_rows\":" + std::to_string(options.ple_cache_rows) + ",\n" +
             "  \"ple_row_cache_payload_budget_bytes\":" + std::to_string(options.ple_cache_budget_bytes) + ",\n" +
@@ -2544,22 +2550,84 @@ static int run_decode_entry(
         }, [&] { warmed_file_backed_bytes = warm_file_backed_tensors(mapped, manifest); });
         if (ple_reclaimer) strix::ple_reclaim::set_active(ple_reclaimer.get());
     }
+    // One bounded continuation is shared by both post-registration boundaries.
+    // Source leases and their storage settings remain pinned; only T decreases.
+    std::string registered_storage_receipt;
+    const auto readmit_registered = [&](strix::decode_cli::PrefillMemory post, bool next_step) {
+        auto request=*yarn_mtp_request;
+        request.options.tokens=options.tokens;
+        const auto old_receipt=registered_storage_receipt;
+        auto retry=strix::decode_cli::readmit_registered_yarn_mtp(request,effective,
+            model,info,manifest,admitted_content,prompt_capabilities,std::move(post),next_step);
+        if (!retry.admitted) throw std::runtime_error(retry.error);
+        effective=std::move(retry);
+        options=effective.options;
+        registered_storage_receipt=strix::decode_cli::yarn_mtp_storage_receipt(effective);
+        if (const auto at=optimization_profile_receipt.find(old_receipt); !old_receipt.empty() && at!=std::string::npos)
+            optimization_profile_receipt.replace(at,old_receipt.size(),registered_storage_receipt);
+        std::cerr << "YaRN MTP post-registration storage step " << effective.admission.at("storage_ladder_step")
+                  << " T=" << options.known_prefix_prefill_rows << "; " << effective.tile_fallback << '\n';
+    };
+    const auto registered_observation = [&] {
+        auto caps=prompt_capabilities;
+        auto post=prompt_memory;
+        const auto physical=strix::observe_linux_uma_memory().memory;
+        const auto device=strix::decode_cli::observe_prefill_memory(caps);
+        post.total=physical.mem_total_bytes; post.available=physical.mem_available_bytes;
+        post.gtt_limit=device.gtt_limit; post.gtt_used=device.gtt_used;
+        post.yarn_registered_rolling_owner=ple_reclaimer && ple_reclaimer->rolling()?ple_reclaimer->owner_bytes():0U;
+        post.refresh_registered=[&](strix::decode_cli::PrefillMemory& sample) {
+            auto fresh_caps=prompt_capabilities;
+            const auto fresh_physical=strix::observe_linux_uma_memory().memory;
+            const auto fresh_device=strix::decode_cli::observe_prefill_memory(fresh_caps);
+            sample.total=fresh_physical.mem_total_bytes.value_or(0);
+            sample.available=fresh_physical.mem_available_bytes.value_or(0);
+            sample.gtt_limit=fresh_device.gtt_limit.value_or(0);
+            sample.gtt_used=fresh_device.gtt_used.value_or(0);
+        };
+        return post;
+    };
     if (yarn) {
         if ((ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U) < effective.ple_reclaim_credit)
             throw std::runtime_error("YaRN verified PLE credit lost after model registration; refusing state allocation");
         yarn_preflight_reclaimer.reset();
-        const auto observed = strix::observe_linux_uma_memory();
-        if (!observed.memory.mem_total_bytes || !observed.memory.mem_available_bytes ||
-            !strix::decode_cli::prefill_physical_margin_fits(*observed.memory.mem_total_bytes,
-                *observed.memory.mem_available_bytes,effective.admission.at("required_bytes"),
-                effective.admission.at("incremental_bytes") - options.rotary.table_bytes()))
-            throw std::runtime_error("YaRN available headroom lost after model registration; refusing state allocation");
-        auto post_capabilities = prompt_capabilities;
-        const auto post = strix::decode_cli::observe_prefill_memory(post_capabilities);
-        if (!post.gtt_limit || !post.gtt_used || *post.gtt_used > *post.gtt_limit ||
-            effective.admission.at("device_growth_bytes") - options.rotary.table_bytes() > *post.gtt_limit - *post.gtt_used)
+        if (options.mtp.enabled) {
+            auto post=registered_observation();
+            post.yarn_registered_base=model_owner_inventory->reservation_upper_bound_bytes;
+            // Check the current step with the runtime envelope, even when the
+            // older estimate fits. Then re-read to catch concurrent pressure.
+            readmit_registered(post,false);
+        }
+        for (;;) {
+            auto post=registered_observation();
+            const auto retained=effective.admission.contains("registered_physical_retained_bytes")
+                ? effective.admission.at("registered_physical_retained_bytes") : effective.admission.at("required_bytes");
+            const auto incremental=effective.admission.contains("registered_physical_incremental_bytes")
+                ? effective.admission.at("registered_physical_incremental_bytes")
+                : effective.admission.at("incremental_bytes")-options.rotary.table_bytes();
+            const auto device=std::max(effective.admission.at("device_growth_bytes")-options.rotary.table_bytes(),
+                options.mtp.enabled?incremental:0U);
+            const bool physical_fits=post.total && post.available &&
+                strix::decode_cli::prefill_physical_margin_fits(*post.total,*post.available,retained,incremental);
+            const bool gtt_fits=post.gtt_limit && post.gtt_used && *post.gtt_used<=*post.gtt_limit &&
+                device<=*post.gtt_limit-*post.gtt_used;
+            if (physical_fits && gtt_fits) break;
+            if (options.mtp.enabled) {
+                strix::decode_cli::record_registered_yarn_refusal(effective,
+                    physical_fits?"GTT headroom lost":"YaRN available headroom lost after model registration",
+                    post,retained,incremental,device);
+                post.yarn_registered_base=model_owner_inventory->reservation_upper_bound_bytes;
+                readmit_registered(post,true); // strictly smaller T: at most two continuations
+                continue;
+            }
+            if (!physical_fits)
+                throw std::runtime_error("YaRN available headroom lost after model registration; refusing state allocation ("+
+                    strix::decode_cli::prefill_physical_margin_detail(post.total.value_or(0),post.available.value_or(0),retained,incremental)+")");
             throw std::runtime_error("YaRN GTT headroom lost after model registration; refusing state allocation");
+        }
     }
+    registered_storage_receipt=strix::decode_cli::yarn_mtp_storage_receipt(effective);
+    optimization_profile_receipt += registered_storage_receipt;
     const auto model_owner_inventory_receipt = [&]() -> std::string {
         if (!model_owner_inventory) return {};
         const auto& inventory = *model_owner_inventory;
@@ -3237,6 +3305,7 @@ static int run_decode_entry(
     std::shared_ptr<KnownPromptMemory> known_group_memory;
     std::shared_ptr<strix::HipKnownPrefixWindow> known_group_owner;
     std::unique_ptr<strix::HipKnownPromptBackend> known_group_backend;
+    for (;;) { // Recompile only unallocated prompt owners after a strictly smaller-T admission.
     if (options.known_prefix_window || options.prompt_lookup) {
         if (options.known_prefix_prefill_rows) {
             // The tiled prefill derives from the prefill serial execution (its dense projection
@@ -3378,65 +3447,71 @@ static int run_decode_entry(
                     m.window_rows ? static_cast<std::uint32_t>(m.window_rows_set.empty() ? 1U : m.window_rows_set.size()) : 0U,
                     m.window_prefix});
             }
-            if(yarn && options.mtp.enabled) {
-                // Same closed owner plan as inspection/pre-device admission.
-                // No credit or source-cache quota is appended here a second time.
+            auto prefill_live = strix::build_uma_owner_inventory(views);
+            std::uint64_t setup_growth=0;
+            if (yarn && options.mtp.enabled) {
                 const auto requirement=strix::decode_cli::compile_prompt_requirements(options,model,manifest,mapped.bytes());
-                // Sidecar setup is complete; post-setup phases take their maximum,
-                // with each shared M1 owner counted once in this growth estimate.
-                mtp_growth={requirement.mtp_post_setup_peak,0};
-                for(const auto* name:{"mtp_m1_keys","mtp_m1_scratch_metadata"})
-                    if(requirement.owners.contains(name)) mtp_growth.retained=add(mtp_growth.retained,requirement.owners.at(name));
-            }
-            const auto prefill_live = strix::build_uma_owner_inventory(views);
-            if(strix::decode_cli::mtp_prompt_phase_separation(options)) {
-                const auto requirement=strix::decode_cli::compile_prompt_requirements(options,model,manifest,mapped.bytes());
-                if(!requirement.owner_error.empty()) throw std::invalid_argument(requirement.owner_error);
-                auto owners=requirement.owners;owners["rotary_table"]=options.rotary.table_bytes();
-                if(rolling_metadata) owners["ple_rolling_owner"]=rolling_metadata;
+                if (!requirement.owner_error.empty()) throw std::invalid_argument(requirement.owner_error);
+                auto owners=requirement.owners; owners["rotary_table"]=options.rotary.table_bytes();
+                if (rolling_metadata) owners["ple_rolling_owner"]=rolling_metadata;
                 const auto peaks=strix::decode_cli::prefill_owner_phase_peaks(owners,requirement.owner_phases,
                     options.known_prefill_host_headroom);
-                // Setup is complete. The live inventory pins actual current backing;
-                // its future commitment is the common calibration/prompt/decode max.
-                const auto peak=*std::max_element(peaks.begin()+1,peaks.end());
-                if(prefill_live.reservation_upper_bound_bytes>peak)
-                    throw std::runtime_error("MTP actual live inventory exceeds phased owner envelope");
-                growth=peak-prefill_live.reservation_upper_bound_bytes;
-                known_prefill_runtime_payload=0;mtp_growth={}; // already in the phase maximum
-                rolling_metadata=0; // already in the same phase envelope used by inspection
+                const auto physical=strix::decode_cli::yarn_registered_prefill_envelope(options,requirement,peaks,
+                    prefill_live,prefill_live.reservation_upper_bound_bytes,rolling_metadata,
+                    ple_reclaimer?ple_reclaimer->credit_bytes():0U,false);
+                known_prefill_reservation=physical.reservation;
+                growth=physical.incremental;
+                known_prefill_runtime_payload=0;
+            } else {
+                known_prefill_reservation = strix::decode_cli::plan_known_prefill_reservation(
+                    prefill_live, growth, known_prefill_runtime_payload,
+                    {options.known_prefill_uma_budget, options.known_prefill_uma_budget},
+                    ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U, rolling_metadata, mtp_growth);
+                growth=add(growth,add(rolling_metadata,mtp_growth.retained));
+                setup_growth=add(known_prefill_runtime_payload,mtp_growth.temporary);
             }
             if (ple_turn) std::fprintf(stderr,
-                "ple-rolling MTP admission: live=%llu growth=%llu metadata=%llu mtp-retained=%llu "
-                "temporary=%llu verified-credit=%llu retained-budget=%llu setup-budget=%llu B\n",
+                "ple-rolling MTP admission: live=%llu growth=%llu temporary=%llu verified-credit=%llu "
+                "retained-budget=%llu setup-budget=%llu B\n",
                 static_cast<unsigned long long>(prefill_live.reservation_upper_bound_bytes),
-                static_cast<unsigned long long>(growth), static_cast<unsigned long long>(rolling_metadata),
-                static_cast<unsigned long long>(mtp_growth.retained),
-                static_cast<unsigned long long>(add(known_prefill_runtime_payload, mtp_growth.temporary)),
+                static_cast<unsigned long long>(growth),static_cast<unsigned long long>(setup_growth),
                 static_cast<unsigned long long>(ple_reclaimer->credit_bytes()),
                 static_cast<unsigned long long>(options.known_prefill_uma_budget),
                 static_cast<unsigned long long>(options.known_prefill_uma_budget));
-            known_prefill_reservation = strix::decode_cli::plan_known_prefill_reservation(
-                prefill_live, growth, known_prefill_runtime_payload,
-                {options.known_prefill_uma_budget, options.known_prefill_uma_budget},
-                ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U, rolling_metadata, mtp_growth);
-            // Physical checks charge only positive growth; never add reclaim to
-            // MemAvailable or deduct it from the independent GTT observation.
-            growth = add(growth, add(rolling_metadata, mtp_growth.retained));
-            const auto setup_growth = add(known_prefill_runtime_payload, mtp_growth.temporary);
             if (ple_turn || yarn) {
                 // Credit reduces the gross model envelope once. MemAvailable
                 // already includes reclaimable cache and never receives credit.
-                const auto observed = strix::observe_linux_uma_memory().memory;
-                if (!observed.mem_total_bytes || !observed.mem_available_bytes ||
-                    !strix::decode_cli::prefill_physical_margin_fits(*observed.mem_total_bytes,*observed.mem_available_bytes,
-                        known_prefill_reservation->setup_peak_reserved_bytes,add(growth,setup_growth)))
-                    throw std::runtime_error("prefill physical admission: total/incremental envelope must retain 4 GiB margin");
-                strix::decode_cli::PrefillCapabilities caps;
-                const auto device = strix::decode_cli::observe_prefill_memory(caps);
-                // PLE is not registered: no credit is subtracted from GTT.
-                if (!device.gtt_limit || !device.gtt_used || *device.gtt_used > *device.gtt_limit ||
-                    add(growth, setup_growth) > *device.gtt_limit - *device.gtt_used)
-                    throw std::runtime_error("prefill physical admission: GTT observation unavailable or growth exceeds remaining capacity");
+                auto post=registered_observation();
+                const auto retained=known_prefill_reservation->setup_peak_reserved_bytes;
+                const auto incremental=add(growth,setup_growth);
+                const bool physical_fits=post.total && post.available &&
+                    strix::decode_cli::prefill_physical_margin_fits(*post.total,*post.available,retained,incremental);
+                const bool gtt_fits=post.gtt_limit && post.gtt_used && *post.gtt_used<=*post.gtt_limit &&
+                    incremental<=*post.gtt_limit-*post.gtt_used;
+                const bool uma_fits=retained<=options.known_prefill_uma_budget &&
+                    known_prefill_reservation->retained_reserved_bytes<=options.known_prefill_uma_budget;
+                if (!physical_fits || !gtt_fits || !uma_fits) {
+                    const auto reason=!physical_fits?"prefill physical admission: total/incremental envelope must retain 4 GiB margin"
+                        : !gtt_fits?"prefill physical admission: GTT observation unavailable or growth exceeds remaining capacity"
+                        : "UMA retained/setup reservation exceeds explicit budget";
+                    if (yarn && options.mtp.enabled) {
+                        strix::decode_cli::record_registered_yarn_refusal(effective,reason,post,retained,incremental,incremental);
+                        post.yarn_registered_base=base_runtime_owner_inventory->reservation_upper_bound_bytes;
+                        post.yarn_registered_base_complete=true;
+                        // No prompt native owner has been constructed yet. Keep
+                        // the model/state/source leases; release the refused host
+                        // plans and their inventory pins before the next trial
+                        // samples memory, so it never sees the abandoned plan.
+                        views.clear(); prefill_live.pinned_views.clear();
+                        known_prefix_plan.reset(); known_prefill_plan.reset();
+                        known_tail_plans.clear(); known_wide_plans.clear();
+                        known_prefill_reservation.reset();
+                        readmit_registered(post,true);
+                        continue;
+                    }
+                    throw std::runtime_error(std::string(reason)+" ("+
+                        strix::decode_cli::prefill_physical_margin_detail(post.total.value_or(0),post.available.value_or(0),retained,incremental)+")");
+                }
             }
             struct PrefillRetained {
                 std::shared_ptr<const void> original, d1, ple, source, plan;
@@ -3665,6 +3740,8 @@ static int run_decode_entry(
         };
         if(rtx_state_registry) prepare_prefix_state();
         }
+    }
+    break;
     }
     if (!options.mtp.enabled) {
         strix::decode_cli::finalize_cache_family(options,options.http_serve?strix::decode_cli::CacheRunner::target:strix::decode_cli::CacheRunner::cli,1);

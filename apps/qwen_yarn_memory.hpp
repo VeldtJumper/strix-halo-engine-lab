@@ -20,10 +20,30 @@ namespace strix::decode_cli {
 // These are host admission/stop policies, independent of rotary and kernel plans.
 inline constexpr std::uint64_t yarn_legacy_host_reserve = UINT64_C(8) << 30U;
 inline constexpr std::uint64_t prefill_physical_margin = UINT64_C(4) << 30U;
+struct PrefillPhysicalShortfall { std::uint64_t retained, incremental; };
+inline PrefillPhysicalShortfall prefill_physical_shortfall(std::uint64_t total,std::uint64_t available,
+    std::uint64_t retained,std::uint64_t incremental) {
+    const auto deficit=[](std::uint64_t have,std::uint64_t need) {
+        if (have < prefill_physical_margin)
+            return need > UINT64_MAX-(prefill_physical_margin-have) ? UINT64_MAX : need+(prefill_physical_margin-have);
+        return need > have-prefill_physical_margin ? need-(have-prefill_physical_margin) : 0U;
+    };
+    return {deficit(total,retained),deficit(available,incremental)};
+}
 inline bool prefill_physical_margin_fits(std::uint64_t total,std::uint64_t available,
     std::uint64_t retained,std::uint64_t incremental) {
-    return total>=prefill_physical_margin && available>=prefill_physical_margin &&
-        retained<=total-prefill_physical_margin && incremental<=available-prefill_physical_margin;
+    const auto shortfall=prefill_physical_shortfall(total,available,retained,incremental);
+    return !shortfall.retained && !shortfall.incremental;
+}
+// The inputs of a refused margin check and how far each side is short (0 = that side fits).
+inline std::string prefill_physical_margin_detail(std::uint64_t total,std::uint64_t available,
+    std::uint64_t retained,std::uint64_t incremental) {
+    const auto shortfall=prefill_physical_shortfall(total,available,retained,incremental);
+    return "mem_total=" + std::to_string(total) + " mem_available=" + std::to_string(available) +
+        " retained=" + std::to_string(retained) + " incremental=" + std::to_string(incremental) +
+        " margin=" + std::to_string(prefill_physical_margin) +
+        " retained_shortfall=" + std::to_string(shortfall.retained) +
+        " incremental_shortfall=" + std::to_string(shortfall.incremental);
 }
 inline constexpr std::uint64_t yarn_memory_stop_bytes = UINT64_C(2) << 30U;
 

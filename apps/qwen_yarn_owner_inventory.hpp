@@ -2,6 +2,7 @@
 #include "qwen_effective_config.hpp"
 #include "strix/memory_plan.hpp"
 #include "strix/q51_known_rows.hpp"
+#include "qwen_mtp_owner_plan.hpp"
 namespace strix::decode_cli {
 // Compact tiled-prefill owners and the serial decode pool, already inside the workspace/tail and state reservations.
 struct YarnPrefillOwnerGeometry {
@@ -68,8 +69,13 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
     result.owners["ple_prompt_and_token_ids"] = add(mul(options.tokens.size(),
         add(mul(model.ple_head_count(),sizeof(std::uint32_t)),4U*sizeof(std::uint32_t))),
         add(mul(options.generate_tokens,sizeof(std::uint32_t)),add(model_bytes/4096U/8U,UINT64_C(1)<<20U)));
-    const auto t = static_cast<std::uint64_t>(known_prefill_pool_rows(options.known_prefix_prefill_rows));
-    const auto groups = (t+63U)/64U;
+    const auto pool_rows = static_cast<std::uint64_t>(known_prefill_pool_rows(options.known_prefix_prefill_rows));
+    // MTP's plain CLI creates the largest prompt window first. PLE/CSR,
+    // folded HC and GDN core16 are call-sized owners, not setup pools.
+    // Keep the serial/resident census unchanged.
+    const bool mtp = options.rotary.mode() == RotaryMode::yarn && options.mtp.enabled;
+    const auto t = mtp ? static_cast<std::uint64_t>(options.known_prefix_prefill_rows) : pool_rows;
+    const auto groups = (pool_rows+63U)/64U;
     // Two persistent stage slots plus one replacement maxima allocation coexist during growth; embedded tables have the
     // launcher's fixed 128-group extent. Compact stage slots cover all T groups but retain only tables/descriptors: their
     // scores and maxima live in the admitted ring.
@@ -122,24 +128,61 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
     result.owners["gdn_core_exchange"] = add(mul(model.gdn_value_heads,2U*4U*8U*32U*4U+2U*8U),
         add(16U,mul(8U*3U*2U,key)));
     result.owners["gdn_core16"] = mul(t,6208U*2U);
+    const auto prefill_mask = options.resolved_prefill_option_mask.value_or(resolve_prefill_options(
+        [](const char* name) { return std::getenv(name); }, options.prefill_exact_fp16, options.prefill_disabled));
+    if (prefill_mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk)) {
+        // Separate grow-only (device, stream, slot) owners, not gdn_core16 or
+        // compiled arenas. src/hip_gdn_fp16_chunk.inc: scratch_bytes (slot 0),
+        // gdn_fp16_chunk_input16 (slot 1); hip_gdn_launcher.hip tiled_in uses
+        // conv_width + value_width = 2*key + 2*value for the BF16 projection.
+        // Growth frees the predecessor first. Each prompt/tail has its own
+        // stream (hip_decode_token_main.cpp KnownPromptMemory construction),
+        // and the static scratch registry survives retirement of those owners.
+        // Projection capacity is conservative for tails that skip tiled_in.
+        const auto append_chunk = [&](const std::string& prefix, std::uint64_t rows) {
+            constexpr std::uint64_t chunk = 32U, dim = 128U;
+            const auto n = add(rows,chunk-1U)/chunk;
+            const auto padded = mul(n,chunk);
+            result.owners[prefix + "gdn_fp16_chunk_projection_bf16"] = mul(mul(rows,add(mul(key,2U),mul(value,2U))),2U);
+            result.owners[prefix + "gdn_fp16_chunk_scratch"] = add(
+                mul(2U,add(mul(mul(model.gdn_key_heads,2U),mul(padded,dim)),
+                    mul(model.gdn_value_heads,mul(n,2U*chunk*chunk)))),
+                add(mul(8U,mul(model.gdn_value_heads,mul(n,chunk))),
+                    mul(2U,mul(model.gdn_value_heads,mul(padded,dim)))));
+            // Tiled-prompt calibration executes serial decode rows. These
+            // slots first allocate in prompt prefill, then remain resident.
+            for (const auto* suffix : {"gdn_fp16_chunk_projection_bf16","gdn_fp16_chunk_scratch"})
+                result.owner_phases[prefix + suffix] = mtp_prompt|mtp_decode|mtp_drain;
+        };
+        append_chunk("",options.known_prefix_prefill_rows);
+        for (const auto rows : options.known_prefix_tail_rows)
+            append_chunk("tail_" + std::to_string(rows) + "_",rows);
+    }
     // Header-inline dense pools are single program owners across all sites.
     result.owners["dense_a8_slots"] = (64U+256U)*8192U*9U;
     result.owners["dense_f16_slots_and_counter"] = 256U*8192U*2U*2U*4U+1024U*8192U*4U+256U;
-    result.owners["dense_tiled_f16"] = mul(t,2U*(10240U+64U)*2U);
+    // tiled::scratch is one inline per-stream owner, freed before growth.
+    // supported() bounds K at 8192. Only the precomputed-image mode allocates it;
+    // the MTP route's default BF16/F32 sites never do, so PIPE adds no second image.
+    result.owners["dense_tiled_f16"] = mtp ? mul(t,8256U*2U) : mul(t,2U*(10240U+64U)*2U);
     result.owners["hc_wide_pack_low_and_up"] = 80U*40U*(32U*32U+4U*8U*4U)+320U*8192U*4U+320U*2560U*16U+4U*2560U*320U*4U;
     result.owners["hc_persistent_barrier"] = 256U+8U*4U*16U*4U+40U*24U*8U+16U*8U+8U*(10240U+320U)*4U;
     result.owners["hc_fold_workspaces"] = mul(mul(t,10240U+320U),8U); // folded and qpf2k owners
     result.owners["hc_f16_weights_low_norm_inverse"] = add((320U*10240U+4U*2560U*320U+8192U*320U)*2U+256U,
-        mul(t,10304U*2U+4U*4U));
+        mul(pool_rows,10304U*2U+4U*4U));
     // Static setup can replace a normalized pool while its old allocation remains live.
-    result.owners["native_setup_growth_peak"] = mul(t,(10240U+64U)*2U);
+    // A fresh MTP CLI reserves the primary before its smaller tails. No old
+    // normalized16 setup image coexists with a replacement on this route.
+    result.owners["native_setup_growth_peak"] = mtp ? 0U : mul(t,(10240U+64U)*2U);
     result.owners["shared_pre_f16"] = mul(t,(640U+64U)*2U);
     std::uint64_t ple_rows = options.known_prefix_prefill_rows;
     for (const auto rows : options.known_prefix_tail_rows) ple_rows = add(ple_rows,rows);
-    // Each owner retains a packed PLE slab; one replacement may coexist.
-    result.owners["ple_packed_growth_peak"] = mul(add(ple_rows,options.known_prefix_prefill_rows),mul(model.ple_embed_dim,4U));
+    // Each owner retains a packed PLE slab; one replacement may coexist. A fresh
+    // MTP CLI fills the primary with its largest block first, so its slab never grows.
+    result.owners["ple_packed_growth_peak"] = mul(mtp ? ple_rows : add(ple_rows,options.known_prefix_prefill_rows),
+        mul(model.ple_embed_dim,4U));
     // Retain the upstream fixed-8192 bound after smaller-T fallbacks.
-    result.owners["moe_f16_input_and_da16"] = std::max(UINT64_C(8192),t)*(2560U+10U*640U)*2U;
+    result.owners["moe_f16_input_and_da16"] = pool_rows*(2560U+10U*640U)*2U;
     result.owners["moe_counters_and_route"] = ((8192U*10U/64U+1024U)*2U+(8192U*16U+64U)+514U+40U*512U)*4U;
     std::uint64_t extra = 0;
     for (const auto& [name,bytes] : result.owners)

@@ -3,6 +3,7 @@
 #include "qwen_yarn_owner_inventory.hpp"
 #include "qwen_mtp_owner_plan.hpp"
 #include "strix/compiled_speculative_verify.hpp"
+#include "strix/ple_lookup.hpp"
 namespace strix::decode_cli {
 // Compile and size the admitted prompt before HIP setup or state mutation.
 inline PrefillRequirements compile_prompt_requirements(const Options& options,
@@ -42,6 +43,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
                 throw std::invalid_argument("YaRN MTP verifier recipe is not serial equivalent");
         }
     }
+    const auto decode_scratch=compiled.arena.total_bytes;
+    const auto decode_alignment=compiled.arena.alignment;
     const auto pair = numerical_profile_pair(options);
     if (pair.split()) {
         if (numerical_profile_fast_prefill(pair.prefill))
@@ -103,9 +106,26 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     result.device_base = add(result.device_base, decode_pool);
     result.workspace = add(add(plan.arena.physical.total_bytes, 65552U),plan.qsa_score_ring_workspace_bytes);
     const auto map_bytes = mul(plan.logit_row_indices.size(), sizeof(std::uint32_t));
+    RegisteredPrefillPlan registered;
+    const bool registered_mtp=options.rotary.mode()==RotaryMode::yarn && options.mtp.enabled;
+    std::uint64_t union_bytes=0;
+    if (registered_mtp) {
+        registered.base_runtime=add(add(decode_scratch,decode_alignment-1U),
+            add(state.host_total_bytes,state.device_total_bytes?add(state.device_total_bytes,state.device_alignment-1U):0U));
+        const auto ple_cache=PlannedPleLookupBackend::cache_reservation_bytes({options.ple_max_rows_per_io,
+            options.ple_max_inflight_ios,options.ple_cpu_helper_threads,options.ple_cache_rows,options.ple_cache_budget_bytes,{}});
+        registered.caller_live=add(add(state.host_total_bytes,state.host_alignment-1U),
+            add(8U,add(ple_cache,add(plan.host_metadata_payload_bytes,map_bytes))));
+        union_bytes=options.known_prefix_expert_union && plan.tile8.routed_expert_union_steps
+            ? q51_known_rows::required_scratch_bytes(8U,static_cast<std::uint32_t>(model.num_experts),
+                static_cast<std::uint32_t>(model.num_experts_per_token)) : 0U;
+        registered.growth=add(add(plan.arena.physical.total_bytes,add(8U,union_bytes)),
+            add(add(plan.host_metadata_payload_bytes,map_bytes),add(plan.qsa_score_ring_workspace_bytes,options.known_prefill_host_headroom)));
+    }
     result.metadata = add(add(plan.host_metadata_payload_bytes, map_bytes), add(plan.host_metadata_payload_bytes, map_bytes));
     result.runtime_payload = add(mul(mul(plan.logical_rows, compiled.execution.steps.size()), sizeof(std::uint32_t)),
         add(map_bytes, add(mul(plan.logit_row_indices.size(), sizeof(ExecutionBufferAddress)), mul(model.vocab_size, 2U * sizeof(float)))));
+    registered.temporary=result.runtime_payload;
     YarnPrefillOwnerGeometry geometry;
     geometry.compact_scores = plan.qsa_score_ring_workspace_bytes != 0;
     geometry.decode_pool_bytes = decode_pool;
@@ -122,6 +142,9 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     geometry.primary_compact_bytes = add(geometry.ring_bytes,geometry.terminal_logits_bytes);
     for (const auto rows : options.known_prefix_tail_rows) {
         const auto tail = make_plan(rows);
+        if (registered_mtp)
+            registered.growth=add(registered.growth,add(add(tail.arena.physical.total_bytes,add(8U,union_bytes)),
+                add(tail.host_metadata_payload_bytes,tail.qsa_score_ring_workspace_bytes)));
         collect_geometry(tail);
         result.tails = add(result.tails, add(add(tail.arena.physical.total_bytes, 65552U),tail.qsa_score_ring_workspace_bytes));
         result.metadata = add(result.metadata, add(tail.host_metadata_payload_bytes, tail.host_metadata_payload_bytes));
@@ -161,7 +184,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
                name=="runtime_payload" || name=="qsa_shared_prefill_pool" || name=="qsa_batch_tables" ||
                name=="gdn_retained_rows_and_controls" || name=="merged_routed_csr" ||
                name=="routed_csr" || name=="ple_staging" || name=="ple_projections_and_gates" ||
-               name=="ple_snapshot_and_hashes" || name.starts_with("tail_"))
+               name=="ple_snapshot_and_hashes" || name=="ple_packed_growth_peak" ||
+               (name.starts_with("tail_") && name.find("gdn_fp16_chunk_")==std::string::npos))
                 result.owner_phases[name]=mtp_setup|mtp_calibration|mtp_prompt;
         }
     }
@@ -186,6 +210,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         result.organization.emplace("qsa_score_ring_rows",plan.qsa_score_ring_rows);
     }
     if(mtp_prompt_phase_separation(options)) result.organization.emplace("mtp_prompt_phase_separation",1U);
+    if (registered_mtp) result.registered_plan=registered;
     if(mtp_pool) result.organization.emplace("qsa_mtp_pool_bytes",mtp_pool);
     return result;
 }

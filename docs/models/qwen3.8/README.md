@@ -106,6 +106,12 @@ beside the model, a bare YaRN command selects exact MTP automatically:
 Use factor 4 with `--context 1048576` for 1M capacity. `--prompt-ids` avoids shell argument limits.
 The QSA committed MTP pool and rolling PLE are default-on on admitted routes. Memory admission tries
 the storage ladder before smaller prompt tiles and reports `storage_ladder_step` and `yarn_mtp_storage`.
+A post-registration physical-margin refusal advances the ladder with allocated storage pinned.
+The ladder ends with a tight storage set at 8,192, then 4,096, then 2,048 rows; a 1M MTP run on one node is admitted at 8,192 rows before
+registration and settles at 2,048 rows with the tight set after it, without falling back to serial. On the MTP route the
+estimate charges one dense FP16 image and no replacement PLE slab, only while the prompt runs; when the
+`gdn_fp16_chunk` prefill option is enabled, its persistent buffers (489.7 MB at 8,192 rows) are charged.
+A refusal reports the observed free memory and the shortfall.
 A missing/invalid bundle before mutation falls back to serial YaRN with a notice; explicit `--mtp`
 retains its pinned-asset contract. `STRIX_QWEN_YARN_MTP=0` selects serial YaRN.
 
@@ -117,12 +123,21 @@ overrides). TTFT runs from process launch to the first token and includes model 
 The 262K prefill cell is from public main `669bcb83` (262,144-token prompt, prefill time without model load,
 `--profile default` and `--profile fast` interleaved, two pairs: 179.07 s and 174.18 s); the 262K decode cells are from
 build `7b2453fe`; the row's other cells are from the build above.
+The 1M row's serial cells are from public main `fdc39faba` on Linux 7.3; its MTP cells and exact gate are from the
+MTP admission change (#288) on Linux 7.4. The two sets were measured on different kernels, so each cell states its
+kernel and the row gives no serial-to-MTP ratio.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
 | 262,400 (2) | Full scope | 219 s / 224 s | **1,464 tok/s** `--profile default`; 1,505 tok/s `--profile fast` (`669bcb83`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
-| 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
+| 1,048,576 (4) | Full scope (MTP against serial with the two prefill paths below off) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); MTP route 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
+
+Since the HC FP16 output path became the default prefill arithmetic, serial YaRN prefill uses it, while the
+YaRN MTP route keeps the previous HC output and index projection arithmetic. Each route is exact against its
+own reference: the MTP route matches serial YaRN run with
+`--prefill-disable hc_output_wmma --prefill-disable index_proj_wmma`. The 262K and 524K MTP == serial rows
+above were measured before that change; the 1M row's gate is the comparison with those two paths off.
 
 See [YaRN MTP and bundles](../../engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli),
 [pool/PLE route matrix](../../engine/qsa-committed-pool.md) and
