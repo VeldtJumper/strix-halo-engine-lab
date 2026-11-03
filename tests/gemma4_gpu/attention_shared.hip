@@ -62,6 +62,14 @@ struct Case {
     bool two_streams, quant;
 };
 std::size_t cases = 0;
+// FNV-1a over every case's outputs (and a8 codes/metadata): compared across processes run with different
+// switches (e.g. STRIX_G4_ATTN_MERGE) to prove those launches byte-identical.
+std::uint64_t digest = 1469598103934665603ULL;
+void absorb(const Buffer& x) {
+    std::vector<std::uint8_t> u(x.size());
+    x.download(u.data(), u.size());
+    for (const auto c : u) digest = (digest ^ c) * 1099511628211ULL;
+}
 double run(const Case& t, bool bench) {
     const unsigned dim = t.global ? 512U : 256U, hcount = heads, width = hcount * dim;
     const auto a = cache(t.frontier, t.global, 11 + t.frontier), b = t.two_streams ? cache(t.frontier + 3, t.global, 7) : Cache{};
@@ -124,6 +132,8 @@ double run(const Case& t, bool bench) {
                   << " quant " << t.quant << '\n';
         throw std::runtime_error("shared key/value attention byte mismatch");
     }
+    absorb(out[0]);
+    if (t.quant) { absorb(codes[0]); absorb(meta[0]); }
     ++cases;
     if (bench)
         std::cout << std::setprecision(4) << "{\"bench\":\"attention\",\"global\":" << t.global << ",\"context\":" << t.frontier
@@ -149,7 +159,8 @@ int main(int argc, char** argv) {
                     run({frontier, global, rows, false, rows == 8U}, false);
                     if (rows > 1U) run({frontier, global, rows, true, rows == 3U}, false);
                 }
-        std::cout << "{\"gate\":\"attention-kv-shared-vs-chunk-fastest\",\"cases\":" << cases << ",\"verdict\":\"EXACT\"}\n";
+        std::cout << "{\"gate\":\"attention-kv-shared-vs-chunk-fastest\",\"cases\":" << cases << ",\"digest\":\"" << std::hex << digest << std::dec
+                  << "\",\"verdict\":\"EXACT\"}\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

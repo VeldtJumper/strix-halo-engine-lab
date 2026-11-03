@@ -151,6 +151,7 @@ inline int run(int argc, char** argv) {
                     }
                     line.set("prefill_host_ms", number(receipt, "timings", "prefill_host_ms"));
                 line.set("context_ms", number(receipt, "timings", "context_ms")); line.set("commit_ms", number(receipt, "timings", "commit_ms"));
+                line.set("decode_ms", number(receipt, "timings", "decode_ms"));
                     line.set("target_calls", *receipt.find("target_calls"));
                     line.set("graphs", *receipt.find("ab_graphs"));
                     line.set("state_digest", state); line.set("state_equal", equal_state); line.set("receipt_equal", equal_receipt);
