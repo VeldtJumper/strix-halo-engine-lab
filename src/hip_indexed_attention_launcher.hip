@@ -4751,6 +4751,78 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_prefetch_kern
     }
 }
 
+// Verify windows (Rows <= 8, STRIX_QSA_WINDOW_OUT_GROUP=2|3|4|6|12): attention_output_rows_group_prefetch_kernel
+// (one block per G query heads sharing a KV head, so each value row is loaded once for the G heads) with,
+// when a8_codes is set, attention_output_rows_dense_a8_kernel's epilogue run for each of the G heads. Per
+// (row, head, feature) the chain is attention_output_body's: the same `sum += score * value` expression per slot in
+// ascending slot order (so it takes this file's contraction exactly as the body does), the same BF16 roundings and
+// gate; the quantizer is wave-local (32 features of one head).
+template <unsigned Rows, unsigned G, bool Int8 = false>
+__global__ __launch_bounds__(256) void attention_output_rows_window_group_kernel(QsaRowsAttentionViews<Rows> views,
+    const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::int8_t* a8_codes, float* a8_deltas) {
+    const auto head0 = static_cast<std::uint32_t>(blockIdx.x) * G, r = static_cast<std::uint32_t>(blockIdx.y);
+    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
+    if (head0 >= attention_heads || feature >= head_dim) return;
+    const auto count = views.count[r];
+    const auto kv_head = head0 / (attention_heads / kv_heads);
+    const auto kv_width = kv_heads * head_dim;
+    const auto offset = static_cast<std::uint64_t>(kv_width) + static_cast<std::uint64_t>(kv_head) * head_dim + feature;
+    const auto* selected = views.selected[r];
+    const float* scores = views.scores[r] + static_cast<std::uint64_t>(head0) * maximum_selected;
+    const auto* values = kv_state + offset;
+    const auto row_elements = static_cast<std::uint64_t>(kv_width) * 2ULL;
+    float sum[G];
+#pragma unroll
+    for (unsigned h = 0; h < G; ++h) sum[h] = 0.0F;
+    constexpr unsigned B = 8U;
+    const auto full = count / B * B;
+    using Raw = std::conditional_t<Int8, float, std::uint16_t>;
+    const auto raw_at = [&](std::uint32_t token) -> Raw {
+        if constexpr (Int8) return kv_int8_load(kv_state, token, kv_width, kv_heads, 1U, kv_head, head_dim, feature);
+        else return values[static_cast<std::uint64_t>(token) * row_elements];
+    };
+    const auto to_float = [](Raw bits) -> float {
+        if constexpr (Int8) return bits;
+        else return bf16_to_float(bits);
+    };
+    Raw raw[B];
+    if (full) {
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i) raw[i] = raw_at(selected[i]);
+    }
+    for (std::uint32_t slot = 0; slot < full; slot += B) {
+        float value[B];
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i) value[i] = to_float(raw[i]);
+        const auto next = slot + B < full ? slot + B : slot;
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i) raw[i] = raw_at(selected[next + i]);
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i)
+#pragma unroll
+            for (unsigned h = 0; h < G; ++h)
+                sum[h] += scores[static_cast<std::uint64_t>(h) * maximum_selected + slot + i] * value[i];
+    }
+    for (auto slot = full; slot < count; ++slot) {
+        const float value = to_float(raw_at(selected[slot]));
+#pragma unroll
+        for (unsigned h = 0; h < G; ++h) sum[h] += scores[static_cast<std::uint64_t>(h) * maximum_selected + slot] * value;
+    }
+#pragma unroll
+    for (unsigned h = 0; h < G; ++h) {
+        const auto head = head0 + h;
+        const auto index = static_cast<std::uint64_t>(head) * head_dim + feature;
+        const float attn = round_bf16(sum[h]);
+        const float gate = round_bf16(1.0F / (1.0F + expf(-views.q_gate[r][static_cast<std::uint64_t>(head) * head_dim * 2ULL + head_dim + feature])));
+        views.image(r)[index] = round_bf16(attn * gate);
+        if (a8_codes)
+            q8_rows::dense_a8_quantize_lane(views.image(r)[index], a8_codes + r * static_cast<std::uint64_t>(attention_heads) * head_dim + index,
+                a8_deltas + (index / 32U) * q8_rows::kDenseA8Rows + r);
+    }
+}
+
 // Q7 arm E, MTP draft only (STRIX_QPERSIST_DRAFT_ATTN, default on; draft_exact, teacher forward and the
 // _sessions_ batch kernels keep their kernels): attention_tail_kernel with more value loads in
 // flight. One workgroup per head as before (no feature split). Softmax is attention_softmax_body
@@ -6647,6 +6719,14 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             return n == 4 || n == 16 ? static_cast<unsigned>(n) : 8U;
         }();
         const auto score_slots = Rows > 8U ? group_slots : window_slots;
+        // STRIX_QSA_WINDOW_OUT_GROUP (exact, default 4): 8-row verify windows (verify_window) form value/gate with
+        // attention_output_rows_window_group_kernel (G = 2|3|4|6|12 query heads per block, so each value row is
+        // read once per G heads); 0 keeps the per-head kernel. Kernel bench (BF16, 2052 / 1031 slots): R8 186 -> 91 /
+        // 99 -> 47 us at G4; 2- and 4-row windows keep the per-head kernel (G4 +9 % / +0 % there). Off under the baseline
+        // and STRIX_QPF2K_DEFAULTS=0.
+        static const unsigned window_out_group_choice = env_choice("STRIX_QSA_WINDOW_OUT_GROUP", 4);
+        static const bool window_out_group_on = qpf2k::long_context_item_enabled("STRIX_QSA_WINDOW_OUT_GROUP", false);
+        const unsigned window_out_group = Rows == 8U && verify_window && window_out_group_on ? window_out_group_choice : 0U;
         // STRIX_QSA_WINDOW_ATTN_V2 (default on): the operand-pinned grouped score for single-session verify windows
         // (see window_attn_v2_route).
         const bool window_v2 = window_attn_v2_route(qsa_window_attn_v2_enabled(), verify_window, Rows, Int8, fast,
@@ -6751,6 +6831,21 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 case 12U: output.template operator()<12U>(); break;
                 default: output.template operator()<6U>(); break;
                 }
+            }
+        } else if (window_out_group && !Int8 && per_kv % (window_out_group ? window_out_group : 1U) == 0U && a.head_dim <= kThreads) {
+            if constexpr (Rows <= 8U && !Int8) {
+            const auto output = [&]<unsigned G>() {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows, G, Int8>), dim3(a.attention_heads / G, Rows),
+                    dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim,
+                    output_slot.codes, output_slot.deltas);
+            };
+            switch (window_out_group) {
+            case 2U: output.template operator()<2U>(); break;
+            case 3U: output.template operator()<3U>(); break;
+            case 4U: output.template operator()<4U>(); break;
+            case 6U: output.template operator()<6U>(); break;
+            default: output.template operator()<12U>(); break;
+            }
             }
         } else if (output_slot.codes)
             hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows, Int8>), dim3(a.attention_heads, Rows),
@@ -8210,6 +8305,44 @@ __global__ void compact_qsa_quantizer_probe(q8_rows::DenseA8Slot slot, unsigned 
     const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<8U*6144U) out[i]=reinterpret_cast<const unsigned char*>(slot.codes)[i];
     if(i<192U*8U) reinterpret_cast<float*>(out+8U*6144U)[i]=slot.deltas[(i/8U)*q8_rows::kDenseA8Rows+i%8U];
+}
+void launch_hip_qsa_window_out_group_probe(const HipQsaWindowOutGroupProbe& p, void* opaque_stream) {
+    auto stream=static_cast<hipStream_t>(opaque_stream);
+    constexpr unsigned heads=24U,kv_heads=2U,dim=256U;
+    const auto run=[&]<unsigned Rows>() {
+        QsaRowsAttentionViews<Rows> v{};
+        for(unsigned r=0;r<Rows;++r) {
+            v.q_gate[r]=p.query+static_cast<std::uint64_t>(r)*heads*dim*2U;
+            v.selected[r]=p.selected+static_cast<std::uint64_t>(r)*p.maximum_selected;
+            v.scores[r]=p.scores+static_cast<std::uint64_t>(r)*heads*p.maximum_selected;
+            v.output[r]=p.image+static_cast<std::uint64_t>(r)*heads*dim;v.count[r]=p.count[r];
+        }
+        const auto group=[&]<unsigned G>() {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_window_group_kernel<Rows,G>),dim3(heads/G,Rows),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim,p.codes,p.deltas);
+        };
+        switch(p.group) {
+        case 0U:
+            if(p.codes) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>),dim3(heads,Rows),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim,p.codes,p.deltas);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>),dim3(heads,Rows),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim);
+            break;
+        case 2U: group.template operator()<2U>(); break;
+        case 3U: group.template operator()<3U>(); break;
+        case 4U: group.template operator()<4U>(); break;
+        case 6U: group.template operator()<6U>(); break;
+        case 12U: group.template operator()<12U>(); break;
+        default: throw std::invalid_argument("window out-group probe: group must be 0|2|3|4|6|12");
+        }
+    };
+    switch(p.rows) {
+    case 2U: run.template operator()<2U>(); break;
+    case 4U: run.template operator()<4U>(); break;
+    case 8U: run.template operator()<8U>(); break;
+    default: throw std::invalid_argument("window out-group probe: rows must be 2|4|8");
+    }
+    check_hip(hipGetLastError(),"window out-group probe launch");
 }
 void launch_hip_compact_qsa_probe(const HipCompactQsaProbe& p, void* opaque_stream) {
     const auto stream = static_cast<hipStream_t>(opaque_stream);

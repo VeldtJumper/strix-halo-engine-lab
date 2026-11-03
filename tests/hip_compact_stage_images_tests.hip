@@ -1,6 +1,7 @@
 #include "strix/hip_compact_qsa_diagnostic.hpp"
 #include <hip/hip_runtime.h>
 #include "../src/hip_rounded_stage_image.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -135,12 +136,67 @@ void run(unsigned rows, hipStream_t stream) {
     }
 }
 }
+// Verify-window value/gate: the window group kernel (G = 2|3|4|6|12) against the per-head kernel, bitwise
+// (image, dense A8 codes and deltas), over a 16384-token BF16 cache with scattered selections; also times both.
+__global__ void initialize_window(float* query, std::uint16_t* kv, std::uint32_t* selected, float* scores,
+    std::uint64_t query_words, std::uint64_t kv_words, std::uint64_t selected_words, std::uint64_t score_words) {
+    const auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    const auto hash=[](std::uint64_t x) {x^=x>>33U;x*=0xff51afd7ed558ccdULL;x^=x>>33U;x*=0xc4ceb9fe1a85ec53ULL;return x^(x>>33U);};
+    if(i<query_words) query[i]=(static_cast<float>(hash(i)%2001U)-1000.0F)/256.0F;
+    if(i<kv_words) {
+        const auto h=hash(i+0x9e37U);
+        kv[i]=static_cast<std::uint16_t>((h%3U==0U?0x8000U:0U)|(0x3a00U+(h>>8U)%0x0c00U));
+    }
+    if(i<selected_words) selected[i]=static_cast<std::uint32_t>(hash(i+0x51U)%16384U);
+    if(i<score_words) scores[i]=static_cast<float>(hash(i+0x77U)%100000U+1U)*0x1p-27F;
+}
+void window_out_group_fixture(hipStream_t stream) {
+    constexpr unsigned heads=24U,dim=256U,tokens=16384U,rows=8U;
+    const std::uint64_t query_words=rows*heads*dim*2ULL,kv_words=tokens*2ULL*2ULL*dim,
+        selected_words=rows*static_cast<std::uint64_t>(maximum),score_words=rows*heads*static_cast<std::uint64_t>(maximum);
+    Buffer query(query_words*4U),kv(kv_words*2U),selected(selected_words*4U),scores(score_words*4U),
+        image(rows*heads*dim*4U),codes(rows*heads*dim),deltas(heads*dim/32U*64U*4U);
+    const auto words=std::max(std::max(query_words,kv_words),std::max(selected_words,score_words));
+    hipLaunchKernelGGL(initialize_window,dim3(static_cast<unsigned>((words+255U)/256U)),dim3(256),0,stream,query.as<float>(),
+        kv.as<std::uint16_t>(),selected.as<std::uint32_t>(),scores.as<float>(),query_words,kv_words,selected_words,score_words);
+    check(hipStreamSynchronize(stream));
+    hipEvent_t start=nullptr,stop=nullptr;check(hipEventCreate(&start));check(hipEventCreate(&stop));
+    const std::uint32_t counts[][8]={{2052U,2052U,2052U,2052U,2052U,2052U,2052U,2052U},{1031U,1032U,1033U,1034U,1035U,1036U,1037U,1038U},
+        {37U,1U,8U,0U,15U,2051U,16U,9U}};
+    for(const unsigned window:{2U,4U,8U}) for(const auto& count:counts) for(const bool a8:{true,false}) {
+        std::vector<std::uint32_t> ref_image(rows*heads*dim);std::vector<std::int8_t> ref_codes(rows*heads*dim);
+        std::vector<float> ref_deltas(heads*dim/32U*64U);
+        for(const unsigned group:{0U,2U,3U,4U,6U,12U}) {
+            strix::HipQsaWindowOutGroupProbe p;
+            p.query=query.as<float>();p.kv=kv.as<std::uint16_t>();p.selected=selected.as<std::uint32_t>();p.scores=scores.as<float>();
+            p.image=image.as<float>();p.codes=a8?codes.as<std::int8_t>():nullptr;p.deltas=a8?deltas.as<float>():nullptr;
+            p.rows=window;p.group=group;p.maximum_selected=maximum;std::memcpy(p.count,count,sizeof(p.count));
+            check(hipMemsetAsync(image.data,0xa5,rows*heads*dim*4U,stream));check(hipMemsetAsync(codes.data,0x5a,rows*heads*dim,stream));
+            check(hipMemsetAsync(deltas.data,0xa5,heads*dim/32U*64U*4U,stream));
+            strix::launch_hip_qsa_window_out_group_probe(p,stream);check(hipStreamSynchronize(stream));
+            std::vector<std::uint32_t> got_image(ref_image.size());std::vector<std::int8_t> got_codes(ref_codes.size());
+            std::vector<float> got_deltas(ref_deltas.size());
+            check(hipMemcpy(got_image.data(),image.data,got_image.size()*4U,hipMemcpyDeviceToHost));
+            check(hipMemcpy(got_codes.data(),codes.data,got_codes.size(),hipMemcpyDeviceToHost));
+            check(hipMemcpy(got_deltas.data(),deltas.data,got_deltas.size()*4U,hipMemcpyDeviceToHost));
+            if(group==0U) {ref_image=got_image;ref_codes=got_codes;ref_deltas=got_deltas;}
+            else if(got_image!=ref_image || got_codes!=ref_codes || std::memcmp(got_deltas.data(),ref_deltas.data(),got_deltas.size()*4U)!=0)
+                throw std::runtime_error("window out-group bytes differ");
+            float ms=0.0F;constexpr int reps=50;
+            check(hipEventRecord(start,stream));
+            for(int i=0;i<reps;++i) strix::launch_hip_qsa_window_out_group_probe(p,stream);
+            check(hipEventRecord(stop,stream));check(hipEventSynchronize(stop));check(hipEventElapsedTime(&ms,start,stop));
+            std::printf("window R%u count %u a8 %u G%u %s %.1f us\n",window,count[0],a8?1U:0U,group,group?"EXACT":"ref",ms*1000.0F/reps);
+        }
+    }
+    check(hipEventDestroy(start));check(hipEventDestroy(stop));
+}
 int main() {
     int count=0;if(hipGetDeviceCount(&count)!=hipSuccess || !count) return 77;
     hipStream_t stream=nullptr;
     try {
         check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking));
-        special_fixture(stream);run(8192U,stream);run(40U,stream);
+        special_fixture(stream);window_out_group_fixture(stream);run(8192U,stream);run(40U,stream);
         check(hipStreamDestroy(stream));return 0;
     } catch(const std::exception& e) {
         std::fprintf(stderr,"compact image fixture: %s\n",e.what());
