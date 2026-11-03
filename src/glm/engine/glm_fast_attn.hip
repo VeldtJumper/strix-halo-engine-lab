@@ -123,6 +123,8 @@ public:
         }
     }
 
+    bool supports_multi_slot_verify() const override { return true; }
+
     void dsa(const DsaLayerWeights& w, DsaState& st, const CallCtx& c, const float* x, float* y) override {
         if (w.heads != Hm_ || st.cap != cap_) throw std::invalid_argument("fast attention: DSA heads / capacity");
         if (w.kv_a.raw.output != kKvLora || w.q_a.raw.output != kQLora) throw std::invalid_argument("fast attention: q_a / kv_a width");
@@ -173,12 +175,38 @@ public:
 
 private:
     // Speculative verify (design notes section 1): R consecutive rows of ONE slot through dev::kda_verify (deferred
-    // replay of the slot's pending rows from set cur, new rows' raw qkv / prep outputs into set 1 - cur).
+    // replay of the slot's pending rows from set cur, new rows' raw qkv / prep outputs into set 1 - cur). With
+    // SpecRows::seg (Engine::verify_multi) the windows of several slots: the projections run batched over all rows (row
+    // invariant), then dev::kda_verify once per window on its rows and its slot's state and replay sets.
     void kda_verify(const KdaLayerWeights& w, KdaState& st, const CallCtx& c, const float* x, float* y, const D::KdaDev& kd,
                     std::size_t SZ, std::size_t CZ) {
         const auto n = static_cast<unsigned>(c.rows.size());
         const SpecRows& sp = *c.spec;
         if (n == 0 || n > F::kMaxRows || st.rep_qkv == nullptr) throw std::logic_error("spec verify: rows / Options::spec");
+        const std::size_t scr = static_cast<std::size_t>(Hk_) * 4 * kKdaDim;
+        if (sp.seg != nullptr && sp.nseg > 1) {
+            qkv(w, x, qkv_, n, c);
+            small_a(w, x, n, c.stream);
+            const F::DenseJob j2[2] = {{w.f_b, fa_, f_, C_, kKdaDim, kKdaDim, C_}, {w.g_b, ga_, g_, C_, kKdaDim, kKdaDim, C_}};
+            F::dense_f16(j2, 2, n, c.stream);
+            for (unsigned g = 0; g < sp.nseg; ++g) {
+                const SpecSeg& sg = sp.seg[g];
+                if (sg.n == 0 || sg.row0 + sg.n > n) throw std::logic_error("spec verify: window rows");
+                const std::size_t base = static_cast<std::size_t>(sg.slot) * 2;
+                const std::size_t rep = (base + sg.cur) * F::kMaxRows, nxt = (base + 1 - sg.cur) * F::kMaxRows;
+                float* qkv_new = st.rep_qkv + nxt * 3 * C_;  // the window's raw pre-conv rows: its slot's next replay input
+                hip_ok(hipMemcpyAsync(qkv_new, qkv_ + static_cast<std::size_t>(sg.row0) * 3 * C_,
+                                      static_cast<std::size_t>(sg.n) * 3 * C_ * sizeof(float), hipMemcpyDeviceToDevice, c.stream),
+                       "spec verify window qkv");
+                D::kda_verify(kd, st.rep_qkv + rep * 3 * C_, st.rep_scr + rep * scr, st.rep_beta + rep * Hk_, sg.n_rep, qkv_new,
+                              f_ + static_cast<std::size_t>(sg.row0) * C_, g_ + static_cast<std::size_t>(sg.row0) * C_,
+                              bb_ + static_cast<std::size_t>(sg.row0) * Hk_, sg.n, st.S + sg.slot * SZ, st.conv + sg.slot * CZ,
+                              st.rep_scr + nxt * scr, st.rep_beta + nxt * Hk_, o_kda_ + static_cast<std::size_t>(sg.row0) * C_,
+                              ky_ + static_cast<std::size_t>(sg.row0) * C_, sp.replay_flag, sp.row_flag + sg.row0, c.stream);
+            }
+            kda_o(w, y, n, c);
+            return;
+        }
         const std::size_t base = static_cast<std::size_t>(sp.slot) * 2;
         const std::size_t rep = (base + sp.cur) * F::kMaxRows, nxt = (base + 1 - sp.cur) * F::kMaxRows;
         float* qkv_new = st.rep_qkv + nxt * 3 * C_;  // [n][3C] raw pre-conv: the next call's replay input
@@ -186,7 +214,6 @@ private:
         small_a(w, x, n, c.stream);
         const F::DenseJob j2[2] = {{w.f_b, fa_, f_, C_, kKdaDim, kKdaDim, C_}, {w.g_b, ga_, g_, C_, kKdaDim, kKdaDim, C_}};
         F::dense_f16(j2, 2, n, c.stream);
-        const std::size_t scr = static_cast<std::size_t>(Hk_) * 4 * kKdaDim;
         D::kda_verify(kd, st.rep_qkv + rep * 3 * C_, st.rep_scr + rep * scr, st.rep_beta + rep * Hk_, sp.n_rep, qkv_new, f_, g_, bb_, n,
                       st.S + sp.slot * SZ, st.conv + sp.slot * CZ, st.rep_scr + nxt * scr, st.rep_beta + nxt * Hk_, o_kda_, ky_,
                       sp.replay_flag, sp.row_flag, c.stream);

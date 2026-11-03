@@ -432,6 +432,7 @@ add_library(strix_serve STATIC
     src/serve/bpe_tokenizer.cpp
     src/serve/chat_template.cpp
     src/serve/deepseek_chat.cpp
+    src/serve/glm_chat.cpp
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
@@ -530,6 +531,17 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-frontend-tests)
     add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
+    add_executable(strix-glm-tokenizer-tests tests/glm_tokenizer_tests.cpp)
+    target_link_libraries(strix-glm-tokenizer-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-glm-tokenizer-tests)
+    set(STRIX_GLM_TOKENIZER_JSON "" CACHE FILEPATH "GLM-4/5 tokenizer.json (optional; enables the HF fixture checks)")
+    add_test(NAME strix-glm-tokenizer-tests COMMAND strix-glm-tokenizer-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/glm_tokenizer_fixtures.json ${STRIX_GLM_TOKENIZER_JSON})
+    add_executable(strix-glm-chat-tests tests/glm_chat_tests.cpp)
+    target_link_libraries(strix-glm-chat-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-glm-chat-tests)
+    add_test(NAME strix-glm-chat-tests COMMAND strix-glm-chat-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/glm_chat_cases.json)
     add_executable(strix-serve-deepseek-chat-tests tests/serve_deepseek_chat_tests.cpp)
     target_link_libraries(strix-serve-deepseek-chat-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-deepseek-chat-tests)
@@ -4462,6 +4474,15 @@ if(STRIX_FAMILY_GLM5)
         target_compile_features(strix-glm5-rank-defaults-cpu-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-glm5-rank-defaults-cpu-tests)
         add_test(NAME strix-glm5-rank-defaults-cpu-tests COMMAND strix-glm5-rank-defaults-cpu-tests)
+        if(TARGET strix_serve)
+            # strix-glm5-serve control channel, lead / follower protocol and scheduling on a fake engine (host-only)
+            add_executable(strix-glm5-serve-cpu-tests tests/glm_serve_cpu_tests.cpp)
+            target_link_libraries(strix-glm5-serve-cpu-tests PRIVATE strix_serve strix_glm5_host Threads::Threads)
+            target_include_directories(strix-glm5-serve-cpu-tests PRIVATE src include)
+            target_compile_features(strix-glm5-serve-cpu-tests PRIVATE cxx_std_20)
+            strix_target_warnings(strix-glm5-serve-cpu-tests)
+            add_test(NAME strix-glm5-serve-cpu-tests COMMAND strix-glm5-serve-cpu-tests)
+        endif()
     endif()
     if(STRIX_ENABLE_HIP_RUNTIME)
         set(strix_glm5_hip_flags -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt
@@ -4502,6 +4523,10 @@ if(STRIX_FAMILY_GLM5)
                 add_executable(strix-hip-glm5-post-exchange-rows-tests tests/hip_glm_post_exchange_rows_tests.hip)
                 target_link_libraries(strix-hip-glm5-post-exchange-rows-tests PRIVATE strix_glm5_engine)
                 list(APPEND strix_glm5_hip_targets strix-hip-glm5-post-exchange-rows-tests)
+                # FastAttn multi-slot verify windows == single-slot verify calls, bitwise
+                add_executable(strix-hip-glm5-fast-verify-tests tests/hip_glm_fast_verify_tests.hip)
+                target_link_libraries(strix-hip-glm5-fast-verify-tests PRIVATE strix_glm5_engine)
+                list(APPEND strix_glm5_hip_targets strix-hip-glm5-fast-verify-tests)
             endif()
             add_executable(strix-glm5-g3-replay tests/glm_g3_replay.hip)
             target_link_libraries(strix-glm5-g3-replay PRIVATE strix_glm5_engine)
@@ -4553,6 +4578,14 @@ if(STRIX_FAMILY_GLM5)
             target_include_directories(strix-glm5-rank PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")
             target_compile_features(strix-glm5-rank PRIVATE cxx_std_20)
             strix_target_warnings(strix-glm5-rank)
+            if(TARGET strix_serve)
+                # TP2 HTTP server with continuous batched decode (rank 0 lead + HTTP, rank 1 follower)
+                add_executable(strix-glm5-serve apps/glm_serve_main.cpp src/glm/spec/glm_spec_run.cpp)
+                target_link_libraries(strix-glm5-serve PRIVATE strix_glm5_engine strix_serve)
+                target_include_directories(strix-glm5-serve PRIVATE "${STRIX_GLM5_TRELLIS_DIR}/include")
+                target_compile_features(strix-glm5-serve PRIVATE cxx_std_20)
+                strix_target_warnings(strix-glm5-serve)
+            endif()
         endif()
         foreach(target ${strix_glm5_hip_targets})
             set_target_properties(${target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHITECTURES}")

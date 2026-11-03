@@ -24,6 +24,25 @@ with the same tokens. `--identity r1` selects a different reference identity. Pr
 8192 rows if both ranks admit them, otherwise 4096. See the [resolver](../../../apps/glm_rank_defaults.hpp),
 [model families](../model-families.md) and [qualification/performance](../../performance.md).
 
+<a id="glm-serve"></a>
+
+## Serve: the pair
+
+`strix-glm5-serve` is the HTTP server (OpenAI `/v1/chat/completions` and `/v1/completions` with SSE streaming,
+`/v1/models`, `/health`). Start rank 1, then rank 0; both take the same engine options (the hello refuses a mismatch)
+and read the tokenizer from `MODEL_DIR/tokenizer.json`:
+
+```sh
+./build/strix-glm5-serve MODEL_DIR --world 2 --rank 1 --transport usb4-auto
+./build/strix-glm5-serve MODEL_DIR --world 2 --rank 0 --transport usb4-auto --host 0.0.0.0 --port 8080 --model-id glm-5.3-flash
+```
+
+Defaults: 8 request slots (`--slots`, at most 8), 8192 positions per slot (`--capacity`), exact MTP self-speculation
+with one request in flight, batched MTP verify with more (`STRIX_GLM_SERVE_G2=0` = batched plain steps), decode-first
+chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). `--serial` admits one
+request at a time; `--api-key-file F` requires a bearer key. `--selftest N` on rank 0 (no HTTP) runs N built-in
+prompts together and each alone and reports EXACT/FAIL with tok/s per concurrency level.
+
 ## Run: one RTX PRO 6000
 
 Windows only, opt-in: build with `pwsh src/glm/rtxpf/producer/build.ps1` against a tierstream source export, build
@@ -82,6 +101,8 @@ admission headroom and the final value with its source. See the [catalog](../../
 | Exact chunked prefill, KDA scan v5 (on the PR #254 defaults) | 8K benchmark prompt, 8192-row chunks | TTFT **16.60 vs 16.60 s** (mean of 8 arms, both run orders: neutral); rank-0 scan **0.355 → 0.340 s**; scan per layer 1.23–1.25 → 1.18–1.20 µs/row (−3.7 %) | logits bitwise equal v3 on both ranks; same binary, v3 via `STRIX_GLM_PF_KDA_SCAN=3`; rank 0 under the kernel tracer; the fourth arm of each pair ran ~5 % slower on every kernel in both orders |
 | Exact chunked prefill, pair levers: fused mHC expand + norm and staged prefill exchange (current defaults) | 1K / 8K benchmark prompts, 8192-row chunks, warm | TTFT **2.83 / 15.27 s** with every pair lever on; staged exchange ABBA: 1K 2.856 / 2.860 → 2.832 / 2.838 s, 8K 15.43 / 15.41 → 15.28 / 15.25 s (**−0.8 % / −0.9 %**, every staged arm faster); fused mHC expand + norm ABBA ×2: **−1.1 % / −1.3 %** | prefill anchors exact 16/16; logits bitwise equal each lever off (`STRIX_GLM_PF_STAGED=0`, `STRIX_GLM_PF_HC_FUSE=0`) |
 | Decode fused HC norm (default) | C1 MTP decode and R8 batch, ABA ×2 | **−2.3 %** C1 MTP, **−3.1 %** R8 | tokens and R8 equal the reference; `STRIX_GLM_HC_NORM=0` restores the unfused finish |
+| Served, `strix-glm5-serve --selftest 8` (defaults) | Concurrent streams C1 / C2 / C4 / C6 / C8, steady state (all streams decoding); 8 built-in short chat prompts in the GLM chat template, 22–59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, cache off, the server has no prompt cache | **C1 40.0 / C2 53.0 (G2 off 37.8) / C4 59.9 (53.6) / C6 62.5 (62.4) / C8 69.5 (69.4) tok/s aggregate**; per stream 40.1 / 26.5 / 15.0 / 10.4 / 8.7; C1 plain (MTP off) 25.30; engine CLI `--batch` R8 69–71 | RESULT EXACT: every stream's tokens equal the same prompt run alone (C=1 plain reference) at every level, G2 on and off |
+| Served, decode-first chunked prefill (`--prefill-chunk 512`, default) | 4 prompts of ~1,830 tokens arriving every 16 decode rounds into 4 running streams, 128 generated tokens each, cache off | Longest decode stall **6.65 → 2.67 s (−60 %)** vs `--prefill-chunk 0`; a lone request is prefilled whole | exact |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
