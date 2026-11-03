@@ -266,7 +266,7 @@ struct Fixture {
         std::vector<std::uint16_t> at(ar.size());
         bool pass = true;
         Variant variant;
-        for (const char* version : {"1", "2", "3", "3r0", "6", "7", "8", "9", "10", "11", "auto"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        for (const char* version : {"1", "2", "3", "3r0", "6", "7", "8", "9", "10", "11", "14", "auto"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
             // Existing checks retain every arm/repeat. Added large cases qualify v3/v6/v7/v8/v9 against the seam.
             if (!selected(version)) continue;
             if (added && (std::strcmp(version, "3r0") == 0 || std::strcmp(version, "1") == 0 || std::strcmp(version, "2") == 0 || tm != 16 || repeat != 0)) continue;
@@ -426,7 +426,7 @@ struct Fixture {
             }
             std::vector<float> yr, gr, pr;
             std::vector<std::uint16_t> ar;
-            for (const char* version : {"3", "6", "7", "8", "9", "10", "11"}) {
+            for (const char* version : {"3", "6", "7", "8", "9", "10", "11", "14"}) {
                 // v3 is this case's reference and always runs.
                 if (std::strcmp(version, "3") != 0 && !selected(version)) continue;
                 Variant::set(version);
@@ -566,7 +566,7 @@ int main(int argc, char** argv) {
             check(a.localSizeBytes == 0, "zero spills " + name);
         }
         {
-            // enqueue dispatches through selected_variant(); auto must pick v11 exactly at the threshold.
+            // enqueue dispatches through selected_variant(); auto must pick v14 exactly at the threshold.
             Variant variant;
             auto min_rows = [](const char* value) {
 #ifdef _WIN32
@@ -579,15 +579,15 @@ int main(int argc, char** argv) {
             min_rows(nullptr);
             Variant::set(nullptr);
             check(X::selected_variant(4096) == 3, "selected variant unset -> 3");
-            for (const char* v : {"1", "2", "3", "6", "7", "8", "9", "10", "11"}) {
+            for (const char* v : {"1", "2", "3", "6", "7", "8", "9", "10", "11", "14"}) {
                 Variant::set(v);
                 check(X::selected_variant(2048) == static_cast<unsigned>(std::atoi(v)), std::string("selected variant ") + v);
             }
             Variant::set("auto");
             for (unsigned rows : {1U, 127U, 128U, 129U, 2048U, 4096U})
-                check(X::selected_variant(rows) == (rows >= 128 ? 11U : 3U), "selected variant auto rows=" + std::to_string(rows));
+                check(X::selected_variant(rows) == (rows >= 128 ? 14U : 3U), "selected variant auto rows=" + std::to_string(rows));
             min_rows("100");
-            check(X::selected_variant(99) == 3 && X::selected_variant(100) == 11, "selected variant auto MIN_ROWS=100");
+            check(X::selected_variant(99) == 3 && X::selected_variant(100) == 14, "selected variant auto MIN_ROWS=100");
             for (const char* bad : {"0", "65537", "abc"}) {
                 min_rows(bad);
                 bool threw = false;

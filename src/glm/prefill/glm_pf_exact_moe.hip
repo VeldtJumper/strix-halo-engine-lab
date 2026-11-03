@@ -418,7 +418,13 @@ void launch_linear_s2(Args a, unsigned shared_bits, hipStream_t stream) {
 // V11: each group (or 64-row shared slice) runs its whole 64-row tiles with eight rows per wave in one kernel and
 // its remainder in a second kernel with the smallest bucket per tile (1, 2 or 4 rows per wave, at most 32 rows per
 // tile), so computed row chains track the live rows. The two kernels write disjoint rows; per-row arithmetic is X3's.
-template<int Bits, bool Down, bool Shared>
+// Rows the full kernel covers for a span: whole 64-row tiles, plus (Fold) a remainder above 32 rows as one padded
+// 64-row tile (rows past the span are computed and never published).
+template<bool Fold> __device__ __forceinline__ unsigned full_rows(unsigned span) {
+    const unsigned full = span / 64U * 64U;
+    return Fold && span - full > 32U ? span : full;
+}
+template<int Bits, bool Down, bool Shared, bool Fold = false>
 __global__ __launch_bounds__(256) void linear_kernel_s3_full(Args a) {
     __shared__ exact_x::StorageS<8> lds;
     const unsigned expert = Shared ? E : blockIdx.y;
@@ -427,13 +433,15 @@ __global__ __launch_bounds__(256) void linear_kernel_s3_full(Args a) {
     const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
     if (r0 >= group.count) return;
     const unsigned span = Shared ? (group.count - r0 < kSharedRows ? group.count - r0 : kSharedRows) : group.count;
-    const unsigned full = span / 64U * 64U;
+    const unsigned full = full_rows<Fold>(span);
     if (full == 0) return;  // uniform, before any barrier
     const auto w = *d::uniform((&a.experts[expert].gate) + m);
-    for (unsigned r = r0; r < r0 + full; r += 64U)
-        exact_x::core_s<Bits, 8>(w, XRows<Down>{a, Tile{expert, group.first + r, 64U}, m}, 64U, Down ? 4U : 32U, false, lds);
+    for (unsigned r = r0; r < r0 + full; r += 64U) {
+        const unsigned n = r0 + full - r < 64U ? r0 + full - r : 64U;
+        exact_x::core_s<Bits, 8>(w, XRows<Down>{a, Tile{expert, group.first + r, n}, m}, n, Down ? 4U : 32U, false, lds);
+    }
 }
-template<int Bits, bool Down, bool Shared>
+template<int Bits, bool Down, bool Shared, bool Fold = false>
 __global__ __launch_bounds__(256) void linear_kernel_s3_tail(Args a) {
     __shared__ exact_x::StorageS<4> lds;
     const unsigned expert = Shared ? E : blockIdx.y;
@@ -442,7 +450,7 @@ __global__ __launch_bounds__(256) void linear_kernel_s3_tail(Args a) {
     const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
     if (r0 >= group.count) return;
     const unsigned span = Shared ? (group.count - r0 < kSharedRows ? group.count - r0 : kSharedRows) : group.count;
-    const unsigned full = span / 64U * 64U;
+    const unsigned full = full_rows<Fold>(span);
     if (full == span) return;  // uniform, before any barrier
     const auto w = *d::uniform((&a.experts[expert].gate) + m);
     auto& one = *reinterpret_cast<exact_x::StorageS<1>*>(&lds);
@@ -456,19 +464,19 @@ __global__ __launch_bounds__(256) void linear_kernel_s3_tail(Args a) {
         r += n;
     }
 }
-template<bool Down>
+template<bool Down, bool Fold = false>
 void launch_linear_s3(Args a, unsigned shared_bits, hipStream_t stream) {
     constexpr unsigned N = Down ? H : I;
     const dim3 routed(N / 128U, E, Down ? 1U : 2U), shared(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U);
-    linear_kernel_s3_full<4, Down, false><<<routed, 256, 0, stream>>>(a);
-    linear_kernel_s3_tail<4, Down, false><<<routed, 256, 0, stream>>>(a);
+    linear_kernel_s3_full<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a);
+    linear_kernel_s3_tail<4, Down, false, Fold><<<routed, 256, 0, stream>>>(a);
     ok(hipGetLastError(), "X3 routed linear");
     if (shared_bits == 6U) {
-        linear_kernel_s3_full<6, Down, true><<<shared, 256, 0, stream>>>(a);
-        linear_kernel_s3_tail<6, Down, true><<<shared, 256, 0, stream>>>(a);
+        linear_kernel_s3_full<6, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
+        linear_kernel_s3_tail<6, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
     } else {
-        linear_kernel_s3_full<4, Down, true><<<shared, 256, 0, stream>>>(a);
-        linear_kernel_s3_tail<4, Down, true><<<shared, 256, 0, stream>>>(a);
+        linear_kernel_s3_full<4, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
+        linear_kernel_s3_tail<4, Down, true, Fold><<<shared, 256, 0, stream>>>(a);
     }
     ok(hipGetLastError(), "X3 shared linear");
 }
@@ -646,7 +654,8 @@ __global__ __launch_bounds__(kPlanRows) void plan_scatter_kernel(PlanArgs p) {
 void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream) {
     input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 gate/up input transform");
-    if (selected == 11) launch_linear_s3<false>(a, shared.gate.bits, stream);
+    if (selected == 14) launch_linear_s3<false, true>(a, shared.gate.bits, stream);
+    else if (selected == 11) launch_linear_s3<false>(a, shared.gate.bits, stream);
     else if (selected == 10) launch_linear_s2<false>(a, shared.gate.bits, stream);
     else if (selected == 9) launch_linear_s<false, 8>(a, shared.gate.bits, stream);
     else if (selected == 8) launch_linear_s<false, 4>(a, shared.gate.bits, stream);
@@ -655,7 +664,8 @@ void launch_grouped(const Args& a, unsigned grid_tiles, unsigned selected, const
     else launch_linear_v3<false>(a, shared.gate.bits, stream);
     activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 R15/down transform");
-    if (selected == 11) launch_linear_s3<true>(a, shared.down.bits, stream);
+    if (selected == 14) launch_linear_s3<true, true>(a, shared.down.bits, stream);
+    else if (selected == 11) launch_linear_s3<true>(a, shared.down.bits, stream);
     else if (selected == 10) launch_linear_s2<true>(a, shared.down.bits, stream);
     else if (selected == 9) launch_linear_s<true, 8>(a, shared.down.bits, stream);
     else if (selected == 8) launch_linear_s<true, 4>(a, shared.down.bits, stream);
@@ -775,7 +785,8 @@ bool v3_row_buckets() {
 unsigned selected_variant(unsigned rows) {
     const char* variant = std::getenv("STRIX_GLM_PF_EXACTMOE_V");
     // v3 is the measured default (real pair, 1K/8K/32K TTFT logits bitwise == v1 on both ranks, -10..-11 % ms/token);
-    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1. auto: v11 (X3 core, row-bucketed tiles) for calls >= x_auto_rows() rows, v3 below (both exact;
+    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1. auto: v14 (X3 core, row-bucketed tiles, remainders above 32 rows as one
+    // padded 64-row tile) for calls >= x_auto_rows() rows, v3 below (both exact;
     // 32-row X tiles mostly pad the small expert groups of short calls).
     if (!variant) return 3;
     const std::string s(variant);
@@ -788,8 +799,9 @@ unsigned selected_variant(unsigned rows) {
     if (s == "9") return 9;
     if (s == "10") return 10;
     if (s == "11") return 11;
-    if (s == "auto") return rows >= x_auto_rows() ? 11 : 3;
-    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6, 7, 8, 9, 10, 11 or auto");
+    if (s == "14") return 14;
+    if (s == "auto") return rows >= x_auto_rows() ? 14 : 3;
+    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6, 7, 8, 9, 10, 11, 14 or auto");
 }
 void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t stream, unsigned tm) {
     const Layout l(plan.capacity);
@@ -798,7 +810,7 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
     if (tm == 0) tm = tm_env();
     if (tm != 16 && tm != 32) throw std::invalid_argument("exact moe: TM must be 16 or 32");
     const unsigned selected = selected_variant(v.rows);
-    const bool v2 = selected == 2, v3 = selected == 3, v6 = selected == 6, v7 = selected == 7, v8 = selected == 8, v9 = selected == 9, v10 = selected == 10, v11 = selected == 11;
+    const bool v2 = selected == 2, v3 = selected == 3, v6 = selected == 6, v7 = selected == 7, v8 = selected == 8, v9 = selected == 9, v10 = selected == 10, v11 = selected == 11, v14 = selected == 14;
     for (unsigned e = 0; e <= E; ++e) {
         const auto& ex = e == E ? v.shared : v.experts[e];
         check_matrix(ex.gate, H, I, e == E);
@@ -841,14 +853,14 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
     ok(hipMemcpyAsync(table + E, &v.shared, sizeof(moe::ExpertSlices), hipMemcpyHostToDevice, stream), "shared expert");
     ok(hipMemcpyAsync(pairs, plan.pairs.data(), plan.pairs.size() * sizeof(unsigned), hipMemcpyHostToDevice, stream), "pairs");
     ok(hipMemcpyAsync(tiles, plan.tiles.data(), plan.tiles.size() * sizeof(Tile), hipMemcpyHostToDevice, stream), "tiles");
-    if (v3 || v6 || v7 || v8 || v9 || v10 || v11) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
+    if (v3 || v6 || v7 || v8 || v9 || v10 || v11 || v14) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
     // Owns host upload lifetimes even when callers immediately reuse their table or Plan.
     ok(hipStreamSynchronize(stream), "plan upload");
     Args a{v.rows, v.x, v.weights, v.out, table, v.shared, pairs, tiles, device_groups,
            reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
            reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U, nullptr};
     const unsigned nt = static_cast<unsigned>(plan.tiles.size());
-    if (v3 || v6 || v7 || v8 || v9 || v10 || v11) {
+    if (v3 || v6 || v7 || v8 || v9 || v10 || v11 || v14) {
         launch_grouped(a, nt, selected, v.shared, stream);
     } else if (v2) {
         if (tm == 16) launch<16, true>(a, nt, stream);

@@ -31,14 +31,15 @@ struct View {
 // V3 linear kernels always use TM16; TM still controls transform/activation work tiles.
 // V6 opts into X (32-row linear tiles); V7 selects X2 with register prefetch; V8/V9 the X3 core (scalar activations,
 // 32/64-row tiles), V10 X3 with the tile chosen per expert group, V11 X3 with whole 64-row tiles plus 1/2/4-row
-// tail buckets; auto = V11 for calls >= x_auto_rows(), v3 below.
+// tail buckets, V14 = V11 with each group's remainder above 32 rows run as one padded 64-row tile (one weight decode
+// instead of two 32-row passes); auto = V14 for calls >= x_auto_rows(), v3 below.
 hipFuncAttributes x_resources(unsigned bits, bool down, bool shared, unsigned variant = 6);
 // TM 0 reads STRIX_GLM_PF_EXACTMOE_TM (16 default; 16 or 32).
 // Plan/table uploads finish before return; kernels remain asynchronous on stream.
 // No device or host allocations during enqueue after Plan construction.
 unsigned x_auto_rows();  // STRIX_GLM_PF_EXACTMOE_V=auto threshold: STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS, default 128
 bool v3_row_buckets();  // STRIX_GLM_PF_EXACTMOE_V3_RCAP (default 1): v3 tiles use the smallest row bucket
-unsigned selected_variant(unsigned rows);  // what enqueue runs for a call of `rows` rows (1, 2, 3 or 6..11)
+unsigned selected_variant(unsigned rows);  // what enqueue runs for a call of `rows` rows (1, 2, 3, 6..11 or 14)
 void enqueue(const View& v, Plan& plan, void* workspace, std::size_t bytes,
              hipStream_t stream, unsigned tm = 0);
 // Device plan: the same pairs/tiles/groups bytes as enqueue() built on the GPU from device ids, without the route
