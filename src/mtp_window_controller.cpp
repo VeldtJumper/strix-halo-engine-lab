@@ -2,6 +2,7 @@
 #include "strix/mtp_batch_window_controller.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <string_view>
@@ -43,6 +44,38 @@ void MtpMinPWindowController::begin_session() {
     for(const auto& o:owners_) rows.push_back(o.rows);
     *this=MtpMinPWindowController(std::move(rows),min_probability_,model_,reprobe_cycles_,timing_independent_);
 }
+void MtpMinPWindowController::seed_costs(std::span<const CostPrior> priors) {
+    const auto set=[](const MtpWindowCostEstimate& c,double& prior,double ms){
+        if(!c.samples() && std::isfinite(ms) && ms>0.0) prior=ms;};
+    for(const auto& p:priors) {
+        if(p.rows==1U) {set(serial_,serial_prior_,p.ms);continue;}
+        for(auto& o:owners_) if(o.rows==p.rows) set(o.cost,o.prior,p.ms);
+    }
+    prior_age_=0;
+}
+std::size_t MtpMinPWindowController::active_priors() const noexcept {
+    std::size_t n=!serial_.samples() && serial_prior_>0.0 ? 1U : 0U;
+    for(const auto& o:owners_) if(!o.cost.samples() && o.prior>0.0) ++n;
+    return n;
+}
+std::vector<MtpMinPWindowController::CostPrior> MtpMinPWindowController::measured_costs(std::uint64_t min_samples) const {
+    std::vector<CostPrior> out;
+    const auto take=[&](std::uint32_t rows,const MtpWindowCostEstimate& c){
+        if(c.samples() && c.samples()>=min_samples) out.push_back({rows,c.value(),c.samples()});};
+    take(1U,serial_);
+    for(const auto& o:owners_) take(o.rows,o.cost);
+    return out;
+}
+void MtpMinPWindowController::reset_costs() {
+    serial_=MtpWindowCostEstimate(model_);serial_prior_=0.0;
+    for(auto& o:owners_) {o.cost=MtpWindowCostEstimate(model_);o.prior=0.0;}
+}
+bool MtpMinPWindowController::fresh() const noexcept {
+    if(choices_ || serial_.samples()) return false;
+    for(const auto& o:owners_) if(o.cost.samples() || o.warmed) return false;
+    for(const auto t:tested_) if(t!=0.0) return false;
+    return true;
+}
 // Calibrated acceptance: the bin's observed rate with a two-draft prior at p.
 double MtpMinPWindowController::acceptance(float p) const {const auto b=bin(p);return (accepted_[b]+2.0*p)/(tested_[b]+2.0);}
 void MtpMinPWindowController::calibrate(std::span<const float> p,std::size_t accepted_drafts,std::size_t verified_rows) {
@@ -65,16 +98,16 @@ double MtpMinPWindowController::expected_tokens(std::uint32_t rows,std::span<con
 bool MtpMinPWindowController::worth_drafting(std::span<const float> p) const {
     if(timing_independent_ || min_probability_<=0.0F || p.empty()) return true;
     const auto usable=p.size()+1U;
-    double best=serial_.samples()?1.0/serial_.value():0.0;
+    double best=known(serial_,serial_prior_)?1.0/cost(serial_,serial_prior_):0.0;
     const Owner* next=nullptr;
     for(const auto& o:owners_) {
-        if(o.rows<=usable) {if(o.cost.samples()) best=std::max(best,expected_tokens(o.rows,p)/o.cost.value());}
+        if(o.rows<=usable) {if(known(o.cost,o.prior)) best=std::max(best,expected_tokens(o.rows,p)/cost(o.cost,o.prior));}
         else if(!next) next=&o;
     }
     if(!next) return false;
-    if(!next->cost.samples()) return true;
+    if(!known(next->cost,next->prior)) return true;
     std::vector<float> assumed(p.begin(),p.end());assumed.resize(next->rows-1U,p.back());
-    return expected_tokens(next->rows,assumed)/next->cost.value()>best;
+    return expected_tokens(next->rows,assumed)/cost(next->cost,next->prior)>best;
 }
 bool MtpMinPWindowController::implausible(const Owner& o) const {
     if(!o.cost.samples() || o.cost.provisional()) return true;
@@ -109,20 +142,24 @@ std::size_t MtpMinPWindowController::choose(std::span<const float> p,std::size_t
     std::size_t cap=n-1U;
     for(std::size_t o=0;o<n;++o) if(owners_[o].rows>=want){cap=o;break;}
     const bool serial_only=want==1U;
-    // Unmeasured options are tried once before the cost model ranks them.
-    if(fits[cap] && !owners_[cap].cost.samples()) return use(cap);
-    if(serial_only && !serial_.samples()) return serial;
+    // Unmeasured options (without a prior) are tried once before the cost model ranks them.
+    if(fits[cap] && !known(owners_[cap].cost,owners_[cap].prior)) return use(cap);
+    if(serial_only && !known(serial_,serial_prior_)) return serial;
     std::size_t best=serial;double best_rate=0.0;
     for(std::size_t o=0;o<n;++o) {
         const auto& owner=owners_[o];
-        if(owner.rows>owners_[cap].rows || !fits[o] || !owner.cost.samples()) continue;
-        const auto rate=expected_tokens(owner.rows,p)/owner.cost.value();
+        if(owner.rows>owners_[cap].rows || !fits[o] || !known(owner.cost,owner.prior)) continue;
+        const auto rate=expected_tokens(owner.rows,p)/cost(owner.cost,owner.prior);
         if(best==serial || rate>best_rate){best=o;best_rate=rate;}
     }
-    if(serial_only && (best==serial || 1.0/serial_.value()>best_rate)) return serial;
+    if(serial_only && (best==serial || 1.0/cost(serial_,serial_prior_)>best_rate)) return serial;
     return use(best!=serial?best:largest());
 }
 void MtpMinPWindowController::observe(std::size_t owner,std::size_t emitted,double ms) {
+    if(++prior_age_>=prior_cycles) { // bootstrap only: every prior still in use expires
+        serial_prior_=0.0;
+        for(auto& o:owners_) o.prior=0.0;
+    }
     if(!emitted) return;
     if(owner==serial) {serial_.add(ms/static_cast<double>(emitted));return;}
     auto& o=owners_.at(owner);
@@ -130,8 +167,8 @@ void MtpMinPWindowController::observe(std::size_t owner,std::size_t emitted,doub
     o.warmed=true;
 }
 std::vector<MtpMinPWindowController::OwnerStats> MtpMinPWindowController::owner_stats() const {
-    std::vector<OwnerStats> out{{1U,serial_.samples(),serial_.value(),0U}};
-    for(const auto& o:owners_) out.push_back({o.rows,o.cost.samples(),o.cost.value(),o.probes});
+    std::vector<OwnerStats> out{{1U,serial_.samples(),cost(serial_,serial_prior_),0U}};
+    for(const auto& o:owners_) out.push_back({o.rows,o.cost.samples(),cost(o.cost,o.prior),o.probes});
     return out;
 }
 } // namespace strix

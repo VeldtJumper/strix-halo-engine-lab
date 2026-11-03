@@ -143,6 +143,7 @@ add_library(strix_core STATIC
     src/model_content_hash.cpp
     src/prompt_terminal_diagnostics.cpp
     src/model_family_registry.cpp
+    src/cost_table_cache.cpp
 )
 else()
 add_library(strix_core STATIC
@@ -271,6 +272,8 @@ add_library(strix_core STATIC
     src/mtp_target_window_policy.cpp
     src/mtp_selection_transaction.cpp
     src/mtp_window_controller.cpp
+    src/cost_table_cache.cpp
+    src/mtp_cost_table_session.cpp
     src/mtp_depth_window_controller.cpp
     src/mtp_sidecar_binding.cpp
     src/mtp_forward_semantics.cpp
@@ -1624,6 +1627,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-window-controller-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-window-controller-tests)
     add_test(NAME strix-mtp-window-controller-tests COMMAND strix-mtp-window-controller-tests)
+    add_executable(strix-cost-table-cache-tests tests/cost_table_cache_tests.cpp)
+    target_link_libraries(strix-cost-table-cache-tests PRIVATE strix_core)
+    strix_target_warnings(strix-cost-table-cache-tests)
+    add_test(NAME strix-cost-table-cache-tests COMMAND strix-cost-table-cache-tests)
     add_executable(strix-mtp-depth-window-controller-tests tests/mtp_depth_window_controller_tests.cpp)
     target_link_libraries(strix-mtp-depth-window-controller-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-depth-window-controller-tests)

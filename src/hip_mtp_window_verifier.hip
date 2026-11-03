@@ -3,6 +3,8 @@
 #include "strix/mtp_payload_geometry.hpp"
 #include "strix/mtp_target_window_policy.hpp"
 #include "strix/mtp_window_controller.hpp"
+#include "strix/mtp_cost_table_session.hpp"
+#include "strix/model_content_hash.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/arithmetic_lineage.hpp"
 #include "strix/session_state_memory.hpp"
@@ -21,7 +23,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <map>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <optional>
 #include <stdexcept>
@@ -44,6 +49,19 @@ bool session_equal(const SerialSessionContext& a,const SerialSessionContext& b) 
         a.committed_tokens==b.committed_tokens && a.health==b.health && a.state.valid==b.state.valid &&
         a.state.generations==b.state.generations && a.arithmetic_lineage.history_identity==b.arithmetic_lineage.history_identity &&
         a.arithmetic_lineage.tainted==b.arithmetic_lineage.tainted && a.arithmetic_lineage.intervals==b.arithmetic_lineage.intervals;
+}
+// STRIX_MTP_REQUEST_RESET=0 keeps the controllers' estimates across requests.
+bool mtp_request_reset() noexcept {
+    static const bool reset=[]{const char* v=std::getenv("STRIX_MTP_REQUEST_RESET");return !v || v[0]!='0';}();
+    return reset;
+}
+// Cost-table device key: architecture, marketing name, compute units, memory size, clock, HIP runtime and driver.
+std::string hip_cost_device_identity() {
+    int device=0,runtime=0,driver=0;hipDeviceProp_t p{};
+    if(hipGetDevice(&device)!=hipSuccess || hipGetDeviceProperties(&p,device)!=hipSuccess ||
+        hipRuntimeGetVersion(&runtime)!=hipSuccess || hipDriverGetVersion(&driver)!=hipSuccess) return {};
+    return std::string(p.gcnArchName)+'|'+p.name+"|cu"+std::to_string(p.multiProcessorCount)+"|mem"+
+        std::to_string(p.totalGlobalMem)+"|clk"+std::to_string(p.clockRate)+"|hip"+std::to_string(runtime)+"|drv"+std::to_string(driver);
 }
 }
 bool hip_mtp_survival_controller() noexcept {
@@ -185,6 +203,40 @@ struct HipMtpWindowVerifier::Impl {
     std::uint64_t cycle_index=0,reprobe_cycles=64;
     double chain_ms=0.0;std::uint32_t chain_steps=0; // the current cycle's draft chain (note_draft)
     std::optional<std::chrono::steady_clock::time_point> last_end;
+    // Persisted min-p controller costs (STRIX_COST_TABLE_DIR plus the app's resolved cost_table_configuration; the
+    // D-022 controller only; MtpCostTableSession). Controller input only: the costs choose which owner verifies;
+    // the table is used only when every owner passes the policy-selection (serial-equivalence) guard.
+    // The table is opened at the first decode cycle after the configuration is resolved (cold until then).
+    bool cost_tables=false;
+    std::shared_ptr<const std::string> cost_configuration;
+    std::vector<std::uint32_t> cost_rows; // 1 (serial) and every owner (all admitted), else table off
+    std::unique_ptr<MtpCostTableSession> costs;
+    // Before every draft decision and verify: resolve the session (greedy, context bucket) for the controller.
+    void prepare_costs(const SerialSessionContext& session) {
+        if(!cost_tables) return;
+        if(!costs) {
+            if(!cost_configuration || cost_configuration->empty()) return;
+            cost_tables=false; // one attempt
+            const auto directory=cost_table_directory_from_env();
+            if(!directory) return;
+            CostTableKey key;
+            key.engine="qwen-mtp-minp";
+            key.binary=cost_table_executable_identity();
+            key.device=hip_cost_device_identity();
+            key.model=model_content_identity_hex(resources.model_weights->model_content_identity);
+            std::string configuration=*cost_configuration+";owners=";
+            for(const auto r:cost_rows) configuration+=std::to_string(r)+',';
+            configuration+=";min-p="+std::to_string(min_probability)+";cost="+
+                (minp->model()==MtpWindowCostEstimate::Model::legacy?"legacy":"robust");
+            key.policy=cost_table_policy_identity(configuration);
+            if(key.binary.empty() || key.device.empty()) return;
+            costs=std::make_unique<MtpCostTableSession>(*directory,std::move(key),cost_table_options_from_env(),cost_rows);
+            cost_tables=true;
+        }
+        costs->prepare(*minp,session.next_position,target->token_sampler()!=nullptr);
+    }
+    void flush_costs() noexcept {if(costs) costs->flush(*minp);}
+    ~Impl() {flush_costs();}
     Impl(std::shared_ptr<HipMtpTargetHidden> t,std::vector<std::shared_ptr<HipKnownPrefixWindow>> w,
          const ExecutionRuntimeResources& r,std::shared_ptr<const void> owner,
          HipMtpWindowVerificationPolicy policy,AllocationGenerationSource& generations)
@@ -236,6 +288,19 @@ struct HipMtpWindowVerifier::Impl {
             explore=env_number("STRIX_MTP_EXPLORE",0.0);
             reprobe_cycles=static_cast<std::uint64_t>(std::max(0.0,env_number("STRIX_MTP_REPROBE",64.0)));
             if(env_number("STRIX_MTP_SURVIVAL_ADAPT",1.0)!=0.0) {calibrator.rate=0.01;calibrator.pull=0.01;}
+        }
+        // Persisted costs: the default min-p controller with measured costs only (no depth/survival controller,
+        // no timing-independent schedule, no diagnostics), per-request resets (the default), and every owner admitted
+        // as serial-equivalent by the policy-selection guard.
+        cost_configuration=policy.cost_table_configuration;
+        cost_tables=cost_configuration && prefix && min_probability>0.0F && !timing_independent && !depth && !survival &&
+            !hip_mtp_full_chain_diagnostic() && mtp_request_reset() && cost_table_directory_from_env().has_value();
+        if(cost_tables) {
+            // Every selectable owner must pass the policy-selection guard, or the verifier declines the table.
+            std::vector<std::uint32_t> rows;std::vector<bool> admitted;
+            for(const auto& o:owners) {rows.push_back(o.rows);admitted.push_back(o.window->policy_selection_admitted());}
+            cost_rows=MtpCostTableSession::seedable_rows(rows,admitted);
+            cost_tables=!cost_rows.empty();
         }
         for(std::size_t o=1;o<owners.size();++o) owners[o].window->share_deferred(*owners.front().window);
         // STRIX_WINDOW_ROUTE_LOG=1 (diagnostics, never timed): after each router step of a verify window, the
@@ -422,10 +487,18 @@ struct HipMtpWindowVerifier::Impl {
     // Wall time between consecutive verified cycles, attributed to this cycle's choice.
     void observe(Owner* owner,std::size_t emitted) {
         const auto now=std::chrono::steady_clock::now();
+        static const bool log_cycles=std::getenv("STRIX_CYCLE_LOG")!=nullptr;
+        if(log_cycles && emitted) {
+            // Per window (diagnostics): rows, emitted tokens, wall ms (-1 = first cycle, untimed), draft steps, the
+            // controller's cost in use for this option before this sample, its own samples, live table priors.
+            const auto stats=minp->owner_stats();
+            const auto& st=stats.at(owner?static_cast<std::size_t>(owner-owners.data())+1U:0U);
+            std::fprintf(stderr,"cycle rows=%u emitted=%zu ms=%.2f draft=%u est=%.2f local=%llu priors=%zu\n",owner?owner->rows:1U,
+                emitted,last_end?std::chrono::duration<double,std::milli>(now-*last_end).count():-1.0,chain_steps,st.cycle_ms,
+                static_cast<unsigned long long>(st.cycles),minp->active_priors());
+        }
         if(last_end && emitted) {
             const auto ms=std::chrono::duration<double,std::milli>(now-*last_end).count();
-            static const bool log_cycles=std::getenv("STRIX_CYCLE_LOG")!=nullptr;
-            if(log_cycles) std::fprintf(stderr,"cycle rows=%u emitted=%zu ms=%.2f\n",owner?owner->rows:1U,emitted,ms);
             minp->observe(owner?static_cast<std::size_t>(owner-owners.data()):MtpMinPWindowController::serial,emitted,ms);
             if(depth)depth->observe(owner?static_cast<std::size_t>(owner-owners.data()):MtpDepthWindowController::serial,emitted,ms);
         }
@@ -610,6 +683,8 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
                 require(result.selection_receipt->size()==n_keep && result.committed_rows.size()==n_keep,"MTP cohort receipt lengths differ");}
             if(!q.transaction && q.probabilities.size()==q.candidates.size())i.minp->calibrate(q.probabilities,k,rows-1U);
             i.skip_sample();
+            // A cohort session's cycle times include the other members: never persisted.
+            if(i.costs) i.costs->exclude();
             provisional.reset();
             natives[a]={};
             p.capture->set_row_selection({});p.capture->set_transaction_selection({});
@@ -781,8 +856,8 @@ void HipMtpWindowVerifier::begin_session() {
     // The owners and their device pools are reusable; their workload estimates
     // are not. In particular, multi-stream cycle wall times include scheduler
     // work that must not price deeper windows out of a later single-stream run.
-    static const bool reset=[]{const char* v=std::getenv("STRIX_MTP_REQUEST_RESET");return !v || v[0]!='0';}();
-    if(reset) {
+    i.flush_costs();
+    if(mtp_request_reset()) {
         i.minp->begin_session();
         if(i.depth) {
             std::vector<std::uint32_t> rows;for(const auto& o:i.owners)rows.push_back(o.rows);
@@ -840,6 +915,7 @@ std::vector<MtpDepthWindowController::CostStats> HipMtpWindowVerifier::depth_cos
 std::vector<MtpDepthWindowController::CostStats> HipMtpWindowVerifier::draft_depth_stats() const {
     return impl_->depth?impl_->depth->draft_stats():std::vector<MtpDepthWindowController::CostStats>{};
 }
+void HipMtpWindowVerifier::prepare_cycle(const SerialSessionContext& session) {impl_->prepare_costs(session);}
 void HipMtpWindowVerifier::note_draft(std::uint32_t steps,double ms) noexcept {
     impl_->chain_steps=steps;impl_->chain_ms=ms;
     if(impl_->depth) {
@@ -904,8 +980,11 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         option=i.survival_choose(probabilities,runner_ups,candidates.size(),[&](const Impl::Option& o){
             return budget>=o.active && room>=o.owner->rows && history && !candidates.empty();});
         owner=option?option->owner:nullptr;
-    } else owner=i.choose(probabilities,candidates.size(),[&](const Impl::Owner& o){
-        return budget>=o.rows && room>=o.rows && history && (pad?!candidates.empty():candidates.size()+1>=o.rows);});
+    } else {
+        i.prepare_costs(session);
+        owner=i.choose(probabilities,candidates.size(),[&](const Impl::Owner& o){
+            return budget>=o.rows && room>=o.rows && history && (pad?!candidates.empty():candidates.size()+1>=o.rows);});
+    }
     if(diagnostic) {
         owner=diagnostic_rows>1U?i.owner_of(diagnostic_rows):nullptr;
         require(diagnostic_rows==1U || owner,"MTP diagnostic owner is not admitted");
