@@ -3,6 +3,8 @@
 #include "glm/spec/glm_spec_host.hpp"
 #include "strix/glm/engine.hpp"
 #include <array>
+#include <chrono>
+#include <vector>
 
 namespace strix::glm::spec {
 enum class BootstrapPolicy { Reference, Chunked };
@@ -50,4 +52,34 @@ Seed bootstrap(engine::Engine&, std::uint32_t slot, std::span<const std::uint32_
                BootstrapPolicy, ControlState&);
 // Budget includes seed.y0. Always flushes deferred committed rows before returning.
 RunResult decode_greedy(engine::Engine&, std::uint32_t slot, Seed, const DecodePolicy&, unsigned budget, ControlState&);
+// decode_greedy one verify cycle at a time (the server interleaves control rounds between cycles; decode_greedy is
+// this loop run to the end). Between cycles no other engine call may run (the drafter input hp points into the
+// engine's MTP hidden rows); finish() flushes the slot's deferred rows and must end every decoder that ran a cycle.
+class GreedyDecoder {
+public:
+    GreedyDecoder(engine::Engine&, std::uint32_t slot, Seed, const DecodePolicy&, unsigned budget, ControlState&);
+    // One cycle; false once the budget is reached or the acceptance stopped (then nothing more to run).
+    bool cycle();
+    void finish();
+    [[nodiscard]] bool done() const noexcept { return done_; }
+    [[nodiscard]] const RunResult& result() const noexcept { return out_; }
+    [[nodiscard]] const CycleRecord& last() const noexcept { return last_; }
+    // Next trunk position (the row of the last emitted token).
+    [[nodiscard]] std::uint64_t position() const noexcept { return p_; }
+private:
+    engine::Engine& e_;
+    std::uint32_t slot_;
+    DecodePolicy policy_;
+    unsigned budget_;
+    ControlState& control_;
+    RunResult out_;
+    CycleRecord last_;
+    std::vector<std::uint32_t> drafts_;
+    std::vector<float> confidences_;
+    bool disabled_ = false, done_ = false, finished_ = false;
+    const float* hp_ = nullptr;
+    std::uint64_t p_ = 0;
+    unsigned pending_ = 0;
+    std::chrono::steady_clock::time_point start_;
+};
 }  // namespace strix::glm::spec

@@ -47,6 +47,7 @@
 // rank with exit code 86 near the OOM line.
 #include "glm_rank_defaults.hpp"
 #include "glm_rank_startup.hpp"
+#include "glm_rank_transport.hpp"
 
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
@@ -100,38 +101,7 @@ std::vector<std::uint32_t> read_u32(const std::string& path) {
     return v;
 }
 
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-// The MiniMax rank app's transport setup (usb4-auto host path, usb4gpu GPU-direct when both ranks agree, tcp).
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt) {
-    const std::chrono::seconds limit(180);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4-auto" || kind == "usb4gpu") {
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = limit;
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        receipt = topology.receipt();
-        if (kind == "usb4gpu") {
-            std::string why_direct, direct_receipt;
-            if (strix::dist::usb4_gpu_direct_streams(o, *t, &why_direct) == 0U) {
-                receipt += "; gpu-direct unavailable (" + why_direct + "): host path only";
-                return t;
-            }
-            gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &direct_receipt);
-            receipt += "; usb4 " + direct_receipt;
-        }
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
-}
+using strix::glm::rank_transport::open_transport;
 
 }  // namespace
 
@@ -342,15 +312,9 @@ int main(int argc, char** argv) {
                 opt.external_exchange = true;
                 std::printf("connected: rank %u exchange xfer %.1f s\n", opt.rank, secs(t_start, Clock::now()));
             } else {
-            strix::dist::Group group;
-            group.rank = opt.rank;
-            group.world = 2;
-            group.plan = 0x474c4d35ULL;  // "GLM5"
             // one exchange carries up to max(8, max_rows) rows of 4096 floats (a chunked prefill exchanges whole chunks)
             opt.exchange_rows = rd::max_rows_auto(eff) ? rd::kFallbackMaxRows : opt.max_rows;
-            const std::size_t max_bytes = std::size_t{std::max(8U, opt.exchange_rows)} * 4096 * sizeof(float) + 4096;
-            comm = gpu_direct ? std::make_unique<strix::dist::Communicator>(group, std::move(transport), std::move(gpu_direct), max_bytes)
-                              : std::make_unique<strix::dist::Communicator>(group, std::move(transport), max_bytes);
+            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(), secs(t_start, Clock::now()));
             }
         }

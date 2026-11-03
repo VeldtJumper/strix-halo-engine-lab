@@ -2248,6 +2248,28 @@
     "doc_anchor": "docs/optimizations.md#glm-hc-norm-fused"
   },
   {
+    "engine": "glm",
+    "name": "Server batched MTP verify",
+    "flag_or_env": "STRIX_GLM_SERVE_G2",
+    "default": "on (with MTP)",
+    "exact": "Pair --selftest 8: every stream's tokens equal the same prompt run alone at C2 / C4 / C6 / C8; multi-slot verify bitwise equal single-slot verify calls.",
+    "gain": "--selftest 8 (8 short chat prompts, 22-59 tokens, up to 128 generated, cache off), steady-state aggregate decode, G2 on (off): C2 53.0 (37.8) tok/s +40 %, C4 59.9 (53.6) +12 %, C6 62.5 (62.4), C8 69.5 (69.4); C>=5 hands over to batched plain steps",
+    "preconditions": "strix-glm5-serve with MTP on and an attention seam with multi-slot verify.",
+    "off_switch": "STRIX_GLM_SERVE_G2=0",
+    "doc_anchor": "docs/optimizations.md#glm-serve-g2"
+  },
+  {
+    "engine": "glm",
+    "name": "Server decode-first chunked prefill",
+    "flag_or_env": "--prefill-chunk",
+    "default": "512 (adaptive: whole prompt when nothing decodes)",
+    "exact": "Every stream's tokens equal the same prompt run alone.",
+    "gain": "4 prompts of ~1,830 tokens every 16 decode rounds into 4 running streams, 128 generated tokens each, cache off: longest decode stall 6.65 -> 2.67 s (-60 %)",
+    "preconditions": "strix-glm5-serve; exact chunked prefill.",
+    "off_switch": "--prefill-chunk 0",
+    "doc_anchor": "docs/optimizations.md#glm-serve-prefill-chunk"
+  },
+  {
     "engine": "qwen",
     "name": "Master baseline",
     "flag_or_env": "--baseline / STRIX_BASELINE",

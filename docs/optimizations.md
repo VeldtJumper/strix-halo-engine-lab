@@ -3504,6 +3504,44 @@ R1b decode fuses the hyper-connection finish (hc_fin) with the following RMSNorm
 - **Measured gain:** Pair ABA x2: C1 MTP decode -2.3 %, R8 -3.1 %
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
 
+<a id="glm-serve-g2"></a>
+
+### Server batched MTP verify
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_SERVE_G2`. **Default:** on (with MTP).
+
+In `strix-glm5-serve`, one request in flight decodes through the engine's exact single-slot MTP self-speculation; with
+more than one request decoding, every decoding slot's window (anchor + adaptive drafts) is verified in ONE multi-slot
+call of at most 8 rows (`Engine::verify_multi`, a FastAttn KDA verify of several slots' windows, per-slot MTP hidden
+rows), and each slot commits its accepted rows. When the windows no longer fit (five or more streams) the server hands
+over to batched plain steps.
+
+- **Preconditions:** `strix-glm5-serve` with MTP on and an attention seam with multi-slot verify (reported at startup).
+- **Automatic selection:** On unless switched off; off when the attention seam verifies one slot per call.
+- **Fallback notice:** Startup says when multi-slot verify is unavailable.
+- **Exactness evidence:** `--selftest 8` on the pair: every stream's tokens equal the same prompt run alone (C=1 plain reference) at C2 / C4 / C6 / C8; multi-slot verify windows bitwise equal single-slot verify calls (device test).
+- **Off switch:** STRIX_GLM_SERVE_G2=0 (batched plain steps); STRIX_GLM_SERVE_MTP=0 turns off MTP at every C
+- **Measured gain:** `--selftest 8` (8 built-in short chat prompts in the GLM chat template, 22-59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, cache off, the server has no prompt cache), steady-state aggregate decode, G2 on (off): C2 53.03 (37.83) tok/s (+40 %), C4 59.88 (53.64) (+12 %), C6 62.50 (62.44), C8 69.48 (69.37) (handed over); C1 39.97 tok/s through MTP vs 25.30 plain
+- **Implementation / evidence:** [server](../apps/glm_serve_main.cpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
+
+<a id="glm-serve-prefill-chunk"></a>
+
+### Server decode-first chunked prefill
+
+**Engine:** `glm`. **Control:** `--prefill-chunk`. **Default:** 512.
+
+While requests decode, the server prefills a new prompt one N-token chunk per decode step, so running streams keep
+producing tokens; with nothing decoding the prompt is prefilled whole in one call (a lone request pays nothing).
+`--prefill-chunk-mtp 0` keeps MTP-bootstrap prompts whole.
+
+- **Preconditions:** `strix-glm5-serve`; exact chunked prefill.
+- **Automatic selection:** Adaptive: chunked only while another request decodes.
+- **Fallback notice:** None.
+- **Exactness evidence:** Every stream's tokens equal the same prompt run alone (self-test interleave levels).
+- **Off switch:** --prefill-chunk 0 (always whole)
+- **Measured gain:** 4 prompts of ~1,830 tokens arriving every 16 decode rounds into 4 running streams, 128 generated tokens each, cache off: longest decode stall of running streams across another prompt's prefill 6.65 -> 2.67 s (-60 %)
+- **Implementation / evidence:** [server](../apps/glm_serve_main.cpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
+
 ## Platform (kernel)
 
 <a id="platform-perfopt"></a>

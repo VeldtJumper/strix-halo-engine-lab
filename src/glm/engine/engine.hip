@@ -582,7 +582,7 @@ struct Engine::Impl {
     std::vector<Row> mtp_rows;
     std::vector<std::uint32_t> mtp_slots;
     std::vector<std::uint64_t> mtp_positions;
-    float *m_e = nullptr, *m_en = nullptr, *m_hn = nullptr, *m_cat = nullptr, *m_z = nullptr, *m_r = nullptr, *m_y = nullptr, *m_h = nullptr,
+    float *m_e = nullptr, *m_en = nullptr, *m_hn = nullptr, *m_cat = nullptr, *m_z = nullptr, *m_r = nullptr, *m_y = nullptr, *m_h = nullptr, *m_hs = nullptr,
           *m_mz = nullptr;
     // load memory accounting (design notes): plan (dry run) -> calibration -> admission -> checked load
     mem::LoadPlan plan;
@@ -1131,6 +1131,7 @@ struct Engine::Impl {
             m_r = lib.buffer<float>(RC * kHidden);
             m_y = lib.buffer<float>(RC * kHidden);
             m_h = lib.buffer<float>(RC * kHidden);
+            m_hs = lib.buffer<float>(static_cast<std::size_t>(opt.slots) * 8 * kHidden);
             m_mz = lib.buffer<float>(2);
         }
         dg = lib.buffer<float>(R * dense_i);
@@ -1725,6 +1726,8 @@ struct Engine::Impl {
         if (slot >= opt.slots || pos0 + R > opt.capacity) throw std::out_of_range("mtp: slot / MTP capacity (clamp first)");
         if (no_mtp.at(slot) && !bootstrap) throw std::logic_error("mtp: the slot was chunk-prefilled (MTP cache not filled; reset first)");
         mtp_cache(slot, h, tokens, pos0, false);
+        hip_ok(hipMemcpyAsync(m_hs + static_cast<std::size_t>(slot) * 8 * kHidden, m_h, std::size_t{R} * kHidden * sizeof(float),
+                              hipMemcpyDeviceToDevice, stream), "mtp hidden per slot");
         lib.run(head, m_h, logits, R, stream);
         D::argmax(logits, vocab_n, vocab0, amv, ami, mtp_flag, R, stream);
         lse_kernel<<<1, 256, 0, stream>>>(logits + static_cast<std::size_t>(R - 1) * vocab_n, vocab_n, m_mz);
@@ -1766,6 +1769,46 @@ struct Engine::Impl {
         pending[slot] = 0;  // consumed by this call whatever the outcome (stored by the replay); commit sets it again
         std::vector<Row> rows(R);
         for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[j], p + j};
+        return verify_rows(rows, sp, ctl);
+    }
+    bool verify_multi_supported() const { return attn && attn->supports_multi_slot_verify(); }
+    Engine::VerifyOut verify_multi(std::span<const Row> rows, Exchange::MergeCtl& ctl) {
+        if (!opt.spec) throw std::logic_error("verify needs Options::spec");
+        if (opt.layers != kLayers && !smoke_head) throw std::logic_error("verify needs all 45 layers");
+        const auto R = static_cast<unsigned>(rows.size());
+        if (R == 0 || R > 8) throw std::invalid_argument("verify_multi: 1..8 rows");
+        std::vector<SpecSeg> seg;
+        for (unsigned r = 0; r < R; ++r) {
+            if (rows[r].slot >= opt.slots || rows[r].pos >= opt.capacity) throw std::out_of_range("verify_multi: slot / capacity");
+            if (r > 0 && rows[r].slot == rows[r - 1].slot) {
+                if (rows[r].pos != rows[r - 1].pos + 1) throw std::invalid_argument("verify_multi: a slot's rows need consecutive positions");
+                ++seg.back().n;
+                continue;
+            }
+            if (r > 0 && rows[r].slot < rows[r - 1].slot) throw std::invalid_argument("verify_multi: rows not sorted by slot");
+            seg.push_back(SpecSeg{rows[r].slot, 0, 0, r, 1});
+        }
+        if (seg.size() == 1) {
+            std::vector<std::uint32_t> t(R);
+            for (unsigned r = 0; r < R; ++r) t[r] = rows[r].token;
+            return verify(seg[0].slot, t, rows[0].pos, ctl);
+        }
+        if (!verify_multi_supported()) throw std::logic_error("verify_multi: the attention seam verifies one slot per call");
+        hip_ok(hipMemsetAsync(row_flag, 0, R * 4, stream), "row flags");
+        hip_ok(hipMemsetAsync(replay_flag, 0, 4, stream), "replay flag");
+        for (auto& g : seg) {
+            g.n_rep = pending[g.slot];
+            g.cur = cur[g.slot];
+            pending[g.slot] = 0;  // consumed whatever the outcome; each slot's commit sets it again
+        }
+        SpecRows sp{seg[0].slot, seg[0].n_rep, seg[0].cur, row_flag, replay_flag};
+        sp.seg = seg.data();
+        sp.nseg = static_cast<unsigned>(seg.size());
+        return verify_rows(rows, sp, ctl);
+    }
+    // The verify forward + head + merge (rows prepared by verify / verify_multi, flags cleared).
+    Engine::VerifyOut verify_rows(std::span<const Row> rows, const SpecRows& sp, Exchange::MergeCtl& ctl) {
+        const auto R = static_cast<unsigned>(rows.size());
         layers_forward(rows, opt.layers, ForwardKind::Verify, &sp);
         D::hc_final(X, hfin, R, stream);
         D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
@@ -2008,6 +2051,12 @@ Engine::MtpOut Engine::mtp(std::uint32_t slot, const float* h, std::span<const s
     return impl_->mtp(slot, h, tokens, mtp_pos0, ctl);
 }
 const float* Engine::mtp_hidden() const { return impl_->m_h; }
+const float* Engine::mtp_hidden(std::uint32_t slot) const {
+    if (slot >= impl_->opt.slots || impl_->m_hs == nullptr) throw std::out_of_range("mtp_hidden: slot / MTP not loaded");
+    return impl_->m_hs + static_cast<std::size_t>(slot) * 8 * kHidden;
+}
+Engine::VerifyOut Engine::verify_multi(std::span<const Row> rows, Exchange::MergeCtl& ctl) { return impl_->verify_multi(rows, ctl); }
+bool Engine::verify_multi_supported() const { return impl_->verify_multi_supported(); }
 std::vector<float> Engine::gate_residual(std::span<const std::uint32_t> tokens, unsigned layers, bool) {
     return impl_->gate_residual(tokens, layers);
 }

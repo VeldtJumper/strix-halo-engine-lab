@@ -131,13 +131,23 @@ public:
     // Grow the shared matmul workspace to >= bytes now (so no call allocates later); default: no workspace to reserve.
     virtual void reserve(std::uint64_t workspace_bytes) const { (void)workspace_bytes; }
 };
-// Speculative verify call (design notes §1): the call's rows are R <= 8 consecutive positions of ONE slot.
+// One slot's window inside a multi-slot verify call: rows row0 .. row0 + n - 1 of the call (consecutive positions).
+struct SpecSeg {
+    std::uint32_t slot = 0;
+    unsigned n_rep = 0, cur = 0;      // as SpecRows, for this slot
+    unsigned row0 = 0, n = 0;
+};
+// Speculative verify call (design notes §1): the call's rows are R <= 8 consecutive positions of ONE slot, or with
+// `seg` (Engine::verify_multi, nseg >= 2) the windows of several slots, sorted by slot; slot / n_rep / cur then
+// describe seg[0].
 struct SpecRows {
     std::uint32_t slot = 0;
     unsigned n_rep = 0;               // pending rows of the slot replayed into the committed KDA state by this call
     unsigned cur = 0;                 // replay set read by this call; its new rows go to set 1 - cur
     unsigned* row_flag = nullptr;     // device [R]: per-row C1-C5 (new rows' C2 included)
     unsigned* replay_flag = nullptr;  // device [1]: C2 of the replayed (committed) rows
+    const SpecSeg* seg = nullptr;     // host [nseg]: multi-slot verify windows (nullptr: one slot)
+    unsigned nseg = 0;
 };
 // What a seam sees of the current call (host + device copies, valid during the call).
 struct CallCtx {
@@ -159,6 +169,8 @@ public:
     virtual ~AttnPath() = default;
     virtual void kda(const KdaLayerWeights& w, KdaState& st, const CallCtx& c, const float* x, float* y) = 0;
     virtual void dsa(const DsaLayerWeights& w, DsaState& st, const CallCtx& c, const float* x, float* y) = 0;
+    // Speculative verify calls with the windows of several slots (SpecRows::seg); false: one slot per verify call.
+    virtual bool supports_multi_slot_verify() const { return false; }
 };
 // FFN of one MoE layer: x = normed [R][4096]; route ids [R][8] ascending + weights [R][8] (computed by the engine,
 // R5/R14) -> y = sum over the row's experts in ascending id of fmaf(w, expert(x)) + shared(x), this rank's partial.
@@ -351,6 +363,12 @@ public:
         bool replay_flag = false;
     };
     VerifyOut verify(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t p, Exchange::MergeCtl& ctl);
+    // The verify windows of several slots in ONE call (served batched self-speculation): rows sorted by slot, each slot's
+    // rows at consecutive positions (its anchor, then its drafts), R <= 8 in total. Per-row merged ids / flags as
+    // verify(); each slot then commits its accepted rows with commit(slot, ...). One slot == verify(). Several slots
+    // need an AttnPath with supports_multi_slot_verify() (verify_multi_supported()); otherwise this throws.
+    VerifyOut verify_multi(std::span<const Row> rows, Exchange::MergeCtl& ctl);
+    [[nodiscard]] bool verify_multi_supported() const;
     // Commit the first `rows` rows of the last verify of `slot` (verify at p): DSA frontier p + rows, KDA pending =
     // those rows (ping-pong swap), MTP cache truncated to p. Not called on abort.
     void commit(std::uint32_t slot, unsigned rows, std::uint64_t p);
@@ -380,6 +398,9 @@ public:
     MtpOut mtp(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens, std::uint64_t mtp_pos0,
                Exchange::MergeCtl& ctl);
     [[nodiscard]] const float* mtp_hidden() const;
+    // The same h' rows of the last mtp() call of `slot`, kept per slot ([<= 8][4096] device) until that slot's next
+    // mtp() call: drafter chains of several slots interleave (served batched self-speculation).
+    [[nodiscard]] const float* mtp_hidden(std::uint32_t slot) const;
     // Exact chunked R1 prompt bootstrap, including layer 45. hp is device [4096], valid until the next call.
     // Requires an exact PrefillPath, all trunk layers and MTP; restores the generated identity on every exit.
     struct MtpPrefillOut {

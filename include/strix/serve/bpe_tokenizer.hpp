@@ -13,13 +13,16 @@ namespace strix::serve {
 // `token_type`, `merges`, `pre`). Encoding splits the text on control and user-defined tokens
 // (when special parsing is on), pre-tokenizes every other piece with the model's pattern, maps its
 // bytes to the byte-level alphabet and applies the merges by rank. Decoding inverts the byte map.
-// The `qwen35` and the DeepSeek V3/V4 (`joyai-llm`, `deepseek-v3`) pre-tokenizers are implemented; other GGUF
-// tokenizers are rejected at load.
+// The `qwen35`, the DeepSeek V3/V4 (`joyai-llm`, `deepseek-v3`) and the GLM-4/5 (`glm4`) pre-tokenizers are
+// implemented; other tokenizers are rejected at load.
 class BpeTokenizer {
 public:
     enum class TokenType : std::int32_t { normal = 1, unknown = 2, control = 3, user_defined = 4, unused = 5, byte = 6 };
 
     static std::shared_ptr<const BpeTokenizer> load_gguf(const std::string& path);
+    // A Hugging Face tokenizer.json of the GLM-4/5 layout (byte-level BPE, the GLM split pattern, ignore_merges);
+    // added tokens become control (special) or user-defined tokens; eos = <|endoftext|>.
+    static std::shared_ptr<const BpeTokenizer> load_hf_json(const std::string& path);
     static std::shared_ptr<const BpeTokenizer> from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
         std::span<const std::string> merges, std::string pre);
     ~BpeTokenizer();
