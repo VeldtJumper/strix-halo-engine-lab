@@ -16,6 +16,7 @@
 #include "strix/hip_token_sampling_device.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <array>
 #include <chrono>
@@ -203,11 +204,11 @@ struct HipMtpWindowVerifier::Impl {
     std::uint64_t cycle_index=0,reprobe_cycles=64;
     double chain_ms=0.0;std::uint32_t chain_steps=0; // the current cycle's draft chain (note_draft)
     std::optional<std::chrono::steady_clock::time_point> last_end;
-    // Persisted min-p controller costs (STRIX_COST_TABLE_DIR plus the app's resolved cost_table_configuration; the
+    // Persisted min-p controller costs (cost_table_directory_from_env plus the app's resolved cost_table_configuration; the
     // D-022 controller only; MtpCostTableSession). Controller input only: the costs choose which owner verifies;
     // the table is used only when every owner passes the policy-selection (serial-equivalence) guard.
     // The table is opened at the first decode cycle after the configuration is resolved (cold until then).
-    bool cost_tables=false;
+    bool cost_tables=false,cost_baseline=false;
     std::shared_ptr<const std::string> cost_configuration;
     std::vector<std::uint32_t> cost_rows; // 1 (serial) and every owner (all admitted), else table off
     std::unique_ptr<MtpCostTableSession> costs;
@@ -217,7 +218,7 @@ struct HipMtpWindowVerifier::Impl {
         if(!costs) {
             if(!cost_configuration || cost_configuration->empty()) return;
             cost_tables=false; // one attempt
-            const auto directory=cost_table_directory_from_env();
+            const auto directory=cost_table_directory_resolve(cost_baseline).path;
             if(!directory) return;
             CostTableKey key;
             key.engine="qwen-mtp-minp";
@@ -293,8 +294,17 @@ struct HipMtpWindowVerifier::Impl {
         // no timing-independent schedule, no diagnostics), per-request resets (the default), and every owner admitted
         // as serial-equivalent by the policy-selection guard.
         cost_configuration=policy.cost_table_configuration;
+        cost_baseline=policy.cost_table_baseline;
         cost_tables=cost_configuration && prefix && min_probability>0.0F && !timing_independent && !depth && !survival &&
-            !hip_mtp_full_chain_diagnostic() && mtp_request_reset() && cost_table_directory_from_env().has_value();
+            !hip_mtp_full_chain_diagnostic() && mtp_request_reset();
+        if(cost_tables) {
+            const auto resolved=cost_table_directory_resolve(cost_baseline);
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true))
+                std::fprintf(stderr,"cost-table: directory source=%s%s%s\n",cost_table_source_name(resolved.source),
+                    resolved.path?" dir=":"",resolved.path?resolved.path->string().c_str():"");
+            cost_tables=resolved.path.has_value();
+        }
         if(cost_tables) {
             // Every selectable owner must pass the policy-selection guard, or the verifier declines the table.
             std::vector<std::uint32_t> rows;std::vector<bool> admitted;

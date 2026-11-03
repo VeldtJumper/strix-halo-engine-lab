@@ -74,13 +74,52 @@ void test_directory_rules() {
     fs::create_directories(dir/"checkout"/".git");
     expect(!strix::cost_table_directory_admitted(dir/"checkout"/"build"/"costs"),"inside a checkout is refused");
     expect(!strix::cost_table_directory_admitted(fs::path{}),"empty is refused");
-    set_env("STRIX_COST_TABLE_DIR",nullptr);
-    expect(!strix::cost_table_directory_from_env(),"unset = off");
     set_env("STRIX_COST_TABLE_DIR",(dir/"checkout").string().c_str());
     expect(!strix::cost_table_directory_from_env(),"env inside a checkout = off");
     set_env("STRIX_COST_TABLE_DIR",(dir/"tables").string().c_str());
-    expect(strix::cost_table_directory_from_env().has_value(),"env outside a checkout = on");
+    expect(strix::cost_table_directory_from_env()==dir/"tables","env outside a checkout = on");
+    for(const char* off:{"off","0",""}) {
+        set_env("STRIX_COST_TABLE_DIR",off);
+#ifdef _WIN32
+        if(!*off) continue; // _putenv_s with "" removes the variable on Windows
+#endif
+        expect(!strix::cost_table_directory_from_env(),"STRIX_COST_TABLE_DIR=off/0/empty = off");
+    }
+    // Default: the user cache directory (created on the first store).
     set_env("STRIX_COST_TABLE_DIR",nullptr);
+#ifdef _WIN32
+    const char* base_var="LOCALAPPDATA";
+    const auto expected=dir/"cache"/"strix"/"cost-tables";
+#else
+    const char* base_var="XDG_CACHE_HOME";
+    const auto expected=dir/"cache"/"strix"/"cost-tables";
+#endif
+    const char* saved=std::getenv(base_var);const std::string saved_value=saved?saved:"";
+    set_env(base_var,(dir/"cache").string().c_str());
+    expect(strix::cost_table_directory_from_env()==expected,"unset = default under the user cache directory");
+#ifndef _WIN32
+    const char* saved_home=std::getenv("HOME");const std::string home_value=saved_home?saved_home:"";
+    set_env("XDG_CACHE_HOME",nullptr);set_env("HOME",(dir/"home").string().c_str());
+    expect(strix::cost_table_directory_from_env()==dir/"home"/".cache"/"strix"/"cost-tables","no XDG_CACHE_HOME: ~/.cache");
+    set_env("HOME","relative/home");
+    expect(!strix::cost_table_directory_from_env(),"no absolute cache base: off");
+    set_env("HOME",saved_home?home_value.c_str():nullptr);
+    set_env("XDG_CACHE_HOME",(dir/"cache").string().c_str());
+#endif
+    set_env("STRIX_COST_TABLE","0");
+    expect(!strix::cost_table_directory_from_env(),"STRIX_COST_TABLE=0 = off");
+    set_env("STRIX_COST_TABLE",nullptr);
+    {   // a store creates the default directory on demand; an unwritable one is ignored (no throw, no table)
+        CostTableKey k=key();
+        CostTableCache c(*strix::cost_table_directory_from_env(),k);
+        (void)c.load();c.record("r4",{50.0,4U});
+        expect(c.store() && fs::exists(expected),"default directory created on the first store");
+        write(dir/"afile","x");
+        CostTableCache bad(dir/"afile"/"sub",k);
+        (void)bad.load();bad.record("r4",{50.0,4U});
+        expect(!bad.store(),"unwritable directory: store fails quietly");
+    }
+    set_env(base_var,saved?saved_value.c_str():nullptr);
     set_env("STRIX_COST_TABLE_RECHECK","0.5");set_env("STRIX_COST_TABLE_DRIFT","0.2");
     auto o=strix::cost_table_options_from_env();
     expect(o.recheck_fraction==0.5 && o.drift_tolerance==0.2,"options from env");
@@ -604,11 +643,52 @@ void test_cross_process_route_key() {
     expect(s.state()==MtpCostTableSession::State::warm && ctl.owner_stats()[2].cycle_ms==53.0,"process B is seeded");
     fs::remove_all(dir);
 }
+// Baseline: --baseline, STRIX_BASELINE=1 and STRIX_QPF2K_DEFAULTS=0 switch the DEFAULT directory off (source
+// "baseline"); an explicit STRIX_COST_TABLE_DIR still wins; STRIX_COST_TABLE=0 is off in every case.
+void test_baseline_resolution() {
+    using strix::CostTableSource;
+    const auto dir=fresh_dir("baseline");
+#ifdef _WIN32
+    const char* base_var="LOCALAPPDATA";
+#else
+    const char* base_var="XDG_CACHE_HOME";
+#endif
+    const char* saved=std::getenv(base_var);const std::string saved_value=saved?saved:"";
+    set_env(base_var,(dir/"cache").string().c_str());
+    set_env("STRIX_COST_TABLE_DIR",nullptr);set_env("STRIX_COST_TABLE",nullptr);
+    set_env("STRIX_BASELINE",nullptr);set_env("STRIX_QPF2K_DEFAULTS",nullptr);
+    const auto def=dir/"cache"/"strix"/"cost-tables";
+    auto r=strix::cost_table_directory_resolve(false);
+    expect(r.path==def && r.source==CostTableSource::default_dir && std::string(strix::cost_table_source_name(r.source))=="default",
+        "default directory, source default");
+    r=strix::cost_table_directory_resolve(true);
+    expect(!r.path && r.source==CostTableSource::baseline && std::string(strix::cost_table_source_name(r.source))=="baseline",
+        "--baseline: no default directory, source baseline");
+    set_env("STRIX_BASELINE","1");
+    r=strix::cost_table_directory_resolve(false);
+    expect(!r.path && r.source==CostTableSource::baseline && !strix::cost_table_directory_from_env(),"STRIX_BASELINE=1: baseline");
+    set_env("STRIX_BASELINE","0");
+    expect(strix::cost_table_directory_resolve(false).source==CostTableSource::default_dir,"STRIX_BASELINE=0: default");
+    set_env("STRIX_BASELINE",nullptr);
+    set_env("STRIX_QPF2K_DEFAULTS","0");
+    expect(strix::cost_table_directory_resolve(false).source==CostTableSource::baseline,"STRIX_QPF2K_DEFAULTS=0: baseline");
+    set_env("STRIX_COST_TABLE_DIR",(dir/"explicit").string().c_str());
+    r=strix::cost_table_directory_resolve(true);
+    expect(r.path==dir/"explicit" && r.source==CostTableSource::explicit_dir &&
+        std::string(strix::cost_table_source_name(r.source))=="env","explicit STRIX_COST_TABLE_DIR wins under baseline");
+    set_env("STRIX_COST_TABLE","0");
+    expect(!strix::cost_table_directory_resolve(false).path &&
+        strix::cost_table_directory_resolve(false).source==CostTableSource::off,"STRIX_COST_TABLE=0 wins over everything");
+    set_env("STRIX_COST_TABLE",nullptr);set_env("STRIX_COST_TABLE_DIR",nullptr);set_env("STRIX_QPF2K_DEFAULTS",nullptr);
+    set_env(base_var,saved?saved_value.c_str():nullptr);
+    fs::remove_all(dir);
+}
 } // namespace
 
 int main() {
     test_buckets();
     test_directory_rules();
+    test_baseline_resolution();
     test_round_trip_and_recheck();
     test_drift();
     test_corruption_and_mismatch();

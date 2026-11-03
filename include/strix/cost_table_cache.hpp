@@ -17,8 +17,11 @@ namespace strix {
 // choice the controller already makes from measured times. Whether that choice can change output bits is the
 // engine's property, not this library's: an engine seeds only choices its own exactness guard admits.
 //
-// The feature is off unless STRIX_COST_TABLE_DIR names a directory; a directory inside a source checkout (any
-// ancestor holding .git) is refused. One file per key under it, named <engine>-<hash of the key>.costs.
+// Tables live in STRIX_COST_TABLE_DIR, else in the user cache directory ($XDG_CACHE_HOME/strix/cost-tables, else
+// ~/.cache/strix/cost-tables; Windows %LOCALAPPDATA%/strix/cost-tables), created on the first store. OFF:
+// STRIX_COST_TABLE=0 or STRIX_COST_TABLE_DIR=off (or 0, or empty); the default directory is also off under the
+// historical baseline (--baseline, STRIX_BASELINE=1, STRIX_QPF2K_DEFAULTS=0). A directory inside a source checkout (any ancestor
+// holding .git) is refused. A failed store is ignored (no table). One file per key, <engine>-<hash of the key>.costs.
 // Key: engine, binary identity, device identity, model identity, policy identity and context bucket. The file
 // repeats every key field and carries a format version and a checksum: a missing, unreadable, oversized, corrupt,
 // other-version or mismatched file is ignored (the controller re-times from scratch, as without the feature) and
@@ -45,8 +48,17 @@ enum class CostTableLoad {not_loaded,missing,loaded,corrupt,version,mismatch};
 
 // 0 below 8192 positions, then one bucket per doubling (1: 8K..16K, 2: 16K..32K, ...).
 [[nodiscard]] std::uint32_t cost_table_context_bucket(std::uint64_t position) noexcept;
-// STRIX_COST_TABLE_DIR, or nullopt (feature off) when unset, empty or inside a source checkout.
+// Where the tables live and why. An explicit STRIX_COST_TABLE_DIR wins (also under baseline); otherwise the
+// historical baseline (the caller's --baseline, STRIX_BASELINE=1 or STRIX_QPF2K_DEFAULTS=0) turns the default off.
+enum class CostTableSource {explicit_dir,default_dir,off,baseline,refused,unavailable};
+[[nodiscard]] const char* cost_table_source_name(CostTableSource) noexcept;
+struct CostTableDirectory {std::optional<std::filesystem::path> path;CostTableSource source=CostTableSource::off;};
+[[nodiscard]] CostTableDirectory cost_table_directory_resolve(bool baseline=false);
+// cost_table_directory_resolve(false).path: the table directory, or nullopt when switched off, under the
+// environment baseline, no cache directory is known, or it is inside a source checkout.
 [[nodiscard]] std::optional<std::filesystem::path> cost_table_directory_from_env();
+// The default directory under the user cache directory, or nullopt.
+[[nodiscard]] std::optional<std::filesystem::path> cost_table_default_directory();
 [[nodiscard]] bool cost_table_directory_admitted(const std::filesystem::path&);
 // STRIX_COST_TABLE_RECHECK (fraction in [0, 1]) and STRIX_COST_TABLE_DRIFT (> 0); invalid values keep defaults.
 [[nodiscard]] CostTableOptions cost_table_options_from_env();

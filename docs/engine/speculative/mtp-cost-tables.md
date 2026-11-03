@@ -43,8 +43,16 @@ same command.
 
 ## Where the tables live and how to switch them off
 
-`STRIX_COST_TABLE_DIR=<dir>` turns the tables on and names their directory (created on the first store). Unset: off.
-A directory inside a source checkout (any ancestor holding `.git`) is refused.
+On by default. Tables live in `STRIX_COST_TABLE_DIR` when it is set, else under the user cache directory:
+`$XDG_CACHE_HOME/strix/cost-tables`, else `~/.cache/strix/cost-tables` (Windows: `%LOCALAPPDATA%/strix/cost-tables`).
+The directory is created on the first store; if it cannot be written, the run simply has no table (cold start, as
+before). A directory inside a source checkout (any ancestor holding `.git`) is refused. Deleting the directory resets
+every table.
+
+OFF: `STRIX_COST_TABLE=0`, or `STRIX_COST_TABLE_DIR=off` (also `0` or empty).
+The historical baseline (`--baseline`, `STRIX_BASELINE=1`, `STRIX_QPF2K_DEFAULTS=0`) also turns the default directory
+off; an explicit `STRIX_COST_TABLE_DIR` still applies there. The first MTP verifier of a process logs
+`cost-table: directory source=env|default|off|baseline|refused|unavailable [dir=...]`.
 
 ## Measurement
 
