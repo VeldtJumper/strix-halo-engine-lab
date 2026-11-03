@@ -865,7 +865,7 @@ def qualify_coverage(rec, n, steps):
     return missing
 
 
-def cache_summary(arm, steps):
+def cache_summary(arm, steps, loop_s=None):
     """Every aggregated counter of a timing arm, unchanged (tierstream: lookups,
     misses, device_hits, resurrected, covered, fetched, prefetched, bank_serves,
     ram_copies, file_reads, file_bytes, file_read_ns, h2d_bytes, evicted,
@@ -889,6 +889,12 @@ def cache_summary(arm, steps):
     out['writeback_bytes_per_token'] = rate('writebacks') * UNIT_BYTES
     out['file_read_s_per_token'] = rate('file_read_ns') / 1e9
     out['file_wait_s_per_token'] = rate('file_wait_ns') / 1e9  # exposed: < read time once reads overlap
+    # file_read_ns sums the read durations of all readers: with reads in flight together it exceeds the wall time,
+    # so compare queue depths by the elapsed rate (file bytes over the generation loop) and the read concurrency
+    # (summed read time over the loop), never by file_read_s alone. Both are proxies: the loop excludes the digest
+    # time (generation_loop_s), and file_read_ns covers non-landing reads incl. submission, not OS-level in-flight I/O.
+    out['file_gb_per_s_elapsed'] = out.get('file_bytes', 0) / 1e9 / loop_s if loop_s else None
+    out['file_read_concurrency'] = out.get('file_read_ns', 0) / 1e9 / loop_s if loop_s else None
     out['clean_drop_bytes_per_token'] = rate('clean_drop_bytes')
     # Landing blocks: the share of landing reads a demand used, and the host time demands still waited on them.
     out['landing_used'] = out.get('landing_promoted', 0) / out['landing_issued'] if out.get('landing_issued') else None
@@ -1343,7 +1349,7 @@ def materialize(a, op, n, item, rec, entry, seg, wall_s, expected_tile, allocate
     v, problems, missing = judge_bench(rec, item[3], a.bench_steps, n)
     ev = evidence_bench(rec, n, a.bench_steps, item[3]) if v == 'EXACT' else None
     arms = [dict(arm=x['arm'], tokens_per_s=x['tokens_per_s'], generation_loop_s=x['generation_loop_s'], tokens=x['tokens'],
-                 file_bytes=file_bytes(r['steps']), cache=cache_summary(r, a.bench_steps))
+                 file_bytes=file_bytes(r['steps']), cache=cache_summary(r, a.bench_steps, x['generation_loop_s']))
             for x, r in zip(ev['arms'], rec['arms'])] if ev else []  # timings only for agreeing arms
     return dict(entry, verdict=v, problems=problems, missing=missing, evidence=ev, arms=arms, wall_s=wall_s)
 
