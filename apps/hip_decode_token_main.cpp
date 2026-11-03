@@ -214,6 +214,50 @@ std::optional<std::uint64_t> file_backed_missing_bytes(const strix::MappedModelF
     return std::nullopt;
 #endif
 }
+// Capped re-warm: populate the not-resident 64 MiB chunks of the file-backed tensors, in file order, until their
+// missing bytes reach `budget`, with normal readahead (parallel), then restore random-access advice. Returns the
+// missing bytes populated. Page contents are the file's; only residency changes.
+std::uint64_t rewarm_file_backed_capped(const strix::MappedModelFile& mapped, const strix::ModelManifest& manifest,
+    std::uint64_t budget) {
+#if defined(__linux__)
+    const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    constexpr std::uint64_t chunk = std::uint64_t{64} << 20;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> selected, tables;
+    std::vector<unsigned char> resident;
+    std::uint64_t taken = 0;
+    for (const auto& tensor : manifest.tensors) {
+        if (tensor.residency != strix::ResidencyPolicy::file_backed_candidate || !tensor.byte_size) continue;
+        if (tensor.absolute_offset > mapped.bytes() || tensor.byte_size > mapped.bytes() - tensor.absolute_offset) continue;
+        const auto first = tensor.absolute_offset / page * page, last = tensor.absolute_offset + tensor.byte_size;
+        tables.emplace_back(first, last - first);
+        for (auto at = first; at < last && taken < budget; at += chunk) {
+            const auto length = std::min(chunk, last - at);
+            resident.assign(static_cast<std::size_t>((length + page - 1U) / page), 0);
+            if (mincore(reinterpret_cast<void*>(mapped.base_address() + at), static_cast<std::size_t>(length), resident.data()) != 0) return 0;
+            std::uint64_t missing = 0;
+            for (const auto r : resident) if (!(r & 1U)) missing += page;
+            if (!missing) continue;
+            if (taken + missing > budget) { taken = budget; break; }
+            selected.emplace_back(at, length);
+            taken += missing;
+        }
+    }
+    std::uint64_t populated = 0;
+    if (!selected.empty()) {
+        (void)mapped.prefault_parallel(selected);
+        for (const auto& [at, length] : selected) {
+            resident.assign(static_cast<std::size_t>((length + page - 1U) / page), 0);
+            if (mincore(reinterpret_cast<void*>(mapped.base_address() + at), static_cast<std::size_t>(length), resident.data()) == 0)
+                for (const auto r : resident) if (r & 1U) populated += page;
+        }
+    }
+    for (const auto& [at, length] : tables) (void)madvise(reinterpret_cast<void*>(mapped.base_address() + at), static_cast<std::size_t>(length), MADV_RANDOM);
+    return populated;
+#else
+    (void)mapped; (void)manifest; (void)budget;
+    return 0;
+#endif
+}
 using strix::decode_cli::parse_options;
 
 // One optional stderr JSON record; stdout keeps its existing decoder receipt.
@@ -4086,7 +4130,21 @@ static int run_decode_entry(
             if (model_residency.registered_locked_bytes() != model_residency.registered_bytes()) skip = "registered model pages are not locked";
             else if (!missing || !now.available) skip = "residency or MemAvailable unknown";
             else if (*missing == 0) skip = "table resident";
-            else if (*missing > *now.available || *now.available - *missing < (UINT64_C(4) << 30)) skip = "missing pages do not fit MemAvailable with 4 GiB headroom";
+            else if (*now.available <= (UINT64_C(4) << 30)) skip = "no MemAvailable above the 4 GiB headroom";
+            else if (*missing > *now.available - (UINT64_C(4) << 30)) {
+                // Rows are hashed n-grams spread over the whole table: any resident fraction helps every prompt.
+                // Fill what fits; STRIX_PLE_REWARM=full keeps the previous all-or-nothing rule.
+                if (rewarm && std::string_view(rewarm) == "full") skip = "missing pages do not fit MemAvailable with 4 GiB headroom";
+                else {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const auto budget = *now.available - (UINT64_C(4) << 30);
+                    const auto populated = rewarm_file_backed_capped(mapped, manifest, budget);
+                    std::fprintf(stderr, "file-backed tensors: re-warmed %.1f of %.1f GB not resident (capped to MemAvailable - 4 GiB) in %.1f s before listening\n",
+                        static_cast<double>(populated) / 1e9, static_cast<double>(*missing) / 1e9,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                    return;
+                }
+            }
             if (skip) {
                 if (missing && *missing) std::fprintf(stderr, "file-backed tensors: re-warm skipped (%s; %.1f GB not resident)\n", skip,
                     static_cast<double>(*missing) / 1e9);

@@ -306,12 +306,12 @@ Keep registered model pages off the reclaim LRU so host memory pressure cannot e
 
 Populate the file-backed PLE n-gram table once more right before the HTTP server listens, because the slot allocations after the startup warm reclaim part of it.
 
-- **Preconditions:** HTTP serving, startup warm on (`STRIX_PLE_WARM`), no PLE reclaim or copy-all mode, every registered model byte locked, and the missing table pages fit `MemAvailable` with 4 GiB to spare.
+- **Preconditions:** HTTP serving, startup warm on (`STRIX_PLE_WARM`), no PLE reclaim or copy-all mode, every registered model byte locked, `MemAvailable` above 4 GiB. When the missing table pages do not all fit, missing 64 MiB chunks are populated up to `MemAvailable` - 4 GiB (`STRIX_PLE_REWARM=full`: all or nothing). The walk stops at the first chunk whose missing bytes would exceed the remaining budget, so at least 4 GiB stays available.
 - **Automatic selection:** Every HTTP server start that meets the preconditions; never forces page touching.
-- **Fallback notice:** `file-backed tensors: re-warm skipped (<reason>; N GB not resident)`.
+- **Fallback notice:** `file-backed tensors: re-warmed X of Y GB not resident (capped ...)` or `re-warm skipped (<reason>; N GB not resident)`.
 - **Exactness evidence:** Page residency only; token ids and prompt/final committed-state digests equal ON vs OFF.
 - **Off switch:** STRIX_PLE_REWARM=0
-- **Measured gain:** With headroom, the first 8000-token request's PLE gather 7 ms vs 0.6-1.3 s cold. On a node whose slots fill memory (8 slots, 14 GiB available, 15-21 GB of the table not resident) the bounded re-warm skips and nothing changes. `STRIX_PLE_SERVE_RESERVE=1` (opt-in) keeps the table out of slot sizing and serve-prefill admission instead; on that node it costs T8192 (T4096) and slots (8 -> 3).
+- **Measured gain:** With headroom, the first 8000-token request's PLE gather 7 ms vs 0.6-1.3 s cold. On a node whose slots fill memory (8 slots, 17-22 GB of the table not resident) the capped re-warm fills 10-13 GB in 5-6 s before listening: first 8000-token PLE gather 0.98 vs 1.56 s, prefill 14.20 vs 14.68 s (first request) and 12.16 vs 12.43 s (second), ABBA, identical token ids and state digests. `STRIX_PLE_SERVE_RESERVE=1` (opt-in) keeps the table out of slot sizing and serve-prefill admission instead; on that node it costs T8192 (T4096) and slots (8 -> 3).
 - **Implementation / evidence:** `apps/hip_decode_token_main.cpp` (re-warm guard), `apps/qwen_effective_config.hpp` (reservation)
 
 ### Prompt-group PLE gather staging
