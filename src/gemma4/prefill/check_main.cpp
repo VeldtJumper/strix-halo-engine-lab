@@ -84,6 +84,7 @@ struct Args {
     std::filesystem::path model, rope, draft_model, draft_rope;
     std::vector<std::filesystem::path> fixtures;
     std::string hf_embedding = "unspecified";
+    std::string linear_policy; // --linear-policy SPEC (g4-wmma-pf-v2 development)
     std::vector<unsigned> lengths;
     unsigned repetitions = 1, warmup = 0, split = 0, continuation = 0;
     bool same_weight = false, check_split = false, profile = false, c4 = false, canonical_reference = false;
@@ -118,6 +119,7 @@ Args arguments(int argc, char** argv) {
         else if (key == "--length") a.lengths.push_back(number(value));
         else if (key == "--repetitions") a.repetitions = number(value);
         else if (key == "--warmup") a.warmup = number(value);
+        else if (key == "--linear-policy") a.linear_policy = value;
         else if (key == "--split") { a.split = number(value); a.check_split = true; }
         else if (key == "--continuation") a.continuation = number(value);
         else if (key == "--linears") {
@@ -306,6 +308,7 @@ int main(int argc, char** argv) try {
     });
     auto tables = g4::load_rope_tables(args.rope);
     pf::DevicePrefill prefill(weights, tables.view, pf::Residency::host, args.profile, pf::attention_mode(), args.linears);
+    if (!args.linear_policy.empty()) prefill.set_linear_policy(pf::LinearPolicy::parse(args.linear_policy));
     std::unique_ptr<pf::DevicePrefill> canonical_reference;
     if (args.canonical_reference)
         canonical_reference = std::make_unique<pf::DevicePrefill>(prefill.borrow_device_weights(), tables.view, pf::Residency::device, false, pf::AttentionMode::canonical);

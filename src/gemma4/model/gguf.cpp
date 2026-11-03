@@ -69,6 +69,7 @@ ModelManifest load_gguf_model(const std::filesystem::path& path) {
     const auto storage = std::make_shared<MappedFile>(path);
     m.storage.push_back(storage);
     m.model_hash = hash_bytes(storage->data(), storage->size());
+    if (info.find_metadata("general.file_type")) m.gguf_file_type = std::int32_t(numeric(info.find_metadata("general.file_type")));
     std::size_t frozen = 0, rope_markers = 0;
     for (const auto& t : info.tensors) {
         WeightFormat format;

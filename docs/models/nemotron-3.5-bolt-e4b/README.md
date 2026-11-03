@@ -23,7 +23,7 @@ build does not contain.
 | Profile | Decode | Prefill | Guarantee |
 |---|---|---|---|
 | `default` | `g4-v1` (FP32 activations, Q4_K_M weights) + MTP drafter at C1 | `prefill-exact` | Exact: output bytes equal the declared serial path for every batch size (C4 == C1) and with the drafter on or off |
-| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter | WMMA prefill (pending `g4-wmma-pf-v2`; exact prefill runs until then) | Named profile, qualified against frozen fidelity bands |
+| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter | `prefill-exact` (v1 prompt prefill for `fast`: qualification of the pair v1 prefill + a8 decode pending) | Named profile, qualified against frozen fidelity bands |
 | `quality` | EXL3 pack (`--exl3-arm DIR`), identity chosen once per pack and session (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exact within its EXL3 identity; higher fidelity than Q4_K_M at similar size |
 
 The identity of the EXL3 route is fixed at startup from the pack and `--streams`, never per step, so a session's
@@ -90,7 +90,8 @@ was measured in the same turn as the row it is compared with.
 
 C1 shipped is the configuration a user gets by default: the MTP drafter found in `MODEL_DIR/drafter-mtp/` plus prompt
 lookup, measured as three interleaved rounds against drafting off with token ids and the committed state equal in
-every round. C1 drafting off, C4 and C8 are plain decode (no drafting). Every profile prefills with exact prefill.
+every round. C1 drafting off, C4 and C8 are plain decode (no drafting). The prefill cells of these tables are exact
+prefill for every profile; the selectable `g4-wmma-pf-v1` / `g4-wmma-pf-v2` routes are below.
 
 Compared with the previously published table (same machine): `quality` C1 shipped 83.8 -> **96.4** tok/s, plain
 decode 44.4 / 153.1 / 258.3 -> **50.2 / 184.8 / 303.0** (C1 / C4 / C8); exact prefill at 2K tokens 466 / 458 / 769
@@ -221,7 +222,7 @@ attention reads each K/V chunk once per pass, byte-identical, `STRIX_G4_ATTN_KV_
 | 32K | 9.8 | **26.7** | 42.6 |
 | 64K | 5.7 | **18.4** | 36.2 |
 
-Prefill (tok/s; every profile uses exact prefill):
+Prefill (tok/s; exact prefill in every column):
 
 | Prompt | `default` | `fast` | `quality` | llama.cpp |
 |---|---:|---:|---:|---:|
@@ -233,7 +234,21 @@ Prefill (tok/s; every profile uses exact prefill):
 
 Exact prefill uses FP32 arithmetic without contraction, so token ids and state are identical at every length;
 `quality` runs the exact many-row EXL3 prefill. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restores the eight-row passes with
-the same bytes. The `fast` profile's WMMA prefill is pending qualification and is not applied.
+the same bytes.
+
+Selectable prompt prefill routes (non-EXL3 packs; every profile keeps exact prefill unless one is selected):
+`STRIX_G4_PREFILL_IDENTITY=v1` runs `g4-wmma-pf-v1`: the linears run on the WMMA prefill GEMMs with FP16 operands over
+weight panels decoded once at load; attention stays canonical; decode is unchanged. `=v2` runs `g4-wmma-pf-v2` (hi/lo
+split activations). Either route runs the prompt bulk: the last <= 8 prompt tokens and the anchor (the final prompt
+position, whose logits pick the first token) run the decode arithmetic (`g4-v1` under `default`), as decode rows do.
+Both change logits, so they are not exact. v1 prompt prefill for `fast`: qualification of the pair v1 prefill + a8 decode pending; `fast` keeps exact prefill
+until then. Q4_K_M, one node, prefill tok/s, interleaved runs in one session:
+
+| Prompt | exact | `g4-wmma-pf-v1` (`=v1`) | `g4-wmma-pf-v2` (`=v2`) |
+|---|---:|---:|---:|
+| 2K | 526 | **2,359** | 1,537 |
+| 4K | 509 | **2,249** | 1,478 |
+| 8K | 481 | **1,957** | 1,349 |
 
 llama.cpp commands: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill

@@ -4,6 +4,7 @@
 #include "../gemma4_gpu/fixture.hpp"
 #include <limits>
 #include <numeric>
+#include <random>
 
 using namespace strix::gemma4;
 namespace pf = strix::gemma4::prefill;
@@ -334,6 +335,90 @@ void overflow_test() {
     CHECK(stream.frontier() == 0 && stream.digest() == before);
     std::puts("prefill FP16 overflow rollback PASS");
 }
+// The fused gate/up kernel with its v2 low panel feeds a corrected down with
+// exactly the bytes of the separate path (FP32 gelu product, split, corrected).
+void v2_pair_tests() {
+    constexpr unsigned hidden = 512, inter = 1024;
+    for (const unsigned rows : {3U, 70U, 256U, 300U}) for (const auto precision : {pf::LinearPrecision::hilo, pf::LinearPrecision::hilo_k128})
+    for (const auto pair_mode : {pf::LinearPrecision::fp16, pf::LinearPrecision::hilo, pf::LinearPrecision::hilo_k128}) {
+        const bool split = pair_mode != pf::LinearPrecision::fp16;
+        const auto pg = fixture::packed(WeightFormat::bf16, inter, hidden, 101), pu = fixture::packed(WeightFormat::bf16, inter, hidden, 202);
+        const auto pd = fixture::packed(WeightFormat::bf16, hidden, inter, 303);
+        gpu::Buffer g(pg.size()), u(pu.size()), d(pd.size()), x(std::size_t(rows) * hidden * 4), gate(std::size_t(rows) * inter * 4), up(gate.size());
+        gpu::Buffer fused(std::size_t(rows) * hidden * 4), separate(fused.size()), failure(4), maximum(4 * 4);
+        gpu::Buffer pair_scratch(2 * std::size_t(rows) * hidden * 2), product(2 * std::size_t(rows) * inter * 2), scratch(product.size());
+        g.upload(pg.data(), pg.size()); u.upload(pu.data(), pu.size()); d.upload(pd.data(), pd.size());
+        std::vector<float> host(std::size_t(rows) * hidden);
+        std::mt19937 rng(rows);
+        for (auto& a : host) a = float(int(rng() % 20001) - 10000) / 2500.0F;
+        x.upload(host.data(), x.size()); failure.zero(); maximum.zero();
+        const LinearView wg{g.as<std::uint8_t>(), inter, hidden, packed_row_bytes(WeightFormat::bf16, hidden), WeightFormat::bf16};
+        const LinearView wu{u.as<std::uint8_t>(), inter, hidden, packed_row_bytes(WeightFormat::bf16, hidden), WeightFormat::bf16};
+        const LinearView wd{d.as<std::uint8_t>(), hidden, inter, packed_row_bytes(WeightFormat::bf16, inter), WeightFormat::bf16};
+        pf::PreparedLinear prepared_g(wg), prepared_u(wu), prepared_d(wd);
+        CHECK(pf::gelu_pair_supported(prepared_g, prepared_u));
+        pf::gelu_pair(prepared_g, prepared_u, x.as<float>(), rows, pair_scratch.data(), product.data(), failure.as<unsigned>(), maximum.as<unsigned>(), nullptr, true, split,
+                      pair_mode == pf::LinearPrecision::hilo_k128);
+        pf::linear(wd, gate.as<float>(), rows, fused.as<float>(), product.data(), failure.as<unsigned>(), maximum.as<unsigned>() + 3,
+                   nullptr, true, &prepared_d, nullptr, true, precision);
+        pf::linear(wg, x.as<float>(), rows, gate.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>() + 3, nullptr, true, &prepared_g,
+                   nullptr, false, pair_mode);
+        pf::linear(wu, x.as<float>(), rows, up.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>() + 3, nullptr, true, &prepared_u,
+                   nullptr, false, pair_mode);
+        gpu::gelu_product(gate.as<float>(), up.as<float>(), rows * inter);
+        pf::linear(wd, gate.as<float>(), rows, separate.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>() + 3,
+                   nullptr, true, &prepared_d, nullptr, false, precision);
+        gpu::synchronize();
+        unsigned flag = 0; failure.download(&flag, 4); CHECK(flag == 0);
+        std::vector<float> a(std::size_t(rows) * hidden), b(a.size());
+        fused.download(a.data(), fused.size()); separate.download(b.data(), separate.size()); bytes(a, b);
+    }
+    std::puts("prefill fused gate/up (fp16, hilo and hilo_k128) low panel == separate v2 path PASS");
+}
+// g4-wmma-pf-v2 corrected linears against emulate_linear_v2, byte for byte:
+// partial and multi-block K, one-row (head) and many-row tiles, BF16/F32/Q4_K,
+// cancellation-heavy activations with -0 and wide magnitudes.
+void v2_case(WeightFormat format, unsigned width, unsigned rows, unsigned outputs, pf::LinearPrecision precision);
+void v2_tests() {
+    for (const auto format : {WeightFormat::bf16, WeightFormat::f32, WeightFormat::q4_k}) {
+        const bool quant = format == WeightFormat::q4_k;
+        for (const unsigned width : quant ? std::vector<unsigned>{256, 2560} : std::vector<unsigned>{17, 48, 128, 129, 2560, 10240})
+            for (const unsigned rows : width > 4096 ? std::vector<unsigned>{1, 40} : std::vector<unsigned>{1, 7, 33, 130})
+                for (const auto precision : {pf::LinearPrecision::hilo, pf::LinearPrecision::hilo_k128})
+                    v2_case(format, width, rows, 83, precision);
+    }
+    // Production routes: outputs > 1024 select hilo_direct (unblocked) and,
+    // with K >= 8192 blocked, staged_hilo; 256 x 2560 is all full tiles.
+    struct Shape { unsigned width, rows, outputs; };
+    for (const auto& shape : {Shape{2560, 256, 2560}, Shape{2560, 130, 1040}, Shape{10240, 130, 1040}})
+        for (const auto precision : {pf::LinearPrecision::hilo, pf::LinearPrecision::hilo_k128})
+            v2_case(WeightFormat::q4_k, shape.width, shape.rows, shape.outputs, precision);
+    std::puts("prefill g4-wmma-pf-v2 hilo/hilo_k128 linears == emulator PASS");
+}
+void v2_case(WeightFormat format, unsigned width, unsigned rows, unsigned outputs, pf::LinearPrecision precision) {
+    const auto stride = (width + 15U) / 16U * 16U;
+    const auto packed = fixture::packed(format, outputs, width, width + 13);
+    gpu::Buffer weights(packed.size()), input(std::size_t(rows) * width * sizeof(float)), output(std::size_t(rows) * outputs * sizeof(float));
+    gpu::Buffer scratch(2 * std::size_t(rows) * stride * sizeof(std::uint16_t)), failure(sizeof(unsigned)), maximum(sizeof(unsigned));
+    weights.upload(packed.data(), packed.size());
+    std::vector<float> x(std::size_t(rows) * width);
+    std::mt19937 rng(width * 7 + rows);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        const float u = float(int(rng() % 2000001) - 1000000) / 1000000.0F;
+        const unsigned kind = rng() % 16;
+        x[i] = kind == 0 ? -0.0F : kind == 1 ? u * 1700.0F : kind == 2 ? u * 1e-5F : kind == 3 ? 1.0F + u * 1e-3F : u * 8.0F;
+    }
+    input.upload(x.data(), input.size()); failure.zero(); maximum.zero();
+    const LinearView w{weights.as<std::uint8_t>(), outputs, width, packed_row_bytes(format, width), format};
+    pf::PreparedLinear prepared(w);
+    pf::linear(w, input.as<float>(), rows, output.as<float>(), scratch.data(), failure.as<unsigned>(), maximum.as<unsigned>(),
+               nullptr, true, &prepared, nullptr, false, precision);
+    gpu::synchronize();
+    unsigned flag = 0; failure.download(&flag, sizeof(flag)); CHECK(flag == 0);
+    std::vector<float> actual(std::size_t(rows) * outputs); output.download(actual.data(), output.size());
+    auto host_weights = w; host_weights.data = packed.data();
+    bytes(actual, pf::emulate_linear_v2(host_weights, x, rows, precision == pf::LinearPrecision::hilo_k128));
+}
 } // namespace
-int main() try { conversion_tests(); layout_tests(); tile_tests(); pinned_absent_taps_tests(); split_tests(); pinned_views_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
+int main() try { conversion_tests(); layout_tests(); tile_tests(); v2_tests(); v2_pair_tests(); pinned_absent_taps_tests(); split_tests(); pinned_views_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
 catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

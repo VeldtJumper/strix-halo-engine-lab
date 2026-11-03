@@ -5,6 +5,8 @@
 #include <map>
 
 namespace strix::gemma4::prefill {
+// Per-op precision of WMMA linears (g4-wmma-pf-v2 development); see LinearPolicy.
+enum class LinearPrecision { fp16, exact, hilo, hilo_k128 };
 [[nodiscard]] bool tiled_enabled(); // startup-cached STRIX_G4_PREFILL_TILING
 [[nodiscard]] bool prepared_enabled(); // startup-cached STRIX_G4_PREFILL_PREPARE
 [[nodiscard]] unsigned direct_mode(); // startup-cached STRIX_G4_PREFILL_DIRECT, default 3
@@ -25,7 +27,10 @@ class PreparedLinear {
 // receives max(abs(input)) as positive FP32 bits. Calls enqueue on queue.
 void linear(LinearView weights, const float* x, unsigned rows, float* out, void* scratch,
             std::uint32_t* failure, std::uint32_t* maximum, gpu::Queue queue = nullptr, bool tiled = true,
-            const PreparedLinear* prepared = nullptr, void* converted_event = nullptr, bool converted = false);
+            const PreparedLinear* prepared = nullptr, void* converted_event = nullptr, bool converted = false,
+            LinearPrecision precision = LinearPrecision::fp16);
+// hilo / hilo_k128 (g4-wmma-pf-v2, emulate_linear_v2) need prepared panels and
+// twice the scratch: high panels then low panels (rows * stride FP16 each).
 // Exact fusion of gate, up, gelu_tanh(gate)*up and the next linear's FP16
 // input conversion: product receives rows x outputs FP16 panels as linear's
 // scratch would after converting the FP32 product; maximum[0..2] receive the
@@ -34,7 +39,8 @@ void linear(LinearView weights, const float* x, unsigned rows, float* out, void*
 [[nodiscard]] bool fused_ffn_enabled();
 [[nodiscard]] bool gelu_pair_supported(const PreparedLinear& gate, const PreparedLinear& up);
 void gelu_pair(const PreparedLinear& gate, const PreparedLinear& up, const float* x, unsigned rows, void* scratch,
-               void* product, std::uint32_t* failure, std::uint32_t* maximum, gpu::Queue queue = nullptr);
+               void* product, std::uint32_t* failure, std::uint32_t* maximum, gpu::Queue queue = nullptr, bool low = false,
+               bool split = false, bool blocked = false); // split: gate/up run hilo (scratch holds high+low input panels); blocked: hilo_k128
 // EXL3 packs on prepared panels (g4-exl3-wmma-pf-v1): the pack's input
 // transform writes the [K16][row][16] input panels, the panel GEMMs above run
 // unchanged, then the pack's output transform. Every output keeps one
@@ -102,6 +108,21 @@ bool canonical_attention(const float* q, std::span<const gpu::KvRead> reads, uns
 // and the same norms/RoPE/PLE stages, so the committed state is prefill-exact
 // (STRIX_G4_PREFILL_EXACT_MANYROW=0 runs the eight-row linears instead).
 enum class Linears { wmma, exact };
+// Per-op precision of WMMA linears (g4-wmma-pf-v2 development). fp16 is v1;
+// exact runs that op with the g4-v1 linear (diagnostic upper bound); hilo
+// splits activations into FP16 high and scaled low panels with independent
+// accumulators; hilo_k128 additionally restarts the accumulators every K128
+// and merges the block partials with compensated FP32 summation.
+// "regex=mode;regex=mode" over op names (ple_model, head, layer.N.{q,k,v,o,
+// gate,up,down,ple_gate,ple_projection}); full match, first rule wins, a rule
+// without "=mode" means hilo_k128. Throws on syntax errors.
+struct LinearPolicy {
+    struct Rule { std::string pattern; LinearPrecision mode; };
+    std::vector<Rule> rules;
+    [[nodiscard]] static LinearPolicy parse(const std::string& spec);
+    [[nodiscard]] LinearPrecision lookup(const std::string& op) const;
+    [[nodiscard]] bool empty() const { return rules.empty(); }
+};
 struct Range {
     std::string tensor;
     float input_maximum = 0.0F;
@@ -120,13 +141,15 @@ struct Stats {
     bool attention_packed = false;
     bool canonical_kernel = false; // whole-chunk canonical attention (canonical mode only)
     Linears linears = Linears::wmma;
+    std::string linear_policy; // canonical spec text of the active LinearPolicy
 };
 enum class Residency { host, device };
 class DevicePrefill {
   public:
     // Host residency uploads packed weights once. Device residency borrows immutable
     // views (owner must outlive this object), allowing the coordinator to share them.
-    // Linears::exact requires canonical attention and prepares no FP16 panels.
+    // Linears::exact prepares no FP16 panels. With WMMA attention it is only a
+    // diagnostic arm (exact linears + g4-wmma-attn-v1), never an identity.
     DevicePrefill(HostWeights weights, RopeTables tables, Residency residency = Residency::host, bool profile = false,
                   AttentionMode attention = attention_mode(), Linears linears = Linears::wmma);
     ~DevicePrefill();
@@ -146,6 +169,8 @@ class DevicePrefill {
     ChunkResult forward(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool all_logits = false, bool logits = true,
                         bool hidden = false, bool taps = true, bool views = false);
     [[nodiscard]] std::vector<float> last_logits();
+    // Development only: per-op precision of the WMMA linears (see LinearPolicy).
+    void set_linear_policy(const LinearPolicy& policy);
     // Commits canonical chunks and returns last-row logits and recent committed taps.
     Result run(gpu::DeviceStream& stream, std::span<const std::uint32_t> tokens, DraftContext* context = nullptr);
     // Cumulative maxima over all chunks evaluated by this object, including failures.

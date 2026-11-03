@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
 
 namespace strix::gemma4::prefill {
@@ -25,6 +27,10 @@ bool queue_io_enabled() {
 }
 bool pack_reuse_enabled() {
     static const bool enabled = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_PACK_REUSE"); return !p || std::string_view(p) != "0"; }();
+    return enabled;
+}
+bool qkv_share_enabled() {
+    static const bool enabled = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_QKV_SHARE"); return !p || std::string_view(p) != "0"; }();
     return enabled;
 }
 using gpu::Buffer;
@@ -120,6 +126,8 @@ struct DevicePrefill::Impl {
         buffer.resize(queue_io ? std::max(bytes, 2 * buffer.size()) : bytes);
     }
     std::vector<Range> ranges;
+    // (slot, source): a pre-converted dot reports its producer's input maximum.
+    std::vector<std::pair<unsigned, unsigned>> range_aliases;
     std::map<std::string, float> range_maxima;
     Stats stats;
     bool profile = false, fuse_ffn = false;
@@ -165,6 +173,26 @@ struct DevicePrefill::Impl {
         }
         std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3);
         checked(hipEventRecord(done, side_queue));
+    }
+    bool split_panels = false;  // a hilo policy: conversion scratch holds high and low panels
+    unsigned rows_capacity = 0; // rows every row-sized buffer holds (chunk_rows)
+    void size_rows(unsigned rows) {
+        const auto& c = w.config;
+        const std::size_t hbytes = rows * std::size_t(c.hidden) * sizeof(float), abytes = rows * std::size_t(c.heads) * 512 * sizeof(float);
+        for (auto* p : {&residual, &x, &out}) p->resize(hbytes);
+        for (auto* p : {&q, &att}) p->resize(abytes);
+        for (auto* p : {&k, &v}) p->resize(rows * std::size_t(c.kv_heads) * 512 * sizeof(float));
+        gate.resize(rows * std::size_t(std::max(c.inter, c.ple_dim)) * sizeof(float)); up.resize(gate.size());
+        ple.resize(rows * std::size_t(c.layers) * c.ple_dim * sizeof(float));
+        taps.resize(5 * hbytes);
+        tokens.resize(rows * sizeof(unsigned)); positions.resize(rows * sizeof(std::uint64_t));
+        if (reads.size() < rows * sizeof(gpu::KvRead)) reads.resize(rows * sizeof(gpu::KvRead));
+        if (writes.size() < rows * sizeof(gpu::KvWrite)) writes.resize(rows * sizeof(gpu::KvWrite));
+        // hilo linears keep high then low panels in the same scratch.
+        const std::size_t panels = split_panels ? 2 : 1;
+        halves.resize(panels * rows * std::size_t((std::max({c.hidden, c.inter, c.heads * 512, c.ple_dim}) + 15U) / 16U) * 16 * sizeof(std::uint16_t));
+        if (fuse_ffn) pair_halves.resize(panels * rows * std::size_t((c.hidden + 15U) / 16U) * 16 * sizeof(std::uint16_t));
+        rows_capacity = rows;
     }
     ~Impl() {
         if (side_queue) (void)hipStreamSynchronize(side_queue);
@@ -230,22 +258,38 @@ struct DevicePrefill::Impl {
     void finite(const Buffer& b, std::size_t count) { gpu::check_finite(b.as<float>(), count, failure.as<unsigned>(), queue); }
     // Fused gate/up/product/convert: leaves the down input panels in halves
     // and the three range maxima at the indices separate dots would use.
-    bool fused(LinearView gate, LinearView up, LinearView down) const {
+    LinearPolicy policy;
+    std::map<std::string, LinearPrecision> precisions;
+    LinearPrecision precision_of(const std::string& op) {
+        if (policy.empty()) return LinearPrecision::fp16;
+        auto it = precisions.find(op);
+        if (it == precisions.end()) it = precisions.emplace(op, policy.lookup(op)).first;
+        return it->second;
+    }
+    bool fused(const std::string& name, LinearView wg, LinearView wu, LinearView down) {
         if (!fuse_ffn || stats.direct < 3 || down.format == WeightFormat::exl3_mul1) return false;
-        const auto g = prepared.find(gate.data), u = prepared.find(up.data), d = prepared.find(down.data);
+        // A corrected down still fuses: the pair kernel emits its low panel.
+        const auto pg = precision_of(name + "gate");
+        if (pg == LinearPrecision::exact || precision_of(name + "up") != pg ||
+            precision_of(name + "down") == LinearPrecision::exact) return false;
+        const auto g = prepared.find(wg.data), u = prepared.find(wu.data), d = prepared.find(down.data);
         return g != prepared.end() && u != prepared.end() && d != prepared.end() && gelu_pair_supported(*g->second, *u->second);
     }
-    void gelu_pair(const std::string& name, LinearView gate, LinearView up, unsigned rows) {
+    void gelu_pair(const std::string& name, LinearView wg, LinearView wu, unsigned rows) {
         const auto index = unsigned(ranges.size());
         ranges.push_back({name + "gate", 0.0F}); ranges.push_back({name + "up", 0.0F});
         timing(stats.linear_ms, [&] {
-            prefill::gelu_pair(*prepared.at(gate.data), *prepared.at(up.data), x.as<float>(), rows, pair_halves.data(), halves.data(),
-                               failure.as<unsigned>(), maximum.as<unsigned>() + index, queue);
+            prefill::gelu_pair(*prepared.at(wg.data), *prepared.at(wu.data), x.as<float>(), rows, pair_halves.data(), halves.data(),
+                               failure.as<unsigned>(), maximum.as<unsigned>() + index, queue,
+                               precision_of(name + "down") != LinearPrecision::fp16, precision_of(name + "gate") != LinearPrecision::fp16,
+                               precision_of(name + "gate") == LinearPrecision::hilo_k128);
         });
     }
     // EXL3 FFN on prepared panels (g4-exl3-wmma-pf-v1): down's input panels in halves.
     bool exl3_pair(const std::string& name, LinearView wg, LinearView wu, LinearView wd, unsigned rows) {
         if (!fuse_ffn || wg.format != WeightFormat::exl3_mul1) return false;
+        for (const char* op : {"gate", "up", "down"})
+            if (precision_of(name + op) != LinearPrecision::fp16) return false;
         const auto g = prepared.find(wg.data), u = prepared.find(wu.data);
         if (g == prepared.end() || u == prepared.end() || !prepared.contains(wd.data) ||
             !exl3_gelu_pair_supported(*g->second, *u->second, wd)) return false;
@@ -299,7 +343,9 @@ struct DevicePrefill::Impl {
         const auto index = unsigned(ranges.size());
         ranges.push_back({name, 0.0F});
         const auto before = stats.linear_ms;
-        if (stats.linears == Linears::exact) {
+        const auto precision = stats.linears == Linears::exact ? LinearPrecision::exact : precision_of(name);
+        if (precision == LinearPrecision::exact) {
+            if (preconverted) throw std::logic_error("exact linear cannot read pre-converted panels");
             timing(stats.linear_ms, [&] { exact_linear(matrix, input, rows, output); });
             if (profile) {
                 auto& p = stats.kernels[name]; ++p.calls; p.ms += stats.linear_ms - before; p.matrix_ms += stats.linear_ms - before;
@@ -311,7 +357,8 @@ struct DevicePrefill::Impl {
         timing(stats.linear_ms, [&] {
             const auto it = prepared.find(matrix.data);
             prefill::linear(matrix, input, rows, output, halves.data(), failure.as<unsigned>(), maximum.as<unsigned>() + index, queue,
-                            true, (rows > 8 || stats.direct >= 3) && it != prepared.end() ? it->second.get() : nullptr, converted, preconverted);
+                            true, (rows > 8 || stats.direct >= 3) && it != prepared.end() ? it->second.get() : nullptr, converted, preconverted,
+                            precision);
         });
         if (profile) {
             auto& p = stats.kernels[name]; ++p.calls; p.ms += stats.linear_ms - before;
@@ -323,6 +370,17 @@ struct DevicePrefill::Impl {
             p.bytes += double(rows) * (matrix.inputs + matrix.outputs) * sizeof(float) +
                        (stats.prepared && (rows > 8 || stats.direct >= 3) ? 2.0 * matrix.inputs * matrix.outputs : double(matrix.row_bytes) * matrix.outputs);
         }
+    }
+    // q, k and v read the same normalized input: k and v may reuse the panels
+    // q's conversion left in halves (same FP16 operands, same bytes) when all
+    // three run panel GEMMs of one precision on non-EXL3 packs.
+    bool share_qkv_panels(const std::string& name, LinearView wq, LinearView wk, LinearView wv) {
+        if (stats.linears == Linears::exact || stats.direct < 3 || !qkv_share_enabled()) return false;
+        const auto mode = precision_of(name + "q");
+        if (mode == LinearPrecision::exact || precision_of(name + "k") != mode || precision_of(name + "v") != mode) return false;
+        for (const auto& m : {wq, wk, wv})
+            if (m.format == WeightFormat::exl3_mul1 || m.inputs != wq.inputs || !prepared.contains(m.data)) return false;
+        return true;
     }
     void norm(const Buffer& input, LinearView weight, Buffer& output, unsigned vectors, unsigned width) {
         gpu::norm(input.as<float>(), weight, output.as<float>(), vectors, width, queue, failure.as<unsigned>());
@@ -355,8 +413,6 @@ struct DevicePrefill::Impl {
 DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency residency, bool profile, AttentionMode attention,
                              Linears linears) : impl_(std::make_unique<Impl>()) {
     detail::validate_weights(weights);
-    if (linears == Linears::exact && attention != AttentionMode::canonical)
-        throw std::invalid_argument("exact prefill linears require canonical attention");
     gpu::require_device();
     if (std::fegetround() != FE_TONEAREST) throw std::invalid_argument("prefill requires RNE");
     detail::validate_tables(t);
@@ -410,10 +466,13 @@ DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency reside
     b.staging_bytes = b.tokens.size() + b.positions.size() + b.reads.size() + b.writes.size() + 4 * 256;
     checked(hipHostMalloc(&b.staging, b.staging_bytes, hipHostMallocDefault));
     b.failure.resize(sizeof(unsigned)); b.maximum.resize((2 + 11 * c.layers) * sizeof(unsigned));
-    b.halves.resize(chunk_rows * std::size_t((std::max({c.hidden, c.inter, c.heads * 512, c.ple_dim}) + 15U) / 16U) * 16 * sizeof(std::uint16_t));
     b.last_row.resize(std::size_t(c.hidden) * sizeof(float));
     b.fuse_ffn = linears == Linears::wmma && fused_ffn_enabled();
-    if (b.fuse_ffn) b.pair_halves.resize(chunk_rows * std::size_t((c.hidden + 15U) / 16U) * 16 * sizeof(std::uint16_t));
+    b.size_rows(chunk_rows);
+    // Engine-visible selector until the profile row lands: the LinearPolicy
+    // spec of the WMMA linears (e.g. 'ple_model=fp16;.*=hilo').
+    if (const auto* p = std::getenv("STRIX_G4_PREFILL_LINEAR_POLICY"); p && *p && linears == Linears::wmma)
+        set_linear_policy(LinearPolicy::parse(p));
 }
 DevicePrefill::~DevicePrefill() = default;
 const std::vector<Range>& DevicePrefill::ranges() const { return impl_->ranges; }
@@ -463,7 +522,7 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             const auto bytes = std::size_t(n) * tx->stream->cache[l].width * sizeof(float);
             if (bytes > tx->overlay[l].k.size()) { tx->overlay[l].k.resize(bytes); tx->overlay[l].v.resize(bytes); }
         }
-        b.ranges.clear(); b.clear(b.maximum); b.clear(b.failure);
+        b.ranges.clear(); b.range_aliases.clear(); b.clear(b.maximum); b.clear(b.failure);
         // Pinned copies only the rows this chunk writes; a model with fewer
         // layers than a tap index leaves that tap's columns at zero, as the
         // vector path's full zero does.
@@ -474,8 +533,8 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             checked(hipMemsetAsync(b.taps.data(), 0, std::size_t(n) * result.tap_width * sizeof(float), b.queue));
         if (pinned) {
             b.copy_ready();
-            if (want_taps) Impl::host_rows(b.pinned_taps, b.pinned_taps_floats, std::size_t(chunk_rows) * result.tap_width);
-            if (hidden) Impl::host_rows(b.pinned_hidden, b.pinned_hidden_floats, std::size_t(chunk_rows) * c.hidden);
+            if (want_taps) Impl::host_rows(b.pinned_taps, b.pinned_taps_floats, std::size_t(b.rows_capacity) * result.tap_width);
+            if (hidden) Impl::host_rows(b.pinned_hidden, b.pinned_hidden_floats, std::size_t(b.rows_capacity) * c.hidden);
         }
         b.put(b.tokens, input.data(), input.size_bytes());
         std::vector<std::uint64_t> positions(n);
@@ -565,8 +624,12 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             const auto name = "layer." + std::to_string(l) + ".";
             if (!x_ready) b.norm(b.residual, y.input_norm, b.x, n, c.hidden);
             x_ready = false;
+            // Without the side queue, k and v read q's converted panels.
+            const bool share = !side && a.producer == l && b.share_qkv_panels(name, y.q, y.k, y.v);
+            const auto q_slot = unsigned(b.ranges.size());
             const auto kv = [&] {
-                b.dot(name + "k", y.k, b.x.as<float>(), b.k.as<float>(), n); b.dot(name + "v", y.v, b.x.as<float>(), b.v.as<float>(), n);
+                if (share) { b.range_aliases.push_back({q_slot + 1, q_slot}); b.range_aliases.push_back({q_slot + 2, q_slot}); }
+                b.dot(name + "k", y.k, b.x.as<float>(), b.k.as<float>(), n, share); b.dot(name + "v", y.v, b.x.as<float>(), b.v.as<float>(), n, share);
                 b.head(b.k, y.k_norm, n, c.kv_heads, d, global);
                 gpu::norm(b.v.as<float>(), {}, b.v.as<float>(), n * c.kv_heads, d, b.queue, b.failure.as<unsigned>());
                 gpu::store_overlay(b.k.as<float>(), b.v.as<float>(), b.writes.as<gpu::KvWrite>() + std::size_t(l) * n, n, c.kv_heads * d, b.queue);
@@ -625,7 +688,7 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
             } else if (b.exl3_pair(name, y.gate, y.up, y.down, n)) {
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);
-            } else if (b.fused(y.gate, y.up, y.down)) {
+            } else if (b.fused(name, y.gate, y.up, y.down)) {
                 b.gelu_pair(name, y.gate, y.up, n);
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);
             } else {
@@ -671,6 +734,7 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         synced_at = Clock::now();
         unsigned failure = 0; b.get(&failure, b.failure, sizeof(failure));
         std::vector<unsigned> maxima(b.ranges.size()); b.get(maxima.data(), b.maximum, maxima.size() * sizeof(unsigned));
+        for (const auto& [slot, source] : b.range_aliases) maxima[slot] = maxima[source];
         std::string overflow;
         for (std::size_t i = 0; i < maxima.size(); ++i) {
             const float observed = bit_cast<float>(maxima[i]);
@@ -709,6 +773,45 @@ bool defer_head_enabled() {
     return enabled;
 }
 } // namespace
+LinearPolicy LinearPolicy::parse(const std::string& spec) {
+    LinearPolicy out;
+    std::stringstream in(spec); std::string item;
+    while (std::getline(in, item, ';')) {
+        if (item.empty()) continue;
+        const auto eq = item.rfind('=');
+        Rule rule{item.substr(0, eq), LinearPrecision::hilo_k128};
+        if (eq != std::string::npos) {
+            const auto mode = item.substr(eq + 1);
+            if (mode == "fp16") rule.mode = LinearPrecision::fp16;
+            else if (mode == "exact") rule.mode = LinearPrecision::exact;
+            else if (mode == "hilo") rule.mode = LinearPrecision::hilo;
+            else if (mode == "hilo_k128") rule.mode = LinearPrecision::hilo_k128;
+            else throw std::invalid_argument("unknown linear precision: " + mode);
+        }
+        (void)std::regex(rule.pattern); // validate
+        out.rules.push_back(rule);
+    }
+    return out;
+}
+LinearPrecision LinearPolicy::lookup(const std::string& op) const {
+    for (const auto& r : rules) if (std::regex_match(op, std::regex(r.pattern))) return r.mode;
+    return LinearPrecision::fp16;
+}
+void DevicePrefill::set_linear_policy(const LinearPolicy& policy) {
+    auto& b = *impl_;
+    bool split = false;
+    for (const auto& r : policy.rules) split |= r.mode == LinearPrecision::hilo || r.mode == LinearPrecision::hilo_k128;
+    if (split && !b.stats.prepared) throw std::invalid_argument("hilo linear precision needs prepared WMMA panels");
+    // High and low activation panels share the conversion scratch.
+    if (split != b.split_panels) { b.split_panels = split; b.size_rows(b.rows_capacity); }
+    b.policy = policy; b.precisions.clear();
+    std::string text;
+    for (const auto& r : policy.rules) {
+        static const char* names[] = {"fp16", "exact", "hilo", "hilo_k128"};
+        text += (text.empty() ? "" : ";") + r.pattern + "=" + names[unsigned(r.mode)];
+    }
+    b.stats.linear_policy = text;
+}
 std::vector<float> DevicePrefill::last_logits() {
     auto& b = *impl_; const auto& w = b.w; const auto& c = w.config;
     // Same head instruction sequence on the saved final-norm row; its range is

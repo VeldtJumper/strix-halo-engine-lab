@@ -24,7 +24,7 @@ declarado y una línea de stderr lo indica. Un perfil solo rechaza por un asset 
 | Perfil | Decode | Prefill | Garantía |
 |---|---|---|---|
 | `default` | `g4-v1` (activaciones FP32, pesos Q4_K_M) + drafter MTP en C1 | `prefill-exact` | Exacto: los bytes de salida son iguales a la ruta serial declarada para cualquier tamaño de batch (C4 == C1) y con el drafter activado o desactivado |
-| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP | Prefill WMMA (pendiente `g4-wmma-pf-v2`; hasta entonces se ejecuta el prefill exacto) | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
+| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP | `prefill-exact` (prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente) | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
 | `quality` | Paquete EXL3 (`--exl3-arm DIR`), identidad elegida una vez por paquete y sesión (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exacto dentro de su identidad EXL3; mayor fidelidad que Q4_K_M con un tamaño similar |
 
 La identidad de la ruta EXL3 se fija al arrancar a partir del paquete y de `--streams`, nunca por paso, así que la
@@ -94,8 +94,8 @@ compilación del motor, y cada valor de llama.cpp se midió en el mismo turno qu
 
 C1 publicado es la configuración que se obtiene por defecto: el drafter MTP encontrado en `MODEL_DIR/drafter-mtp/` más
 prompt lookup, medido en tres rondas intercaladas frente a la ejecución sin draft, con los ids de los tokens y el
-estado confirmado iguales en todas las rondas. C1 sin draft, C4 y C8 son decode simple (sin draft). Todos los perfiles
-usan prefill exacto.
+estado confirmado iguales en todas las rondas. C1 sin draft, C4 y C8 son decode simple (sin draft). Las celdas de prefill
+de estas tablas son prefill exacto en todos los perfiles; las rutas seleccionables `g4-wmma-pf-v1` / `g4-wmma-pf-v2` están abajo.
 
 Frente a la tabla publicada anteriormente (misma máquina): C1 publicado de `quality` 83.8 -> **96.4** tok/s,
 decode simple 44.4 / 153.1 / 258.3 -> **50.2 / 184.8 / 303.0** (C1 / C4 / C8); prefill exacto con 2K tokens
@@ -236,7 +236,7 @@ anterior; la atención de las capas globales lee cada fragmento K/V una vez por 
 | 32K | 9.8 | **26.7** | 42.6 |
 | 64K | 5.7 | **18.4** | 36.2 |
 
-Prefill (tok/s; todos los perfiles usan prefill exacto):
+Prefill (tok/s; prefill exacto en todas las columnas):
 
 | Prompt | `default` | `fast` | `quality` | llama.cpp |
 |---|---:|---:|---:|---:|
@@ -248,8 +248,21 @@ Prefill (tok/s; todos los perfiles usan prefill exacto):
 
 El prefill exacto usa aritmética FP32 sin contracción, así que los ids de token y el estado son idénticos en todas
 las longitudes; `quality` usa el prefill exacto de muchas filas de EXL3. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura
-las pasadas de ocho filas con los mismos bytes. El prefill WMMA del perfil `fast` está pendiente de cualificación y no
-se aplica.
+las pasadas de ocho filas con los mismos bytes.
+
+Rutas de prefill de prompts seleccionables (paquetes no EXL3; todos los perfiles mantienen el prefill exacto salvo que
+se elija una): `STRIX_G4_PREFILL_IDENTITY=v1` usa `g4-wmma-pf-v1`: los lineales usan los GEMM WMMA del prefill con
+operandos FP16 sobre paneles de pesos decodificados una vez al cargar; la atención sigue siendo canónica; el decode no
+cambia. `=v2` usa `g4-wmma-pf-v2` (activaciones divididas hi/lo). Ambas rutas procesan el grueso del prompt: los
+últimos <= 8 tokens del prompt y el ancla (la posición final del prompt, cuyos logits eligen el primer token) usan la
+aritmética del decode (`g4-v1` en `default`), como las filas de decode. Ambas cambian los logits, así que no son exactas.
+Prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente; `fast` mantiene el prefill exacto hasta entonces. Q4_K_M, un nodo, tok/s de prefill, ejecuciones intercaladas en una sesión:
+
+| Prompt | exacto | `g4-wmma-pf-v1` (`=v1`) | `g4-wmma-pf-v2` (`=v2`) |
+|---|---:|---:|---:|
+| 2K | 526 | **2,359** | 1,537 |
+| 4K | 509 | **2,249** | 1,478 |
+| 8K | 481 | **1,957** | 1,349 |
 
 Comandos de llama.cpp: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill

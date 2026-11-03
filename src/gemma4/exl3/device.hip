@@ -1472,7 +1472,7 @@ bool device_ffn_rows(LinearView gate, LinearView up, LinearView down, const floa
 }
 void device_input_panels(LinearView w, const float* x, unsigned rows, void* scratch, unsigned* failure, unsigned* maximum,
                          gpu::Queue queue) {
-    if (!geometry(w) || !rows || rows > prefill::chunk_rows || !x || !scratch || !failure)
+    if (!geometry(w) || !rows || rows > prefill::max_chunk_rows || !x || !scratch || !failure)
         throw std::invalid_argument("EXL3 panel input arguments");
     hipLaunchKernelGGL(input_kernel<true>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, static_cast<hipStream_t>(queue),
                        w, x, rows, static_cast<_Float16*>(scratch), failure, maximum);
@@ -1487,7 +1487,7 @@ void device_output(LinearView w, float* out, unsigned rows, unsigned* failure, g
 void device_ffn_middle_panels(LinearView gate, LinearView up, LinearView down, const float* gate_core, const float* up_core,
                               unsigned rows, void* product, unsigned* failure, unsigned* maximum, gpu::Queue queue) {
     if (!geometry(gate) || !geometry(up) || !geometry(down) || gate.inputs != up.inputs || gate.outputs != up.outputs ||
-        down.inputs != gate.outputs || !rows || rows > prefill::chunk_rows || !gate_core || !up_core || !product || !failure)
+        down.inputs != gate.outputs || !rows || rows > prefill::max_chunk_rows || !gate_core || !up_core || !product || !failure)
         throw std::invalid_argument("EXL3 FFN middle arguments");
     hipLaunchKernelGGL(ffn_middle_kernel<true>, dim3((rows * (down.inputs / 128) + 3) / 4), dim3(128), 0,
                        static_cast<hipStream_t>(queue), gate, up, down, gate_core, 1U, up_core, 1U, rows,
@@ -1496,7 +1496,7 @@ void device_ffn_middle_panels(LinearView gate, LinearView up, LinearView down, c
 }
 void device_prefill(LinearView w, const float* x, unsigned rows, float* out, void* scratch,
                     unsigned* failure, unsigned* maximum, const void* panels, gpu::Queue queue, void* converted_event) {
-    if (!geometry(w) || !rows || rows > prefill::chunk_rows || !x || !out || !scratch || !failure || !maximum)
+    if (!geometry(w) || !rows || rows > prefill::max_chunk_rows || !x || !out || !scratch || !failure || !maximum)
         throw std::invalid_argument("EXL3 WMMA arguments");
     const auto q = static_cast<hipStream_t>(queue);
     hipLaunchKernelGGL(input_kernel<>, dim3((rows * (w.inputs / 128) + 3) / 4), dim3(128), 0, q, w, x, rows,

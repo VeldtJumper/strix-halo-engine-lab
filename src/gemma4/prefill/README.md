@@ -37,12 +37,29 @@ exactly the original per-output
 instruction sequence. Modes `0` through `2` use the packed route for small head calls. All
 three switches are read once per process; restart between comparisons.
 Mode `3` (default) uses 64-by-64 tiles for output widths at most
-1024, 128-by-128 below 8192, and 256-by-128 otherwise. It also uses prepared
+2048 (`STRIX_G4_PREFILL_NARROW_MAX` changes the limit, same bytes; 2048 instead
+of 1024 measured +0.7 % at 2K, flat at 512/8K), 128-by-128 below 8192, and
+256-by-128 otherwise. It also uses prepared
 one-wave tiles for calls of at most eight rows, including the last-row head.
 Activation conversion stages `[K16][row][K]` panels in the same scratch space,
 so neighboring lanes read neighboring rows without a large input stride.
 The accumulator and padded-operand order are unchanged. Mode `2` restores the
 previous register policy and packed small-row calls.
+
+`g4-wmma-pf-v2` (corrected linears, "hilo") keeps the same FP16 weight panels
+and splits each activation into `high = RNE16(x)` and
+`low = RNE16((x - high) * 2^12)`. Two independent increasing-K16 WMMA chains
+run on high and low, and each output is `h + l * 2^-12` in FP32. In
+`hilo_k128` both chains restart every 128 inputs and the block parts are
+added in increasing K (`s = s + part`, separately rounded FP32 adds). `emulate_linear_v2`
+(`emulator.cpp`) is the specification; every device kernel (`hilo_gemm`,
+`hilo_direct`, `staged_hilo`, the fused gate/up with its low panel and the
+narrow tiles) equals it byte for byte in `strix-gemma4-prefill-device-tests`.
+The precision is chosen per linear by a `LinearPolicy`, a list of
+`regex=mode` rules (`fp16`, `exact`, `hilo`, `hilo_k128`; first match wins),
+for example `ple_model=fp16;.*=hilo`. `strix-gemma4-prefill-check` takes it as
+`--linear-policy`; `STRIX_G4_PREFILL_LINEAR_POLICY` sets it for any
+`DevicePrefill` that runs WMMA linears.
 
 The [AMD ISA reference](https://docs.amd.com/v/u/en-US/rdna3-shader-instruction-set-architecture-feb-2023_0)
 and [AMD WMMA introduction](https://gpuopen.com/learn/wmma_on_rdna3/)
@@ -159,7 +176,11 @@ with two (D256) or four (D512) waves per head owning disjoint output columns.
 `STRIX_G4_PREFILL_ATTN_WIDE=0` one/two waves per head. `STRIX_G4_PREFILL_ATTN_GROUP`
 (2 default, 1 or 4) is a diagnostic V-prefetch depth. All give identical bytes. Layers
 that read a producer's KV (24 and above) reuse its pack within a chunk
-(`STRIX_G4_PREFILL_PACK_REUSE=0` repacks). `strix-gemma4-prefill-attention-device-tests
+(`STRIX_G4_PREFILL_PACK_REUSE=0` repacks). On the panel route, the k and v projections of a
+KV-producing layer read the FP16 panels that q's conversion of the same
+normalized input left in scratch, instead of converting it twice more (same
+operands, same bytes; their recorded input maximum is q's).
+`STRIX_G4_PREFILL_QKV_SHARE=0` converts per projection. `strix-gemma4-prefill-attention-device-tests
 --bench` times the last 512-row chunk of an 8K prompt (diagnostic only).
 
 Other exact speed switches of the matrix route:
@@ -293,3 +314,19 @@ Profiling separates activation conversion and matrix event times. `matrix_tflops
 uses only the matrix interval; ordinary `tflops` includes conversion. Optional
 `--counter` on the matrix diagnostic runs one prepared gate/up shape without
 warm-up or byte qualification, for an external device counter collector.
+
+`strix-gemma4-prefill-teacher --model MODEL_DIR --rope TABLES --parent
+BOUNDARY.npz ORDINARY.npz [--parent ...] [--continuation 64]` is a separate
+BF16 full-model qualification tool. It compares exact prefill, matrix prefill
+with canonical attention, and matrix prefill with the WMMA attention profile
+on the same teacher-forced inputs. Output contains every counted row's top-1,
+same-weight full-vocabulary KL, sparse head/tail KL lower bound, and sampled
+HF full-vocabulary KL. The final beyond-document prediction is excluded.
+FP16 teacher rows use their own logsumexp; sparse FP32 normalizers never
+normalize rounded full rows. HF error magnitudes are diagnostic outputs.
+Each parent also checks a scheduler split against committed state and reports
+independent greedy continuation agreement relative to exact prefill. Bound
+the number of parents per invocation to the external reservation budget.
+No fixture corpus, comparative receipt, or admission decision is embedded in
+the executable. Frozen corpus coverage and native instruction/state gates
+must be assessed together with numerical bands before changing any default.
