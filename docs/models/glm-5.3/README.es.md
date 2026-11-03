@@ -21,7 +21,8 @@ Ejecute una vez por nodo con `R` establecido en 0 o 1 y el mismo prompt tokeniza
 ```
 
 El decode R1b predeterminado usa autoespeculación MTP exacta y prefill de prompt R1; `--mtp 0` ejecuta decode simple
-con los mismos tokens. `--identity r1` selecciona una identidad de referencia distinta. El prefill usa automáticamente
+con los mismos tokens. `strix-tokenize MODEL_DIR encode|plain|decode FILE` ejecuta el tokenizador del motor (el
+mismo `MODEL_DIR/tokenizer.json` que carga el servidor) en la línea de comandos. `--identity r1` selecciona una identidad de referencia distinta. El prefill usa automáticamente
 8192 filas si ambos ranks las admiten; en caso contrario, 4096. Véanse el [resolutor](../../../apps/glm_rank_defaults.hpp),
 las [familias de modelos](../model-families.md) y la [cualificación/rendimiento](../../performance.md).
 

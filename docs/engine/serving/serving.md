@@ -971,7 +971,8 @@ single tokens. The chat template is a native implementation of the template embe
 rendering, thinking on/off generation prompt). `tools/serve/gen_chat_template_cases.py` renders the
 embedded template on fixed cases; `strix-serve-frontend-tests` checks the native renderer against
 them byte for byte, and the tokenizer against expected splits. `strix-tokenize MODEL.gguf
-encode|plain|decode FILE` exposes the tokenizer on the command line.
+encode|plain|decode FILE` exposes the tokenizer on the command line; MODEL may also be a Hugging Face
+`tokenizer.json` or a model directory that holds one (EXL3 models).
 
 ## Tests
 

@@ -1,4 +1,5 @@
 // strix-tokenize: the server's tokenizer from a GGUF file, for prompts and checks.
+//   MODEL may also be a Hugging Face tokenizer.json, or a model directory that holds one (EXL3 models such as GLM-5.3).
 //   strix-tokenize MODEL.gguf encode FILE   token IDs of FILE's bytes (special tokens parsed), comma-separated
 //   strix-tokenize MODEL.gguf plain FILE    same without special-token parsing
 //   strix-tokenize MODEL.gguf decode FILE   text of the comma/space-separated token IDs in FILE
@@ -9,24 +10,37 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
+namespace {
+
+std::shared_ptr<const strix::serve::BpeTokenizer> load_tokenizer(const std::string& model) {
+    namespace fs = std::filesystem;
+    if (fs::is_directory(model)) return strix::serve::BpeTokenizer::load_hf_json((fs::path(model) / "tokenizer.json").string());
+    if (fs::path(model).extension() == ".json") return strix::serve::BpeTokenizer::load_hf_json(model);
+    return strix::serve::BpeTokenizer::load_gguf(model);
+}
+
+}  // namespace
+
 int main(int argc, char** argv) try {
     const std::string mode = argc > 2 ? argv[2] : "";
     if (argc != 4 && !(argc == 5 && mode == "time")) {
-        std::cerr << "usage: strix-tokenize MODEL.gguf encode|plain|decode|time FILE [K]\n";
+        std::cerr << "usage: strix-tokenize MODEL.gguf|tokenizer.json|MODEL_DIR encode|plain|decode|time FILE [K]\n";
         return 2;
     }
     std::ifstream file(argv[3], std::ios::binary);
     if (!file) throw std::runtime_error(std::string("cannot read ") + argv[3]);
     const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     const auto t_load = std::chrono::steady_clock::now();
-    const auto tokenizer = strix::serve::BpeTokenizer::load_gguf(argv[1]);
+    const auto tokenizer = load_tokenizer(argv[1]);
     if (mode == "time") {
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
         const double load_ms = ms(std::chrono::steady_clock::now() - t_load);
