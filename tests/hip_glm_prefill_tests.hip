@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <random>
 #include <set>
@@ -1060,6 +1061,131 @@ void timing(const std::string& cases, std::mt19937& g) {
 
 }  // namespace
 
+void hip_ok_copy(float* d, const std::vector<float>& h) {
+    hok(hipMemcpy(d, h.data(), h.size() * sizeof(float), hipMemcpyHostToDevice), "upload");
+}
+// STRIX_GLM_PF_HC_FUSE: hc_expand_norm_rows + hc_pre_rows_normed == dev::hc_expand + hc_pre_rows_v2 (== v1) bitwise
+// (expanded X, F, z, mix, collapsed x, C-flag), random and stress inputs, an +inf row for the flag.
+// Element pool for the controlled case: the diagonal mix below passes X and Y through, so these values (and their
+// sums) reach the fused norm after expansion.
+float hc_special(std::mt19937& g) {
+    static const std::uint32_t pool[] = {0x00000000U, 0x80000000U, 0x00000001U, 0x80000005U, 0x007FFFFFU, 0x00800000U,
+                                         0x7F7FFFFFU, 0xFF7FFFFFU, 0x7F800000U, 0xFF800000U, 0x7FC12345U, 0xFFA00001U,
+                                         0x5E000000U, 0x1E000000U, 0x3F800000U, 0xBF800000U};
+    std::uniform_int_distribution<unsigned> pick(0, 31);
+    const unsigned k = pick(g);
+    if (k >= 16) return std::uniform_real_distribution<float>(-2.0F, 2.0F)(g);
+    float f = 0.0F;
+    std::memcpy(&f, &pool[k], sizeof(f));
+    return f;
+}
+void test_hc_expand_norm(std::mt19937& g) {
+    constexpr unsigned n = kHc * kHidden;
+    constexpr std::size_t guard = 17;
+    if (!P::hc_expand_norm_enabled()) {  // STRIX_GLM_PF_HC=1 or STRIX_GLM_PF_HC_FUSE=0: the fused route is not selected
+        std::printf("mHC expand+norm fused: skipped (v2 sites or STRIX_GLM_PF_HC_FUSE not selected)\n");
+        return;
+    }
+    for (unsigned R : {1U, 2U, 7U, 64U, 65U, 1000U, 2048U}) {
+        for (unsigned stress = 0; stress < 5; ++stress) {
+            float* fn = up(rnd(static_cast<std::size_t>(kHcMix) * n, g, 0.01F));
+            float* base = up(rnd(kHcMix, g, 1.0F));
+            float* scale = up(rnd(3, g, 1.0F));
+            auto X0 = stress == 1 ? hc_stress_input(R, g) : rnd(static_cast<std::size_t>(R) * n, g, 1.0F);
+            auto Y0 = rnd(static_cast<std::size_t>(R) * kHidden, g, 1.0F);
+            if (stress == 2) Y0[static_cast<std::size_t>(R / 2) * kHidden + 5] = std::numeric_limits<float>::infinity();
+            float *dX = up(X0), *dY = up(Y0);
+            const std::size_t nf = static_cast<std::size_t>(R) * n, nz = static_cast<std::size_t>(R) * kHcMix;
+            const std::size_t nx = static_cast<std::size_t>(R) * kHidden;
+            // the mix of the current site (what expand consumes) from a real hc_pre pass over X
+            float* mix = nullptr;
+            if (stress >= 3) {
+                // controlled: m_pre = 1, c = identity (output i = 1 * y + x_i), specials in X and Y after expansion;
+                // stress 4 also cancels (y = -x_0) and overflows the norm (large finite rows).
+                std::vector<float> hm(nz, 0.0F);
+                for (unsigned r = 0; r < R; ++r) {
+                    float* m = hm.data() + static_cast<std::size_t>(r) * kHcMix;
+                    for (unsigned i = 0; i < kHc; ++i) { m[i] = 0.25F; m[kHc + i] = 1.0F; m[2 * kHc + i * kHc + i] = 1.0F; }
+                }
+                for (auto& v : X0) v = hc_special(g);
+                for (auto& v : Y0) v = hc_special(g);
+                if (stress == 4)
+                    for (unsigned r = 0; r < R; ++r)
+                        for (unsigned d = 0; d < kHidden; ++d) {
+                            const std::size_t xi = static_cast<std::size_t>(r) * n + d, yi = static_cast<std::size_t>(r) * kHidden + d;
+                            if (r % 3 == 0) Y0[yi] = -X0[xi];
+                            else if (r % 3 == 1) X0[xi] = 3.0e37F;
+                        }
+                hip_ok_copy(dX, X0);
+                hip_ok_copy(dY, Y0);
+                mix = up(hm);
+            } else {
+                // the mix of the current site (what expand consumes) from a real hc_pre pass over X
+                float *f0 = poison<float>(nf), *z0 = poison<float>(nz), *x0 = poison<float>(nx);
+                mix = poison<float>(nz);
+                P::hc_pre_rows_v2(dX, fn, base, scale, f0, z0, mix, x0, R, nullptr);
+            }
+            float *Xa = poison<float>(nf + guard), *Xb = poison<float>(nf + guard);
+            float *fa = poison<float>(nf + guard), *fb = poison<float>(nf + guard);
+            float *za = poison<float>(nz + guard), *zb = poison<float>(nz + guard);
+            float *ma = poison<float>(nz + guard), *mb = poison<float>(nz + guard);
+            float *xa = poison<float>(nx + guard), *xb = poison<float>(nx + guard);
+            unsigned *fla = zalloc<unsigned>(1), *flb = zalloc<unsigned>(1);
+            D::hc_expand(dX, mix, dY, Xa, fla, R, nullptr);
+            P::hc_pre_rows_v2(Xa, fn, base, scale, fa, za, ma, xa, R, nullptr);
+            P::hc_expand_norm_rows(dX, mix, dY, Xb, fb, flb, R, nullptr);  // fb[0..R) receives rr
+            P::hc_pre_rows_normed(Xb, fn, base, scale, fb, zb, mb, xb, R, nullptr);
+            // the split control (STRIX_GLM_PF_HC_FUSE=2): rr from the unfused expand's output
+            float* fc = poison<float>(R + guard);
+            P::hc_norm_factor_rows(Xa, fc, R, nullptr);
+            // v1 on the same expanded X: independent of the v2 chain's tile / column split (STRIX_GLM_PF_HC_TILE / _COLS)
+            float *fd = poison<float>(nf + guard), *zd = poison<float>(nz + guard), *md = poison<float>(nz + guard);
+            float* xd = poison<float>(nx + guard);
+            P::hc_pre_rows_v1(Xa, fn, base, scale, fd, zd, md, xd, R, nullptr);
+            bool ok = true;
+            // Bitwise, except that two NaNs may differ in payload (the commutative fadd in the norm's lds_tree may
+            // take its operands in either order per kernel; such runs set the C flag and the engine refuses them).
+            std::size_t payload_only = 0;
+            auto compare = [&](const float* a, const float* b, std::size_t count, const char* name) {
+                const auto ha = down(a, count + guard), hb = down(b, count + guard);
+                bool same = true;
+                for (std::size_t i = 0; i < ha.size(); ++i) {
+                    std::uint32_t ua = 0, ub = 0;
+                    std::memcpy(&ua, &ha[i], 4);
+                    std::memcpy(&ub, &hb[i], 4);
+                    if (ua == ub) continue;
+                    if (i < count && ha[i] != ha[i] && hb[i] != hb[i]) { ++payload_only; continue; }
+                    same = false;
+                }
+                if (!same) std::printf("FAIL hc fuse %s R=%u input=%u\n", name, R, stress);
+                ok &= same;
+            };
+            compare(Xa, Xb, nf, "expanded X");
+            compare(za, zb, nz, "z");
+            compare(ma, mb, nz, "mix");
+            compare(xa, xb, nx, "xc");
+            compare(fb, fc, R, "rr fused vs split");
+            compare(fa, fd, nf, "F v2 vs v1");
+            compare(za, zd, nz, "z v2 vs v1");
+            compare(ma, md, nz, "mix v2 vs v1");
+            compare(xa, xd, nx, "xc v2 vs v1");
+            const unsigned ca = down(fla, 1)[0], cb = down(flb, 1)[0];
+            ok &= ca == cb && (stress != 2 || ca != 0) && (stress < 3 || ca != 0);
+            ok &= payload_only == 0 || ca != 0;  // payload-only NaN differences are allowed only in flagged runs
+            check(ok, "mHC expand+norm fused == expand + hc_pre v2 bitwise (X, z, mix, xc, guards, C flag " +
+                      std::to_string(ca) + "/" + std::to_string(cb) + ", NaN-payload-only " + std::to_string(payload_only) +
+                      "), rows=" + std::to_string(R) +
+                      (stress == 0 ? " random" : stress == 1 ? " large/tiny/signed-zero/subnormal" : stress == 2 ? " +inf row"
+                       : stress == 3 ? " expanded specials (+-0, subnormal, NaN payloads, +-inf, max)" : " cancellation + norm overflow"));
+            free_all();
+        }
+    }
+    P::hc_expand_norm_rows(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+    P::hc_pre_rows_normed(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+    P::hc_norm_factor_rows(nullptr, nullptr, 0, nullptr);
+    hok(hipGetLastError(), "mHC fused zero rows");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s CASES_DIR [--no-timing]\n", argv[0]);
@@ -1067,9 +1193,15 @@ int main(int argc, char** argv) {
     }
     const bool want_timing = !(argc > 2 && std::string(argv[2]) == "--no-timing");
     std::mt19937 g(20261025);
+    if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "hcfuse") {
+        test_hc_expand_norm(g);  // fixture-free
+        std::printf("checks: %d failures: %d\n", checks, failures);
+        return failures ? 1 : 0;
+    }
     test_dense_rows(argv[1], g);
     test_hc_rows(argv[1], g);
     test_hc_rows_v2(argv[1], g);
+    test_hc_expand_norm(g);
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "hc") g_only_hc = true;
     if (!g_only_hc) {
         test_kda(argv[1], g);

@@ -67,6 +67,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference"},
         {"spec-xfer", "STRIX_GLM_SPEC_XCH", "xfer", "comm", false, true,
          "Measurement: verify + MTP drafter on XferExchange, token vectors match --mtp 0, SP1a PASS"},
+        {"hc-norm-fused", "STRIX_GLM_HC_NORM", "1", "0", true, true,
+         "Measurement: R1b decode hc_fin + RMSNorm fused, tokens and R8 match reference; pair ABA x2 -2.3 % C1 MTP, -3.1 % R8"},
         {"spec-kda-tree-2", "STRIX_GLM_SPEC_KDA_TREE", "2", "1", true, true,
          "Measurement: two-barrier KDA verify tree, bitwise == 9-barrier tree, token vectors match --mtp 0, +2.8 %"},
         {"xfer-boundary-fused", "STRIX_GLM_BOUNDARY", "1", "0", false, true,
@@ -94,6 +96,10 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: indexer select v2 same token lists as v1, 0.38 vs 0.99 us/row at t0 28672, 0.08 vs 0.50 at t0 4096"},
         {"max-rows-auto", "STRIX_GLM_MAX_ROWS_AUTO", "1", "0", false, true,
          "Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank"},
+        {"pf-staged", "STRIX_GLM_PF_STAGED", "1", "0", false, true,
+         "Measurement: pipelined prefill exchanges through the coherent staging views; pair ABBA -0.8 % 1K / -0.9 % 8K TTFT, logits bitwise"},
+        {"pf-hc-fuse", "STRIX_GLM_PF_HC_FUSE", "1", "0", false, true,
+         "Measurement: mHC expand + next-site norm fused (F not materialised), logits bitwise; pair ABBA x2 -1.1 % 1K / -1.3 % 8K TTFT"},
     };
     return items;
 }

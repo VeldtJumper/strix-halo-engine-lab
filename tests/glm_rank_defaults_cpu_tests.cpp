@@ -111,7 +111,7 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 26);
+    CHECK(rd::env_items().size() == 29);
     CHECK(resolve(cat(kDeploy, kDecodeWork), {}).env.at("STRIX_GLM_SPEC_XCH").value == "xfer");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_SPEC_XCH").value == "comm");
     CHECK(resolve({}, {{"STRIX_GLM_SPEC_XCH", "comm"}}).env.at("STRIX_GLM_SPEC_XCH").source == "explicit");
@@ -125,8 +125,9 @@ void test_apply_env_default() {
     }
     CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}, {"STRIX_GLM_PF_PIPELINE", "2"},
                               {"STRIX_DIST_ASYNC_START", "1"}, {"STRIX_GLM_SPEC_KDA_TREE", "2"},
-                              {"STRIX_GLM_PF_EXACT_X", "auto"}, {"STRIX_GLM_PF_EXACTMOE_V", "auto"}}));
-    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree
+                              {"STRIX_GLM_PF_EXACT_X", "auto"}, {"STRIX_GLM_PF_EXACTMOE_V", "auto"},
+                              {"STRIX_GLM_HC_NORM", "1"}}));
+    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree + the fused HC norm
     // an explicit value is never overwritten
     const auto expl = resolve(cat(kDeploy, kDecodeWork), {{"STRIX_DIST_CRC_PARALLEL", "0"}});
     Env set2;

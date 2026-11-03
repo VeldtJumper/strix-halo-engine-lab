@@ -171,11 +171,12 @@ public:
             pe_rows_ = own_.alloc<std::uint32_t>(pe_cap_);
             pe_dst_ = own_.alloc<std::uint32_t>(pe_cap_);
         }
-        if (own_.bytes != device_bytes(Hk_, Hm_, cap_, Rmax_) || own_.ptrs.size() > kPrefillAllocationBound)
+        if (own_.bytes != device_bytes(Hk_, Hm_, cap_, Rmax_, tb_) || own_.ptrs.size() > kPrefillAllocationBound)
             throw std::logic_error("glm pf path: allocation tally differs from prefill_budget (update both)");
     }
-    // Exact bytes the constructor allocates (checked there against its own tally).
-    static std::uint64_t device_bytes(unsigned Hk, unsigned Hm, std::uint64_t cap, unsigned Rmax) {
+    // Exact bytes the constructor allocates (checked there against its own tally). The admission budget passes the
+    // default (gemv, the larger: it adds the exact MoE workspace the wmma identity never allocates).
+    static std::uint64_t device_bytes(unsigned Hk, unsigned Hm, std::uint64_t cap, unsigned Rmax, TierB tb = TierB::gemv) {
         const std::uint64_t R = Rmax, C = std::uint64_t{Hk} * kKdaDim, I = std::uint64_t{kExpertI} * Hk / kKdaHeads;
         const std::uint64_t f = 3 * C + 3 * C + 2 * C + Hk + 2 * kKdaDim + std::uint64_t{Hk} * 4 * kKdaDim + Hk +
                                 std::max<std::uint64_t>(C, std::uint64_t{Hm} * kMlaDim) + C + 2 * kQLora + std::uint64_t{Hm} * kMlaDim +
@@ -188,7 +189,7 @@ public:
         // including 9R pairs of GU FP32, down-input FP16, output FP32,
         // two matrix-specific H-wide FP16 input transforms and plan/table.
         // 792849408 bytes at R=2048; 1585660416 bytes at R=4096 (64-bit ABI).
-        if (exact_moe_enabled() && I == kMoeInter) b += exact_moe::workspace_bytes(Rmax);
+        if (exact_moe_enabled() && I == kMoeInter && tb == TierB::gemv) b += exact_moe::workspace_bytes(Rmax);
         b += (std::uint64_t{kTopE} * kHidden + 3 * kExpertI + kHidden) * 4;
         b += 3 * R * std::max<std::uint64_t>(std::uint64_t{kDenseI} * Hk / kKdaHeads, I) * 4;
         if (I != kMoeInter) b += R * kTopE * (3 * kHidden * 4 + 2 * 4);

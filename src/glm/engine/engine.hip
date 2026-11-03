@@ -98,6 +98,24 @@ __global__ void sum2_kernel(const float* p0, const float* p1, float* y, std::siz
     const std::size_t i = blockIdx.x * std::size_t{256} + threadIdx.x;
     if (i < n) y[i] = p0[i] + p1[i];
 }
+// Staged prefill exchange: the partial goes into the communicator's coherent TX view on the compute stream.
+__global__ void stage_copy_kernel(const float4* __restrict__ src, float4* __restrict__ dst, std::size_t n4) {
+    const std::size_t i = blockIdx.x * std::size_t{256} + threadIdx.x;
+    if (i < n4) dst[i] = src[i];
+}
+// STRIX_GLM_PF_STAGED (default on, =0 off): pipelined prefill exchanges through the communicator's coherent staging
+// views (one copy kernel into TX, sum2 reads RX in place) instead of the async chunked D2H / H2D copies, which a side
+// stream only gets between the long prefill kernels. Same p0 + p1 adds in rank order, same bits.
+bool pf_staged_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRIX_GLM_PF_STAGED");
+        if (v == nullptr || *v == '\0') return true;
+        const std::string s(v);
+        if (s != "0" && s != "1") throw std::invalid_argument("STRIX_GLM_PF_STAGED must be 0 or 1");
+        return s == "1";
+    }();
+    return on;
+}
 
 // ---------------------------------------------------------------- default seams (bitwise references)
 struct Scratch {  // per-row scratch shared by the default seams (one row at a time)
@@ -273,6 +291,24 @@ public:
     void start_reduce(float* p, unsigned rows, hipStream_t s) override {
         start_reduce_region(p, rows, 0, -1, s);
     }
+    // STRIX_GLM_PF_STAGED: staged and chunked framings do not interoperate, so both ranks vote once (whatever their
+    // environment) before the first pipelined layer and use the staging views only if both offer them.
+    void agree_staged(hipStream_t s, bool async_start) {
+        if (staged_vote_ >= 0) return;
+        const std::size_t probe = static_cast<std::size_t>(capacity_ / 2U + 1U) * kHidden * sizeof(float);
+        const std::uint64_t mine = async_start && pf_staged_enabled() && comm_.send_staging(std::min(probe, comm_.max_bytes())) != nullptr ? 1U : 0U;
+        std::uint64_t peer = 0;
+        dist::Tag tag;
+        tag.kind = static_cast<std::uint32_t>(dist::TagKind::control);
+        tag.request = seq_++;
+        hip_ok(hipMemcpyAsync(am_l_, &mine, sizeof(mine), hipMemcpyHostToDevice, s), "staged vote");
+        comm_.exchange(s, am_l_, am_r_, sizeof(mine), tag);
+        hip_ok(hipMemcpyAsync(&peer, am_r_, sizeof(peer), hipMemcpyDeviceToHost, s), "staged vote peer");
+        hip_ok(hipStreamSynchronize(s), "staged vote sync");
+        staged_vote_ = mine == 1U && peer == 1U ? 1 : 0;
+        std::fprintf(stderr, "rank %u prefill exchange: %s (local %u, peer %u)\n", rank_,
+                     staged_vote_ == 1 ? "staging views" : "chunked copies", static_cast<unsigned>(mine), static_cast<unsigned>(peer));
+    }
     // Only the N=2 opt-in schedule supplies a half and a disjoint row region.
     void wait_source(unsigned half, hipStream_t s) {
         if (source_pending_[half]) {
@@ -288,6 +324,20 @@ public:
         pending_remote_ = remote_ + static_cast<std::size_t>(offset) * kHidden;
         pending_half_ = half;
         const std::size_t bytes = static_cast<std::size_t>(rows) * kHidden * sizeof(float);
+        if (half >= 0 && staged_vote_ == 1) {
+            // Both ranks agreed on the staging views; a per-size refusal here (above max_bytes, a direct route) is
+            // rank-symmetric because the old chunked path depends on the same sizes and routes.
+            if (auto* tx = static_cast<float4*>(comm_.send_staging(bytes))) {
+                const std::size_t n4 = bytes / sizeof(float4);
+                stage_copy_kernel<<<static_cast<unsigned>((n4 + 255) / 256), 256, 0, s>>>(reinterpret_cast<const float4*>(p), tx, n4);
+                hip_ok(hipGetLastError(), "prefill stage copy");
+                comm_.start_staged(s, bytes, tag);
+                staged_ = true;
+                pending_part_ = p;
+                pending_rows_ = rows;
+                return;
+            }
+        }
         if (half >= 0) {
             if (!source_free_[half]) hip_ok(hipEventCreateWithFlags(&source_free_[half], hipEventDisableTiming), "prefill source event");
             if (!remote_last_use_[half]) {
@@ -304,6 +354,17 @@ public:
         float* p = pending_part_;
         const std::size_t n = static_cast<std::size_t>(pending_rows_) * kHidden;
         pending_part_ = nullptr;  // a failed finish stops the communicator; do not retry it during unwinding
+        if (staged_) {
+            staged_ = false;
+            // RX is read in place; release_staged fences its reuse after this sum2.
+            const auto* rx = static_cast<const float*>(comm_.finish_staged(s));
+            const float* p0 = rank_ == 0 ? p : rx;
+            const float* p1 = rank_ == 0 ? rx : p;
+            sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n);
+            hip_ok(hipGetLastError(), "sum2 prefill staged");
+            comm_.release_staged(s);
+            return;
+        }
         // finish waits for checked peer bytes. Each half's last-use event protects
         // its remote region from the next off-stream H2D; pinned staging is owned by comm_.
         comm_.finish(s, pending_remote_);
@@ -386,6 +447,8 @@ private:
     int pending_half_ = -1;
     hipEvent_t source_free_[2] = {}, remote_last_use_[2] = {};
     bool source_pending_[2] = {};
+    bool staged_ = false;  // the in-flight reduction uses the staging views (STRIX_GLM_PF_STAGED)
+    int staged_vote_ = -1;  // -1 not yet agreed, 0 chunked copies, 1 staging views (both ranks)
 };
 
 // ---------------------------------------------------------------- layer weights
@@ -442,6 +505,7 @@ struct Engine::Impl {
     unsigned kda_heads = 0, mla_heads = 0, expert_i = 0, dense_i = 0;
     // activations
     float* hz = nullptr;                // [rows][24] mHC chains of a prefill chunk (pf::hc_pre_rows)
+    float* hrr = nullptr;               // [rows] next-site norm factors of a prefill chunk (STRIX_GLM_PF_HC_FUSE)
     std::vector<unsigned char> no_mtp;  // per slot: chunk-prefilled, MTP cache not filled
     int null_layer = -1;  // set_null_flip (test hook)
     std::uint64_t null_pos = 0;
@@ -1030,6 +1094,7 @@ struct Engine::Impl {
         X2 = lib.buffer<float>(RC * kHc * kHidden);
         F = lib.buffer<float>(RC * kHc * kHidden);
         hz = lib.buffer<float>(RC * kHcMix);
+        hrr = lib.buffer<float>(RC);
         mix = lib.buffer<float>(RC * kHcMix);
         xc = lib.buffer<float>(RC * kHidden);
         xn = lib.buffer<float>(RC * kHidden);
@@ -1172,13 +1237,17 @@ struct Engine::Impl {
         struct Half {
             unsigned offset, count;
             float *x, *out;
+            bool normed = false;  // the half's F already holds its next site's norm (STRIX_GLM_PF_HC_FUSE)
         };
         Half a{0, A, X, X2};
         Half b{A, R - A, X + static_cast<std::size_t>(A) * kHc * kHidden,
                X2 + static_cast<std::size_t>(A) * kHc * kHidden};
+        const bool hc_fuse = glm::pf::hc_expand_norm_enabled();
         CommExchange* async_xch = nullptr;
         if (const char* v = std::getenv("STRIX_DIST_ASYNC_START"); v && std::string(v) == "1")
             async_xch = dynamic_cast<CommExchange*>(xch.get());
+        // Every Comm rank votes (the async start is part of the vote: only its half regions use the staging views).
+        if (auto* cx = dynamic_cast<CommExchange*>(xch.get())) cx->agree_staged(stream, async_xch != nullptr);
         auto wait_source = [&](const Half& h) {
             if (async_xch) async_xch->wait_source(h.offset == 0 ? 0U : 1U, stream);
         };
@@ -1187,14 +1256,17 @@ struct Engine::Impl {
                            flag, stream, false, nullptr};
         };
         auto partial = [&](const Half& h) { return part + static_cast<std::size_t>(h.offset) * kHidden; };
-        auto pre = [&](const Half& h, const HcSite& site, const std::uint16_t* norm) {
+        auto pre = [&](Half& h, const HcSite& site, const std::uint16_t* norm) {
             const std::size_t q = h.offset;
-            glm::pf::hc_pre_rows(h.x, site.fn, site.base, site.scale, F + q * kHc * kHidden,
-                                 hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
+            if (h.normed) glm::pf::hc_pre_rows_normed(h.x, site.fn, site.base, site.scale, hrr + q,
+                                                      hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
+            else glm::pf::hc_pre_rows(h.x, site.fn, site.base, site.scale, F + q * kHc * kHidden,
+                                      hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
+            h.normed = false;
             D::rmsnorm(xc + q * kHidden, norm, D::WType::BF16, kHidden, kEps, xn + q * kHidden, h.count, stream);
             mark(segHc);
         };
-        auto attention = [&](const Half& h, LayerW& w) {
+        auto attention = [&](Half& h, LayerW& w) {
             wait_source(h);  // this half's seam may overwrite part; the other half remains independent
             pre(h, w.hc_attn, w.in_norm);
             const CallCtx c = context(h);
@@ -1203,7 +1275,7 @@ struct Engine::Impl {
             else pf->dsa(w.dsaw, w.dst, c, x, partial(h));
             mark(w.kda ? segKda : segDsa);
         };
-        auto ffn = [&](const Half& h, LayerW& w) {
+        auto ffn = [&](Half& h, LayerW& w) {
             wait_source(h);
             pre(h, w.hc_ffn, w.post_norm);
             const CallCtx c = context(h);
@@ -1237,7 +1309,17 @@ struct Engine::Impl {
             mark(segXch);
         };
         auto expand = [&](Half& h) {
-            D::hc_expand(h.x, mix + static_cast<std::size_t>(h.offset) * kHcMix, partial(h), h.out, flag, h.count, stream);
+            if (hc_fuse && glm::pf::hc_expand_norm_split()) {  // split control: unfused expand, then rr alone
+                D::hc_expand(h.x, mix + static_cast<std::size_t>(h.offset) * kHcMix, partial(h), h.out, flag, h.count, stream);
+                glm::pf::hc_norm_factor_rows(h.out, hrr + h.offset, h.count, stream);
+                h.normed = true;
+            } else if (hc_fuse) {  // also this half's next-site norm factors (its next pre skips hc_norm_rows and F)
+                glm::pf::hc_expand_norm_rows(h.x, mix + static_cast<std::size_t>(h.offset) * kHcMix, partial(h), h.out,
+                                             hrr + h.offset, flag, h.count, stream);
+                h.normed = true;
+            } else {
+                D::hc_expand(h.x, mix + static_cast<std::size_t>(h.offset) * kHcMix, partial(h), h.out, flag, h.count, stream);
+            }
             mark(segHc);
             std::swap(h.x, h.out);
         };
