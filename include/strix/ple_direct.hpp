@@ -37,6 +37,7 @@ struct DirectStats {
     std::uint64_t peak_owned_bytes = 0, peak_used_bytes = 0, used_bytes = 0;
     std::uint64_t peak_inflight = 0;
     std::uint64_t pending_critical = 0;
+    std::uint64_t inflight_hits = 0;   // part of hits: pages found still in flight (the caller joins their read)
 };
 
 // Owns its descriptor and a fixed, aligned anonymous arena. The page authority

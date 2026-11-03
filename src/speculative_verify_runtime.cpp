@@ -622,7 +622,7 @@ KnownWindowRun::KnownWindowRun(
             start_ple_lookup_prefetch(*serial_resources.ple_hash_contract, ple->id, tokens[0], session.next_position,
                 *serial_resources.model_manifest, *serial_resources.model_weights, *serial_resources.tensor_access,
                 *serial_resources.session_state_layout, *serial_resources.session_state_memory,
-                *serial_resources.ple_lookup, *serial_resources.ple_prefetch);
+                *serial_resources.ple_lookup, *serial_resources.ple_prefetch, false);
     }
 }
 

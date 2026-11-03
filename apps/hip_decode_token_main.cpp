@@ -5395,6 +5395,8 @@ static int run_decode_entry(
                     static_cast<unsigned long long>(session.next_position),
                     strix::model_content_identity_hex(session_registry->target_state_digest(session.next_position,prompt,pending)).c_str());
             }
+            // PLE pre-issue: plain eager CLI decode only (prompt consumed above; never an MTP session).
+            if (!options.mtp.enabled && ple_lookup == &mapped_ple_lookup) mapped_ple_lookup.enable_preissue(true);
             const auto& generated = chunks.finish_greedy();
             if (session_cache_enabled) std::cerr << "session initial_generation_ms=" << std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - initial_generation_start).count() << '\n';

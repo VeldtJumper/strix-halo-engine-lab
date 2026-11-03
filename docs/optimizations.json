@@ -302,6 +302,17 @@
   },
   {
     "engine": "qwen",
+    "name": "PLE decode pre-issue",
+    "flag_or_env": "STRIX_PLE_PREISSUE",
+    "default": "ON",
+    "exact": "Exact by construction: the pre-issue helper never writes a destination; it only starts the reads of the rows the step's own gather copies, through the same rolling source. Hashing, stored rows, IQ4_NL decoding, BF16 conversion and GPU arithmetic are unchanged. Eager 1K/16K ON vs OFF: full logits and prompt/final target-state digests equal; token IDs equal in every timing arm.",
+    "gain": "Eager decode, --generate 40, fresh process per arm, 20 ABBA pairs per cell, witness off: 1K -0.09 % (41.127 -> 41.089 ms/step), 16K -0.03 % (43.967 -> 43.954 ms/step); GPU-visible PLE gap per token 1K 0.112 -> 0.097 ms, 16K 0.281 -> 0.228 ms.",
+    "preconditions": "Plain CLI decode (no --mtp) with rolling residency, after the prompt is consumed. MTP sessions, verify windows, prompt blocks, HTTP serving, cohorts and distributed stages keep the plain path. Explicit setting refused on YaRN routes.",
+    "off_switch": "STRIX_PLE_PREISSUE=0 (also off with STRIX_QPF2K_DEFAULTS=0 or STRIX_BASELINE=1, which win over an explicit =1).",
+    "doc_anchor": "docs/optimizations.md#qwen-ple-preissue"
+  },
+  {
+    "engine": "qwen",
     "name": "Combined QPF2K and wrapper defaults",
     "flag_or_env": "STRIX_QPF2K_DEFAULTS",
     "default": "ON",

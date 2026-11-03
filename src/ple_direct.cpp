@@ -473,7 +473,7 @@ std::uint64_t DirectPageCache::ensure(std::span<const std::uint64_t> requested, 
         for (auto pg : pages) {
             if (const auto it = s.entries.find(pg); it != s.entries.end()) {
                 ++s.counters.hits;
-                if (!it->second.ready) joined.push_back(it->second.job);
+                if (!it->second.ready) { joined.push_back(it->second.job); ++s.counters.inflight_hits; }
                 continue;
             }
             std::uint64_t slot;

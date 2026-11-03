@@ -739,12 +739,12 @@ void Prefetcher::finish() {
             const auto d = direct_->stats();
             std::fprintf(stderr, "ple-direct summary: reads-issued=%llu bytes-read=%llu cache-hits=%llu "
                 "read-wait-hidden-ms=%.3f read-wait-exposed-ms=%.3f peak-owned-bytes=%llu peak-used-bytes=%llu "
-                "mapping-resident-pages-end=%llu peak-inflight=%llu page-cache-contribution=0 B\n",
+                "mapping-resident-pages-end=%llu peak-inflight=%llu page-cache-contribution=0 B hits-inflight=%llu\n",
                 static_cast<unsigned long long>(d.reads), static_cast<unsigned long long>(d.bytes),
                 static_cast<unsigned long long>(d.hits), static_cast<double>(d.hidden_wait_ns) / 1e6,
                 static_cast<double>(d.exposed_wait_ns) / 1e6, static_cast<unsigned long long>(d.peak_owned_bytes),
                 static_cast<unsigned long long>(d.peak_used_bytes), static_cast<unsigned long long>(resident / config_.page),
-                static_cast<unsigned long long>(d.peak_inflight));
+                static_cast<unsigned long long>(d.peak_inflight), static_cast<unsigned long long>(d.inflight_hits));
         }
     }
     if (config_.strict && exceeded) {
