@@ -2451,11 +2451,13 @@ register_for_compiled_execution(
 static void gather_staged_rows(std::byte* staging, std::uint64_t stride, std::span<const std::uint32_t> row_ids, std::uint32_t heads,
     std::uint64_t row_bytes, TensorPair table, std::uint64_t* majflt,
     const ple_reclaim::Prefetcher::PromptSource* source = nullptr,
-    const std::shared_ptr<ple_reclaim::ResidencyManager::Turn>& turn = {}) {
+    const std::shared_ptr<ple_reclaim::ResidencyManager::Turn>& turn = {},
+    std::size_t worker_limit = 0) {
     if (!heads || heads > PleHashContract::maximum_heads || row_ids.size() % heads || heads * row_bytes > stride)
         throw std::invalid_argument("PLE staged gather geometry is invalid");
     const auto rows = row_ids.size() / heads;
-    const auto workers = static_cast<std::size_t>(std::min(8U, std::max(1U, std::thread::hardware_concurrency())));
+    const auto workers = worker_limit ? worker_limit
+        : static_cast<std::size_t>(std::min(8U, std::max(1U, std::thread::hardware_concurrency())));
     std::vector<std::exception_ptr> errors(workers);
     std::vector<std::uint64_t> faults(workers, 0);
     const auto gather = [&](std::size_t worker) {
@@ -2520,6 +2522,9 @@ struct HipPleKnownWindow::Impl {
         std::vector<std::uint32_t> row_ids;
         std::exception_ptr error;
         bool active = false;
+        bool serve = false;
+        unsigned workers = 0;
+        ple_detail::StageSource source;
     } stage;
     void join_stage() noexcept { if (stage.thread.joinable()) stage.thread.join(); }
     void start_rolling_stage(ple_reclaim::Prefetcher* reclaim, std::uint64_t next,
@@ -2531,6 +2536,7 @@ struct HipPleKnownWindow::Impl {
         // window's capacity (clipped to the prompt); the next launch uses its first rows.size() rows.
         if (const auto staged = reclaim->stage_rows(next, max_rows, ids)) {
             auto& st = stage;
+            st.serve = false;
             st.first = next; st.rows = staged; st.slot = slot ^ 1U; st.heads = reclaim->heads();
             st.row_ids = std::move(ids); st.error = nullptr; st.ns = 0; st.majflt = 0; st.copy_ns = 0; st.activity = {}; st.active = true;
             st.row_bytes = row_bytes; st.table_runtime = table.runtime;
@@ -2832,6 +2838,56 @@ void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows
     }
 }
 
+void HipPleKnownWindow::stage_serve(std::span<const ExecutionDispatchContext> rows) {
+    auto& w=*impl_;
+    static const bool enabled=[] { const char* v=std::getenv("STRIX_PLE_STAGE_SERVE"); return !v || v[0]!='0'; }();
+    if(!enabled || !w.prefill || rows.size()<32U || ple_reclaim::active() || w.stage.active) return;
+    const auto workers=ple_detail::serve_stage_workers(std::thread::hardware_concurrency());
+    if(!workers) return;
+    const char* copy=std::getenv("STRIX_MODEL_COPY_ALL");
+    if(copy && copy[0] && copy[0]!='0') return;
+    auto* backend=dynamic_cast<FileMappedPleLookupBackend*>(rows[0].resources->ple_lookup);
+    if(!backend || backend->residency() || (rows[0].resources->ple_prefetch && rows[0].resources->ple_prefetch->active)) return;
+    const auto prepared=w.prepare(rows);
+    const auto& p=prepared[0];
+    if(p.tensors.table.manifest->residency!=ResidencyPolicy::file_backed_candidate ||
+        p.tensors.table.runtime->storage!=RuntimeTensorStorage::file_mapped) return;
+    w.join_stage();
+    auto& st=w.stage;
+    // Called before the predecessor launch: it flips to slot^1, and the
+    // successor flips back to slot. Never fill the predecessor's inline slot.
+    st.serve=true;st.active=true;st.error=nullptr;st.slot=w.slot;st.workers=workers;
+    st.first=rows[0].position;st.rows=rows.size();st.row_bytes=p.hash_contract.row_bytes;
+    st.table_runtime=p.tensors.table.runtime;st.turn_id=0;st.epoch=0;
+    st.ns=0;st.majflt=0;st.copy_ns=0;st.activity={};
+    st.source={st.first,st.rows,st.row_bytes,st.table_runtime->allocation_generation,
+        st.table_runtime,p.tensors.table.manifest,st.table_runtime->address};
+    try {
+        const auto context_count=static_cast<std::size_t>(w.config.model.ngram_size-1ULL);
+        std::array<std::uint32_t,PleHashContract::maximum_ngram-1> previous{};
+        if(!st.first) std::fill_n(previous.begin(),context_count,static_cast<std::uint32_t>(w.config.model.ple_eos_token_id));
+        else std::memcpy(previous.data(),reinterpret_cast<const void*>(p.ngram_state.address),context_count*sizeof(std::uint32_t));
+        st.row_ids.clear();st.row_ids.reserve(rows.size()*PleHashContract::maximum_heads);
+        for(const auto& row:rows) {
+            const auto hash=hash_ple_token(p.hash_contract,row.input_token_id,
+                std::span<const std::uint32_t>(previous.data(),context_count));
+            st.heads=hash.row_count;
+            for(std::uint32_t h=0;h<hash.row_count;++h) st.row_ids.push_back(static_cast<std::uint32_t>(hash.row_ids[h]));
+            std::copy_n(hash.next_context.begin(),context_count,previous.begin());
+        }
+        st.thread=std::thread([&st,destination=w.staging[st.slot],event=w.released[st.slot],
+            wait=w.recorded[st.slot],stride=w.stride,table=p.tensors.table] {
+            try {
+                const auto t0=std::chrono::steady_clock::now();
+                if(wait) check_hip(hipEventSynchronize(event),"PLE serve staged slot reuse");
+                gather_staged_rows(destination,stride,st.row_ids,st.heads,st.row_bytes,table,&st.majflt,nullptr,{},st.workers);
+                st.ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-t0).count());
+            } catch(...) { st.error=std::current_exception(); }
+        });
+    } catch(...) { st.error=std::current_exception(); }
+}
+
 void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     auto& w = *impl_;
     const auto launch_start = std::chrono::steady_clock::now();
@@ -2856,13 +2912,19 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     else
         std::memcpy(previous.data(), reinterpret_cast<const void*>(prepared[0].ngram_state.address),
             context_count * sizeof(std::uint32_t));
-    // c1: the worker (if any) targeted this launch's slot; join it before anything writes staging.
+    // Serve lookahead may target the other slot. Keep it running, but join any
+    // worker owning our selected slot before hashing can write even row 0.
+    const auto needed_table=prepared[0].tensors.table;
+    const ple_detail::StageSource needed{rows[0].position,rows.size(),contract.row_bytes,
+        needed_table.runtime->allocation_generation,needed_table.runtime,needed_table.manifest,needed_table.runtime->address};
+    const auto stage_action=ple_detail::serve_stage_action(w.stage.source,needed,w.stage.slot,w.slot^1U);
+    const bool join_stage=w.stage.active && (!w.stage.serve || stage_action!=ple_detail::ServeStageAction::keep);
     ple_reclaim::Prefetcher::GatherReceipt reclaim_receipt;
     auto* const stats_reclaim = w.prefill ? ple_reclaim::active() : nullptr;
     const bool block_stats = stats_reclaim && stats_reclaim->block_stats();
     ple_reclaim::DirectActivity activity;
     const ple_reclaim::DirectReadScope block_read_scope(false, block_stats ? &activity : nullptr);
-    if (w.stage.active) {
+    if (join_stage) {
         const auto wait0 = std::chrono::steady_clock::now();
         w.join_stage();
         reclaim_receipt.stage_attempted = true;
@@ -2887,9 +2949,10 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     const auto staged_turn = staged_backend ? staged_backend->residency() : nullptr;
     const bool same_stage_turn = staged_turn ? w.stage.turn_id == staged_turn->id() && w.stage.epoch == staged_turn->epoch()
         : w.stage.turn_id == 0U;
-    const bool stage_candidate = same_stage_turn && w.stage.active && !w.stage.error && w.stage.slot == (w.slot ^ 1U) &&
+    const bool stage_candidate = join_stage && same_stage_turn && !w.stage.error && w.stage.slot == (w.slot ^ 1U) &&
+        (!w.stage.serve || stage_action==ple_detail::ServeStageAction::consume) &&
         w.stage.first == rows[0].position && rows.size() <= w.stage.rows;   // any plan block size that fits
-    w.stage.active = false;
+    if (join_stage) w.stage.active = false;
     w.slot ^= 1U;
     // The slot was last read by the window before the previous one.
     if (w.recorded[w.slot]) check_hip(hipEventSynchronize(w.released[w.slot]), "known-window PLE staging reuse");
@@ -2964,11 +3027,14 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         std::copy_n(hash.next_context.begin(), context_count, previous.begin());
         w.hashes[r] = hash;
     }
-    if (stage_candidate && reclaim && parallel &&
+    if (stage_candidate && (reclaim || w.stage.serve) && parallel &&
         w.stage.row_bytes == contract.row_bytes && w.stage.table_runtime == prepared[0].tensors.table.runtime) {
-        reclaim_receipt.staged_rows = ple_detail::accept_staged_gather(
-            std::span<const PleHashResult>(w.hashes.data(), rows.size()), w.stage.heads,
-            w.stage.row_ids, first_row_consumed, deferred);
+        const auto hashes=std::span<const PleHashResult>(w.hashes.data(),rows.size());
+        if(w.stage.serve) {
+            reclaim_receipt.staged_rows=ple_detail::accept_serve_staged_gather(w.stage.source,needed,
+                hashes,w.stage.heads,w.stage.row_ids,first_row_consumed,deferred);
+        } else reclaim_receipt.staged_rows = ple_detail::accept_staged_gather(
+            hashes, w.stage.heads, w.stage.row_ids, first_row_consumed, deferred);
     }
     lap("hash");
     if (!w.prefill) ple_window_warm::window(std::span<const PleHashResult>(w.hashes.data(), rows.size()), launch_start);
@@ -2983,8 +3049,9 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         else if (reclaim && reclaim->rolling()) source = reclaim->prompt_source(rows[0].position + first, last - first);
         // Keep verify conversion in its historical row order; prompt helpers
         // remain parallel. Both consume immutable owned bytes on leased turns.
-        const auto workers = w.prefill
-            ? static_cast<std::size_t>(std::min(8U, std::max(1U, std::thread::hardware_concurrency()))) : 1U;
+        const auto hardware=std::max(1U,std::thread::hardware_concurrency());
+        const auto available=w.stage.active && w.stage.serve ? hardware-w.stage.workers : hardware;
+        const auto workers = w.prefill ? static_cast<std::size_t>(std::min(8U,available)) : 1U;
         std::vector<std::exception_ptr> errors(workers);
         const auto gather = [&](std::size_t worker) {
             try {

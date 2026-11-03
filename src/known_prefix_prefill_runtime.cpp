@@ -739,6 +739,12 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
                 for(std::size_t s=0;s<count;++s) {count_tiles(results[s],mode,id,rows[s]/8U);record(s,step,rows[s]);observe(step,s);}
                 continue;
             }
+            const auto stage_segment=[&](std::size_t s) {
+                if(!segment_hooks.stage_ple || mode!=KnownWindowStepMode::ple_rows || !full_by_id[id] || !full_by_id[id]->stage) return;
+                std::vector<ExecutionDispatchContext> all(rows[s]);
+                for(std::uint32_t r=0;r<rows[s];++r) all[r]=context(step,s,r);
+                full_by_id[id]->stage(all,full_by_id[id]->config);
+            };
             for(std::size_t s=0;s<count;++s) {
                 auto& result=results[s];
                 auto correlation=current_execution_correlation();correlation.execution_identity=plan.prefill_execution_identity;
@@ -748,6 +754,8 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
                     std::vector<ExecutionDispatchContext> all(rows[s]);for(std::uint32_t r=0;r<rows[s];++r) all[r]=context(step,s,r);
                     correlation.position=all[0].position;correlation.rows=rows[s];correlation.row=UINT32_MAX;
                     ExecutionCorrelationScope observed(correlation);
+                    // Gather the successor concurrently with this segment's inline gather.
+                    if(s+1U<count) stage_segment(s+1U);
                     full_by_id[id]->launch(all,full_by_id[id]->config);
                     count_tiles(result,mode,id,rows[s]/8U);record(s,step,rows[s]);observe(step,s);
                     continue;

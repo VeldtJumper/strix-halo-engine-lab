@@ -361,8 +361,8 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         expect(!prefix_cache_inflight_state(resolve(off,*observed).options).effective,"gate route: joining OFF arm");
         }
     }
-    // Native dense-A8 serving geometry at C24576. File-only backing must not
-    // crowd out T8192; registration is charged to both UMA and GTT. Represent
+    // Native dense-A8 serving geometry at C24576. Reserve-OFF preserves the old
+    // envelope; registration is charged to both UMA and GTT. Represent
     // the aggregate extents with synthetic tensors, without model assets.
     {
         constexpr std::uint64_t file_bytes=111334654400ULL, registered=82523500544ULL;
@@ -372,6 +372,20 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         cache.absolute_offset=registered; cache.byte_size=file_bytes-registered;
         cache.residency=ResidencyPolicy::file_backed_candidate;
         layout.tensors={pinned,cache};
+        {
+            auto overlap=layout;
+            overlap.tensors[0].byte_size=4097;
+            overlap.tensors[1].absolute_offset=4097;overlap.tensors[1].byte_size=8191;
+            PrefillRequirements r;
+            auto o=request.options;o.coalesce_gap_bytes=0;
+            account_http_registered_target(r,o,overlap,16384,4096);
+            expect(r.model_backing==8192 && r.organization.at("target_file_backed_unregistered_bytes")==4096,
+                "PLE reservation excludes the page already charged to registration");
+            overlap.tensors[0].byte_size=12288;
+            account_http_registered_target(r,o,overlap,16384,4096);
+            expect(r.organization.at("target_file_backed_unregistered_bytes")==0,
+                "fully registered PLE extents receive no second reservation");
+        }
         auto production=request;
         production.options.http_batch_cap=0;
         production.options.generate_tokens=1;
@@ -402,6 +416,21 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
                 "native serving committed target backing admits T8192 in startup and inspection");
             const auto& o=admitted.options;
             const auto r=observed.estimate(o); const auto m=observed.serving(o);
+            const auto table=r.organization.at("target_file_backed_unregistered_bytes");
+            expect(table==(file_bytes+4095U)/4096U*4096U-registered,
+                "HTTP backing inventory includes page-rounded unregistered PLE bytes once");
+            auto reserved=production;reserved.environment["STRIX_PLE_SERVE_RESERVE"]="1";
+            expect(resolve(reserved,observed).options.known_prefix_prefill_rows==4096,
+                "warmed PLE reservation prevents T8192 consuming the file cache under pressure");
+            auto roomy=observed;roomy.available=200000000000ULL;
+            reserved.options.known_prefill_uma_explicit=true;reserved.options.known_prefill_uma_budget=200000000000ULL;
+            const auto warm=resolve(reserved,roomy);
+            expect(warm.options.known_prefix_prefill_rows==8192 &&
+                warm.host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL+table,
+                "HTTP automatic prefill reserves warmed PLE backing exactly once");
+            reserved.environment["STRIX_PLE_WARM"]="0";
+            expect(resolve(reserved,roomy).host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL,
+                "PLE warm OFF restores automatic prefill backing total");
             const auto primary=r.model_backing+r.state_d1+r.serial_scratch+r.workspace+r.tails+
                 r.metadata+r.runtime_payload+r.external_host;
             const auto capacity=resolve_http_bridge_capacity(gib_bytes,m,available-primary,

@@ -198,7 +198,8 @@ public:
         bool head = false;
         PrefillStepObserver observer;
     };
-    [[nodiscard]] std::vector<KnownWindowResult> execute_prefill_segments(std::span<const PrefillSegmentRequest> members);
+    [[nodiscard]] std::vector<KnownWindowResult> execute_prefill_segments(std::span<const PrefillSegmentRequest> members,
+        bool stage_ple = false);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -100,6 +100,84 @@ int main() {
     expect(accept_staged_gather({}, heads, ids, true, deferred) == 0,
         "empty launch cannot be accepted");
 
+    using strix::ple_detail::StageSource;
+    using strix::ple_detail::accept_serve_staged_gather;
+    using strix::ple_detail::ServeStageAction;
+    using strix::ple_detail::serve_stage_action;
+    using strix::ple_detail::serve_stage_workers;
+    const int runtime=0,manifest=0,other=0;
+    const StageSource source{17,rows,128,9,&runtime,&manifest,4096};
+    for(unsigned hardware=0;hardware<=256U;++hardware) {
+        const auto workers=serve_stage_workers(hardware);
+        expect(workers<=8U,"serve stage uses at most eight gather workers");
+        if(hardware<2U) expect(!workers,"unknown or single-thread hosts decline serve overlap");
+        else {
+            const auto remaining=hardware-workers;
+            const auto inline_workers=remaining<8U?remaining:8U;
+            expect(workers && inline_workers && workers+inline_workers<=hardware,
+                "stage coordinator and inline caller are included in the hardware worker budget");
+        }
+    }
+    for(std::uint32_t slot=0;slot<2U;++slot) {
+        // Pre-launch lookahead fills the slot after the current launch's slot.
+        // Keeping it active prevents the next pre-launch hook replacing it.
+        const auto staged_slot=slot;
+        const auto inline_slot=slot^1U;
+        auto predecessor=source;predecessor.first+=rows;
+        expect(serve_stage_action(source,predecessor,staged_slot,inline_slot)==ServeStageAction::keep,
+            "predecessor leaves the successor's other-slot gather running");
+        expect(serve_stage_action(source,source,staged_slot,inline_slot)==ServeStageAction::keep,
+            "equal segment positions and sources do not steal another slot's stage");
+        expect(serve_stage_action(source,source,staged_slot,inline_slot^1U)==ServeStageAction::consume,
+            "successor joins its selected slot before validating every staged row");
+        expect(serve_stage_action(source,predecessor,staged_slot,inline_slot^1U)==ServeStageAction::discard,
+            "selected-slot mismatch must join before inline fallback reuses storage");
+        // Distinct sessions can have identical positions and table sources.
+        auto different=hashes;++different[0].row_ids[0];
+        deferred=all;
+        expect(accept_serve_staged_gather(source,source,different,heads,ids,false,deferred)==0 && deferred==all,
+            "selected-slot source match still rejects another session's row ids after joining");
+    }
+    for(bool consumed:{false,true}) {
+        deferred=consumed?tail:all;
+        expect(accept_serve_staged_gather(source,source,hashes,heads,ids,consumed,deferred)==rows && deferred.empty(),
+            "matching serve positions, table and row ids accept");
+        for(unsigned mismatch=0;mismatch<8;++mismatch) {
+            auto wrong=source;
+            switch(mismatch) {
+            case 0: ++wrong.first; break;
+            case 1: --wrong.rows; break;
+            case 2: ++wrong.row_bytes; break;
+            case 3: ++wrong.generation; break;
+            case 4: wrong.runtime=&other; break;
+            case 5: wrong.manifest=&other; break;
+            case 6: ++wrong.address; break;
+            case 7: wrong.runtime=nullptr; break;
+            }
+            deferred=consumed?tail:all;
+            const auto original=deferred;
+            expect(serve_stage_action(wrong,source,0,1)==ServeStageAction::keep &&
+                serve_stage_action(wrong,source,0,0)==ServeStageAction::discard,
+                "all source mismatches preserve other-slot work but join selected-slot work");
+            expect(accept_serve_staged_gather(wrong,source,hashes,heads,ids,consumed,deferred)==0 && deferred==original,
+                "any serve source mismatch retains inline work");
+        }
+        for(std::size_t i=0;i<ids.size();++i) {
+            auto wrong=ids;++wrong[i];
+            deferred=consumed?tail:all;
+            const auto original=deferred;
+            expect(accept_serve_staged_gather(source,source,hashes,heads,wrong,consumed,deferred)==0 && deferred==original,
+                "serve staging compares every row id, including consumed row zero");
+            Bytes fallback{},expected{};
+            if(consumed) gather(hashes,std::array<std::size_t,1>{0},fallback);
+            gather(hashes,deferred,fallback);gather(hashes,all,expected);
+            expect(fallback==expected,"serve rejection gathers the same bytes inline");
+        }
+    }
+    auto wrong=source;++wrong.rows;
+    deferred=all;
+    expect(accept_serve_staged_gather(wrong,wrong,hashes,heads,ids,false,deferred)==0 && deferred==all,
+        "serve hash count must match requested positions");
     if (!failures) std::cout << "PLE staged gather acceptance and fallback tests passed\n";
     return failures ? 1 : 0;
 }
