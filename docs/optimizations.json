@@ -1149,6 +1149,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Prefill o_low A8 in the o_a epilogue",
+    "flag_or_env": "STRIX_DS41_PREFILL_O_LOW_A8_FUSED",
+    "default": "on",
+    "exact": "o_low's A8 operands for o_b are formed with the operations of the separate quantize_a8 kernel (the same maximum tree, so all-NaN groups keep a NaN delta): device tests against the same dense form followed by the separate quantize, for every tall form, finite and overflowing (+-Inf, all-NaN) inputs, row and output tails; two-node serve logits and generated ids identical.",
+    "gain": "The dense o_a calls write o_low's A8 from registers (each lane holds both 16-column halves of its 32-output group), so the separate quantize pass over o_low is gone. Kernel bench at the prefill chunk shape (1024 rows, o_a as one dense call per o-group, three interleaved runs): -3.6 % with 4 o-groups, -4.2 % with 8 o-groups (o_a + quantize).",
+    "preconditions": "Device prefill path; o_a on the dense tall forms whose blocks own whole 32-output groups (the default selection).",
+    "off_switch": "STRIX_DS41_PREFILL_O_LOW_A8_FUSED=0",
+    "doc_anchor": "docs/optimizations.md#ds-prefill-o-low-a8"
+  },
+  {
+    "engine": "deepseek",
     "name": "Prefill hyper-connection fusion",
     "flag_or_env": "STRIX_DS41_PREFILL_HC_FUSE",
     "default": "on",

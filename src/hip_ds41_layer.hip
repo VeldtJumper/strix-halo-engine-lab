@@ -1612,15 +1612,54 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
             for (unsigned e = 0; e < 8; ++e)
                 part[w][rt * OT + t][e][l] = (acc[0][rt][t][e] + acc[2][rt][t][e]) + (acc[1][rt][t][e] + acc[3][rt][t][e]);
     __syncthreads();
-    for (unsigned i = threadIdx.x; i < RT * OT * 8U * 32U; i += 32U * tall_waves) {
+    constexpr unsigned per_thread = RT * OT * 8U * 32U / (32U * tall_waves);
+    float ys[per_thread];
+#pragma unroll
+    for (unsigned q = 0; q < per_thread; ++q) {
+        const unsigned i = threadIdx.x + q * 32U * tall_waves;
         const unsigned ln = i % 32U, e = (i / 32U) % 8U, tile = i / 256U, rt = tile / OT, t = tile % OT;
         const unsigned o = o0 + t * 16U + (ln & 15U), r = r0 + rt * 16U + 2U * e + (ln >> 4U);
         const float s0 = part[0][tile][e][ln] + part[4][tile][e][ln], s1 = part[1][tile][e][ln] + part[5][tile][e][ln];
         const float s2 = part[2][tile][e][ln] + part[6][tile][e][ln], s3 = part[3][tile][e][ln] + part[7][tile][e][ln];
         const float y = (s0 + s2) + (s1 + s3);
+        ys[q] = y;
         if (o < v.count && r < v.rows) {
             float* dst = v.out + static_cast<std::size_t>(r) * v.out_stride + o;
             *dst = v.accumulate ? *dst + y : y;
+        }
+    }
+    // Optional A8 of the outputs (OT even: the block owns whole 32-output groups). ys[q] is tile q (rt = q / OT, t = q % OT)
+    // at row 2w + l / 16 and column l % 16 of the tile, so tiles t = 2g and 2g + 1 hold columns lo and lo + 16 of the same
+    // row and group in one lane: each half wave quantizes its row's group with quantize_a8_kernel's operations, its first
+    // maximum step (lanes L and L ^ 16) being the lane's own fmaxf(|x0|, |x1|), then the 8 / 4 / 2 / 1 steps in the half.
+    if constexpr (OT % 2U == 0U) {
+        if (v.a8_codes) {
+#pragma unroll
+            for (unsigned rt = 0; rt < RT; ++rt)
+#pragma unroll
+                for (unsigned g = 0; g < OT / 2U; ++g) {
+                    const float x0 = ys[rt * OT + 2U * g], x1 = ys[rt * OT + 2U * g + 1U];
+                    float amax = fmaxf(fabsf(x0), fabsf(x1));
+                    for (int stride = 8; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 16));
+                    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
+                    const float dl = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
+                    const float rounded0 = tiny ? 0.0F : rintf(x0 / dl), rounded1 = tiny ? 0.0F : rintf(x1 / dl);
+                    const int c0 = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded0)));
+                    const int c1 = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded1)));
+                    int sum = c0 + c1;
+                    for (int stride = 8; stride; stride /= 2) sum += __shfl_xor(sum, stride, 16);
+                    const unsigned r = r0 + rt * 16U + 2U * w + (l >> 4U), o = o0 + g * 32U;
+                    if (r < v.rows && o < v.count) {
+                        std::int8_t* code = v.a8_codes + static_cast<std::size_t>(r) * v.a8_stride + o + lo;
+                        code[0] = static_cast<std::int8_t>(c0);
+                        code[16] = static_cast<std::int8_t>(c1);
+                        if (lo == 0U) {
+                            const std::size_t gi = static_cast<std::size_t>(r) * (v.a8_stride / 32U) + o / 32U;
+                            v.a8_deltas[gi] = dl;
+                            v.a8_sums[gi] = sum;
+                        }
+                    }
+                }
         }
     }
 }
@@ -2802,10 +2841,12 @@ __global__ __launch_bounds__(32 * post_waves) void q8_0_a8_post_kernel(Q8A8Dense
         }
 }
 
-void enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
+bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
     require(v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 && v.x_stride >= v.width &&
                 v.x_stride % 16U == 0 && v.out_stride >= v.count && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
-                (!v.row_width || (v.row_width % 32U == 0 && v.k_offset % 32U == 0 && v.k_offset + v.width <= v.row_width)),
+                (!v.row_width || (v.row_width % 32U == 0 && v.k_offset % 32U == 0 && v.k_offset + v.width <= v.row_width)) &&
+                (!v.a8_codes || (v.a8_deltas && v.a8_sums && !v.accumulate && v.count % 32U == 0 && v.a8_stride >= v.count &&
+                                 v.a8_stride % 32U == 0)),
             "Q8_0 x A8 dense prefill view");
     unsigned outputs = 32U;
     if (prefill_tuning::tiles())
@@ -2943,6 +2984,13 @@ void enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
     }
     check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
+    // the tall forms with an even OT wrote the outputs' A8 (the others ignore a8_codes)
+    static constexpr unsigned a8_forms[] = {22U,  14U,   114U,  112U,  214U,  212U,  314U,  312U,  414U,  412U,  514U,  614U,
+                                            612U, 714U,  814U,  812U,  914U,  422U,  822U,  1514U, 1522U, 1614U, 1714U, 1722U,
+                                            1814U, 1914U, 1922U, 2014U, 2114U, 2122U, 2214U, 12U};
+    bool a8 = false;
+    for (const unsigned f : a8_forms) a8 = a8 || f == tall;
+    return v.a8_codes != nullptr && staged && a8;
 }
 
 void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_norm, const float* k_norm, std::uint32_t rows,

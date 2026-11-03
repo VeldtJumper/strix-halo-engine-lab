@@ -678,6 +678,76 @@ void synthetic(std::mt19937& rng) {
                "dense prefill (WMMA) = product_q8_0 bitwise, width=" + std::to_string(width) + " rows=" + std::to_string(many));
     }
 
+    // Dense prefill with the outputs' A8 (o_a -> o_low): every tall form that reports it written gives the outputs of the same
+    // call without A8 and the separate enqueue_quantize_a8 of them (GPU against GPU), at an output / A8 stride of two groups'
+    // width with the second group's offset (the o_low layout). The second input set overflows some rows (activation deltas
+    // 3e38): +-Inf outputs and all-NaN groups. The finite set's outputs are also product_q8_0 bitwise.
+    {
+        const std::uint32_t width = 1024;
+        for (const std::uint32_t count : {128U, 96U})  // 96: an output tail inside the 64-output tiles
+        for (const bool overflow : {false, true})
+            for (const std::uint32_t many : {16U, 37U, 300U}) {
+                const auto w = random_q8(rng, count, width);
+                auto xa = host_a8(random_vector(rng, std::size_t{many} * width, 1.0F), many, width);
+                if (overflow)
+                    for (std::uint32_t r = 0; r < many; r += 3)
+                        for (auto& d : xa.rows[r].deltas) d = 3e38F;
+                const std::uint32_t stride = 2 * count;
+                Device<std::uint8_t> dw(w);
+                DevA8 dx(xa);
+                for (const std::uint32_t form : {22U, 14U, 114U, 112U, 214U, 212U, 314U, 312U, 414U, 412U, 514U, 614U, 612U, 714U, 814U,
+                                                 812U, 914U, 422U, 822U, 1514U, 1522U, 1614U, 1714U, 1722U, 1814U, 1914U, 1922U, 2014U,
+                                                 2114U, 2122U, 2214U, 12U, 41U, 0U}) {
+                    Q8A8DensePrefillView v;
+                    v.weight = dw.p; v.width = width; v.count = count; v.codes = dx.codes.p; v.deltas = dx.deltas.p; v.rows = many;
+                    v.x_stride = width; v.out_stride = stride; v.tall = form;
+                    // the reference: the same form without A8, then the separate quantize of its outputs (contiguous)
+                    Device<float> ref_out(std::vector<float>(std::size_t{many} * stride, -1.0F));
+                    v.out = ref_out.p + count;
+                    expect(!enqueue_q8_0_a8_dense_prefill(v, nullptr), "dense prefill without A8 reports none written");
+                    const auto ro = ref_out.down();
+                    std::vector<float> packed(std::size_t{many} * count);
+                    for (std::uint32_t r = 0; r < many; ++r)
+                        std::memcpy(packed.data() + std::size_t{r} * count, ro.data() + std::size_t{r} * stride + count, count * 4U);
+                    if (!overflow && form == 0U)
+                        expect(same_bits(packed, host_q8(w, width, 0, count, count, xa)), "dense prefill wide = product_q8_0 bitwise");
+                    Device<float> dpacked(packed);
+                    DevA8 ref_a8(many, count);
+                    enqueue_quantize_a8(dpacked.p, count, many, ref_a8.codes.p, ref_a8.deltas.p, ref_a8.sums.p, nullptr);
+                    const auto rc = ref_a8.codes.down();
+                    const auto rd = ref_a8.deltas.down();
+                    const auto rs = ref_a8.sums.down();
+                    Device<float> out(std::vector<float>(std::size_t{many} * stride, -1.0F));
+                    Device<std::int8_t> codes(std::vector<std::int8_t>(std::size_t{many} * stride, 0));
+                    Device<float> deltas(std::vector<float>(std::size_t{many} * stride / 32U, -1.0F));
+                    Device<std::int32_t> sums(std::vector<std::int32_t>(std::size_t{many} * stride / 32U, -1));
+                    v.out = out.p + count;
+                    v.a8_codes = codes.p + count; v.a8_deltas = deltas.p + count / 32U; v.a8_sums = sums.p + count / 32U; v.a8_stride = stride;
+                    const bool written = enqueue_q8_0_a8_dense_prefill(v, nullptr);
+                    const auto o = out.down();
+                    const auto c = codes.down();
+                    const auto d = deltas.down();
+                    const auto sm = sums.down();
+                    bool ok = same_bits(o, ro);
+                    if (written)
+                        for (std::uint32_t r = 0; r < many; ++r) {
+                            ok = ok && std::memcmp(c.data() + std::size_t{r} * stride + count, rc.data() + std::size_t{r} * count, count) == 0;
+                            ok = ok && std::memcmp(d.data() + std::size_t{r} * stride / 32U + count / 32U, rd.data() + std::size_t{r} * count / 32U,
+                                                   count / 32U * 4U) == 0;
+                            ok = ok && std::memcmp(sm.data() + std::size_t{r} * stride / 32U + count / 32U, rs.data() + std::size_t{r} * count / 32U,
+                                                   count / 32U * 4U) == 0;
+                        }
+                    bool nan_group = false;
+                    for (const float x : rd) nan_group = nan_group || x != x;
+                    if (overflow) expect(nan_group, "overflow rows give all-NaN groups (NaN deltas)");
+                    const bool expect_written = form != 41U && form != 0U;
+                    expect(ok && written == expect_written, "dense prefill + output A8 bitwise, form " + std::to_string(form) + " count=" + std::to_string(count) + " rows=" +
+                                                                std::to_string(many) + (overflow ? " overflow" : "") +
+                                                                (written ? " (A8 written)" : " (A8 not written)"));
+                }
+            }
+    }
+
     // K-split site (attn_output_b over two ranks): part 0 then part 1 accumulated, = q8_0_a8_split_rows.
     {
         const std::uint32_t width = 8192, count = 256, half = width / 2;
