@@ -1750,8 +1750,10 @@ int main(int argc, char** argv) {
         // exchange module (shares the host transport)
         const char* pfx_env = std::getenv("STRIX_MM_PFX");
         const bool pfx_load = (pfx_env == nullptr || std::string(pfx_env) != "off") && !gpu_direct;
-        // Unset = on only on the qualified host-path USB4 transport; elsewhere unset = load (constructed, off).
-        const bool pfx_default_on = std::string(argv[3]).rfind("usb4", 0) == 0;
+        // Unset = on only on the qualified host-path USB4 transport and without STRIX_MM_BASELINE=1; otherwise unset = load
+        // (constructed, off: the previous default).
+        const char* pfx_base = std::getenv("STRIX_MM_BASELINE");
+        const bool pfx_default_on = std::string(argv[3]).rfind("usb4", 0) == 0 && (pfx_base == nullptr || std::string(pfx_base) != "1");
         const bool pfx_on = pfx_env == nullptr ? pfx_default_on : std::string(pfx_env) == "on";
         std::unique_ptr<strix::minimax::pfx::Exchanger> pfx;
         if (pfx_load) {

@@ -1760,7 +1760,7 @@
     "exact": "Exact: prefill state, final rows and tokens identical on both ranks in-process and across fresh processes in any order.",
     "gain": "TTFT 1K -3.5 %, 8K -1.5 % (strix-minimax-rank)",
     "preconditions": "Host-path USB4 transport only (elsewhere constructed but off); rank app only (serve would lose nested serving).",
-    "off_switch": "STRIX_MM_PFX=load (previous default) or =off",
+    "off_switch": "STRIX_MM_PFX=load (previous default) or =off; STRIX_MM_BASELINE=1 also leaves it loaded but off",
     "doc_anchor": "docs/optimizations.md#mm-rank-pfx"
   },
   {
