@@ -1755,6 +1755,21 @@ struct Bench {
                 if (!exact) throw std::runtime_error(cell + " failed bitwise qualification");
                 std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
             }
+            {  // MoE tail classes beside the MT8 launch on a side stream (default) vs all on the caller's stream
+                struct RestoreTails { ~RestoreTails() { opt::set_prefill_tail_stream(-1); } } restore_tails;
+                for (int pipe : {1, 2}) {
+                    opt::set_prefill_tail_stream(0);
+                    const PfDump serial = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    opt::set_prefill_tail_stream(1);
+                    const PfDump side = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const bool exact = serial.part == side.part && serial.xt == side.xt && serial.at == side.at &&
+                                       same_bits(serial.out, side.out) && off.part == side.part && same_bits(off.out, side.out);
+                    const std::string cell = "tail stream PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
+                    check(exact, cell + " raw partials/transformed inputs/down inputs/output");
+                    if (!exact) throw std::runtime_error(cell + " failed bitwise qualification");
+                    std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
+                }
+            }
             for (int core8 : {1, 2}) {
                 const PfDump on = run_dump(q, 3, mtfit, true, core8);
                 const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at;
@@ -2059,6 +2074,7 @@ struct Bench {
             ~Restore() {
                 opt::set_prefill_marker(nullptr, nullptr);
                 opt::set_prefill_pipe(pipe);
+                opt::set_prefill_tail_stream(-1);
                 opt::set_prefill_core(-1);
                 opt::set_prefill_core8(-1);
                 opt::set_prefill_mtfit(-1);
@@ -2066,16 +2082,20 @@ struct Bench {
             }
         } restore{saved_pipe};
         for (int mtfit : {0, 1}) {
-            double times[3][5] = {};
+            // Arms 0-2 = PIPE 0/1/2 with every class on one stream; 3 = PIPE1 with the tail classes beside MT8.
+            constexpr int kArms = 4;
+            constexpr int kPipe[kArms] = {0, 1, 2, 1}, kTail[kArms] = {0, 0, 0, 1};
+            double times[kArms][5] = {};
             // One warmup per arm followed by five interleaved repetitions.
             for (int rep = -1; rep < 5; ++rep) {
-                for (int arm = 0; arm < 3; ++arm) {
+                for (int arm = 0; arm < kArms; ++arm) {
                     Marks mk;
                     opt::set_prefill_core(3);
                     opt::set_prefill_core8(0);
                     opt::set_prefill_gufuse(0);
                     opt::set_prefill_mtfit(mtfit);
-                    opt::set_prefill_pipe(arm);
+                    opt::set_prefill_pipe(kPipe[arm]);
+                    opt::set_prefill_tail_stream(kTail[arm]);
                     opt::set_prefill_marker(&Bench::marker_cb, &mk);
                     prefill_B(q);
                     opt::set_prefill_marker(nullptr, nullptr);
@@ -2094,9 +2114,13 @@ struct Bench {
                     for (auto event : mk.pool) (void)hipEventDestroy(event);
                 }
             }
-            for (int arm = 0; arm < 3; ++arm)
-                std::printf("PIPE stages %s mtfit=%d PIPE=%d mean of 5 interleaved ms: gather %.3f gate/up %.3f finish %.3f down %.3f combine %.3f\n",
-                            name.c_str(), mtfit, arm, times[arm][0], times[arm][1], times[arm][2], times[arm][3], times[arm][4]);
+            for (int arm = 0; arm < kArms; ++arm) {
+                double total = 0;
+                for (double t : times[arm]) total += t;
+                std::printf("PIPE stages %s mtfit=%d PIPE=%d tail_stream=%d mean of 5 interleaved ms: gather %.3f gate/up %.3f finish %.3f down %.3f combine %.3f total %.3f\n",
+                            name.c_str(), mtfit, kPipe[arm], kTail[arm], times[arm][0], times[arm][1], times[arm][2], times[arm][3],
+                            times[arm][4], total);
+            }
         }
     }
     void test_prefill_pipe() {

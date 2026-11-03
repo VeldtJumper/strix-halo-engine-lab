@@ -1677,6 +1677,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill MoE tail classes beside the MT8 launch",
+    "flag_or_env": "STRIX_MMX_PREFILL_TAIL_STREAM",
+    "default": "1",
+    "exact": "Same items, kernels and split partials; the tail classes (MT 1-7) only move to a side stream that the stage's consumer waits for, and every class writes its own experts' partials. Prefill MoE bench: split partials, tile-major gate/up and down inputs and outputs byte-identical to all classes on one stream (PIPE 1 and 2, crafted row counts, synthetic 3/4/5/6/8-bit and real weights, T 100 to 4096); prefill state, final rows and tokens identical on both ranks in every PAIR arm at 1K and 8K.",
+    "gain": "MoE call, real weights and routes of one layer (5 interleaved runs): 4096 rows 49.31 -> 47.81 ms (-3.0 %), 2048 rows 29.29 -> 28.72 ms (-1.9 %), 1024 rows 18.48 -> 18.12 ms (-1.9 %). Two Strix Halo nodes, in-process A B A B A B A: 1K TTFT -0.1 to -1.1 % (every B faster, two runs), 8K mean -1.6 % (5 of 6 arms faster, one +2.3 % within the 8K noise); 32K fresh process per arm (A B A, B A B): TTFT -0.8 % / -0.3 % against the bracketing arms, MoE GPU time 24.46 -> 24.21 s (mean of 3)",
+    "preconditions": "v4 prefill MoE core with the MT-fit row tiles (the defaults); a stage uses the side stream only when it has both MT8 and tail items.",
+    "off_switch": "STRIX_MMX_PREFILL_TAIL_STREAM=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-tail-stream"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MoE token-major gather",
     "flag_or_env": "STRIX_MMX_PREFILL_GATHER_TOK",
     "default": "1",

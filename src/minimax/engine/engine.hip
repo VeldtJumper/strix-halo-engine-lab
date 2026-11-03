@@ -563,6 +563,7 @@ struct Engine::Impl {
         }
         moe::opt::cleanup_prefill_table_ring();
         moe::opt::cleanup_prefill_dense();
+        moe::opt::cleanup_prefill_tail_stream();
         for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
         for (auto* events : {&idx_fork, &idx_join, &xb_attn_ev, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
             for (hipEvent_t ev : *events)
@@ -600,6 +601,7 @@ struct Engine::Impl {
         moe::opt::set_prefill_mtfit(-1);
         moe::opt::set_prefill_core8(-1);
         moe::opt::set_prefill_pipe(-1);
+        moe::opt::set_prefill_tail_stream(-1);
         moe::opt::set_prefill_table_ring(-1);
         moe::opt::set_prefill_gufuse(-1);
         profiling = env_flag("STRIX_MM_PROFILE", false);
