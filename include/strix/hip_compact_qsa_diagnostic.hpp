@@ -30,7 +30,8 @@ struct HipCompactQsaProbe {
 void launch_hip_compact_qsa_probe(const HipCompactQsaProbe&, void* stream);
 
 // Test-only seam for the verify-window value/gate kernels (24 query / 2 KV heads, dimension 256, BF16 KV):
-// group 0 runs the per-head kernel (dense A8 when codes is set), 2|3|4|6|12 the window group kernel.
+// group 0 runs the per-head kernel (dense A8 when codes is set), 2|3|4|6|12 the window group kernel with each
+// head's features over `split` blocks (1|2|4|8).
 struct HipQsaWindowOutGroupProbe {
     const float* query = nullptr;
     const std::uint16_t* kv = nullptr;
@@ -39,7 +40,7 @@ struct HipQsaWindowOutGroupProbe {
     float* image = nullptr;
     std::int8_t* codes = nullptr;
     float* deltas = nullptr;
-    std::uint32_t rows = 8, group = 0, maximum_selected = 2052, count[8]{};
+    std::uint32_t rows = 8, group = 0, split = 1, maximum_selected = 2052, count[8]{};
 };
 
 void launch_hip_qsa_window_out_group_probe(const HipQsaWindowOutGroupProbe&, void* stream);
