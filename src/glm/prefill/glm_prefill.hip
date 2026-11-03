@@ -1281,12 +1281,22 @@ __device__ __forceinline__ void scores_vopd_step(float (&a)[64], const float (&c
     scores_vopd_heads<P>(a, c, qa, qb, qc, qd);
     if constexpr (P + 1 < 8) scores_vopd_step<P + 1>(a, c, qr, l0);
 }
+// Scores v7 = v6 with G = kS7Group: a 1-D grid in groups of G rows x the 5 list tiles, rows fastest inside a group, so the
+// CTAs in flight are up to G adjacent rows' same list tile (their sorted selections overlap and share latent lines in
+// L2) while a row's absorbed q is still reused within its group. Same work per CTA. Measured per DSA layer at t0 0 /
+// 4096 / 12288 / 28672 (C 4096): 4.96 / 8.42 / 9.41 / 10.46 -> 4.90 / 6.08 / 7.87 / 9.89 us/row (groups of 16 or 64
+// rows gained less, all rows at once lost 38 % at t0 0). G = 0: v6's (tile, row) grid.
+constexpr unsigned kS6Tiles = (kMaxTokens + 32 * kS5Waves * 2 - 1) / (32 * kS5Waves * 2), kS7Group = 256;
+template <unsigned G>
 __global__ __launch_bounds__(32 * kS5Waves) void mla_scores_v6_kernel(DsaSlot sl, const std::uint32_t* tokens_all, const std::uint32_t* n_all,
-                                                                      const float* qt, float* e_all) {
+                                                                      const float* qt, float* e_all, unsigned C) {
     constexpr unsigned H = 32;
-    const unsigned r = blockIdx.y, n = n_all[r];
+    const unsigned idx = blockIdx.x % (G ? G * kS6Tiles : 1U);
+    const unsigned r = G ? blockIdx.x / (G * kS6Tiles) * G + idx % G : blockIdx.y, tile = G ? idx / G : blockIdx.x;
+    if (r >= C) return;  // uniform per CTA (partial last group)
+    const unsigned n = n_all[r];
     const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32))), lane = threadIdx.x % 32;
-    const unsigned j0 = (blockIdx.x * kS5Waves + wave) * 64;
+    const unsigned j0 = (tile * kS5Waves + wave) * 64;
     if (j0 >= n) return;  // uniform per wave
     const std::uint32_t* tok = tokens_all + static_cast<std::size_t>(r) * kMaxTokens;
     const uint4* lat[2];
@@ -2175,14 +2185,15 @@ unsigned mla_gemm_version() {  // default v2 absorb / out GEMM (same bits, -20..
     }();
     return v;
 }
-unsigned scores_version() {  // default v6 (VOPD v5, bitwise == v5/v4/v3, -9..-26 % vs v5); STRIX_GLM_PF_SCORES=5 / 4 / 3 / 2
+unsigned scores_version() {  // default v7 (v6 in 256-row groups, bitwise == v6 / v5, -1..-28 % vs v6); STRIX_GLM_PF_SCORES=6 / 5 / 4 / 3 / 2
     static const unsigned v = [] {
         const char* e = std::getenv("STRIX_GLM_PF_SCORES");
+        if (e && std::string(e) == "6") return 6U;
         if (e && std::string(e) == "5") return 5U;
         if (e && std::string(e) == "4") return 4U;
         if (e && std::string(e) == "3") return 3U;
         if (e && std::string(e) == "2") return 2U;
-        return 6U;
+        return 7U;
     }();
     return v;
 }
@@ -2382,7 +2393,7 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
     if (C == 0) return;
     if (heads != 32 && heads != 64) throw std::runtime_error("glm pf mla_attention_rows: heads must be 32 or 64");
     if (gemm_v != 1 && gemm_v != 2) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
-    if ((scores_v != 1 && scores_v != 2 && scores_v != 3 && scores_v != 4 && scores_v != 5 && scores_v != 6) ||
+    if ((scores_v != 1 && scores_v != 2 && scores_v != 3 && scores_v != 4 && scores_v != 5 && scores_v != 6 && scores_v != 7) ||
         (obar_v != 1 && obar_v != 2 && obar_v != 4 && obar_v != 5 && obar_v != 6 && obar_v != 7) ||
         ((scores_v == 1) != (obar_v == 1)))
         throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported version pair");
@@ -2401,9 +2412,12 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         if (scores_v == 2) {
             if (heads == 32) mla_scores_v2_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
             else mla_scores_v2_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
-        } else if (scores_v == 5 || scores_v == 6) {  // v6: heads 32 only (heads 64 runs v5)
+        } else if (scores_v >= 5) {  // v6 / v7: heads 32 only (heads 64 runs v5)
             constexpr unsigned tile = 32 * kS5Waves * 2;  // entries per CTA at H = 32 (half that at H = 64)
-            if (heads == 32 && scores_v == 6) mla_scores_v6_kernel<<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e);
+            if (heads == 32 && scores_v == 7)
+                mla_scores_v6_kernel<kS7Group><<<(C + kS7Group - 1) / kS7Group * kS7Group * kS6Tiles, 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C);
+            else if (heads == 32 && scores_v == 6)
+                mla_scores_v6_kernel<0><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e, C);
             else if (heads == 32) mla_scores_v5_kernel<32><<<dim3((kMaxTokens + tile - 1) / tile, C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e);
             else mla_scores_v5_kernel<64><<<dim3((kMaxTokens + tile / 2 - 1) / (tile / 2), C), 32 * kS5Waves, 0, s>>>(slot, tokens, n, qt, e);
         } else {

@@ -39,9 +39,10 @@ namespace P = strix::glm::pf;
 
 namespace {
 // Explicit MLA {scores, o-bar, gemm} versions gated bitwise against the 3/5/1 reference (intermediates, decode outputs).
-constexpr unsigned kMlaPairs = 11;
+constexpr unsigned kMlaPairs = 13;
 constexpr unsigned kMlaPair[kMlaPairs][3] = {{4, 5, 1}, {3, 6, 1}, {4, 6, 1}, {5, 5, 1}, {4, 7, 1}, {5, 7, 1},
-                                             {5, 7, 2}, {4, 5, 2}, {4, 6, 2}, {6, 7, 2}, {6, 5, 1}};
+                                             {5, 7, 2}, {4, 5, 2}, {4, 6, 2}, {6, 7, 2}, {6, 5, 1}, {7, 7, 2},
+                                             {7, 5, 1}};
 
 int failures = 0, checks = 0;
 void check(bool ok, const std::string& what) {
