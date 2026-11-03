@@ -32,6 +32,7 @@ de velocidad. Cómo medimos, qué cubre "exacto" y cómo una optimización pasa 
 | GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodos TP2 sobre USB4 | **Production** | Identidad de decode R1b por defecto; autoespeculación MTP exacta por defecto; prefill por fragmentos R1 exacto; `--identity r1` restaura R1; corrección R≥3 verificada en el par; servidor HTTP `strix-glm5-serve` (chat/completions de OpenAI + SSE, batching continuo) |
 | GLM-5.3 Flash en una RTX PRO 6000 (borrador) | RTX PRO 6000 (96 GB, Windows) | **Opcional (opt-in)** | Prefill y decode greedy exactos; expertos enrutados servidos por la caché con compuerta en el dispositivo de [tierstream](https://github.com/hyukudan/tierstream) (dispositivo, RAM pinned, archivo de unidades); `--profile`; [guía](src/glm/rtxpf/README.md) |
 | Nemotron 3.5 Bolt E4B (Q4_K_M; paquete EXL3 para `quality`) | 1 nodo | **Compilación opcional (opt-in)** (`STRIX_FAMILY_GEMMA4=ON`) | `--profile default\|fast\|quality`; decode exacto con cualquier tamaño de batch; drafter MTP exacto en C1; servidor con batching continuo |
+| **MiniMax H3** (audio + vídeo; DiT int8, pack nvfp4 del codificador de texto) | 1 nodo; 2 nodos sobre USB4 | **Compilación opcional (opt-in)** (`STRIX_FAMILY_H3=ON`) | Clip de 5 s 1344x768 + audio estéreo en **405.5 s** en el par; dos nodos idénticos byte a byte a un nodo; referencia densa y palancas de clase FAST (LoRA de 6 pasos, atención dispersa, VAE rápido) cada una con su interruptor; [página](docs/models/minimax-h3/README.es.md) |
 
 El núcleo no conoce ningún modelo: cada familia es un módulo con su propio contrato, plan, kernels y gates
 ([docs/models/model-families.md](docs/models/model-families.md)). Las rutas automáticas admiten los assets de modelo según sus contratos documentados; la procedencia y las licencias se registran en
@@ -89,11 +90,12 @@ filas con sus condiciones, número de repeticiones, evidencia de exactitud e int
 | Nemotron 3.5 Bolt E4B | 1 nodo | Ruta de prefill de prompts seleccionable `g4-wmma-pf-v1` (`STRIX_G4_PREFILL_IDENTITY=v1`; lineales WMMA FP16 en el grueso del prompt, los últimos <= 8 tokens del prompt y el ancla con la aritmética del decode; no exacto), 2K / 4K / 8K | **2,359 / 2,249 / 1,957** tok/s | prefill exacto 526 / 509 / 481, `g4-wmma-pf-v2` (`=v2`) 1,537 / 1,478 / 1,349 en la misma sesión; todos los perfiles mantienen el prefill exacto por defecto | actual |
 | Nemotron 3.5 Bolt E4B | 1 nodo | Prefill exacto, 2K / 8K / 32K: `default` y `quality` | **535 / 509 / 397** y **815 / 746 / 533 tok/s** | 466 / 429 / 358 y 769 / 701 / 520 tok/s antes del tile fusionado gate/up, los tiles lineales, la decodificación de 24 bits y la de Q6_K compartida, y los pares LDS de EXL3 | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 nodo | Servidor HTTP, `default`, 8 clientes, prompts mixtos (chat, código, un documento de ~1.3K tokens), caché de prefijos desactivada, 128 tokens: agregado / TTFT p50 | **76.1 tok/s / 0.6 s** | una petición cada vez: 66.9 tok/s / 13.8 s | `f32aab24` |
+| **MiniMax H3** | 2 nodos sobre USB4 | Texto a vídeo + audio, 1344x768, 124 fotogramas (5.17 s) + audio estéreo, semilla 42: LoRA de 6 pasos, atención dispersa tau 0.75, VAE rápido | **405.5 s** (DiT 300.2 s, VAE de vídeo 42.4 s) | referencia densa de 8 pasos: ~16 min en 1 nodo, ~8 min en el par | h3 block `9d9d523b` |
 | llama.cpp `74a4fb00`, misma máquina, mismo Q4_K_M | 1 nodo | Referencia: C1 simple / C4 / C8; prefill 2K / 8K / 32K; servidor con 8 clientes | 55.5 / 193.3 / 279.9 tok/s; 2,062 / 1,881 / 1,376 tok/s; 227.1 tok/s | medido en la misma sesión que las filas de Nemotron | `74a4fb00` |
 
 Páginas de los modelos: [Qwen](docs/models/qwen3.8/README.es.md) · [DeepSeek](docs/models/deepseek-v4.1/README.es.md) ·
 [MiniMax](docs/models/minimax-m3.1/README.es.md) · [GLM](docs/models/glm-5.3/README.es.md) ·
-[Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.es.md). El registro de cambios de cada valor predeterminado
+[Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.es.md) · [MiniMax H3](docs/models/minimax-h3/README.es.md). El registro de cambios de cada valor predeterminado
 incorporado con su ganancia medida y su interruptor de desactivación es [ganancias medidas](docs/measured-gains.es.md);
 los registros fechados están en [rendimiento](docs/performance.md).
 
@@ -200,6 +202,15 @@ no ayuda una ruta y solución de problemas: [uso de una GPU discreta](docs/discr
   [tierstream](https://github.com/hyukudan/tierstream) entre VRAM, RAM pinned y disco. Prefill y decode exactos; TTFT
   19.7 / 41.7 s con 8K / 32K en la tarjeta completa, y también funciona de forma exacta con 24 GiB de VRAM + 32 GiB de
   RAM del host. [Resultados](docs/models/glm-5.3/README.es.md#glm-rtx-results) · [guía](src/glm/rtxpf/README.md).
+
+## MiniMax H3 audio + vídeo (compilación opcional)
+
+**Un clip de vídeo de 5 s 1344x768 con audio estéreo en 405.5 s en el par USB4.** Texto a vídeo + audio, 124
+fotogramas, semilla 42, LoRA de 6 pasos, atención dispersa, VAE rápido; un nodo, el esquema de dos nodos en un nodo y
+los dos nodos dan los mismos bits para esa identidad. Se compila con `-DSTRIX_FAMILY_H3=ON` (sin la opción no se
+compila nada); cada palanca de velocidad tiene su propio flag y sin ellas la ejecución es la referencia densa.
+[Instalación, ficheros del modelo, un comando por clip y vuelta atrás](docs/models/minimax-h3/README.es.md#h3-install) ·
+[desglose por etapas](docs/models/minimax-h3/README.es.md#h3-result).
 
 ## Documentación
 
