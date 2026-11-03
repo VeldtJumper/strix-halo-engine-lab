@@ -111,7 +111,7 @@ __global__ __launch_bounds__(threads) G4_CANON_OCCUPANCY void canonical_scores(c
                                                              const unsigned* present_keys, gpu::KvRead r,
                                                              unsigned rows, unsigned heads, std::uint64_t base,
                                                              unsigned width, float* scores, unsigned* maxima,
-                                                             unsigned* failure) {
+                                                             unsigned* failure, bool rows_major = false, unsigned row_group = 0) {
     constexpr unsigned J = Dim / 32U, Leaves = 32U / J, Stages = 32U / Leaves, S = 68U;
     static_assert(Leaves * J == 32U && Leaves >= 2U);
     __shared__ alignas(16) float qs[32U * S]; // [leaf * J + j][position * 4 + head], padded rows
@@ -120,11 +120,23 @@ __global__ __launch_bounds__(threads) G4_CANON_OCCUPANCY void canonical_scores(c
     __shared__ unsigned present[key_tile];
     const unsigned tid = threadIdx.x, lane = tid % 32U, wave = tid / 32U;
     const unsigned tk = lane % 16U, tq = lane / 16U + 2U * wave;
-    const unsigned row0 = blockIdx.y * block_positions, kv_head = blockIdx.z;
+    // rows_major: the grid runs row tiles fastest, so the row tiles of one key tile run together and share its keys
+    // through the caches (same work per block, same bytes).
+    // row_group > 0: a 1-D grid in groups of `row_group` row tiles; inside a group the key tiles advance after every row
+    // tile of the group, so the group's queries and the current keys stay cache-resident (same bytes).
+    unsigned key_block = rows_major ? blockIdx.y : blockIdx.x, row_block = rows_major ? blockIdx.x : blockIdx.y;
+    if (row_group) {
+        const unsigned row_tiles = (rows + block_positions - 1U) / block_positions, key_tiles = width / key_tile;
+        const unsigned id = blockIdx.x, first = id / (row_group * key_tiles) * row_group, size = min(row_group, row_tiles - first);
+        const unsigned within = id - first * key_tiles;
+        row_block = first + within % size;
+        key_block = within / size;
+    }
+    const unsigned row0 = row_block * block_positions, kv_head = blockIdx.z;
     const unsigned count = min(block_positions, rows - row0);
     const std::uint64_t first_position = r.position + row0, last_position = first_position + count - 1U;
     const std::uint64_t lo = first_visible(r, first_position);
-    const std::uint64_t k0 = base + std::uint64_t(key_tile) * blockIdx.x;
+    const std::uint64_t k0 = base + std::uint64_t(key_tile) * key_block;
     if (k0 > last_position || k0 + key_tile - 1U < lo) return;
     if (tid < key_tile) {
         const auto p = k0 + tid;
@@ -307,27 +319,52 @@ __global__ __launch_bounds__(threads) void canonical_softmax(float* scores, floa
 // while staging and every block forms the 64 chunk denominators in LDS (the
 // decode partial loop's order; invisible keys stage e = +0, which adds exactly
 // nothing to a sum that is never -0).
-template <unsigned Dim, bool Fused>
-__global__ __launch_bounds__(threads) void canonical_values(const float* scores, const float* denominators,
+// Parts = 2: one block of 2 x 256 threads covers 2 x 128 columns; the first part stages the probabilities (and
+// their exp and chunk denominators) once for both, each part stages and multiplies its own values (same bytes).
+// Tall (Parts = 2): the two parts take two consecutive 16-row tiles of the same 128 columns instead, so the
+// value tile is staged once for 32 rows (half the value reads); each part keeps its own probabilities and
+// denominators. The block runs the union of the two tiles' stages; a stage outside a tile's own range has
+// every probability 0 there and adds +0, so every output keeps its operations and order. Same bytes.
+template <unsigned Dim, bool Fused, unsigned Parts = 1, bool Tall = false>
+__global__ __launch_bounds__(threads * Parts) G4_CANON_OCCUPANCY void canonical_values(const float* scores, const float* denominators,
                                                              gpu::KvRead r, unsigned rows, unsigned heads,
                                                              std::uint64_t base, unsigned width, float* out,
-                                                             unsigned* failure) {
+                                                             unsigned* failure, bool rows_major = false, unsigned row_group = 0) {
     constexpr unsigned Cols = 128, Keys = 32, EStride = 68;
-    __shared__ alignas(16) float es[Keys * EStride]; // [key][position * 4 + head], padded rows
-    __shared__ alignas(16) float vs[Keys * Cols];    // [key][column]
+    constexpr unsigned RowParts = Tall ? Parts : 1U, ColParts = Tall ? 1U : Parts, Staged = 16U / RowParts;
+    __shared__ alignas(16) float es[RowParts][Keys * EStride]; // [row part][key][position * 4 + head], padded rows
+    __shared__ alignas(16) float vs[ColParts][Keys * Cols];   // [column part][key][column]
     __shared__ const float* values[2][Keys];
-    __shared__ float merged[64];
-    const unsigned tid = threadIdx.x, lane = tid % 32U, wave = tid / 32U;
+    __shared__ float merged[RowParts][64];
+    const unsigned part = threadIdx.x / threads, tid = threadIdx.x % threads, lane = tid % 32U, wave = tid / 32U;
+    // own: this thread stages and reduces its part's probabilities (every part when Tall, the first otherwise).
+    const bool lead = part == 0U, own = Tall || lead;
+    const unsigned ep = Tall ? part : 0U, vp = Tall ? 0U : part, staging = Tall ? threadIdx.x : tid;
     const unsigned cg = lane % 16U, tq = lane / 16U + 2U * wave;
-    const unsigned row0 = blockIdx.y * block_positions, kv_head = blockIdx.z, c0 = blockIdx.x * Cols;
-    const unsigned count = min(block_positions, rows - row0);
-    const std::uint64_t first_position = r.position + row0, last_position = first_position + count - 1U;
-    const std::uint64_t lo = first_visible(r, first_position);
+    // rows_major: row tiles fastest, so the row tiles of one column slice stream the same values together.
+    unsigned slice = rows_major ? blockIdx.y : blockIdx.x, row_block = rows_major ? blockIdx.x : blockIdx.y;
+    // row_group > 0: 1-D grid, groups of `row_group` row tiles x every column slice, rows fastest, so neighbouring
+    // blocks share both the probabilities of their rows and the values of their slices (same bytes).
+    if (row_group) {
+        const unsigned row_tiles = (rows + block_positions * RowParts - 1U) / (block_positions * RowParts);
+        const unsigned slices = Dim / (Cols * ColParts);
+        const unsigned id = blockIdx.x, first = id / (row_group * slices) * row_group, size = min(row_group, row_tiles - first);
+        const unsigned within = id - first * slices;
+        row_block = first + within % size;
+        slice = within / size;
+    }
+    const unsigned block_row0 = row_block * block_positions * RowParts, row0 = block_row0 + (Tall ? part : 0U) * block_positions;
+    const unsigned kv_head = blockIdx.z, c0 = (slice * ColParts + (Tall ? 0U : part)) * Cols;
+    const unsigned count = row0 < rows ? min(block_positions, rows - row0) : 0U;
+    const unsigned block_count = min(block_positions * RowParts, rows - block_row0);
+    const std::uint64_t first_position = r.position + row0;
+    const std::uint64_t last_position = r.position + block_row0 + block_count - 1U; // the block's last row
+    const std::uint64_t lo = first_visible(r, r.position + block_row0);
     const std::uint64_t first_key = lo / attention_chunk * attention_chunk;
     const auto stages = unsigned((last_position / attention_chunk + 1U) * attention_chunk - first_key) / Keys;
     const unsigned kv_offset = kv_head * Dim + c0, head0 = kv_head * group;
     const auto pointers = [&](unsigned stage) {
-        if (tid < Keys) {
+        if (lead && tid < Keys) {
             const auto p = first_key + std::uint64_t(stage) * Keys + tid;
             values[stage & 1U][tid] = p >= lo && p <= last_position ? canonical_at(r, p, true, failure) : nullptr;
         }
@@ -335,9 +372,9 @@ __global__ __launch_bounds__(threads) void canonical_values(const float* scores,
     // Staging offsets are block-relative 32-bit values: key kp = p - first_key,
     // row position P = position - first_key; (row, key) is visible iff
     // kp <= P and (global or P - kp < window), the decode kernel's range.
-    const auto relative0 = unsigned(first_position - first_key);
+    const auto relative0 = unsigned(first_position - first_key); // own tile
     const float* row_scores = scores + (first_key - base);
-    float se[8], sv[16], maximum[8];
+    float se[8], sv[Staged], maximum[8];
     if constexpr (Fused) {
 #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
@@ -352,15 +389,16 @@ __global__ __launch_bounds__(threads) void canonical_values(const float* scores,
     };
     const auto load = [&](unsigned stage) {
         const unsigned kp = stage * Keys + lane;
+        if (own)
 #pragma unroll
-        for (unsigned i = 0; i < 8; ++i) {
-            const unsigned qr = wave + 8U * i, position = qr / 4U, head = qr % 4U;
-            se[i] = seen(stage, i) ? row_scores[((row0 + position) * heads + head0 + head) * width + kp] : 0.0F;
-        }
+            for (unsigned i = 0; i < 8; ++i) {
+                const unsigned qr = wave + 8U * i, position = qr / 4U, head = qr % 4U;
+                se[i] = seen(stage, i) ? row_scores[((row0 + position) * heads + head0 + head) * width + kp] : 0.0F;
+            }
 #pragma unroll
-        for (unsigned i = 0; i < 16; ++i) {
-            const float* v = values[stage & 1U][tid / Cols + 2U * i];
-            sv[i] = v ? v[kv_offset + tid % Cols] : 0.0F;
+        for (unsigned i = 0; i < Staged; ++i) {
+            const float* v = values[stage & 1U][staging / Cols + 2U * RowParts * i];
+            sv[i] = v ? v[kv_offset + staging % Cols] : 0.0F;
         }
     };
     float partial[4][8], numerator[4][8];
@@ -374,29 +412,30 @@ __global__ __launch_bounds__(threads) void canonical_values(const float* scores,
     load(0);
     for (unsigned stage = 0; stage < stages; ++stage) {
         __syncthreads();
+        if (own)
 #pragma unroll
-        for (unsigned i = 0; i < 8; ++i) {
-            // exp is applied here, a stage after the load was issued.
-            if constexpr (Fused) se[i] = seen(stage, i) ? declared_exp(se[i] - maximum[i]) : 0.0F;
-            es[lane * EStride + wave + 8U * i] = se[i];
-        }
+            for (unsigned i = 0; i < 8; ++i) {
+                // exp is applied here, a stage after the load was issued.
+                if constexpr (Fused) se[i] = seen(stage, i) ? declared_exp(se[i] - maximum[i]) : 0.0F;
+                es[ep][lane * EStride + wave + 8U * i] = se[i];
+            }
 #pragma unroll
-        for (unsigned i = 0; i < 16; ++i) vs[tid + threads * i] = sv[i];
+        for (unsigned i = 0; i < Staged; ++i) vs[vp][staging + threads * RowParts * i] = sv[i];
         if (stage + 1U < stages) pointers(stage + 1U);
         __syncthreads();
         if (stage + 1U < stages) load(stage + 1U);
         if constexpr (Fused) {
-            if (tid < 64U) {
+            if (own && tid < 64U) {
 #pragma unroll 8
-                for (unsigned key = 0; key < Keys; ++key) chunk = chunk + es[key * EStride + tid];
+                for (unsigned key = 0; key < Keys; ++key) chunk = chunk + es[ep][key * EStride + tid];
                 if (stage & 1U) { denominator = denominator + chunk; chunk = 0.0F; }
             }
         }
 #pragma unroll 2
         for (unsigned key = 0; key < Keys; ++key) {
-            const float4 x = *reinterpret_cast<const float4*>(es + key * EStride + 4U * tq);
-            const float4 y0 = *reinterpret_cast<const float4*>(vs + key * Cols + 8U * cg);
-            const float4 y1 = *reinterpret_cast<const float4*>(vs + key * Cols + 8U * cg + 4U);
+            const float4 x = *reinterpret_cast<const float4*>(es[ep] + key * EStride + 4U * tq);
+            const float4 y0 = *reinterpret_cast<const float4*>(vs[vp] + key * Cols + 8U * cg);
+            const float4 y1 = *reinterpret_cast<const float4*>(vs[vp] + key * Cols + 8U * cg + 4U);
             const float ev[4] = {x.x, x.y, x.z, x.w}, vv[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
 #pragma unroll
             for (unsigned a = 0; a < 4; ++a)
@@ -415,14 +454,14 @@ __global__ __launch_bounds__(threads) void canonical_values(const float* scores,
         }
     }
     if constexpr (Fused) {
-        if (tid < 64U) merged[tid] = denominator;
+        if (own && tid < 64U) merged[ep][tid] = denominator;
         __syncthreads();
     }
     if (tq >= count) return;
     const auto row = row0 + tq;
 #pragma unroll
     for (unsigned a = 0; a < 4; ++a) {
-        const float total = Fused ? merged[4U * tq + a] : denominators[std::size_t(row) * heads + head0 + a];
+        const float total = Fused ? merged[ep][4U * tq + a] : denominators[std::size_t(row) * heads + head0 + a];
 #pragma unroll
         for (unsigned b = 0; b < 8; ++b) {
             const float value = numerator[a][b] / total;
@@ -441,6 +480,52 @@ bool same_descriptor(const gpu::KvRead& a, const gpu::KvRead& b) {
 bool canonical_kernel_enabled() {
     static const bool enabled = [] {
         const auto* p = std::getenv("STRIX_G4_PREFILL_CANON_KERNEL");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled;
+}
+// Default on: score and value grids run row tiles fastest (same bytes). Measured v1 32K prefill attention
+// 19.26 -> 16.51 s (1,037 -> 1,138 tok/s, profiled), 8K unchanged (1,400 ms). OFF: STRIX_G4_PREFILL_CANON_ROWS_MAJOR=0.
+bool canonical_rows_major_enabled() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_PREFILL_CANON_ROWS_MAJOR");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled;
+}
+// STRIX_G4_PREFILL_CANON_GROUP=G (1..64): grouped score grid of G row tiles; default 8 (attention -5 % at 8K with
+// the wide values), 0 = off.
+unsigned canonical_group_rows() {
+    static const unsigned g = [] {
+        const auto* p = std::getenv("STRIX_G4_PREFILL_CANON_GROUP");
+        const long v = p ? std::strtol(p, nullptr, 10) : 8;
+        return v > 0 && v <= 64 ? unsigned(v) : 0U;
+    }();
+    return g;
+}
+// STRIX_G4_PREFILL_CANON_VGROUP=G (1..64): grouped value grid, G row tiles x all column slices (0 = off).
+unsigned canonical_value_group_rows() {
+    static const unsigned g = [] {
+        const auto* p = std::getenv("STRIX_G4_PREFILL_CANON_VGROUP");
+        const long v = p ? std::strtol(p, nullptr, 10) : 0;
+        return v > 0 && v <= 64 ? unsigned(v) : 0U;
+    }();
+    return g;
+}
+// STRIX_G4_PREFILL_CANON_TALL=1: D512 values in 512-thread blocks of two 16-row tiles sharing one value tile
+// (same bytes; default off).
+bool canonical_tall_values_enabled() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_PREFILL_CANON_TALL");
+        return p && std::string_view(p) == "1";
+    }();
+    return enabled;
+}
+// STRIX_G4_PREFILL_CANON_WIDE (default on, 0 = off): D512 values in 512-thread blocks of two 128-column parts
+// sharing one probability tile (same bytes).
+bool canonical_wide_values_enabled() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_PREFILL_CANON_WIDE");
         return !p || std::string_view(p) != "0";
     }();
     return enabled;
@@ -499,8 +584,18 @@ bool canonical_attention(const float* q, std::span<const gpu::KvRead> reads, uns
         if (!marks[i] && hipEventCreate(&marks[i]) != hipSuccess) throw std::runtime_error("canonical attention event");
         if (hipEventRecord(marks[i], stream) != hipSuccess) throw std::runtime_error("canonical attention event");
     };
-    const dim3 tiles(span.width / key_tile, (rows + block_positions - 1U) / block_positions, heads / group);
-    const dim3 slices(dim / 128U, tiles.y, tiles.z);
+    const bool rows_major = canonical_rows_major_enabled();
+    const unsigned row_group = canonical_group_rows(), value_group = canonical_value_group_rows();
+    const unsigned row_tiles = (rows + block_positions - 1U) / block_positions;
+    const dim3 tiles = row_group ? dim3(row_tiles * (span.width / key_tile), 1, heads / group)
+                       : rows_major ? dim3(row_tiles, span.width / key_tile, heads / group) : dim3(span.width / key_tile, row_tiles, heads / group);
+    // TALL (D512) wins over WIDE when both are set.
+    const bool tall = dim == 512U && canonical_tall_values_enabled();
+    const unsigned parts = tall || (dim == 512U && canonical_wide_values_enabled()) ? 2U : 1U;
+    const unsigned nslices = dim / (128U * (tall ? 1U : parts));
+    const unsigned value_tiles = tall ? (rows + 2U * block_positions - 1U) / (2U * block_positions) : row_tiles;
+    const dim3 slices = value_group ? dim3(value_tiles * nslices, 1, heads / group)
+                        : rows_major ? dim3(value_tiles, nslices, heads / group) : dim3(nslices, value_tiles, heads / group);
     float* packed_queries = scratch.packed;
     float* packed_keys = packed ? scratch.packed + query_floats : nullptr;
     auto* present = packed ? reinterpret_cast<unsigned*>(packed_keys + std::size_t(span.width) * r.width) : nullptr;
@@ -529,7 +624,7 @@ bool canonical_attention(const float* q, std::span<const gpu::KvRead> reads, uns
     const float* query = packed ? packed_queries : q;
 #define G4_CANON_SCORES(D, P)                                                                                              \
     hipLaunchKernelGGL((canonical_scores<D, P>), tiles, dim3(threads), 0, stream, query, packed_keys, present, r, rows,   \
-                       heads, span.base, span.width, scratch.scores, maxima, failure)
+                       heads, span.base, span.width, scratch.scores, maxima, failure, rows_major, row_group)
     if (dim == 256U) { if (packed) G4_CANON_SCORES(256, true); else G4_CANON_SCORES(256, false); }
     else { if (packed) G4_CANON_SCORES(512, true); else G4_CANON_SCORES(512, false); }
 #undef G4_CANON_SCORES
@@ -538,11 +633,13 @@ bool canonical_attention(const float* q, std::span<const gpu::KvRead> reads, uns
         hipLaunchKernelGGL(canonical_softmax, dim3((rows * heads + threads / 32U - 1U) / (threads / 32U)), dim3(threads), 0,
                            stream, scratch.scores, scratch.denominators, r, rows, heads, span.base, span.width);
     mark(3);
-#define G4_CANON_VALUES(D, F)                                                                                              \
-    hipLaunchKernelGGL((canonical_values<D, F>), slices, dim3(threads), 0, stream, scratch.scores, scratch.denominators,  \
-                       r, rows, heads, span.base, span.width, out, failure)
-    if (dim == 256U) { if (fused) G4_CANON_VALUES(256, true); else G4_CANON_VALUES(256, false); }
-    else { if (fused) G4_CANON_VALUES(512, true); else G4_CANON_VALUES(512, false); }
+#define G4_CANON_VALUES(D, F, N, T)                                                                                         \
+    hipLaunchKernelGGL((canonical_values<D, F, N, T>), slices, dim3(threads * N), 0, stream, scratch.scores,              \
+                       scratch.denominators, r, rows, heads, span.base, span.width, out, failure, rows_major, value_group)
+    if (dim == 256U) { if (fused) G4_CANON_VALUES(256, true, 1, false); else G4_CANON_VALUES(256, false, 1, false); }
+    else if (tall) { if (fused) G4_CANON_VALUES(512, true, 2, true); else G4_CANON_VALUES(512, false, 2, true); }
+    else if (parts == 2U) { if (fused) G4_CANON_VALUES(512, true, 2, false); else G4_CANON_VALUES(512, false, 2, false); }
+    else { if (fused) G4_CANON_VALUES(512, true, 1, false); else G4_CANON_VALUES(512, false, 1, false); }
 #undef G4_CANON_VALUES
     mark(4);
     if (const auto e = hipGetLastError(); e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));

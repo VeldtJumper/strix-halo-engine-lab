@@ -272,6 +272,8 @@ Prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8
 | 4K | 509 | **2,249** | 1,478 |
 | 8K | 481 | **1,957** | 1,349 |
 
+Las rutas mantienen la atención canónica, idéntica en bytes a la atención de decodificación. Su rejilla de scores recorre primero las teselas de filas en grupos de 8 y sus valores D512 se calculan en bloques de 512 hilos que comparten una tesela de probabilidades en LDS: atención 8K 1,333 → 1,265 ms (−5.3 %), 32K 16.83 → 15.91 s (−5.5 %), mismos bytes; se apaga con `STRIX_G4_PREFILL_CANON_WIDE=0 STRIX_G4_PREFILL_CANON_GROUP=0` (`STRIX_G4_PREFILL_CANON_ROWS_MAJOR=0` vuelve a recorrer primero las teselas de claves).
+
 Comandos de llama.cpp: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 0 -r 2 -p 512,2048,8192` y `-r 1 -p 16384,32768`; el servidor de llama.cpp `74a4fb00` con

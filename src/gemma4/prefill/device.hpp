@@ -83,6 +83,7 @@ struct CanonicalSpan {
     unsigned width = 0;
 };
 [[nodiscard]] bool canonical_pack_enabled(); // startup-cached STRIX_G4_PREFILL_CANON_PACK, default on
+[[nodiscard]] bool canonical_rows_major_enabled(); // startup-cached STRIX_G4_PREFILL_CANON_ROWS_MAJOR, default on
 [[nodiscard]] bool canonical_fuse_enabled(); // startup-cached STRIX_G4_PREFILL_CANON_FUSE, default on
 [[nodiscard]] CanonicalSpan canonical_span(const gpu::KvRead& first_row, unsigned rows);
 // Packed queries/keys (post-order lane layout) and key presence for launch one.

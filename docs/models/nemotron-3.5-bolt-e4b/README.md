@@ -257,6 +257,8 @@ until then. Q4_K_M, one node, prefill tok/s, interleaved runs in one session:
 | 4K | 509 | **2,249** | 1,478 |
 | 8K | 481 | **1,957** | 1,349 |
 
+The routes keep canonical attention, byte-identical to the decode attention. Its score grid runs row tiles first in groups of 8 and its D512 values run in 512-thread blocks that share one staged probability tile: attention 8K 1,333 → 1,265 ms (−5.3 %), 32K 16.83 → 15.91 s (−5.5 %), same bytes; off with `STRIX_G4_PREFILL_CANON_WIDE=0 STRIX_G4_PREFILL_CANON_GROUP=0` (`STRIX_G4_PREFILL_CANON_ROWS_MAJOR=0` restores key tiles first).
+
 llama.cpp commands: C1 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 128 -p 0 -r 3`; C4/C8
 `llama-batched-bench -m Q4_K_M.gguf -fa on -ngl 99 -c 2048 -npp 64 -ntg 32 -npl 1,4,8`; prefill
 `llama-bench -m Q4_K_M.gguf -fa 1 -ngl 99 -n 0 -r 2 -p 512,2048,8192` and `-r 1 -p 16384,32768`; the llama.cpp `74a4fb00` server with
