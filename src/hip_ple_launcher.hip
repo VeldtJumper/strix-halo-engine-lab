@@ -2810,7 +2810,7 @@ HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationSt
         for (std::size_t i = 0; i < tensors.size(); ++i) if (tensors[i].role == TensorRole::ngram_table) {
             const auto* runtime = find_runtime_tensor_binding(*prime_resources->model_weights, static_cast<std::uint32_t>(i));
             if (!runtime) throw std::invalid_argument("PLE setup prime lacks its actual table binding");
-            w.start_rolling_stage(reclaim, 0, prime_resources->ple_hash_contract->row_bytes, {&tensors[i], runtime});
+            w.start_rolling_stage(reclaim, reclaim->prompt_begin(), prime_resources->ple_hash_contract->row_bytes, {&tensors[i], runtime});
             break;
         }
     }
@@ -2823,11 +2823,11 @@ void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows
     // First-block source reads have already been primed by Prefetcher setup.
     // Start its copy while the preflight and earlier GPU steps are still ahead.
     auto* reclaim = ple_reclaim::active();
-    if (impl_->prefill && rows[0].position == 0 && reclaim && reclaim->rolling() && !impl_->stage.active) {
+    if (impl_->prefill && reclaim && rows[0].position == reclaim->prompt_begin() && reclaim->rolling() && !impl_->stage.active) {
         const auto* backend = dynamic_cast<FileMappedPleLookupBackend*>(rows[0].resources->ple_lookup);
         if (backend && !(rows[0].resources->ple_prefetch && rows[0].resources->ple_prefetch->active)) {
             const auto turn = backend->residency();
-            impl_->start_rolling_stage(reclaim, 0, prepared[0].hash_contract.row_bytes, prepared[0].tensors.table, turn);
+            impl_->start_rolling_stage(reclaim, reclaim->prompt_begin(), prepared[0].hash_contract.row_bytes, prepared[0].tensors.table, turn);
         }
     }
 }

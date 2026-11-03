@@ -1161,6 +1161,7 @@ static int run_decode_entry(
             "  --prefix-cache-staging-bytes N (0: one T-block plus fixed state; STRIX_PREFIX_CACHE_STAGING_BYTES)\n"
             "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
+            "  --rtx-state-import-file NAME.json (fresh CLI prefix import; NAME.bin beside it, --prompt-ids is full prompt)\n"
             "  --http-serve [--http-bind ADDR] [--http-port N] [--http-model-id NAME] [--http-api-key-file FILE]\n"
             "      [--http-sampling greedy|reject] [--http-default-max-tokens N] [--http-max-queue N] [--http-max-connections N]\n"
             "      (OpenAI/Anthropic-compatible HTTP server on the tiled MTP route; the prompt is the calibration prompt)\n"
@@ -1183,6 +1184,10 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
+    if (!options.rtx_state_import_file.empty()) {
+        const auto metadata = strix::decode_cli::read_rtx_state_import_metadata(options.rtx_state_import_file, options.tokens);
+        options.rtx_state_import_position = strix::decode_cli::parse_rtx_state_begin(metadata).position;
+    }
     bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty();
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     options.mtp_cli_phase_retirement=false;
@@ -2437,6 +2442,8 @@ static int run_decode_entry(
             const char* decode_bytes = std::getenv("STRIX_PLE_RECLAIM_DECODE_BYTES");
             config.decode_allowance_bytes = strix::ple_reclaim::decode_allowance(config.rolling_positions ? 0U : options.generate_tokens, config.rolling_positions ? 1U : lookups_per_token,
                 contract.head_count, page, decode_bytes ? std::strtoull(decode_bytes, nullptr, 10) : 0U);
+            if (!options.http_serve && !options.rtx_state_import_file.empty())
+                config.prompt_begin = options.rtx_state_import_position;
             config.ahead_rows = 2U * options.known_prefix_prefill_rows;
             if (config.rolling_positions)
                 config.critical_rows = options.known_prefix_prefill_rows;
@@ -4956,6 +4963,21 @@ static int run_decode_entry(
         }
 
         auto* session_registry = prefix_state ? prefix_state.get() : rtx_state_session.get();
+        if (!options.rtx_state_import_file.empty()) {
+            if (!session_registry) throw std::logic_error("CLI import state registry missing");
+            strix::decode_cli::RtxStateImportFacts facts;
+            for (const auto& step : compiled.execution.steps) {
+                const auto written = static_cast<std::uint32_t>(step.writes_state);
+                facts.valid_union = facts.valid_union | step.writes_state;
+                for (std::size_t f = 0; f < facts.generations_per_row.size(); ++f)
+                    if (written & (1U << f)) ++facts.generations_per_row[f];
+            }
+            facts.model_content = model_residency.binding().model_content_identity;
+            session_registry->set_rtx_facts(facts);
+            auto imports = std::make_shared<strix::RtxStateImportRegistry>(strix::decode_cli::hip_pinned_prefix_buffer, 1, 0);
+            session_registry->enable_rtx_import(imports, session);
+            strix::decode_cli::stage_rtx_state_import_file(*imports, options.rtx_state_import_file, options.tokens, 4U << 20U, options.rtx_state_import_position);
+        }
         strix::SessionCompatibility session_compatibility;
         std::vector<std::uint32_t> session_history;
         std::optional<std::uint32_t> session_pending;
@@ -5025,7 +5047,7 @@ static int run_decode_entry(
             std::size_t i = 0;
             const auto rows = options.known_prefix_prefill_rows;
             const auto suffix_plan = strix::plan_session_suffix(session.next_position, inputs.size(), rows,
-                options.session_tiled_suffix && static_cast<bool>(known_prefill_plan));
+                (options.session_tiled_suffix || !options.rtx_state_import_file.empty()) && static_cast<bool>(known_prefill_plan));
             const bool tiled = suffix_plan.tiled;
             const auto alignment = suffix_plan.serial_rows;
             const auto serial = static_cast<std::size_t>(alignment);
@@ -5295,6 +5317,12 @@ static int run_decode_entry(
                     original_work_device->recover_or_fail_stop();
                     throw;
                 }
+            }
+            if (!options.rtx_state_import_file.empty()) {
+                const auto restored = session_registry->begin_request(session, options.tokens);
+                if (!restored) throw std::runtime_error("CLI import was not restored");
+                return run_session_suffix(std::span<const std::uint32_t>(options.tokens).subspan(
+                    static_cast<std::size_t>(restored)));
             }
             if (!known_prefix_backend) return options.gpu_greedy_token
                 ? strix::execute_serial_greedy_token_request(request, *generation_backend)

@@ -1,5 +1,6 @@
 #include "strix/startup_markers.hpp"
 #pragma once
+#include "rtx_state_import_routes.hpp"
 #include "qwen_yarn_memory.hpp"
 #include "mtp_asset_verification.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
@@ -2492,6 +2493,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     if(parents->tiled.cache && parents->tiled.cache->has_store())
                         options.state_cache_stats->publish(prefix_snapshot(parents->tiled.cache->store()));
                 });
+
+            if (!options.rtx_state_import_file.empty())
+                stage_rtx_state_import_file(*parents->tiled.rtx_import, options.rtx_state_import_file, options.tokens, 4U << 20U, options.rtx_state_import_position);
 
             std::uint64_t served=0;
                 const MtpServeRunner ordinary_request=[&](const MtpServeRequest& q) {

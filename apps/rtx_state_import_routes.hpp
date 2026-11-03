@@ -5,7 +5,7 @@
 //
 //   GET  /admin/rtx-import/layout
 //   POST /admin/rtx-import/begin        JSON {tokens, position, producer{numerical,reduction,state_update}, layout_identity,
-//                                             geometry_identity?, keep?, encoding?, local_rows?} -> {id, payload_bytes, ...}
+//                                             geometry_identity?, rotary?, context_tokens?, keep?, encoding?, local_rows?} -> {id, payload_bytes, ...}
 //   POST /admin/rtx-import/chunk?id=I&component=C&first_row=R      body: whole rows of row component C (id or index)
 //   POST /admin/rtx-import/chunk?id=I&fixed=F&offset=O             body: bytes [O, O+n) of fixed component F
 //   POST /admin/rtx-import/chunks?id=I                             body: segments (parse_rtx_chunk_segments)
@@ -21,6 +21,9 @@
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/json.hpp"
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -87,6 +90,9 @@ inline serve::Json rtx_layout_json(const RtxStateLayout& l) {
     out.set("valid_union", Json(static_cast<std::uint64_t>(l.valid_union)));
     out.set("valid_base", Json(static_cast<std::uint64_t>(l.valid_base)));
     out.set("max_context", Json(l.context_tokens));
+    out.set("context_tokens", Json(l.context_tokens));
+    out.set("rotary", serve::parse_json(l.rotary.descriptor().mode() == RotaryMode::yarn
+        ? l.rotary.json() : l.rotary.descriptor().json()));
     out.set("model_content", Json(l.model_content_hex));
     out.set("identity_extension", Json(l.identity_extension_hex));
     out.set("cache_identity", Json(l.cache_identity_hex));
@@ -108,6 +114,163 @@ inline std::size_t rtx_component_index(const RtxStateLayout& layout, const std::
     try { index = rtx_parse_u64(name); } catch (const std::invalid_argument&) {}
     if (index >= count) throw std::invalid_argument(std::string("unknown ") + (fixed ? "fixed" : "row") + " component " + name);
     return static_cast<std::size_t>(index);
+}
+
+// One begin parser for HTTP and file imports; admission remains in RtxStateStaging.
+inline RtxStateBeginRequest parse_rtx_state_begin(const serve::Json& body) {
+    if (!body.is_object()) throw std::invalid_argument("the begin body must be a JSON object");
+    RtxStateBeginRequest begin;
+    const auto* tokens = body.find("tokens");
+    const auto* position = body.find("position");
+    const auto* producer = body.find("producer");
+    const auto* layout_identity = body.find("layout_identity");
+    if (!tokens || !tokens->is_array() || !position || !producer || !producer->is_object() || !layout_identity)
+        throw std::invalid_argument("begin takes tokens (array), position, producer {numerical, reduction, state_update} and layout_identity");
+    for (const auto& t : tokens->as_array()) {
+        const auto v = rtx_json_u64(t, "token");
+        if (v > UINT32_MAX) throw std::invalid_argument("token exceeds uint32");
+        begin.tokens.push_back(static_cast<std::uint32_t>(v));
+    }
+    begin.position = rtx_json_u64(*position, "position");
+    const auto id_of = [&](const char* key) {
+        const auto* v = producer->find(key);
+        if (!v) throw std::invalid_argument(std::string("producer.") + key + " is required");
+        return rtx_json_u64(*v, key);
+    };
+    begin.producer = {id_of("numerical"), id_of("reduction"), id_of("state_update")};
+    begin.layout_identity = rtx_json_u64(*layout_identity, "layout_identity");
+    if (const auto* g = body.find("geometry_identity")) begin.geometry_identity = rtx_json_u64(*g, "geometry_identity");
+    if (const auto* c = body.find("context_tokens")) begin.context_tokens = rtx_json_u64(*c, "context_tokens");
+    if (const auto* r = body.find("rotary")) {
+        if (!r->is_object()) throw std::invalid_argument("rotary identity must be an object");
+        const auto* mode = r->find("rope_mode");
+        if (r->size() == 0) begin.rotary = RotaryIdentity{};
+        else {
+            const auto* factor = r->find("factor");
+            const auto* original = r->find("original_max");
+            if (!mode || !mode->is_string() || !factor || !original ||
+                rtx_json_u64(*original, "rotary.original_max") != RotaryDescriptor::original_max)
+                throw std::invalid_argument("rotary identity requires rope_mode, factor and original_max=262144");
+            const auto f = rtx_json_u64(*factor, "rotary.factor");
+            if (mode->as_string() == "native" && f == 0) {
+                if (const auto* table = r->find("table_sha256"); table && !table->is_null())
+                    throw std::invalid_argument("native rotary identity must not carry a table SHA256");
+                begin.rotary = RotaryIdentity{};
+            } else if (mode->as_string() == "yarn" && (f == 2 || f == 4)) {
+                const auto* table = r->find("table_sha256");
+                if (!table || !table->is_string()) throw std::invalid_argument("rotary identity requires table_sha256");
+                begin.rotary = RotaryIdentity(RotaryDescriptor::yarn(static_cast<std::uint32_t>(f)),
+                    rtx_parse_sha256(table->as_string()));
+            } else throw std::invalid_argument("rotary identity has invalid mode or factor");
+        }
+    }
+    if (const auto* k = body.find("keep"); k && k->is_bool()) begin.keep = k->as_bool();
+    if (const auto* q = body.find("local_rows")) begin.local_rows = rtx_json_u64(*q, "local_rows");
+    if (const auto* e = body.find("encoding"); e && !e->is_null()) {
+        if (!e->is_string()) throw std::invalid_argument("begin encoding must be a string");
+        if (e->as_string() != "identity") begin.encoding = e->as_string();
+    }
+    return begin;
+}
+
+// CPU-only metadata preflight shared with staging. The payload and runtime identities
+// remain independently validated by the registry before any state is restored.
+inline serve::Json read_rtx_state_import_metadata(const std::filesystem::path& path,
+    std::span<const std::uint32_t> prompt) {
+    std::ifstream metadata(path, std::ios::binary | std::ios::ate);
+    if (!metadata || metadata.tellg() < 0 || metadata.tellg() > (64 << 20))
+        throw std::invalid_argument("cannot read import JSON (limit 64 MiB)");
+    std::string text(static_cast<std::size_t>(metadata.tellg()), '\0');
+    metadata.seekg(0);
+    if (!metadata.read(text.data(), static_cast<std::streamsize>(text.size())))
+        throw std::invalid_argument("cannot read import JSON");
+    auto body = serve::parse_json(text);
+    const auto begin = parse_rtx_state_begin(body);
+    if (!begin.position || begin.position != begin.tokens.size() || begin.tokens.size() >= prompt.size() ||
+        !std::equal(begin.tokens.begin(), begin.tokens.end(), prompt.begin()))
+        throw std::invalid_argument("import tokens must match position and prefix the full prompt with a nonempty suffix");
+    return body;
+}
+
+// The file is canonical component-order bytes, including zero fixed-blob padding.
+// Only the registry owns pinned payload storage; the reader uses a bounded ordinary buffer.
+inline void stage_rtx_state_import_file(RtxStateImportRegistry& registry, const std::filesystem::path& path,
+    std::span<const std::uint32_t> prompt, std::size_t chunk_bytes = 4U << 20U, std::uint64_t expected_position = 0) {
+    if (!chunk_bytes || chunk_bytes > (64U << 20U)) throw std::invalid_argument("invalid import file chunk size");
+    const auto body = read_rtx_state_import_metadata(path, prompt);
+    auto begin = parse_rtx_state_begin(body);
+    if (expected_position && begin.position != expected_position)
+        throw std::invalid_argument("import position changed after PLE admission");
+    const auto* bytes = body.find("payload_bytes");
+    const auto* sha = body.find("payload_sha256");
+    if (!bytes || !sha || !sha->is_string()) throw std::invalid_argument("import requires payload_bytes and payload_sha256");
+    const auto expected_bytes = rtx_json_u64(*bytes, "payload_bytes");
+    const auto expected_sha = rtx_parse_sha256(sha->as_string());
+    auto binary = path;
+    binary.replace_extension(".bin");
+    if (std::filesystem::file_size(binary) != expected_bytes) throw std::invalid_argument("import payload_bytes mismatch");
+    std::ifstream input(binary, std::ios::binary);
+    if (!input) throw std::invalid_argument("cannot open import payload");
+    const auto id = registry.begin(std::move(begin));
+    try {
+        const auto staging = registry.find(id);
+        if (staging->payload_bytes() != expected_bytes) throw std::invalid_argument("import payload_bytes differs from layout");
+        const auto& layout = staging->layout();
+        std::vector<std::byte> buffer(chunk_bytes);
+        Sha256Fast payload_sha;
+        std::vector<ModelContentIdentity> digests;
+        std::uint64_t data_bytes = 0;
+        const auto read = [&](std::size_t n) {
+            if (!input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(n)))
+                throw std::invalid_argument("truncated import payload");
+            const auto data = std::span<const std::byte>(buffer).first(n);
+            payload_sha.update(data);
+            return data;
+        };
+        const auto write = [&](const RtxStateSegment& segment, std::span<const std::byte> data) {
+            RtxStateChunkRecord record;
+            record.seq = digests.size(); record.digest = rtx_chunk_digest(data); record.wire_bytes = data.size();
+            staging->write_chunk(std::span<const RtxStateSegment>(&segment, 1), record);
+            digests.push_back(record.digest); data_bytes += data.size();
+        };
+        for (std::size_t c = 0; c < layout.rows.size(); ++c) {
+            const auto bpr = layout.rows[c].bytes_per_row;
+            if (bpr > chunk_bytes) throw std::invalid_argument("import row exceeds chunk bound");
+            const auto rows = staging->position() > layout.rows[c].shift ? staging->position() - layout.rows[c].shift : 0;
+            for (std::uint64_t first = 0; first < rows;) {
+                const auto n = std::min<std::uint64_t>(rows - first, chunk_bytes / bpr);
+                const auto data = read(static_cast<std::size_t>(n * bpr));
+                write(staging->rows_segment(c, first, data), data); first += n;
+            }
+        }
+        std::uint64_t fixed_at = 0;
+        const auto padding = [&](std::uint64_t n) {
+            while (n) {
+                const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(n, chunk_bytes));
+                const auto data = read(count);
+                if (std::any_of(data.begin(), data.end(), [](std::byte b) { return b != std::byte{0}; }))
+                    throw std::invalid_argument("import fixed padding must be zero");
+                n -= count;
+            }
+        };
+        for (std::size_t c = 0; c < layout.fixed.size(); ++c) {
+            const auto& f = layout.fixed[c];
+            padding(f.offset - fixed_at);
+            for (std::uint64_t at = 0; at < f.bytes;) {
+                const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(f.bytes - at, chunk_bytes));
+                const auto data = read(count);
+                write(staging->fixed_segment(c, at, data), data); at += count;
+            }
+            fixed_at = f.offset + f.bytes;
+        }
+        padding(layout.fixed_bytes - fixed_at);
+        if (input.peek() != std::char_traits<char>::eof()) throw std::invalid_argument("extra import payload bytes");
+        if (payload_sha.finalize() != expected_sha) throw std::invalid_argument("import payload_sha256 mismatch");
+        registry.commit(id, {digests.size(), data_bytes, rtx_manifest_digest(digests), false});
+    } catch (...) {
+        registry.abort(id);
+        throw;
+    }
 }
 
 // Handles /admin/rtx-import/* (returns false for any other path). Answers every error itself.
@@ -165,34 +328,7 @@ inline bool handle_rtx_state_import_route(RtxStateImportRegistry& registry, cons
             Json body;
             try { body = serve::parse_json(request.body); }
             catch (const serve::JsonError& e) { throw std::invalid_argument(std::string("invalid JSON body: ") + e.what()); }
-            if (!body.is_object()) throw std::invalid_argument("the begin body must be a JSON object");
-            RtxStateBeginRequest begin;
-            const auto* tokens = body.find("tokens");
-            const auto* position = body.find("position");
-            const auto* producer = body.find("producer");
-            const auto* layout_identity = body.find("layout_identity");
-            if (!tokens || !tokens->is_array() || !position || !producer || !producer->is_object() || !layout_identity)
-                throw std::invalid_argument("begin takes tokens (array), position, producer {numerical, reduction, state_update} and layout_identity");
-            for (const auto& t : tokens->as_array()) {
-                const auto v = rtx_json_u64(t, "token");
-                if (v > UINT32_MAX) throw std::invalid_argument("token exceeds uint32");
-                begin.tokens.push_back(static_cast<std::uint32_t>(v));
-            }
-            begin.position = rtx_json_u64(*position, "position");
-            const auto id_of = [&](const char* key) {
-                const auto* v = producer->find(key);
-                if (!v) throw std::invalid_argument(std::string("producer.") + key + " is required");
-                return rtx_json_u64(*v, key);
-            };
-            begin.producer = {id_of("numerical"), id_of("reduction"), id_of("state_update")};
-            begin.layout_identity = rtx_json_u64(*layout_identity, "layout_identity");
-            if (const auto* g = body.find("geometry_identity")) begin.geometry_identity = rtx_json_u64(*g, "geometry_identity");
-            if (const auto* k = body.find("keep"); k && k->is_bool()) begin.keep = k->as_bool();
-            if (const auto* q = body.find("local_rows")) begin.local_rows = rtx_json_u64(*q, "local_rows");
-            if (const auto* e = body.find("encoding"); e && !e->is_null()) {
-                if (!e->is_string()) throw std::invalid_argument("begin encoding must be a string");
-                if (e->as_string() != "identity") begin.encoding = e->as_string();
-            }
+            auto begin = parse_rtx_state_begin(body);
             const auto encoding = begin.encoding;
             const auto start = std::chrono::steady_clock::now();
             const auto position_value = begin.position;

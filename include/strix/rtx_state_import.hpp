@@ -12,6 +12,7 @@
 // once. The canonical-payload SHA-256 is an optional diagnostic. No GPU here: the engine copies a committed
 // staging into device state.
 #include "strix/bp_codec.hpp"
+#include "strix/rotary_descriptor.hpp"
 #include "strix/model_runtime_binding.hpp"
 #include "strix/prefix_state_cache.hpp"
 
@@ -49,7 +50,8 @@ struct RtxStateLayout {
     std::vector<RtxStateFixedComponent> fixed;
     std::uint64_t row_bytes = 0, fixed_bytes = 0;
     std::uint64_t layout_identity = 0;  // the session state layout identity of the consumer
-    std::uint64_t context_tokens = 0;
+    std::uint64_t context_tokens = 0;  // consumer route capacity
+    RotaryIdentity rotary;  // resolved model identity, including the existing table SHA256
     // Descriptive (the consumer's own facts, reported so a producer can check it targets the same model):
     // per prompt row, how many times each persistent-state flag generation advances (the serial plan's
     // writes), the union of written flags, the fresh session's generations, model and identity extension digests.
@@ -70,7 +72,8 @@ struct RtxStateLayout {
 };
 
 // FNV-1a over the component list and the layout identity: a producer that echoes it proves it splits the
-// payload exactly as this consumer does.
+// payload exactly as this consumer does. YaRN additionally binds route capacity and
+// the resolved rotary identity; native retains the original identity byte stream.
 [[nodiscard]] std::uint64_t rtx_state_geometry_identity(const RtxStateLayout& layout);
 
 struct RtxStateProducer {
@@ -82,7 +85,9 @@ struct RtxStateBeginRequest {
     std::uint64_t position = 0;
     RtxStateProducer producer;
     std::uint64_t layout_identity = 0;    // must equal the consumer's
-    std::uint64_t geometry_identity = 0;  // 0: not checked
+    std::uint64_t geometry_identity = 0;  // 0: native unchecked; YaRN needs explicit rotary + capacity
+    std::optional<RotaryIdentity> rotary;
+    std::optional<std::uint64_t> context_tokens;
     bool keep = false;                    // true: a request does not consume the parked state
     // Chunk encoding the producer may use ("" = none; "bp-v1": chunks with X-Chunk-Encoding: bp-v1 carry a
     // bp_codec frame of the plain body). Chunks without the header are plain either way.

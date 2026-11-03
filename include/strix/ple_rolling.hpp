@@ -180,7 +180,7 @@ public:
     };
     struct PromptConfig {
         std::span<const std::uint32_t> rows;
-        std::uint64_t cap = 0, ahead = 0, block_rows = 0;
+        std::uint64_t cap = 0, ahead = 0, block_rows = 0, first_position = 0;
     };
     void configure_prompt(PromptConfig config);
     ResidencyManager(std::string backing, std::uintptr_t table, std::uint64_t generation,

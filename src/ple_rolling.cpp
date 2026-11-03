@@ -796,7 +796,9 @@ void ResidencyManager::Turn::observe(std::uint64_t first, std::span<const std::u
         const std::lock_guard lock(manager_->mutex_);
         auto& s = manager_->state(id_);
         if (!s.prompt) throw std::runtime_error("PLE residency: stale prompt observer");
-        if (s.pipeline) s.pipeline->advance(first + rows.size() / manager_->heads_);
+        if (first < manager_->prompt_config_.first_position)
+            throw std::out_of_range("PLE observer precedes suffix");
+        if (s.pipeline) s.pipeline->advance(first - manager_->prompt_config_.first_position + rows.size() / manager_->heads_);
         observer = s.observer;
     }
     try { if (observer) observer(first, rows, ns, minflt, majflt); }
@@ -874,7 +876,11 @@ void ResidencyManager::Turn::gather_prompt(std::uint64_t first, std::uint64_t co
         pipeline = s.pipeline; manager_->permit_ = id_;
     }
     std::exception_ptr error;
-    try { pipeline->gather_range(first, count, copy); }
+    try {
+        const auto base = manager_->prompt_config_.first_position;
+        if (first < base) throw std::out_of_range("PLE gather precedes suffix");
+        pipeline->gather_range(first - base, count, [&](auto p, auto n) { copy(p + base, n); });
+    }
     catch (...) { error = std::current_exception(); }
     {
         std::unique_lock lock(manager_->mutex_);
@@ -890,6 +896,9 @@ std::shared_ptr<const DirectPageCache::View> ResidencyManager::Turn::prompt_view
     const std::lock_guard lock(manager_->mutex_);
     auto& s = manager_->turns_.at(id_);
     if (manager_->failed_) throw std::runtime_error("PLE residency: invalidated prompt view");
+    const auto base = manager_->prompt_config_.first_position;
+    if (first < base) throw std::out_of_range("PLE view precedes suffix");
+    first -= base;
     const auto& rows = manager_->prompt_config_.rows;
     const auto heads = manager_->heads_;
     if (!s.prompt || !s.pipeline || manager_->permit_ != id_ || !count || count > manager_->h_ ||

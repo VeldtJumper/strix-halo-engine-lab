@@ -616,6 +616,22 @@ int main(){try{
         args.insert(args.end(),{"--http-selection-fast","off"});require(!parse(args).http_selection_fast,"argmax-first selection off");
         args.back()="invalid";reject_as(args,"--http-selection-fast requires on|off","argmax-first invalid value");
     }
+    {
+        auto args=request(); args.insert(args.begin()+5,{"4","5","6","7","8","9","10"}); args.insert(args.end(), {"--rtx-state-import-file","state.json","--rope-yarn","2","--context","524288"});
+        const auto imported=parse(args);
+        require(imported.rtx_state_import && imported.rtx_state_import_file=="state.json", "YaRN MTP CLI file import admitted");
+        args.insert(args.end(), {"--http-serve"});
+        reject(args,"file import refuses HTTP");
+        args.pop_back(); args.insert(args.end(), {"--http-batch","0"});
+        reject(args,"file import refuses HTTP batch");
+        const auto native=parse({"decoder","target.gguf","1","2","--generate","1","--rtx-state-import-file","state.json"});
+        require(native.rtx_state_import && !native.route_owned, "native import preserves automatic prefill routing");
+        reject_as({"decoder","target.gguf","1","--rtx-state-import-file","state.json","--http-port","8080"},
+            "--rtx-state-import-file refuses HTTP-only features", "file import refuses HTTP-only configuration");
+        const auto serial=parse({"decoder","target.gguf","1","2","--generate","1","--rope-yarn","2","--context","524288",
+            "--rtx-state-import-file","state.json"});
+        require(serial.rtx_state_import && !serial.mtp.enabled, "YaRN serial CLI file import admitted");
+    }
     expert_copy_cli_contract();
     depth_policy_options_contract();
     return 0;

@@ -336,7 +336,7 @@ public:
         std::uint32_t block_rows, std::uint64_t every, const ModelContract& model,
         const SerialSessionStateLayout& layout, const SessionStateMemoryBinding& memory)
         : store_(std::move(store)), identity_(identity), block_rows_(block_rows), every_(every),
-          layout_(layout), memory_(memory) {
+          layout_(layout), memory_(memory), rotary_(model.rotary_identity()) {
         // A null store: the component registry only (--rtx-state-import / STRIX_RTX_EXPORT_STATE without a prefix
         // cache): no capture, no lookup, no disk tier.
         if (!identity_.valid() || !block_rows_ || !every_ || every_ % block_rows_)
@@ -538,6 +538,7 @@ public:
         l.fixed_bytes = fixed_bytes_;
         l.layout_identity = layout_.layout_identity;
         l.context_tokens = layout_.context_tokens;
+        l.rotary = rotary_;
         if (rtx_facts_) {
             l.generations_per_row = rtx_facts_->generations_per_row;
             l.valid_union = static_cast<std::uint32_t>(rtx_facts_->valid_union);
@@ -1488,6 +1489,7 @@ private:
     bool fixed_mtp_sessions_ = false;
     const SerialSessionStateLayout& layout_;
     const SessionStateMemoryBinding& memory_;
+    const RotaryIdentity rotary_;
     std::size_t target_rows_=0,target_fixed_=0;
     std::vector<Row> rows_;
     std::vector<Fixed> fixed_;

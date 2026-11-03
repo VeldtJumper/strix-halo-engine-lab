@@ -296,6 +296,11 @@ inline std::optional<ple_reclaim::Config> prefill_reclaim_config(const Options& 
         }
         ple_reclaim::Config config;
         config.page = *page;
+        // HTTP imports retain their existing prompt-wide, nonrolling contract.
+        if (!options.http_serve && !options.rtx_state_import_file.empty()) {
+            if (!options.rtx_state_import_position || options.rtx_state_import_position >= options.tokens.size()) return {};
+            config.prompt_begin = options.rtx_state_import_position;
+        }
         config.table_offset = table->absolute_offset;
         config.table_rows = table->dimensions[1];
         config.stored_row_bytes = table->ggml_type == 20U ? table->dimensions[0] / 32U * 18U : table->dimensions[0] * 2U;
@@ -346,13 +351,16 @@ inline std::uint64_t prefill_rolling_owner_bytes(const Options& options, const M
     const ModelManifest& manifest, const Environment& environment, std::optional<std::uint64_t> page) {
     const auto config = prefill_reclaim_config(options,model,manifest,environment,page);
     return config && config->rolling_positions ? ple_reclaim::planned_owner_bytes(*config,
-        build_ple_hash_contract(model).head_count,options.tokens.size()) : 0U;
+        build_ple_hash_contract(model).head_count,options.tokens.size() - config->prompt_begin) : 0U;
 }
 // Shared CPU preflight for execution and HTTP --print-effective-config. Capacity
 // requiring actual device allocations is resolved later and remains provisional.
 inline void validate_effective_startup(const EffectiveConfig& config) {
     require_effective_prefill_execution(config);
     validate_http_serve(config.options);
+    if (!config.options.rtx_state_import_file.empty() &&
+        (!config.options.known_prefix_window || !config.options.known_prefix_prefill_rows))
+        throw std::invalid_argument("--rtx-state-import-file requires tiled CLI prefill");
     validate_prefix_state_cache(config.options);
 }
 inline void validate_effective_options(const Options& o, const ModelContract& model) {

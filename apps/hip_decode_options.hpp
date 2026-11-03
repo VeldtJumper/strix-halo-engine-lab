@@ -489,6 +489,8 @@ struct Options {
     // --rtx-state-import: opt-in /admin/rtx-import/* routes; a request whose prompt starts with a parked imported
     // state starts from it (docs/rtx-state-import.md). Single-request serving only (not --http-batch).
     bool rtx_state_import = false;
+    std::uint64_t rtx_state_import_position = 0; // CPU-validated CLI prefix boundary.
+    std::string rtx_state_import_file;  // CLI canonical JSON/bin pair; shares the import registry.
     // --rtx-state-import-decode-threads N: background workers that decode X-Chunk-Encoding: bp-v1 chunks (the
     // connection thread decodes too; created on the first encoded chunk).
     std::uint32_t rtx_state_import_decode_threads = 4;
@@ -555,6 +557,8 @@ inline bool cache_mtp_contract_qualified(const Options& o) {
 
 // Prefix-cache requests may restore or replace the original prompt in this process.
 // Keep their public prompt-wide PLE path until rolling owners are rebuilt per prompt.
+// CLI file import restores the prefix once; suffix rows use the same exact reader
+// as fresh prefill, with absolute positions and the restored prefix hash context.
 [[nodiscard]] inline bool ple_rolling_default_qualified(const Options& options) noexcept {
     return !options.mtp.enabled || options.rotary.mode()!=RotaryMode::yarn ||
         ((options.rotary.factor()==2U && options.context_tokens<=524288U) ||
@@ -565,7 +569,8 @@ inline bool cache_mtp_contract_qualified(const Options& o) {
     if (!ple_rolling_default_qualified(options) && !options.ple_rolling_explicit_opt_in &&
         !(explicit_on && std::string_view(explicit_on)=="1")) return false;
     return !options.prefix_cache_host_bytes && options.prefix_cache_dir.empty() &&
-        options.prefix_cache_then_prompts.empty() && !options.rtx_state_import;
+        options.prefix_cache_then_prompts.empty() &&
+        (!options.rtx_state_import || (!options.http_serve && !options.rtx_state_import_file.empty()));
 }
 
 // Shared by runtime setup, pre-HIP admission and the inactive witness.
@@ -599,7 +604,7 @@ inline bool cache_mtp_contract_qualified(const Options& o) {
         if (options.mtp.sample_timing_schedule) return "mtp-sample-timing-schedule";
         if (!options.mtp.copy_wide_rows.empty()) return "mtp-copy-wide-rows";
         if (options.prefix_cache_host_bytes || !options.prefix_cache_dir.empty()) return "prefix-cache-restore";
-        if (options.rtx_state_import) return "rtx-state-import";
+        if (options.rtx_state_import && (options.http_serve || options.rtx_state_import_file.empty())) return "rtx-state-import";
         if (!ple_rolling_prompt_supported(options)) return "unqualified-route-requires-STRIX_PLE_ROLLING=1";
         if (!options.raw_recording_path.empty()) return "raw-recording";
         if (!options.validation_final_state_path.empty()) return "validation-final-state";
@@ -1195,8 +1200,17 @@ inline void resolve_http_route(Options& o) {
 }
 // HTTP serving runs the tiled MTP route after one calibration replay.
 inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
-    if (o.rtx_state_import && (!o.http_serve || o.http_batch))
+    if (o.rtx_state_import && o.rtx_state_import_file.empty() && (!o.http_serve || o.http_batch))
         throw std::invalid_argument("--rtx-state-import requires --http-serve (the tiled MTP prompt) without --http-batch");
+    if (!o.rtx_state_import_file.empty()) {
+        for (const auto& flag : o.supplied_options)
+            if (flag.starts_with("--http-") || flag == "--rtx-state-import")
+                throw std::invalid_argument("--rtx-state-import-file refuses HTTP-only features");
+        if (o.http_serve || o.http_batch || o.session_options_requested || o.prompt_lookup ||
+            o.prefix_cache_roundtrip || prefix_state_cache_requested(o) || !o.serving_prefix_files.empty() ||
+            o.teacher_forced_score || o.execution.mode != DecodeExecutionMode::eager)
+            throw std::invalid_argument("--rtx-state-import-file requires a fresh single-request eager CLI route");
+    }
     if (o.rtx_state_import_decode_threads > 64U) throw std::invalid_argument("--rtx-state-import-decode-threads is 0..64");
     if (o.http_default_temperature.value_or(0.0) > 0.0 && o.http_sampling != "sample")
         throw std::invalid_argument("--http-default-temperature > 0 requires --http-sampling sample");
@@ -1658,7 +1672,7 @@ inline std::string yarn_route_refusal(const Options& o) {
         // Explicit qualification assets remain mandatory. Only this target organization is admitted.
         for(const auto& flag:o.supplied_options) {
             if(flag.starts_with("--mtp") || flag=="--prefix-batch-cert" || flag=="--rope-yarn" || flag=="--context" || flag=="--generate" ||
-               flag=="--unqualified-context" || flag=="--print-effective-config" || flag=="--prompt-ids" ||
+               flag=="--rtx-state-import-file" || flag=="--unqualified-context" || flag=="--print-effective-config" || flag=="--prompt-ids" ||
                flag=="--profile" || flag=="--allow-pending" ||
                flag=="--optimization-profile" || flag=="--known-prefix-window" || flag=="--known-prefix-full-rows" ||
                flag=="--known-prefix-expert-union" || flag=="--known-window-router-rows" ||
@@ -1917,6 +1931,14 @@ inline Options parse_options(
             const auto value = equal != std::string_view::npos ? argument.substr(equal + 1) :
                 (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{});
             yarn_cli = value;
+            continue;
+        }
+        if (argument == "--rtx-state-import-file") {
+            if (options.rtx_state_import || index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument("duplicate or missing --rtx-state-import-file value");
+            options.rtx_state_import_file = argv[++index];
+            if (options.rtx_state_import_file.empty()) throw std::invalid_argument("empty --rtx-state-import-file");
+            options.rtx_state_import = true;
             continue;
         }
         if (argument == "--prompt-ids") {

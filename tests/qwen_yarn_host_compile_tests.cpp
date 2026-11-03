@@ -417,6 +417,35 @@ void mtp_receipt_admission(const ModelManifest& original) {
         const auto resolve=[&](const RequestedOptions& r,const PrefillMemory& mem) {
             return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},mem);
         };
+        if (c == 262400U) {
+            auto imported = request;
+            // The parent census deliberately pins 128 MiB to reject larger contexts.
+            // Use a capacity-appropriate predictor cap for this admission regression.
+            imported.options.mtp.runtime_bytes = UINT64_C(1) << 30U;
+            imported.options.rtx_state_import = true;
+            imported.options.rtx_state_import_file = "PREFIX.json";
+            imported.options.rtx_state_import_position = 253952U;
+            imported.environment.clear(); // qualified production defaults, no rolling opt-in
+            const auto admitted = resolve(imported, memory);
+            require(admitted.admitted, "262K f2 CLI import production estimator: " + admitted.error);
+            require(admitted.options.mtp.enabled && admitted.ple_rolling_h == 1024U &&
+                ple_rolling_prompt_supported(admitted.options), "262K import keeps rolling MTP admission");
+            const auto config = prefill_reclaim_config(admitted.options, model, manifest, admitted.environment, memory.ple_reclaim_page);
+            require(config && config->prompt_begin == 253952U, "estimator uses restored suffix boundary");
+            const auto plan = ple_reclaim::plan_prompt(*config, build_ple_hash_contract(model), admitted.options.tokens);
+            require(plan.rows.size() == 8192U * build_ple_hash_contract(model).head_count,
+                "262K import plans only 8192 suffix rows");
+            auto fresh = admitted.options; fresh.rtx_state_import = false; fresh.rtx_state_import_file.clear();
+            fresh.rtx_state_import_position = 0; fresh.tokens.resize(8192U);
+            const auto owner = prefill_rolling_owner_bytes(admitted.options, model, manifest, admitted.environment, memory.ple_reclaim_page);
+            require(owner == prefill_rolling_owner_bytes(fresh, model, manifest, admitted.environment, memory.ple_reclaim_page),
+                "import suffix owner equals fresh suffix owner");
+            auto http = admitted.options; http.http_serve = true;
+            require(!ple_rolling_prompt_supported(http) &&
+                ple_reclaim_inactive_reason(http, HipModelResidencyPolicy{}, false) == "http-serving",
+                "HTTP import remains excluded");
+            std::cout << "CLI_IMPORT_SUFFIX_262K PASS rows=8192 restore=253952 rolling=1024\n";
+        }
         for(const bool dump:{true,false}) {
             auto arm=request;if(dump) { arm.options.mtp.golden_dump="DUMP.bin";arm.options.mtp.golden.clear();arm.options.mtp.golden_sha256.clear(); }
             const auto result=resolve(arm,memory);

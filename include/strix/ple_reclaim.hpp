@@ -47,6 +47,7 @@ struct Config {
     std::uint64_t table_rows = 0;
     std::uint64_t stored_row_bytes = 0;  // 90 for IQ4_NL [160, rows]
     std::vector<Interval> reclaim;       // from reclaim_intervals()
+    std::uint64_t prompt_begin = 0;       // absolute first position requiring PLE work
     std::uint64_t ahead_rows = 0;        // prefetch window beyond the block just gathered
     std::uint64_t critical_rows = 0;     // GPU prompt block size; ignored by disabled routes
     std::uint64_t decode_allowance_bytes = 0;
@@ -110,9 +111,9 @@ class Prefetcher : public std::enable_shared_from_this<Prefetcher> {
 public:
     // credit_only verifies the same credit without activating prompt work. Destroy it
     // before constructing the runtime owner, which must perform a fresh verified drop.
-    // Hashes the whole prompt (the launcher's chain: position 0 with EOS context) and builds the touched-page set,
+    // Hashes [prompt_begin, prompt.size()) with the original prefix context and builds the touched-page set,
     // then drops the reclaim intervals (MADV_RANDOM, MADV_DONTNEED on this mapping's PTEs, page-cache drop) and starts
-    // the helper, which prefetches positions [0, ahead_rows).
+    // the helper, which prefetches the first ahead_rows suffix positions.
     // Automatic setup defers diagnostics until success so a rejected attempt can fall back to the warm path silently.
     Prefetcher(Config config, const PleHashContract& contract, std::span<const std::uint32_t> prompt,
         bool automatic = false);
@@ -127,6 +128,7 @@ public:
     }
     [[nodiscard]] std::shared_ptr<ResidencyManager::Turn> begin_turn(ResidencyManager::PromptObserver observer = {});
     [[nodiscard]] bool rolling() const noexcept { return rolling_ != nullptr || manager_ != nullptr; }
+    [[nodiscard]] std::uint64_t prompt_begin() const noexcept { return config_.prompt_begin; }
     [[nodiscard]] std::uint64_t gather_positions() const noexcept { return config_.rolling_positions; }
     struct PromptSource {
         std::shared_ptr<const DirectPageCache::View> view;

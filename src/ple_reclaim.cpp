@@ -128,7 +128,8 @@ PromptPlan plan_prompt(const Config& config, const PleHashContract& contract,
     const auto table_bytes = checked_mul(config.table_rows, config.stored_row_bytes);
     if (checked_add(config.table_offset, table_bytes) > config.mapping_bytes)
         throw std::invalid_argument("PLE reclaim table exceeds the model mapping");
-    if (prompt.empty()) throw std::invalid_argument("PLE reclaim requires the known prompt tokens");
+    if (prompt.empty() || config.prompt_begin >= prompt.size())
+        throw std::invalid_argument("PLE reclaim requires a nonempty known prompt suffix");
     if (!contract.head_count || contract.head_count > PleHashContract::maximum_heads || contract.ngram_size < 2 ||
         contract.ngram_size > PleHashContract::maximum_ngram)
         throw std::invalid_argument("PLE reclaim hash contract is invalid");
@@ -149,14 +150,17 @@ PromptPlan plan_prompt(const Config& config, const PleHashContract& contract,
 
     // The launcher's hash chain (hip_ple_launcher.hip launch: position 0 starts from EOS context, then next_context).
     const auto heads = contract.head_count;
-    const auto positions = prompt.size();
+    const auto positions = prompt.size() - config.prompt_begin;
     result.rows.resize(static_cast<std::size_t>(checked_mul(positions, heads)));
     const auto context_count = static_cast<std::size_t>(contract.ngram_size - 1U);
     std::array<std::uint32_t, PleHashContract::maximum_ngram - 1> previous{};
     std::fill_n(previous.begin(), context_count, contract.eos_token_id);
+    // Seed from the actual prefix in chronological order, just like restored PLE state.
+    for (std::size_t i = 0; i < context_count && i < config.prompt_begin; ++i)
+        previous[context_count - 1U - i] = prompt[static_cast<std::size_t>(config.prompt_begin) - 1U - i];
     std::uint64_t touched_pages = 0;
     for (std::uint64_t p = 0; p < positions; ++p) {
-        const auto hash = hash_ple_token(contract, prompt[static_cast<std::size_t>(p)],
+        const auto hash = hash_ple_token(contract, prompt[static_cast<std::size_t>(config.prompt_begin + p)],
             std::span<const std::uint32_t>(previous.data(), context_count));
         if (hash.row_count != heads) throw std::logic_error("PLE reclaim hash row count differs from the contract");
         for (std::uint32_t h = 0; h < heads; ++h) {
@@ -254,7 +258,7 @@ Prefetcher::Prefetcher(Config config, const PleHashContract& contract, std::span
     auto plan = plan_prompt(config_, contract, prompt);
     hash_marker.end();
     heads_ = contract.head_count;
-    positions_ = prompt.size();
+    positions_ = prompt.size() - config_.prompt_begin;
     rows_ = std::move(plan.rows);
     stats_ = plan.stats;
     admitted_ = stats_.admitted_bytes;
@@ -338,7 +342,7 @@ Prefetcher::Prefetcher(Config config, const PleHashContract& contract, std::span
     if (config_.credit_only) return; // authority/probes/drop verified; runtime activates its fresh owner
     if (manager_) {
         const auto budget = rolling_budget(config_, heads_);
-        manager_->configure_prompt({rows_, budget.cap, config_.ahead_rows, config_.critical_rows});
+        manager_->configure_prompt({rows_, budget.cap, config_.ahead_rows, config_.critical_rows, config_.prompt_begin});
         std::fprintf(stderr, "ple-rolling: activated MTP-CLI H=%llu bound=%llu B verified-credit=%llu B "
             "resident-after-drop=%llu B slots=1 decode-quota=%llu B async-prompt (O_DIRECT owned CPU sources)\n",
             static_cast<unsigned long long>(config_.rolling_positions),
@@ -392,6 +396,8 @@ bool Prefetcher::block_stats() const noexcept {
     return rolling_ && v && std::strcmp(v, "1") == 0;
 }
 Prefetcher::PromptSource Prefetcher::prompt_source(std::uint64_t first, std::uint64_t count) const {
+    if (first < config_.prompt_begin) throw std::out_of_range("PLE prompt position precedes suffix");
+    first -= config_.prompt_begin;
     if (!rolling_ || first > positions_ || !count || count > positions_ - first || count > config_.rolling_positions)
         throw std::logic_error("PLE direct prompt view requires a bounded rolling window");
     std::vector<std::uint64_t> pages;
@@ -407,12 +413,19 @@ Prefetcher::PromptSource Prefetcher::prompt_source(std::uint64_t first, std::uin
 }
 void Prefetcher::gather_window(std::uint64_t first, std::uint64_t count, const std::function<void()>& copy) {
     if (config_.credit_only) throw std::logic_error("PLE reclaim: credit-only owner cannot read prompt sources");
-    if (rolling_) rolling_->gather(first, count, copy); else copy();
+    if (rolling_) {
+        if (first < config_.prompt_begin) throw std::out_of_range("PLE gather precedes suffix");
+        rolling_->gather(first - config_.prompt_begin, count, copy);
+    } else copy();
 }
 void Prefetcher::gather_range(std::uint64_t first, std::uint64_t count,
     const std::function<void(std::uint64_t, std::uint64_t)>& copy) {
     if (config_.credit_only) throw std::logic_error("PLE reclaim: credit-only owner cannot read prompt sources");
-    if (rolling_) rolling_->gather_range(first, count, copy); else copy(first, count);
+    if (rolling_) {
+        if (first < config_.prompt_begin) throw std::out_of_range("PLE gather precedes suffix");
+        rolling_->gather_range(first - config_.prompt_begin, count,
+            [&](auto p, auto n) { copy(p + config_.prompt_begin, n); });
+    } else copy(first, count);
 }
 void Prefetcher::source_copy(std::uintptr_t table, std::span<const std::uint64_t> rows, const std::function<void()>& copy) {
     if (config_.credit_only) throw std::logic_error("PLE reclaim: credit-only owner cannot read prompt sources");
@@ -594,6 +607,8 @@ std::exception_ptr Prefetcher::drain_stages() {
 }
 
 std::uint64_t Prefetcher::stage_rows(std::uint64_t first, std::uint64_t max_count, std::vector<std::uint32_t>& out) const {
+    if (first < config_.prompt_begin) return 0;
+    first -= config_.prompt_begin;
     if (config_.credit_only || !config_.stage_prefetch || !max_count || first >= positions_) return 0;
     const auto count = std::min(max_count, positions_ - first);
     const auto begin = rows_.begin() + static_cast<std::ptrdiff_t>(first * heads_);
@@ -602,6 +617,9 @@ std::uint64_t Prefetcher::stage_rows(std::uint64_t first, std::uint64_t max_coun
 }
 
 void Prefetcher::on_gather(std::uint64_t first_position, std::span<const PleHashResult> hashes, const GatherReceipt& receipt) {
+    if (first_position < config_.prompt_begin) throw std::out_of_range("PLE receipt precedes suffix");
+    const auto absolute_first = first_position;
+    first_position -= config_.prompt_begin;
     const auto gather_ns = receipt.gather_ns, minflt = receipt.minflt, majflt = receipt.majflt;
     std::uint64_t mismatches = 0, outside = 0;
     for (std::size_t r = 0; r < hashes.size(); ++r) {
@@ -649,7 +667,7 @@ void Prefetcher::on_gather(std::uint64_t first_position, std::span<const PleHash
     wake_.notify_one();
     if (!rolling()) std::fprintf(stderr, "ple-reclaim block %llu rows %zu staged %llu (worker %.2f ms hidden, wait %.2f ms, majflt %llu) "
         "exposed gather %.2f ms minflt %llu majflt %llu prefetched-until %llu issued %llu pages resident %llu B\n",
-        static_cast<unsigned long long>(first_position), hashes.size(), static_cast<unsigned long long>(receipt.staged_rows),
+        static_cast<unsigned long long>(absolute_first), hashes.size(), static_cast<unsigned long long>(receipt.staged_rows),
         static_cast<double>(receipt.stage_ns) / 1e6, static_cast<double>(receipt.stage_wait_ns) / 1e6,
         static_cast<unsigned long long>(receipt.stage_majflt),
         static_cast<double>(gather_ns) / 1e6, static_cast<unsigned long long>(minflt), static_cast<unsigned long long>(majflt),
@@ -663,7 +681,7 @@ void Prefetcher::on_gather(std::uint64_t first_position, std::span<const PleHash
         std::fprintf(stderr,
             "ple-rolling block: block=%llu first=%llu rows=%zu bytes-read=%llu read-wait-ms=%.3f copy-ms=%.3f hash-ms=%.3f join-wait-ms=%.3f "
             "critical-bytes=%llu critical-read-ms=%.3f critical-iops=%.3f critical-MB-s=%.3f lookahead-bytes=%llu\n",
-            static_cast<unsigned long long>(snapshot.blocks - 1U), static_cast<unsigned long long>(first_position), hashes.size(),
+            static_cast<unsigned long long>(snapshot.blocks - 1U), static_cast<unsigned long long>(absolute_first), hashes.size(),
             static_cast<unsigned long long>(receipt.bytes_read), static_cast<double>(receipt.read_wait_ns) / 1e6,
             static_cast<double>(receipt.copy_ns) / 1e6, static_cast<double>(receipt.hash_ns) / 1e6,
             static_cast<double>(receipt.stage_wait_ns) / 1e6, static_cast<unsigned long long>(a.bytes),

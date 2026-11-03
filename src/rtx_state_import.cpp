@@ -119,6 +119,8 @@ std::optional<std::size_t> RtxStateLayout::find_fixed(std::string_view id) const
 
 void RtxStateLayout::validate() const {
     if (rows.empty() || !layout_identity || !context_tokens) throw std::invalid_argument("rtx state layout is incomplete");
+    if (rotary.descriptor().mode() == RotaryMode::yarn && context_tokens > rotary.descriptor().effective_max())
+        throw std::invalid_argument("rtx state context capacity exceeds rotary table extent");
     std::uint64_t sum = 0;
     for (const auto& row : rows) {
         if (row.id.empty() || !row.bytes_per_row || row.shift > 1U) throw std::invalid_argument("rtx state row component is invalid");
@@ -147,6 +149,11 @@ std::uint64_t rtx_state_geometry_identity(const RtxStateLayout& layout) {
     u64(layout.layout_identity); u64(layout.row_bytes); u64(layout.fixed_bytes); u64(layout.rows.size()); u64(layout.fixed.size());
     for (const auto& row : layout.rows) { text(row.id); u64(row.bytes_per_row); u64(row.shift); }
     for (const auto& f : layout.fixed) { text(f.id); u64(f.bytes); u64(f.offset); }
+    if (layout.rotary.descriptor().mode() == RotaryMode::yarn) {
+        text("RTXSTAT1-YARN-CONTEXT");
+        u64(layout.context_tokens);
+        h = append_rotary_identity(h, layout.rotary);
+    }
     return h;
 }
 
@@ -159,6 +166,13 @@ RtxStateStaging::RtxStateStaging(std::shared_ptr<const RtxStateLayout> layout, R
     const auto& l = *layout_;
     if (request_.layout_identity != l.layout_identity)
         throw std::invalid_argument("rtx state layout identity differs from this engine's (" + rtx_hex_u64(l.layout_identity) + ")");
+    if (request_.rotary && *request_.rotary != l.rotary)
+        throw std::invalid_argument("rtx state rotary identity mismatch (mode, factor or table SHA256)");
+    if (request_.context_tokens && *request_.context_tokens != l.context_tokens)
+        throw std::invalid_argument("rtx state context capacity mismatch");
+    if (l.rotary.descriptor().mode() == RotaryMode::yarn && !request_.geometry_identity &&
+        !(request_.rotary && request_.context_tokens))
+        throw std::invalid_argument("rtx state YaRN import requires geometry_identity or rotary and context_tokens");
     if (request_.geometry_identity && request_.geometry_identity != rtx_state_geometry_identity(l))
         throw std::invalid_argument("rtx state geometry identity differs from this engine's");
     if (!request_.position || request_.position >= l.context_tokens || request_.tokens.size() != request_.position)
@@ -519,7 +533,9 @@ ModelContentIdentity write_rtx_state_file(const std::filesystem::path& path, con
         h << (f ? "," : "") << "{\"id\":"; json_string(h, layout.fixed[f].id);
         h << ",\"bytes\":" << layout.fixed[f].bytes << ",\"offset\":" << layout.fixed[f].offset << '}';
     }
-    h << "],\"session\":{\"next_position\":" << session.next_position << ",\"committed_tokens\":" << session.committed_tokens
+    h << "],\"context_tokens\":" << layout.context_tokens << ",\"rotary\":"
+      << (layout.rotary.descriptor().mode() == RotaryMode::yarn ? layout.rotary.json() : layout.rotary.descriptor().json());
+    h << ",\"session\":{\"next_position\":" << session.next_position << ",\"committed_tokens\":" << session.committed_tokens
       << ",\"valid\":" << session.valid << ",\"generations\":[";
     for (std::size_t g = 0; g < session.generations.size(); ++g) h << (g ? "," : "") << session.generations[g];
     h << "],\"lineage\":[";

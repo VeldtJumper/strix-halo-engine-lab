@@ -3,6 +3,7 @@
 
   upload    send a strix-qwen-rtx-state-v1 file (STRIX_RTX_EXPORT_STATE) to a server, then optionally run
             /v1/completions on a prompt that starts with the state's tokens; prints tokens and timings as JSON
+  file-pair write NAME.json/NAME.bin for --rtx-state-import-file from an exported state
   complete  /v1/completions only (the baseline without an import)
   layout    print GET /admin/rtx-import/layout
   check     compare a state file's recorded session generations with a server's layout formula
@@ -98,6 +99,47 @@ def segment(kind, comp, a, b, data):
     return struct.pack("<IIIIQ", kind, comp, a, b, len(data)) + data
 
 
+def state_begin_body(header, keep=False):
+    begin_request = {
+        "tokens": header["tokens"], "position": int(header["position"]), "keep": keep,
+        "producer": {k: str(int(v, 0)) for k, v in header["producer"].items()},
+        "layout_identity": str(int(header["layout_identity"], 0)), "geometry_identity": str(int(header["geometry_identity"], 0))}
+    for key in ("rotary", "context_tokens"):
+        if key in header:
+            begin_request[key] = header[key]
+    begin_request["encoding"] = "identity"
+    return begin_request
+
+
+def write_file_pair(source, destination, chunk_bytes=4 << 20):
+    """Write the HTTP begin body and its canonical, unencoded payload beside it."""
+    from pathlib import Path
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+    header, offset = read_state_header(source)
+    metadata = Path(destination)
+    binary = metadata.with_suffix(".bin")
+    if metadata.suffix != ".json" or Path(source).resolve() in (metadata.resolve(), binary.resolve()):
+        raise ValueError("destination must be a distinct NAME.json/NAME.bin pair")
+    body = state_begin_body(header)
+    count, digest = 0, hashlib.sha256()
+    with open(source, "rb") as src, open(binary, "wb") as dst:
+        src.seek(offset)
+        while True:
+            data = src.read(chunk_bytes)
+            if not data:
+                break
+            digest.update(data)
+            dst.write(data)
+            count += len(data)
+    if count != int(header["payload_bytes"]) or digest.hexdigest() != header["sha256"]:
+        binary.unlink()
+        raise ValueError("source payload size or SHA256 mismatch")
+    body.update(payload_bytes=count, payload_sha256=digest.hexdigest())
+    metadata.write_text(json.dumps(body, indent=2) + "\n", encoding="ascii", newline="\n")
+    return {"payload_bytes": count, "payload_sha256": digest.hexdigest()}
+
+
 def upload(server, path, chunk_bytes, keep=False, canonical=False, check_only=False):
     header, offset = read_state_header(path)
     _, layout = server.request("GET", "/admin/rtx-import/layout")
@@ -113,6 +155,14 @@ def upload(server, path, chunk_bytes, keep=False, canonical=False, check_only=Fa
             problems.append(key)
     if [(r["bytes_per_row"], r["shift"]) for r in layout["rows"]] != [(r["bytes_per_row"], r["shift"]) for r in header["rows"]]:
         problems.append("rows")
+    if "context_tokens" in header and int(header["context_tokens"]) != int(layout.get("context_tokens", layout["max_context"])):
+        problems.append("context_tokens")
+    if "rotary" in header:
+        def rotary_key(value):
+            return (value.get("rope_mode", "native"), value.get("factor", 0),
+                    value.get("original_max", 262144), value.get("table_sha256"))
+        if rotary_key(header["rotary"]) != rotary_key(layout.get("rotary", {})):
+            problems.append("rotary")
     if problems:
         raise SystemExit("the state file does not target this server: " + ", ".join(problems))
     generations = check_generations(layout, header)
@@ -120,10 +170,8 @@ def upload(server, path, chunk_bytes, keep=False, canonical=False, check_only=Fa
     if check_only:
         return report, header
     t0 = time.time()
-    _, begin = server.request("POST", "/admin/rtx-import/begin", json.dumps({
-        "tokens": header["tokens"], "position": p, "keep": keep,
-        "producer": {k: str(int(v, 0)) for k, v in header["producer"].items()},
-        "layout_identity": str(int(layout["layout_identity"], 0)), "geometry_identity": str(int(layout["geometry_identity"], 0))}))
+    begin_request = state_begin_body(header, keep)
+    _, begin = server.request("POST", "/admin/rtx-import/begin", json.dumps(begin_request))
     ident = begin["id"]
     t1 = time.time()
     offsets, rows_end = row_offsets(layout, p)
@@ -215,7 +263,7 @@ def decode_ckpt(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["upload", "complete", "layout", "check", "ckpt"])
+    ap.add_argument("command", choices=["upload", "complete", "layout", "check", "ckpt", "file-pair"])
     ap.add_argument("--server", default="http://127.0.0.1:8080")
     ap.add_argument("--api-key")
     ap.add_argument("--state", help="strix-qwen-rtx-state-v1 file")
@@ -225,11 +273,14 @@ def main():
     ap.add_argument("--keep", action="store_true", help="the parked state survives the request")
     ap.add_argument("--canonical", action="store_true", help="diagnostic: the server also hashes the canonical payload")
     ap.add_argument("--ckpt", help="ckpt-*.tmpc file (command ckpt)")
+    ap.add_argument("--file-pair", help="destination NAME.json for command file-pair")
     ap.add_argument("--out", help="also write the JSON result here")
     a = ap.parse_args()
     server = Server(a.server, a.api_key)  # connects lazily
     result = {}
-    if a.command == "layout":
+    if a.command == "file-pair":
+        result = write_file_pair(a.state, a.file_pair, a.chunk_mib << 20)
+    elif a.command == "layout":
         result = server.request("GET", "/admin/rtx-import/layout")[1]
     elif a.command == "check":
         result = upload(server, a.state, a.chunk_mib << 20, check_only=True)[0]

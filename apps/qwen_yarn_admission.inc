@@ -98,6 +98,10 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DIGEST", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE_DIGEST_COMPONENTS", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_FINAL_STATE_DIGEST", YarnEnvironmentClass::nonrotary, "0|1"},
+    // Test producer for RTX state import: copies the committed prompt state at a prompt-unit boundary (path, position);
+    // it adds no rotary site and leaves the continuation's arithmetic unchanged.
+    YarnEnvironmentRule{"STRIX_RTX_EXPORT_STATE", YarnEnvironmentClass::nonrotary, ""},
+    YarnEnvironmentRule{"STRIX_RTX_EXPORT_POSITION", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_RELEASE_EVENTS", YarnEnvironmentClass::diagnostic, "0|1"},
     YarnEnvironmentRule{"STRIX_STARTUP_MARKERS", YarnEnvironmentClass::diagnostic, "0|1"},
     YarnEnvironmentRule{"STRIX_SERIAL_LOGITS_DIGEST", YarnEnvironmentClass::nonrotary, "0|1"},

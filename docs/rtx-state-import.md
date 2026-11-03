@@ -52,6 +52,54 @@ Other rules:
 - `--rtx-state-import` requires `--http-serve` without `--http-batch`, because batch slots get no registry
   in v1.
 
+## CLI file pair: `--rtx-state-import-file NAME.json`
+
+A fresh single-request CLI can consume the same prefix without an HTTP server:
+
+```sh
+python tools/rtx_state_import.py file-pair --state prefix.rtxs --file-pair prefix.json
+strix-hip-decode-token MODEL.gguf --prompt-ids full-prompt.ids --context 524288 --rope-yarn 2 --rtx-state-import-file prefix.json --generate 256
+```
+
+`--prompt-ids` is the full prompt. Its first `position` tokens must equal the
+imported tokens, and it must contain at least one suffix token. The node prefills
+that suffix and decodes the requested generation. Native rotary is also admitted
+with matching assets and capacity. Use the existing YaRN MTP bundle or explicit
+`--mtp` asset options to select MTP; the existing admission notice and serial
+fallback apply when the bundle cannot admit MTP. The pair must match the selected
+consumer component layout, including predictor components when MTP is selected.
+
+`NAME.json` is exactly an HTTP begin object plus `payload_bytes` and
+`payload_sha256` (64 hexadecimal characters). It carries `tokens`, `position`,
+`producer` (`numerical`, `reduction`, `state_update`), `layout_identity`,
+`geometry_identity`, `encoding`, and any producer `context_tokens` and `rotary`
+identity. Identities use the same string representation as HTTP. The writer
+shares the HTTP begin-body builder and preserves producer capacity and rotary.
+
+`NAME.bin`, beside the JSON, is the unencoded canonical payload: each row
+component in layout order, then the fixed blob, including zero alignment padding.
+`payload_bytes` and `payload_sha256` cover this entire binary file, including
+padding. The begin `encoding` retains the HTTP negotiation semantics; file bytes
+are always canonical bytes, with no chunk frames or segment headers.
+
+The reader streams through a 4 MiB ordinary-memory buffer into the registry's
+staging allocation, without a second payload-sized pinned allocation. It uses
+the HTTP begin parser, `RtxStateStaging` admission, segment coverage and commit
+checks; capacity and rotary mismatches are refused by those same checks. A bad
+hash, length or token prefix fails the command without a cold-prompt fallback.
+The ordinary HTTP restore then sets counters and lineage and invokes the MTP
+frontier hook. Imported state never enters the local prefix cache.
+
+HTTP-only options, session/replay/cache routes and graph execution are refused.
+These CPU admission checks do not establish GPU continuation fidelity or qualify
+an externally produced numerical identity.
+
+Measured between two Strix Halo nodes (same build, YaRN factor 2, MTP route on both sides): a
+state exported at position 253,952 of a 262,144-token prompt (7.7 GB) was imported by a fresh CLI, which
+prefilled the remaining 8,192 tokens and decoded 256: generated tokens, the full committed-logit
+ledger and the final state equal the full-prompt run, in 135.5 s against 333.5 s for the full prompt.
+The same check at 32K is exact too.
+
 ## HTTP (connection threads; host memory only, so imports stream while another request decodes)
 
 The connection is HTTP/1.1 keep-alive, with Content-Length bodies of up to 256 MiB when the flag is on. Every u64
@@ -59,13 +107,24 @@ identity in JSON is a decimal or `0x` hex **string**.
 
 | route | body / reply |
 |---|---|
-| `GET /admin/rtx-import/layout` | `format` = `strix-qwen-rtx-state-v1`; `rows` [{id (index), name, bytes_per_row, shift}]; `fixed` [{id, name, bytes, offset}]; `row_bytes`, `fixed_bytes`, `layout_identity`, `geometry_identity`, `generations_per_row`, `generations_base`, `valid_union`, `valid_base`, `max_context`, `model_content`, `identity_extension` (MTP), `cache_identity`, `sha256_provider` |
-| `POST /admin/rtx-import/begin` | {tokens, position, producer {numerical, reduction, state_update}, layout_identity, geometry_identity?, keep?} -> {id, payload_bytes, ...}. Allocates pinned host memory. At most 2 imports in flight. |
+| `GET /admin/rtx-import/layout` | `format` = `strix-qwen-rtx-state-v1`; `rows` [{id (index), name, bytes_per_row, shift}]; `fixed` [{id, name, bytes, offset}]; `row_bytes`, `fixed_bytes`, `layout_identity`, `geometry_identity`, `generations_per_row`, `generations_base`, `valid_union`, `valid_base`, `max_context`, `context_tokens`, `rotary`, `model_content`, `identity_extension` (MTP), `cache_identity`, `sha256_provider` |
+| `POST /admin/rtx-import/begin` | {tokens, position, producer {numerical, reduction, state_update}, layout_identity, geometry_identity?, rotary?, context_tokens?, keep?} -> {id, payload_bytes, ...}. Allocates pinned host memory. At most 2 imports in flight. |
 | `POST /admin/rtx-import/chunks?id=` | a sequence of segments, each a 16-byte header {u32 kind (0 rows, 1 fixed), u32 component id, u32 first_row \| offset_lo, u32 rows \| offset_hi}, then a u64 byte count, then the bytes (LE). Each chunk is all or none: every segment is bounds-checked and must not overlap written bytes or another segment. |
 | `POST /admin/rtx-import/chunk?id=&component=&first_row=` / `?id=&fixed=&offset=` | One component, given by name or index. |
 | every chunk | `X-Chunk-Sha256` (the body's SHA-256), verified on receipt. Optional `X-Chunk-Seq` gives the order; without it, the receive order. |
 | `POST /admin/rtx-import/commit?id=` | {chunks, bytes (segment data bytes), manifest_sha256 = SHA-256 of the 32-byte chunk digests in sequence order, canonical_sha256?}. Checks every byte was written exactly once, the counts and the manifest, then parks the import. `canonical_sha256: true` also hashes the canonical payload (a diagnostic, off the critical path). |
 | `GET /admin/rtx-import/status`, `POST /admin/rtx-import/abort?id=` | |
+
+The layout's `context_tokens` (also exposed as `max_context`) is the consumer route's
+capacity; import positions must satisfy `1 <= position < context_tokens`. `rotary`
+uses the model's resolved rotary descriptor JSON: `rope_mode`, `factor`,
+`original_max` and the existing `table_sha256` identify the table. Native mode has
+no table. A supplied begin `rotary` or `context_tokens` must match the consumer.
+YaRN geometry additionally binds capacity and the resolved rotary identity; begin
+requires either that geometry identity or both explicit rotary and capacity.
+Native geometry retains its original byte stream for existing producers. State
+files record rotary and capacity, and the upload tool forwards those producer facts.
+These are admission and layout contracts, not native execution or fidelity qualification.
 
 ## Chunk encoding (opt-in): `bp-v1`
 

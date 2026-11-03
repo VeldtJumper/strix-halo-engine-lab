@@ -342,6 +342,8 @@ void test_file() {
     require(header.find("format")->as_string() == "strix-qwen-rtx-state-v1" && header.find("position")->as_int() == 4, "file header");
     require(header.find("layout_identity")->as_string() == "0xfeedfacecafebeef", "u64 identities as strings");
     require(header.find("sha256")->as_string() == strix::model_content_identity_hex(sha), "file header sha");
+    require(header.find("context_tokens")->as_int() == 64 &&
+        header.find("rotary")->find("rope_mode")->as_string() == "native", "native file capacity and rotary");
     std::ifstream in(path, std::ios::binary);
     in.seekg(static_cast<std::streamoff>(view.payload_offset));
     std::vector<char> back(payload.size());
@@ -369,6 +371,189 @@ Writer call(strix::RtxStateImportRegistry& registry, std::string method, std::st
     Writer w;
     require(strix::decode_cli::handle_rtx_state_import_route(registry, request, w), "route handled");
     return w;
+}
+
+// Identity admission is checked before staging allocation; large geometry needs no device.
+void test_rotary_import() {
+    using namespace strix;
+    const auto native = small_layout();
+    require(rtx_state_geometry_identity(native) == 0xf019966b9ba456deULL, "legacy native geometry identity pinned");
+    auto native_capacity = native;
+    native_capacity.context_tokens = 262144;
+    require(rtx_state_geometry_identity(native_capacity) == 0xf019966b9ba456deULL, "native capacity preserves legacy identity");
+    const auto table = rtx_parse_sha256(std::string(64, '1')); // synthetic CPU fixture, not a generated table hash
+    const auto other_table = rtx_parse_sha256(std::string(64, '2'));
+    std::vector<std::uint64_t> identities;
+    for (const auto factor : {2U, 4U}) {
+        auto l = native;
+        l.context_tokens = 262144ULL * factor;
+        l.rotary = RotaryIdentity(RotaryDescriptor::yarn(factor), table);
+        l.validate();
+        const auto identity = rtx_state_geometry_identity(l);
+        require(identity != rtx_state_geometry_identity(native), "YaRN differs from native");
+        identities.push_back(identity);
+        auto changed = l;
+        --changed.context_tokens;
+        require(rtx_state_geometry_identity(changed) != identity, "YaRN capacity binds geometry");
+        changed = l;
+        changed.rotary = RotaryIdentity(RotaryDescriptor::yarn(factor), other_table);
+        require(rtx_state_geometry_identity(changed) != identity, "YaRN table binds geometry");
+        changed.rotary = RotaryIdentity(RotaryDescriptor::yarn(factor == 2 ? 4 : 2), table);
+        require(rtx_state_geometry_identity(changed) != identity, "YaRN factor binds geometry");
+        const auto position = l.context_tokens - 1;
+        require(l.rows_bytes(position) == position * 30 - 10 &&
+            l.payload_bytes(position) == position * 30 + 1014, "long context payload arithmetic");
+        auto wide = l;
+        wide.rows[0].bytes_per_row = 65536;
+        wide.row_bytes += 65536 - 16;
+        wide.validate();
+        require(wide.component_offset(wide.rows.size(), position) == position * wide.row_bytes - 10 &&
+            wide.payload_bytes(position) == position * wide.row_bytes + 1014 &&
+            wide.payload_bytes(position) > UINT32_MAX, "long payload retains 64-bit offsets");
+        expect_throw([&] { (void)wide.payload_bytes(UINT64_MAX); }, "payload overflow refused");
+        auto beyond_table = l; ++beyond_table.context_tokens;
+        expect_throw([&] { beyond_table.validate(); }, "capacity beyond rotary table refused");
+        auto layout = std::make_shared<const RtxStateLayout>(l);
+        auto request = begin_request(l, position);
+        request.rotary = l.rotary;
+        request.context_tokens = l.context_tokens;
+        { RtxStateStaging staging(layout, request, "long", heap);
+          require(staging.payload_bytes() == l.payload_bytes(position), "C-1 accepted"); }
+        const auto refused = [&](RtxStateBeginRequest bad, const std::string& message) {
+            bool allocated = false;
+            try {
+                RtxStateStaging staging(layout, std::move(bad), "bad", [&](std::uint64_t bytes) {
+                    allocated = true;
+                    return heap(bytes);
+                });
+            } catch (const std::invalid_argument& e) {
+                require(!allocated && std::string(e.what()).find(message) != std::string::npos, "clear pre-allocation refusal");
+                return;
+            }
+            throw std::runtime_error("expected import refusal: " + message);
+        };
+        auto bad = request; bad.rotary = RotaryIdentity{}; refused(bad, "rotary identity mismatch");
+        bad = request; bad.rotary = changed.rotary; refused(bad, "rotary identity mismatch");
+        bad = request; bad.rotary = RotaryIdentity(RotaryDescriptor::yarn(factor), other_table);
+        refused(bad, "rotary identity mismatch");
+        bad = request; bad.context_tokens = l.context_tokens - 1; refused(bad, "context capacity mismatch");
+        bad = request; bad.rotary.reset(); bad.context_tokens.reset(); refused(bad, "requires geometry_identity");
+        bad.geometry_identity = rtx_state_geometry_identity(native); refused(bad, "geometry identity differs");
+        bad = request; bad.position = 0; bad.tokens.clear(); refused(bad, "1 <= position < context");
+        bad = request; ++bad.position; bad.tokens.push_back(1); refused(bad, "1 <= position < context");
+        RtxStateImportRegistry registry(heap, 2);
+        registry.set_layout(l);
+        const auto published = serve::parse_json(call(registry, "GET", "/admin/rtx-import/layout", "", "").body);
+        require(published.find("context_tokens")->as_int() == static_cast<std::int64_t>(l.context_tokens) &&
+            published.find("rotary")->dump() == serve::parse_json(l.rotary.json()).dump(), "published capacity and resolved rotary");
+        const auto body = [&](const RotaryIdentity& rotary, std::uint64_t capacity) {
+            return "{\"tokens\":[1],\"position\":1,\"producer\":{\"numerical\":1,\"reduction\":2,\"state_update\":3},"
+                "\"layout_identity\":\"" + rtx_hex_u64(l.layout_identity) + "\",\"context_tokens\":" + std::to_string(capacity) +
+                ",\"rotary\":" + rotary.json() + "}";
+        };
+        auto response = call(registry, "POST", "/admin/rtx-import/begin", "", body(l.rotary, l.context_tokens));
+        require(response.status == 200, "HTTP matching YaRN identity: " + response.body);
+        require(call(registry, "POST", "/admin/rtx-import/begin", "", body(changed.rotary, l.context_tokens)).status == 400,
+            "HTTP mismatched factor refused");
+        require(call(registry, "POST", "/admin/rtx-import/begin", "", body(l.rotary, l.context_tokens - 1)).status == 400,
+            "HTTP mismatched capacity refused");
+        require(call(registry, "POST", "/admin/rtx-import/begin", "", body(RotaryIdentity{}, l.context_tokens)).status == 400,
+            "HTTP native producer refused on YaRN");
+        require(call(registry, "POST", "/admin/rtx-import/begin", "",
+            body(RotaryIdentity(RotaryDescriptor::yarn(factor), other_table), l.context_tokens)).status == 400,
+            "HTTP mismatched table refused");
+        auto malformed = serve::parse_json(body(l.rotary, l.context_tokens));
+        auto rotary_json = serve::parse_json(l.rotary.json());
+        rotary_json.set("original_max", serve::Json(131072));
+        malformed.set("rotary", rotary_json);
+        require(call(registry, "POST", "/admin/rtx-import/begin", "", malformed.dump()).status == 400,
+            "HTTP mismatched original context refused");
+        const auto path = std::filesystem::temp_directory_path() / "strix-rtx-yarn-state-test.rtxs";
+        (void)write_rtx_state_file(path, l, std::vector<std::uint32_t>{1}, 1, {1, 2, 3}, {}, canonical_payload(l, 1));
+        const auto file = serve::parse_json(read_rtx_state_file_header(path).header_json);
+        require(file.find("rotary")->dump() == serve::parse_json(l.rotary.json()).dump() &&
+            file.find("context_tokens")->as_int() == static_cast<std::int64_t>(l.context_tokens), "YaRN file preserves producer facts");
+        std::filesystem::remove(path);
+        auto proof = begin_request(l, 1); proof.geometry_identity = identity;
+        RtxStateStaging staging(layout, proof, "geometry-proof", heap);
+        auto native_request = begin_request(native, 1); native_request.rotary = l.rotary;
+        expect_throw([&] { RtxStateStaging rejected(std::make_shared<const RtxStateLayout>(native), native_request, "native", heap); },
+            "YaRN producer refused on native");
+    }
+    require(identities[0] != identities[1], "f2/f4 route identities differ");
+}
+
+void test_file_pair() {
+    using namespace strix;
+    using namespace strix::decode_cli;
+    const auto path = std::filesystem::temp_directory_path() / "strix-rtx-pair.json";
+    auto binary = path; binary.replace_extension(".bin");
+    const auto clean = std::shared_ptr<void>(nullptr, [&](void*) { std::filesystem::remove(path); std::filesystem::remove(binary); });
+    auto l = small_layout();
+    l.context_tokens = 524288;
+    auto table = rtx_parse_sha256(std::string(64, '1'));
+    l.rotary = RotaryIdentity(RotaryDescriptor::yarn(2), table);
+    const auto payload = canonical_payload(l, 5);
+    auto header = serve::Json::object();
+    auto tokens = serve::Json::array();
+    for (unsigned i = 100; i < 105; ++i) tokens.push(serve::Json(static_cast<std::uint64_t>(i)));
+    header.set("tokens", std::move(tokens)); header.set("position", serve::Json(std::uint64_t{5}));
+    auto producer = serve::Json::object();
+    for (const auto* key : {"numerical", "reduction", "state_update"}) producer.set(key, serve::Json("11"));
+    header.set("producer", std::move(producer));
+    header.set("layout_identity", serve::Json(rtx_hex_u64(l.layout_identity)));
+    header.set("geometry_identity", serve::Json(rtx_hex_u64(rtx_state_geometry_identity(l))));
+    header.set("context_tokens", serve::Json(l.context_tokens));
+    header.set("rotary", serve::parse_json(l.rotary.json()));
+    header.set("encoding", serve::Json("identity"));
+    header.set("payload_bytes", serve::Json(static_cast<std::uint64_t>(payload.size())));
+    header.set("payload_sha256", serve::Json(model_content_identity_hex(sha256_bytes(payload))));
+    const auto save = [&] {
+        std::ofstream json(path); json << header.dump();
+        std::ofstream bin(binary, std::ios::binary);
+        bin.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    };
+    const std::vector<std::uint32_t> prompt{100,101,102,103,104,105};
+    RtxStateImportRegistry chunks(heap, 1, 0), one(heap, 1, 0);
+    chunks.set_layout(l); one.set_layout(l); save();
+    require(parse_rtx_state_begin(read_rtx_state_import_metadata(path, prompt)).position == 5,
+        "CPU metadata preflight establishes the PLE suffix boundary");
+    expect_throw([&] { stage_rtx_state_import_file(chunks, path, prompt, 32, 4); },
+        "staging refuses a changed position after PLE admission");
+    require(chunks.status().empty(), "changed boundary refuses before staging storage");
+    stage_rtx_state_import_file(chunks, path, prompt, 32, 5);
+    const auto id = one.begin(parse_rtx_state_begin(header));
+    const auto staging = one.find(id);
+    std::uint64_t data_bytes = 0;
+    auto wire = rows_body(l, 5, payload, 0, 5, data_bytes);
+    for (std::size_t f = 0; f < l.fixed.size(); ++f) {
+        const auto fixed = fixed_body(l, 5, payload, f, data_bytes);
+        wire.insert(wire.end(), fixed.begin(), fixed.end());
+    }
+    RtxStateChunkRecord record; record.seq = 0; record.digest = rtx_chunk_digest(wire);
+    staging->write_chunk(parse_rtx_chunk_segments(*staging, wire), record);
+    const std::vector<ModelContentIdentity> manifest{record.digest};
+    one.commit(id, {1, data_bytes, rtx_manifest_digest(manifest), false});
+    const auto a = chunks.take(prompt), b = one.take(prompt);
+    require(a && b && a->chunks() > b->chunks(), "file chunk size exercised");
+    require(std::equal(a->payload().begin(), a->payload().end(), b->payload().begin()), "chunked and one-shot staged bytes equal");
+    require(std::equal(a->payload().begin(), a->payload().end(), payload.begin()), "file canonical bytes preserved");
+    RtxStateImportRegistry rejected(heap, 1, 0); rejected.set_layout(l);
+    auto wrong = prompt; wrong[0] = 99;
+    expect_throw([&] { stage_rtx_state_import_file(rejected, path, wrong, 32); }, "file prefix mismatch");
+    header.set("payload_sha256", serve::Json(std::string(64, '0'))); save();
+    expect_throw([&] { stage_rtx_state_import_file(rejected, path, prompt, 32); }, "file SHA mismatch");
+    require(rejected.status().empty(), "failed SHA aborts staging");
+    header.set("payload_sha256", serve::Json(model_content_identity_hex(sha256_bytes(payload))));
+    header.set("context_tokens", serve::Json(std::uint64_t{1048576})); save();
+    expect_throw([&] { stage_rtx_state_import_file(rejected, path, prompt, 32); }, "file capacity mismatch");
+    header.set("context_tokens", serve::Json(l.context_tokens));
+    table = rtx_parse_sha256(std::string(64, '2'));
+    header.set("rotary", serve::parse_json(RotaryIdentity(RotaryDescriptor::yarn(2), table).json())); save();
+    expect_throw([&] { stage_rtx_state_import_file(rejected, path, prompt, 32); }, "file rotary mismatch");
+    header.set("rotary", serve::parse_json(l.rotary.json()));
+    header.set("geometry_identity", serve::Json("1")); save();
+    expect_throw([&] { stage_rtx_state_import_file(rejected, path, prompt, 32); }, "file geometry mismatch");
 }
 
 void test_routes() {
@@ -733,10 +918,12 @@ int main(int argc, char** argv) {
                 argc >= 5 ? static_cast<unsigned>(strix::rtx_parse_u64(argv[4])) : 4U);
 #endif
         test_layout();
+        test_rotary_import();
         test_staging();
         test_staging_local_rows();
         test_registry();
         test_file();
+        test_file_pair();
         test_routes();
         test_routes_codec();
         std::cout << "rtx state import tests passed\n";

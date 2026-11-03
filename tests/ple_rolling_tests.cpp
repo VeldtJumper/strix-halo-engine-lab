@@ -568,6 +568,29 @@ void accounting() {
         "shared cap plus decode plus margin admission");
     expect(c.mapping_bytes == 28800138240ULL && c.mapping_bytes - plan.stats.credit_bytes == budget.admitted + 3072 &&
         plan.stats.credit_bytes == 25193033728ULL, "3 GiB cap admission including table-edge bytes");
+    for (const auto begin : {1U, 2U, 3U}) for (const auto rolling : {0U, 1024U}) {
+        auto suffix_config = c; suffix_config.prompt_begin = begin; suffix_config.rolling_positions = rolling;
+        auto full_config = suffix_config; full_config.prompt_begin = 0;
+        const auto suffix = plan_prompt(suffix_config, contract, ids);
+        const auto full = plan_prompt(full_config, contract, ids);
+        expect(std::equal(suffix.rows.begin(), suffix.rows.end(), full.rows.begin() + begin * contract.head_count),
+            "suffix row IDs equal fresh prompt rows at the same absolute positions and prefix context");
+        // Compare an independent touched-page/decode equation over exactly the selected rows.
+        std::set<std::uint64_t> touched;
+        for (const auto row : suffix.rows) for (auto pg = row * 90ULL / c.page;
+            pg <= (row * 90ULL + 89U) / c.page; ++pg)
+            if (pg * c.page < c.reclaim.back().end) touched.insert(pg);
+        const auto bytes = rolling ? rolling_budget(suffix_config, contract.head_count).cap : touched.size() * c.page;
+        const auto admitted = rolling ? rolling_budget(suffix_config, contract.head_count).admitted :
+            bytes + c.decode_allowance_bytes + (64ULL << 20U) + bytes / 64U;
+        expect(suffix.stats.touched_bytes == bytes && suffix.stats.admitted_bytes == admitted &&
+            suffix.stats.credit_bytes == suffix.stats.reclaimable_bytes - admitted,
+            "suffix credit charges only suffix pages plus the unchanged decode allowance and margin");
+        expect(planned_owner_bytes(suffix_config, contract.head_count, ids.size() - begin) ==
+            owner_bytes(suffix_config, contract.head_count, suffix.rows.size(),
+                ((c.reclaim.back().end - c.reclaim.front().begin) / c.page + 63U) / 64U),
+            "suffix rolling metadata charges only suffix row IDs");
+    }
     c.rolling_positions = 0;
     const auto old = plan_prompt(c,contract,ids);
     c.rolling_positions = rolling_positions("0",nullptr,nullptr);
@@ -828,6 +851,38 @@ void verified_credit() {
         read_ms == 2 && copy_ms == 3 && hash_ms == 4 && join_ms == 5 && ahead_bytes == 0 && (critical_bytes ? critical_ms > 0 && iops > 0 && mb_s > 0 : iops == 0 && mb_s == 0) && std::fgetc(capture) == EOF,
         "STATS-only production block line parses with exact units and no extra lines");
     std::fclose(capture);
+    for (const bool leased : {false, true}) {
+        auto suffix_config = c; suffix_config.prompt_begin = 2;
+        suffix_config.bounded_turns = leased;
+        suffix_config.backing_identity = "suffix-runtime"; suffix_config.mapping_generation = 77;
+        auto suffix = std::make_shared<Prefetcher>(suffix_config, contract, prompt);
+        std::vector<std::uint32_t> staged_ids;
+        expect(suffix->stage_rows(0, 4, staged_ids) == 0 && suffix->stage_rows(2, 4, staged_ids) == 2,
+            "staging starts at restored absolute position and clips at suffix end");
+        expect(staged_ids == plan_prompt(suffix_config, contract, prompt).rows,
+            "runtime and admission retain the same suffix row IDs");
+        auto suffix_turn = leased ? suffix->begin_turn() : std::shared_ptr<ResidencyManager::Turn>{};
+        if (suffix_turn) suffix_turn->phase(true);
+        const auto copy = [&](auto suffix_first, auto suffix_count) {
+            expect(suffix_first == 2 && suffix_count == 2, "reader callbacks preserve absolute suffix positions");
+            const auto view = suffix_turn ? suffix_turn->prompt_view(suffix_first, suffix_count) : suffix->prompt_source(suffix_first, suffix_count).view;
+            std::array<std::byte, 90> row;
+            for (auto p = suffix_first; p < suffix_first + suffix_count; ++p) for (unsigned h = 0; h < contract.head_count; ++h)
+                view->copy(hashes[p].row_ids[h] * 90ULL, row);
+        };
+        if (suffix_turn) {
+            suffix_turn->gather_prompt(2, 2, copy);
+            std::vector<std::uint64_t> rows(staged_ids.begin(), staged_ids.end());
+            suffix_turn->observe(2, rows, 0, 0, 0);
+            suffix_turn->phase(false); suffix_turn->finish();
+        } else {
+            suffix->gather_range(2, 2, copy);
+            suffix->on_gather(2, std::span<const PleHashResult>(hashes).subspan(2), {});
+        }
+        suffix->finish();
+        expect(!suffix->stats().hash_mismatches && !suffix->stats().rows_outside_prompt,
+            "plain and MTP suffix readers check every gathered row without prefix work");
+    }
     verified.stage_begin();
     std::promise<void> finishing;
     auto retired = std::async(std::launch::async,[&] { finishing.set_value(); verified.finish(); });

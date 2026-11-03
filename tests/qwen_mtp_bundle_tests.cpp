@@ -50,6 +50,12 @@ int main(int argc,char** argv) try {
     const auto bundled=parse(base);
     require(bundled.mtp.enabled && bundled.mtp_bundle_path==bundle.string(),"automatic discovery");
     require(bundled.yarn_decode_source==bundle.string(),"bundle source");
+    auto import_args=base;
+    import_args.insert(import_args.end(),{"--rtx-state-import-file","prefix.json"});
+    const auto imported=parse(import_args);
+    require(imported.mtp.enabled && imported.mtp_bundle_path==bundle.string() && imported.rtx_state_import_file=="prefix.json",
+        "CLI file import preserves bundle admission");
+
     EffectiveConfig inspected;inspected.options=bundled;inspected.admitted=true;
     auto receipt=serve::parse_json_unique(effective_config_json(inspected));
     require(receipt.find("yarn_decode_route")->find("source")->as_string()==bundle.string(),"effective bundle source");
