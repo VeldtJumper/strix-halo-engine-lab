@@ -83,6 +83,14 @@ public:
 class FileMappedPleLookupBackend final
     : public PleLookupBackend {
 public:
+    FileMappedPleLookupBackend();   // out of line: the helper type is complete only in ple_lookup.cpp
+    // Drains the pre-issue helper before any member or captured source can go away.
+    ~FileMappedPleLookupBackend() override;
+    // Exclusive helper ownership: a copy or move would share or orphan an in-flight pre-issue.
+    FileMappedPleLookupBackend(const FileMappedPleLookupBackend&) = delete;
+    FileMappedPleLookupBackend& operator=(const FileMappedPleLookupBackend&) = delete;
+    FileMappedPleLookupBackend(FileMappedPleLookupBackend&&) = delete;
+    FileMappedPleLookupBackend& operator=(FileMappedPleLookupBackend&&) = delete;
     void bind_residency(std::shared_ptr<ple_reclaim::ResidencyManager::Turn> turn) {
         if (pending_.active) throw std::logic_error("PLE binding requires cancelled/drained lookup");
         residency_ = std::move(turn);
@@ -94,6 +102,20 @@ public:
         prompt_view_ = std::move(view); prompt_table_ = table; prompt_offset_ = offset;
     }
     [[nodiscard]] std::uint64_t implementation_identity() const noexcept override;
+
+    // STRIX_PLE_PREISSUE (default on where enable_preissue() admitted the route; =0, STRIX_QPF2K_DEFAULTS=0 or
+    // STRIX_BASELINE=1 turn it off): after start(),
+    // issue the reads of `rows` now on a parked helper through the same source the gather will use (bound
+    // residency turn or active rolling source), with an empty copy. No bytes are handed over; the later
+    // finish() finds the pages ready or joins them in flight. Joined at the end of finish(), in cancel() and
+    // on destruction. Only O_DIRECT-owned sources; otherwise and on any error it does nothing.
+    void preissue(std::span<const std::uint64_t> rows) noexcept;
+    // Route gate (off by default): only the plain eager CLI decode turns it on, after its prompt is consumed and
+    // never for an MTP session. Every other owner (MTP, serving, cohorts, distributed stages) keeps the plain path.
+    void enable_preissue(bool on) noexcept { preissue_route_ = on; }
+    [[nodiscard]] static bool preissue_enabled() noexcept;
+    // Master switches first: STRIX_BASELINE=1 or STRIX_QPF2K_DEFAULTS=0 turn it off even with an explicit =1.
+    [[nodiscard]] static bool preissue_enabled_from(const char* preissue, const char* defaults, const char* baseline) noexcept;
 
     [[nodiscard]] PleLookupHandle start(
         const PleLookupRequest& request) override;
@@ -121,8 +143,13 @@ private:
         std::shared_ptr<ple_reclaim::ResidencyManager::Turn> residency;
     };
 
+    struct PreissueWorker;
+    void join_preissue() noexcept;
+
     PleLookupHandle next_handle_ = 1;
     Pending pending_;
+    std::unique_ptr<PreissueWorker> preissue_;
+    bool preissue_route_ = false;
     std::shared_ptr<ple_reclaim::ResidencyManager::Turn> residency_;
     std::shared_ptr<const ple_reclaim::DirectPageCache::View> prompt_view_;
     std::uintptr_t prompt_table_ = 0;
@@ -245,7 +272,10 @@ void start_ple_lookup_prefetch(
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     PleLookupBackend& backend,
-    PleLookupPrefetchState& prefetch);
+    PleLookupPrefetchState& prefetch,
+    // False skips the read pre-issue: verify windows (their rows are warmed during the draft phase; an
+    // admission-time issue of the whole window measured no gain) and prompt blocks (staged ahead already).
+    bool preissue = true);
 
 [[nodiscard]] PleHashResult finish_ple_lookup_prefetch(
     std::uint32_t input_token_id,

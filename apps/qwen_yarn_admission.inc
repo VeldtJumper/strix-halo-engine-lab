@@ -105,6 +105,7 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_PREFILL_LOGITS_DIGEST", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_PLE_ROLLING", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_PLE_ROLLING_STATS", YarnEnvironmentClass::nonrotary, "0|1"},
+    YarnEnvironmentRule{"STRIX_PLE_GAP_WITNESS", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_PLE_DIRECT_IO", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_PLE_DIRECT_IO_STATS", YarnEnvironmentClass::nonrotary, "0|1"},
     YarnEnvironmentRule{"STRIX_MTP_DRAFT_Q4_ALL", YarnEnvironmentClass::nonrotary, "0|1"},
@@ -175,6 +176,7 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_QPF2K_HC_CHECK", YarnEnvironmentClass::refused, "", "device check not audited for YaRN"},
     YarnEnvironmentRule{"STRIX_PLE_WARM", YarnEnvironmentClass::refused, "", "page residency not audited for YaRN admission"},
     YarnEnvironmentRule{"STRIX_PLE_WINDOW_WARM", YarnEnvironmentClass::refused, "", "page residency not audited for YaRN admission"},
+    YarnEnvironmentRule{"STRIX_PLE_PREISSUE", YarnEnvironmentClass::refused, "", "page residency not audited for YaRN admission"},
     YarnEnvironmentRule{"STRIX_MODEL_REGISTER_MLOCK", YarnEnvironmentClass::refused, "", "page residency not audited for YaRN admission"},
 };
 inline const YarnEnvironmentRule* yarn_environment_rule(std::string_view name) {

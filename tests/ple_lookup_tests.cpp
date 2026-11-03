@@ -1,4 +1,5 @@
 #include "strix/ple_lookup.hpp"
+#include "strix/ple_gap_witness.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,7 @@
 #include <limits>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 
 namespace {
 
@@ -278,8 +280,64 @@ void qualify_row_cache_source_contract() {
     expect(legacy.cache_stats().reserved_bytes == 0U, "default backend does not allocate or admit a payload cache");
 }
 
+// The pre-issue helper is owned by exactly one backend.
+static_assert(!std::is_copy_constructible_v<strix::FileMappedPleLookupBackend> &&
+    !std::is_copy_assignable_v<strix::FileMappedPleLookupBackend> &&
+    !std::is_move_constructible_v<strix::FileMappedPleLookupBackend>,
+    "file-mapped PLE backend owns its pre-issue helper exclusively");
+
+void qualify_preissue_switches() {
+    using B = strix::FileMappedPleLookupBackend;
+    expect(B::preissue_enabled_from(nullptr, nullptr, nullptr), "pre-issue defaults on");
+    expect(!B::preissue_enabled_from("0", nullptr, nullptr), "STRIX_PLE_PREISSUE=0 turns it off");
+    expect(B::preissue_enabled_from("1", nullptr, nullptr), "explicit STRIX_PLE_PREISSUE=1 keeps it on");
+    expect(!B::preissue_enabled_from("1", nullptr, "1"), "STRIX_BASELINE=1 wins over explicit pre-issue");
+    expect(!B::preissue_enabled_from("1", "0", nullptr), "STRIX_QPF2K_DEFAULTS=0 wins over explicit pre-issue");
+    expect(B::preissue_enabled_from(nullptr, "1", "0"), "non-disabling master values keep the default");
+}
+
+// Host mock of the event API: query() completes once `done` is set; elapsed = b.t - a.t.
+struct MockEvents {
+    struct Event { double t = -1; bool done = false; };
+    using Stream = double*;   // the mock "stream clock"
+    static bool create(Event&) noexcept { return true; }
+    static void destroy(Event&) noexcept {}
+    static bool record(Event& e, Stream s) noexcept { e.t = *s; e.done = true; return true; }
+    static bool query(Event& e) noexcept { return e.done; }
+    static bool elapsed(float& ms, Event& a, Event& b) noexcept { ms = static_cast<float>(b.t - a.t); return true; }
+};
+
+void qualify_gap_witness_slots() {
+    double clock = 0;
+    strix::ple_gap::Site<MockEvents, 4> site("test", true);
+    // Overlapping gathers get distinct slots and both samples are counted.
+    const int first = site.begin(&clock);
+    const int second = site.begin(&clock);
+    expect(first >= 0 && second >= 0 && first != second, "overlapping witness begins reserve distinct slots");
+    clock = 2; site.end(first, &clock, 0, 0, 0);
+    clock = 5; site.end(second, &clock, 0, 0, 0);
+    site.collect();
+    expect(site.samples() == 2 && site.gap_ms() == 7.0, "both overlapping witness pairs are read");
+    // A begin without end (exception path) is reclaimed when the ring returns to its slot.
+    const int lost = site.begin(&clock);
+    expect(lost >= 0, "witness slot reserved");
+    for (int i = 0; i < 3; ++i) { const int k = site.begin(&clock); site.end(k, &clock, 0, 0, 0); }
+    const int again = site.begin(&clock);
+    expect(again != lost && again % 4 == lost % 4 && site.abandoned() == 1, "abandoned witness slot is reclaimed and counted");
+    site.end(lost, &clock, 0, 0, 0);   // stale end of the reclaimed slot must not record over the new owner
+    site.end(again, &clock, 0, 0, 0);
+    site.collect();
+    expect(site.samples() == 6, "reclaimed slot yields one sample, not two");
+    strix::ple_gap::Site<MockEvents, 4> off("off", false);
+    expect(off.begin(&clock) == -1, "witness off reserves nothing");
+    expect(strix::ple_gap::enabled_from("1", nullptr) && strix::ple_gap::enabled_from(nullptr, "1") &&
+        !strix::ple_gap::enabled_from("0", "0") && !strix::ple_gap::enabled_from(nullptr, nullptr), "witness switches");
+}
+
 int main() {
     qualify_row_cache_source_contract();
+    qualify_preissue_switches();
+    qualify_gap_witness_slots();
     const auto model =
         strix::ModelContract::qwen38_flash_next();
     const auto contract =

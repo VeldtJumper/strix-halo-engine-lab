@@ -7,6 +7,7 @@
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_reclaim.hpp"
+#include "strix/ple_gap_witness.hpp"
 #include "strix/ple_staged_gather.hpp"
 #include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
@@ -44,6 +45,27 @@
 #endif
 
 namespace strix {
+// STRIX_PLE_GAP_WITNESS=1 (or STRIX_PLE_ROLLING_STATS=1): diagnostic only; see strix/ple_gap_witness.hpp.
+// Brackets the host PLE gather of an eager decode step and of a verify window with two timing events on the
+// execution stream; no bytes, launches or synchronizations of the default path change.
+namespace ple_gap {
+struct HipEvents {
+    using Event = hipEvent_t;
+    using Stream = hipStream_t;
+    static bool create(Event& e) noexcept { return hipEventCreate(&e) == hipSuccess; }
+    static void destroy(Event& e) noexcept { (void)hipEventDestroy(e); }
+    static bool record(Event& e, Stream s) noexcept { return hipEventRecord(e, s) == hipSuccess; }
+    static bool query(Event& e) noexcept { return hipEventQuery(e) == hipSuccess; }
+    static bool elapsed(float& ms, Event& a, Event& b) noexcept { return hipEventElapsedTime(&ms, a, b) == hipSuccess; }
+};
+using HipSite = Site<HipEvents>;
+HipSite& eager_site() { static HipSite site("eager-decode"); return site; }
+HipSite& window_site() { static HipSite site("verify-window"); return site; }
+double since_ms(std::chrono::steady_clock::time_point t0) noexcept {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+}  // namespace ple_gap
+
 // STRIX_PLE_WINDOW_WARM (default on; =0, STRIX_QPF2K_DEFAULTS=0 or STRIX_BASELINE=1 turn it off): decode cache
 // warming for the next verify window's PLE rows. The MTP draft loop reports
 // each window row's input token as soon as the host knows it (the pending token when the draft chain starts, each
@@ -75,7 +97,7 @@ struct Warmer {
     // STRIX_CYCLE_TIMING counters.
     unsigned long long cycles = 0, warmed_rows = 0, row_reads = 0, pages_read = 0, errors = 0, windows = 0,
         window_rows = 0, matched_rows = 0, pending_at_window = 0;
-    double warm_ms = 0, ahead_ms = 0;
+    double warm_ms = 0, ahead_ms = 0, warm_wait_ms = 0;
     unsigned long long ahead_n = 0;
     bool timing = std::getenv("STRIX_CYCLE_TIMING") != nullptr;
     ~Warmer() {
@@ -85,6 +107,12 @@ struct Warmer {
         }
         wake.notify_all();
         if (thread.joinable()) thread.join();
+        if (ple_gap::enabled() && cycles)
+            std::fprintf(stderr, "ple-gap warm-worker: cycles=%llu rows-warmed=%llu pages-read=%llu worker-ms=%.3f "
+                "worker-read-wait-ms=%.3f (background, not in exposed) errors=%llu windows=%llu rows=%llu matched=%llu "
+                "warm-running-at-window=%llu warm-done-ahead-ms=%.4f (%llu windows)\n",
+                cycles, warmed_rows, pages_read, warm_ms, warm_wait_ms, errors, windows, window_rows, matched_rows,
+                pending_at_window, ahead_n ? ahead_ms / static_cast<double>(ahead_n) : 0.0, ahead_n);
         if (!timing || !cycles) return;
         std::fprintf(stderr, "window PLE warm: %llu cycles, rows warmed %llu, row reads %llu, pages read %llu, warm %.4f ms/cycle, "
             "errors %llu; %llu windows: rows %llu matched %llu, warm done %.4f ms before window start (%llu windows), "
@@ -121,12 +149,16 @@ struct Warmer {
             std::uint64_t read = 0;
             bool failed = !owner;
             const auto t0 = std::chrono::steady_clock::now();
+            ple_reclaim::DirectActivity activity;
             if (owner) {
+                // Worker reads are background: their joins count as hidden wait, never as demand (exposed) wait.
+                const ple_reclaim::DirectReadScope scope(true, &activity);
                 try { read = owner->warm(address, gen, batch); } catch (...) { failed = true; }
             }
             const auto t1 = std::chrono::steady_clock::now();
             lock.lock();
             --jobs;
+            warm_wait_ms += static_cast<double>(activity.wait_ns) / 1e6;
             warmed_at = t1;
             warmed_rows += count; row_reads += batch.size(); pages_read += read; errors += failed ? 1U : 0U;
             warm_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2001,6 +2033,12 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
             throw std::invalid_argument("captured PLE requires opt-in resident BF16 table without host upload");
         hash.row_count = hash_contract.head_count;
     } else {
+    // STRIX_PLE_GAP_WITNESS: bracket this step's host gather on the stream (diagnostic only).
+    std::optional<ple_reclaim::DirectActivity> gap_activity;
+    std::optional<ple_reclaim::DirectReadScope> gap_scope;
+    const auto gap_t0 = std::chrono::steady_clock::now();
+    const int gap_pair = ple_gap::eager_site().begin(hip_execution_stream());
+    if (gap_pair >= 0) { gap_activity.emplace(); gap_scope.emplace(false, &*gap_activity); }
     auto& backend =
         *context.resources->ple_lookup;
 
@@ -2098,6 +2136,10 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
         }
     }
 
+    if (gap_pair >= 0) {
+        gap_scope.reset();
+        ple_gap::eager_site().end(gap_pair, hip_execution_stream(), ple_gap::since_ms(gap_t0), gap_activity->wait_ns, 0.0);
+    }
     }
 
     const auto lookup_bytes =
@@ -2173,6 +2215,7 @@ void launch_ple(const ExecutionDispatchContext& context, void* user_data) {
     check_hip(
         hipStreamSynchronize(hip_execution_stream()),
         "HIP PLE synchronize");
+    ple_gap::eager_site().collect(); // after the existing step synchronization
 
     std::memcpy(
         reinterpret_cast<void*>(
@@ -2923,7 +2966,8 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     auto* const stats_reclaim = w.prefill ? ple_reclaim::active() : nullptr;
     const bool block_stats = stats_reclaim && stats_reclaim->block_stats();
     ple_reclaim::DirectActivity activity;
-    const ple_reclaim::DirectReadScope block_read_scope(false, block_stats ? &activity : nullptr);
+    const bool gap_window = !w.prefill && ple_gap::enabled();
+    const ple_reclaim::DirectReadScope block_read_scope(false, block_stats || gap_window ? &activity : nullptr);
     if (join_stage) {
         const auto wait0 = std::chrono::steady_clock::now();
         w.join_stage();
@@ -2955,7 +2999,13 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     if (join_stage) w.stage.active = false;
     w.slot ^= 1U;
     // The slot was last read by the window before the previous one.
+    const auto gap_fence0 = std::chrono::steady_clock::now();
     if (w.recorded[w.slot]) check_hip(hipEventSynchronize(w.released[w.slot]), "known-window PLE staging reuse");
+    // STRIX_PLE_GAP_WITNESS: bracket the verify window's host hash + gather on the stream (diagnostic only).
+    const double gap_fence_ms = gap_window ? ple_gap::since_ms(gap_fence0) : 0.0;
+    const auto gap_wait0 = activity.wait_ns;
+    const auto gap_t0 = std::chrono::steady_clock::now();
+    const int gap_pair = gap_window ? ple_gap::window_site().begin(hip_execution_stream()) : -1;
     auto* staging = w.staging[w.slot];
     // Prefill blocks on the file-mapped backend: the n-gram hashes chain row to row, but each row's
     // gather (IQ4_NL decode to BF16) is independent, so the rows are hashed in order on this thread and
@@ -3106,6 +3156,9 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         });
     } else if (!deferred.empty()) gather_chunk(0, rows.size());
     lap("gather");
+    if (gap_pair >= 0)
+        ple_gap::window_site().end(gap_pair, hip_execution_stream(), ple_gap::since_ms(gap_t0), activity.wait_ns - gap_wait0,
+            gap_fence_ms);
     if (reclaim || leased_prompt) {
         std::uint64_t minflt = 0, majflt = 0;
 #if defined(__linux__)

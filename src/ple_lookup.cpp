@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
 #include <cstring>
 #include <vector>
 #include <limits>
@@ -320,7 +324,8 @@ void start_ple_lookup_prefetch(
     const SerialSessionStateLayout& state_layout,
     const SessionStateMemoryBinding& state_memory,
     PleLookupBackend& backend,
-    PleLookupPrefetchState& prefetch) {
+    PleLookupPrefetchState& prefetch,
+    bool preissue) {
     if (prefetch.active) {
         throw std::logic_error("PLE prefetch already active");
     }
@@ -417,6 +422,11 @@ void start_ple_lookup_prefetch(
         contract.row_bytes;
     prefetch.hash = hashed;
     prefetch.active = true;
+    // Pre-issue: start this step's reads now, while the host still enqueues the work ahead of the PLE op.
+    // Only reads move earlier; the lookup above and its later finish() are unchanged.
+    if (auto* mapped = dynamic_cast<FileMappedPleLookupBackend*>(&backend);
+        preissue && mapped && FileMappedPleLookupBackend::preissue_enabled())
+        mapped->preissue(std::span<const std::uint64_t>(hashed.row_ids.data(), hashed.row_count));
 }
 
 PleHashResult finish_ple_lookup_prefetch(
@@ -617,6 +627,11 @@ FileMappedPleLookupBackend::start(
 void FileMappedPleLookupBackend::finish(
     PleLookupHandle handle,
     std::span<std::byte> destination) {
+    // A pre-issue of this lookup never outlives finish(), on every exit path.
+    struct JoinPreissue {
+        FileMappedPleLookupBackend& backend;
+        ~JoinPreissue() { backend.join_preissue(); }
+    } join_preissue_on_exit{*this};
     if (!pending_.active ||
         handle == 0 ||
         handle != pending_.handle) {
@@ -722,8 +737,102 @@ void FileMappedPleLookupBackend::finish(
     pending_ = {};
 }
 
+struct FileMappedPleLookupBackend::PreissueWorker {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::thread thread;
+    std::function<void()> job;
+    bool stop = false, busy = false;
+    ~PreissueWorker() {
+        { const std::lock_guard lock(mutex); stop = true; }
+        wake.notify_all();
+        if (thread.joinable()) thread.join();
+    }
+    void wait() noexcept {
+        std::unique_lock lock(mutex);
+        wake.wait(lock, [this] { return !busy; });
+    }
+    void submit(std::function<void()> work) {
+        std::unique_lock lock(mutex);
+        wake.wait(lock, [this] { return !busy; });
+        if (!thread.joinable()) thread = std::thread([this] { run(); });
+        job = std::move(work); busy = true;
+        lock.unlock();
+        wake.notify_all();
+    }
+    void run() noexcept {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [this] { return stop || static_cast<bool>(job); });
+            if (stop && !job) return;
+            auto work = std::move(job); job = nullptr;
+            lock.unlock();
+            try { work(); } catch (...) {}
+            work = nullptr;   // release the captured source before the caller can observe completion
+            lock.lock();
+            busy = false;
+            wake.notify_all();
+        }
+    }
+};
+
+namespace {
+const char* preissue_environment(const char* name) noexcept {
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)  // getenv: read once, before the first lookup
+#endif
+    return std::getenv(name);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+}
+}  // namespace
+
+bool FileMappedPleLookupBackend::preissue_enabled_from(const char* preissue, const char* defaults, const char* baseline) noexcept {
+    if ((baseline && std::strcmp(baseline, "1") == 0) || (defaults && defaults[0] == '0')) return false;
+    return !(preissue && std::strcmp(preissue, "0") == 0);
+}
+
+bool FileMappedPleLookupBackend::preissue_enabled() noexcept {
+    static const bool on = preissue_enabled_from(preissue_environment("STRIX_PLE_PREISSUE"),
+        preissue_environment("STRIX_QPF2K_DEFAULTS"), preissue_environment("STRIX_BASELINE"));
+    return on;
+}
+
+FileMappedPleLookupBackend::FileMappedPleLookupBackend() = default;
+FileMappedPleLookupBackend::~FileMappedPleLookupBackend() { join_preissue(); }
+
+void FileMappedPleLookupBackend::preissue(std::span<const std::uint64_t> rows) noexcept {
+    try {
+        if (!preissue_route_ || !pending_.active || rows.empty() || prompt_view_) return;
+        // The same source finish() will use; non-owned (mmap) sources gain nothing and are left alone.
+        auto turn = pending_.residency;
+        auto* const active = turn ? nullptr : ple_reclaim::active();
+        if (turn ? !turn->owned_sources() : !(active && active->rolling() && pending_.rolling_source)) return;
+        // The helper owns what it reads through (the turn, or the rolling source), never a borrowed pointer.
+        std::shared_ptr<ple_reclaim::Prefetcher> source;
+        if (!turn && !(source = active->weak_from_this().lock())) return;
+        const auto table = pending_.table_address;
+        const auto generation = pending_.mapping_generation;
+        std::vector<std::uint64_t> ids(rows.begin(), rows.end());
+        if (!preissue_) preissue_ = std::make_unique<PreissueWorker>();
+        preissue_->submit([turn = std::move(turn), source = std::move(source), table, generation, ids = std::move(ids)] {
+            // Background scope: these joins are not demand waits.
+            const ple_reclaim::DirectReadScope scope(true);
+            if (turn) (void)turn->warm(table, generation, ids);
+            else source->source_copy(table, ids, [] {});
+        });
+    } catch (...) {}
+}
+
+void FileMappedPleLookupBackend::join_preissue() noexcept {
+    if (preissue_) preissue_->wait();
+}
+
 void FileMappedPleLookupBackend::cancel(
     PleLookupHandle handle) noexcept {
+    join_preissue();
     if (pending_.active &&
         handle != 0 &&
         handle == pending_.handle) {

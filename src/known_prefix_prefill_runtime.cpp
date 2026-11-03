@@ -332,7 +332,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         require(ple!=serial.execution.steps.end(),"known prefill has PLE resources without PLE step");
         start_ple_lookup_prefetch(*resources.ple_hash_contract,ple->id,tokens[0],session.next_position,*resources.model_manifest,
             *resources.model_weights,*resources.tensor_access,*resources.session_state_layout,*resources.session_state_memory,
-            *resources.ple_lookup,*resources.ple_prefetch);
+            *resources.ple_lookup,*resources.ple_prefetch,false);
     }
     std::array<double,32> launch_ms{};std::array<std::uint32_t,32> launch_steps{};
     const auto observe=[&](std::size_t step) {
