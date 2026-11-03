@@ -891,10 +891,23 @@ int main(int argc, char** argv) {
         sp::ControlState decode_control;
         decode_control.rank = opt.rank;
         unsigned pi = 0;
+        // Both ranks start the prefill timer together: without this pair barrier the earlier-loaded rank's wall includes
+        // its wait for the peer's load inside the first exchange. STRIX_GLM_PF_TIMER_BARRIER=0 restores the old start.
+        const char* tb_env = std::getenv("STRIX_GLM_PF_TIMER_BARRIER");
+        const bool timer_barrier = comm && !(tb_env != nullptr && std::string(tb_env) == "0");
         for (const auto& toks : decode_prompts) {
             eng.reset(0);
             std::size_t free0 = 0, free1 = 0, total = 0;
             if (hipMemGetInfo(&free0, &total) != hipSuccess) throw std::runtime_error("mem info");
+            if (timer_barrier) {
+                const auto tb = Clock::now();
+                const std::uint32_t mine = pi;
+                std::uint32_t peer = 0;
+                comm->exchange_host(std::as_bytes(std::span{&mine, 1}), std::as_writable_bytes(std::span{&peer, 1}),
+                                    strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x9E00U, pi});
+                if (peer != mine) throw std::runtime_error("prefill timer barrier: peer at prompt " + std::to_string(peer));
+                std::printf("rank %u prefill timer barrier: waited %.3f s for the peer\n", opt.rank, secs(tb, Clock::now()));
+            }
             const auto t0 = Clock::now();
             auto& control = decode_control;
             sp::Seed seed;

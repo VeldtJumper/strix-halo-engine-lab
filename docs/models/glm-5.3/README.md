@@ -20,7 +20,9 @@ Run once per node with `R` set to 0 or 1 and the same tokenized prompt on both:
 ```
 
 Default R1b decode uses exact MTP self-speculation and R1 prompt prefill; `--mtp 0` runs plain decode
-with the same tokens. `strix-tokenize MODEL_DIR encode|plain|decode FILE` runs the engine's tokenizer (the
+with the same tokens. Both ranks start the prefill timer after a pair barrier, so the two ranks report the same prefill
+wall and neither includes the peer's load time (the barrier wait is printed; `STRIX_GLM_PF_TIMER_BARRIER=0` restores the
+old start). `strix-tokenize MODEL_DIR encode|plain|decode FILE` runs the engine's tokenizer (the
 same `MODEL_DIR/tokenizer.json` the server loads) on the command line. `--identity r1` selects a different reference identity. Prefill automatically uses
 8192 rows if both ranks admit them, otherwise 4096. See the [resolver](../../../apps/glm_rank_defaults.hpp),
 [model families](../model-families.md) and [qualification/performance](../../performance.md).
