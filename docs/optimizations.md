@@ -1658,6 +1658,22 @@ The exact attention combine already forms the A8 operands of o (int8 codes, delt
 - **Measured gain:** Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, default first): 8.883 / 31.251 s with STRIX_DS41_PREFILL_O_A8_FUSED=0 vs 8.767 / 30.886 s default (-1.3 / -1.2 %); logits and generated ids identical.
 - **Public evidence:** [Prefill attention site](../src/hip_deepseek41_prefill.hip)
 
+<a id="ds-prefill-o-low-a8"></a>
+
+### Prefill o_low A8 in the o_a epilogue
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_O_LOW_A8_FUSED`. **Default:** on.
+
+o_b reads the A8 operands of o_low, the output of o_a. They came from a separate quantize pass over o_low. The dense tall kernels whose blocks own whole 32-output groups now form them in their epilogue: each lane holds the two 16-column halves of its 32-output group in registers, so each half wave reduces its row's group with the quantize kernel's own operations and order.
+
+- **Preconditions:** Device prefill path; o_a on the dense tall forms whose blocks own whole 32-output groups (the default selection).
+- **Automatic selection:** On whenever every o-group's dense call takes such a form; otherwise the separate quantize runs as before.
+- **Fallback notice:** None.
+- **Exactness evidence:** o_low's A8 operands for o_b are formed with the operations of the separate quantize_a8 kernel (the same maximum tree, so all-NaN groups keep a NaN delta): device tests against the same dense form followed by the separate quantize, for every tall form, finite and overflowing (+-Inf, all-NaN) inputs, row and output tails; two-node serve logits and generated ids identical.
+- **Off switch:** STRIX_DS41_PREFILL_O_LOW_A8_FUSED=0
+- **Measured gain:** Kernel bench at the prefill chunk shape (1024 rows, o_a as one dense call per o-group, three interleaved runs): -3.6 % with 4 o-groups, -4.2 % with 8 o-groups (o_a + quantize). Below the run-to-run spread of a whole two-node prefill.
+- **Public evidence:** [Dense prefill kernels](../src/hip_ds41_layer.hip)
+
 <a id="ds-fast-moe-down-rows"></a>
 
 ### FAST MoE down row groups

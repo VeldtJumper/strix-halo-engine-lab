@@ -362,6 +362,12 @@ bool prefill_o_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_A8_FUSED");
     return !(v && v[0] == '0');
 }
+// STRIX_DS41_PREFILL_O_LOW_A8_FUSED (read per call; default on, =0 off): o_a's dense calls write o_low's A8 operands for
+// o_b (quantize_a8's bits) when their form owns whole 32-output groups; else the separate quantize_a8 as before
+bool prefill_o_low_a8_fused() {
+    const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
+    return !(v && v[0] == '0');
+}
 // STRIX_DS41_PREFILL_HC_FUSE (read per call; default on, =0 off): the attention's hc expansion also computes the ffn
 // site's mixes (one enqueue_hc_site, no re-read of the stream), and each site's collapse is read by its RMSNorm (no x
 // round trip); same kernels' arithmetic, same bits
@@ -476,19 +482,22 @@ struct DevicePrefill::Impl {
     bool fast_attn_at(std::uint32_t layer) const {
         return options.fast_attention && layer >= options.approx_layer_first && layer < options.approx_layer_end;
     }
-    void dense(const ds41::Q8A8DensePrefillView& v, const float* input_x, void* st, bool fp16) {
+    // true: the view's output A8 (a8_codes) was written
+    bool dense(const ds41::Q8A8DensePrefillView& v, const float* input_x, void* st, bool fp16) {
         (void)input_x;
         if (fp16) {
 #ifdef STRIX_DS41_PREFILL_FP16_LT
             dense_fp16.enqueue(v,input_x,st,options.fp16_keep_a8);
+            return false;
 #else
             throw std::runtime_error("FP16 dense prefill requires STRIX_DS41_PREFILL_FP16_LT");
 #endif
         } else if (dense_select && v.tall == 0U) {
             auto w = v;
             w.tall = 1U;  // auto
-            ds41::enqueue_q8_0_a8_dense_prefill(w,st);
-        } else ds41::enqueue_q8_0_a8_dense_prefill(v,st);
+            return ds41::enqueue_q8_0_a8_dense_prefill(w,st);
+        }
+        return ds41::enqueue_q8_0_a8_dense_prefill(v,st);
     }
 
     // row_split MoE: PrefillMoe::enqueue_half_joint (one route build and expert pass over the peer's and this rank's
@@ -2503,6 +2512,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     }
                     mark_part(3);
                     if (!fast_o_a && !o_a8_fused) ds41::enqueue_quantize_a8(m.o.p, QL, n, m.ocodes.p, m.odeltas.p, m.osums.p, st);
+                    const bool o_low_a8 = prefill_o_low_a8_fused();
+                    bool o_low_quantized = false;  // every o-group's dense call wrote its A8 of o_low
                     {
                         ds41::Q8A8PrefillView v;
                         v.width = QH / c.o_groups;
@@ -2535,6 +2546,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             }
                         } else if (m.dense_o_a && n >= m.dense_min_rows) {
                             // one dense call per o-group (the same group products as the grouped batch kernel)
+                            o_low_quantized = o_low_a8;
                             for (unsigned g = 0; g < groups; ++g) {
                                 ds41::Q8A8DensePrefillView d;
                                 d.weight = q8_rows(v.weight, std::size_t{g} * c.o_lora_rank, v.width);
@@ -2546,12 +2558,19 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                 d.deltas = m.odeltas.p + g * v.width / 32U;
                                 d.out = m.o_low.p + g * c.o_lora_rank;
                                 d.out_stride = OLL;
-                                m.dense(d, m.o.p + g * v.width, st, false);
+                                if (o_low_a8) {
+                                    d.a8_codes = m.olcodes.p + g * c.o_lora_rank;
+                                    d.a8_deltas = m.oldeltas.p + g * c.o_lora_rank / 32U;
+                                    d.a8_sums = m.olsums.p + g * c.o_lora_rank / 32U;
+                                    d.a8_stride = OLL;
+                                }
+                                const bool written = m.dense(d, m.o.p + g * v.width, st, false);
+                                o_low_quantized = o_low_quantized && written;
                             }
                         } else ds41::enqueue_q8_0_a8_prefill(v, st);
                     }
                     const bool fast_o_b = m.options.fp16_fast && m.fp16_at(16U, layer, n);
-                    if (!fast_o_b) ds41::enqueue_quantize_a8(m.o_low.p, OLL, n, m.olcodes.p, m.oldeltas.p, m.olsums.p, st);
+                    if (!fast_o_b && !o_low_quantized) ds41::enqueue_quantize_a8(m.o_low.p, OLL, n, m.olcodes.p, m.oldeltas.p, m.olsums.p, st);
                     {
                         // wo_b as two K-halves h0 (columns 0..4095) + h1 (4096..8191): h0 into y, then h1 accumulated
                         const bool fp16_o_b = m.fp16_at(16U, layer, n);

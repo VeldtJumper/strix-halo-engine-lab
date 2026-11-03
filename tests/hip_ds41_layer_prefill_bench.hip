@@ -301,6 +301,53 @@ void per_row(std::mt19937& rng, std::uint32_t T, int iterations) {
 
 } // namespace
 
+// STRIX_BENCH_OLOW=1: o_a as the prefill runs it (one dense call per o-group, tall auto, chunk rows) followed by the
+// separate quantize_a8 of o_low, against the same calls writing o_low's A8 themselves; codes / deltas / sums compared.
+void olow(std::mt19937& rng, std::uint32_t T, std::uint32_t groups, int iterations) {
+    const std::uint32_t width = 4096, rank = 1024, oll = groups * rank, in_row = groups * width;
+    const auto w = random_q8(rng, oll, width);
+    auto* dw = dev(w);
+    auto* dx = dev(random_vector(rng, std::size_t{T} * in_row, 1.0F));
+    auto* codes = dev<std::int8_t>(std::size_t{T} * in_row);
+    auto* deltas = dev<float>(std::size_t{T} * in_row / 32);
+    auto* sums = dev<std::int32_t>(std::size_t{T} * in_row / 32);
+    enqueue_quantize_a8(dx, in_row, T, codes, deltas, sums, nullptr);
+    auto* out = dev<float>(std::size_t{T} * oll);
+    std::int8_t* lc[2] = {dev<std::int8_t>(std::size_t{T} * oll), dev<std::int8_t>(std::size_t{T} * oll)};
+    float* ld[2] = {dev<float>(std::size_t{T} * oll / 32), dev<float>(std::size_t{T} * oll / 32)};
+    std::int32_t* ls[2] = {dev<std::int32_t>(std::size_t{T} * oll / 32), dev<std::int32_t>(std::size_t{T} * oll / 32)};
+    auto run = [&](bool fused) {
+        bool all = fused;
+        for (std::uint32_t g = 0; g < groups; ++g) {
+            Q8A8DensePrefillView v;
+            v.weight = dw + std::size_t{g} * rank * (width / 32U) * 34U;
+            v.width = width; v.count = rank; v.rows = T; v.x_stride = in_row;
+            v.codes = codes + g * width; v.deltas = deltas + g * width / 32U;
+            v.out = out + g * rank; v.out_stride = oll; v.tall = 1U;
+            if (fused) { v.a8_codes = lc[1] + g * rank; v.a8_deltas = ld[1] + g * rank / 32U; v.a8_sums = ls[1] + g * rank / 32U; v.a8_stride = oll; }
+            const bool written = enqueue_q8_0_a8_dense_prefill(v, nullptr);
+            all = all && written;
+        }
+        if (!all) enqueue_quantize_a8(out, oll, T, lc[fused ? 1 : 0], ld[fused ? 1 : 0], ls[fused ? 1 : 0], nullptr);
+        return all;
+    };
+    run(false);
+    const bool written = run(true);
+    check(hipDeviceSynchronize(), "sync");
+    const bool same = down(lc[0], std::size_t{T} * oll) == down(lc[1], std::size_t{T} * oll) &&
+                      std::memcmp(down(ld[0], std::size_t{T} * oll / 32).data(), down(ld[1], std::size_t{T} * oll / 32).data(), std::size_t{T} * oll / 32 * 4) == 0 &&
+                      down(ls[0], std::size_t{T} * oll / 32) == down(ls[1], std::size_t{T} * oll / 32);
+    double sep = 0, fus = 0;
+    for (int round = 0; round < 3; ++round) {  // interleaved
+        sep += time_ms(iterations, [&] { run(false); });
+        fus += time_ms(iterations, [&] { run(true); });
+    }
+    std::printf("{\"kernel\":\"o_a+o_low A8\",\"rows\":%u,\"groups\":%u,\"separate_ms\":%.4f,\"fused_ms\":%.4f,\"written\":%d,\"bitwise\":%d}\n", T,
+                groups, sep / 3, fus / 3, written ? 1 : 0, same ? 1 : 0);
+    (void)hipFree(dw); (void)hipFree(dx); (void)hipFree(codes); (void)hipFree(deltas); (void)hipFree(sums); (void)hipFree(out);
+    for (int i = 0; i < 2; ++i) { (void)hipFree(lc[i]); (void)hipFree(ld[i]); (void)hipFree(ls[i]); }
+}
+
 int main(int argc, char** argv) {
     const int iterations = argc > 1 ? std::atoi(argv[1]) : 10;
     std::mt19937 rng(7);
@@ -314,6 +361,11 @@ int main(int argc, char** argv) {
     // STRIX_BENCH_SITES=1: the attention sites only, at the production rows of a rank (row split: q_a / kv up to 4096
     // rows of an 8K prompt; q_b / o_a / o_b per chunk of at most chunk_rows = 1024; batch routes of 16 rows as the
     // prefill builds them)
+    if (const char* e = std::getenv("STRIX_BENCH_OLOW"); e && e[0] == '1') {
+        for (const std::uint32_t groups : {4U, 8U})
+            for (const std::uint32_t T : {256U, 512U, 1024U}) olow(rng, T, groups, iterations);
+        return 0;
+    }
     if (sites_mode()) {
         for (const std::uint32_t T : {512U, 1024U, 2048U, 3072U, 4096U})
             for (const auto& s : {sites[0], sites[1]}) projection(rng, s, T, iterations);

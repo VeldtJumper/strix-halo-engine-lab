@@ -242,8 +242,16 @@ struct Q8A8DensePrefillView {
     std::uint32_t row_width = 0, k_offset = 0;  // K-split parts, as Q8A8View
     bool accumulate = false;
     std::uint32_t tall = 0;  // tall form RT * 10 + OT, 1 auto (the same bits); 0: STRIX_DS41_DENSE_TALL (default off)
+    // Optional A8 of the outputs (enqueue_quantize_a8's bits; accumulate off, count a multiple of 32): codes at
+    // r * a8_stride + o, deltas / sums at r * a8_stride / 32 + o / 32. Written by the tall forms whose blocks own whole
+    // 32-output groups; the enqueue returns whether it was written (else the caller quantizes out).
+    std::int8_t* a8_codes = nullptr;
+    float* a8_deltas = nullptr;
+    std::int32_t* a8_sums = nullptr;
+    std::uint32_t a8_stride = 0;
 };
-void enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
+// Returns true when the outputs' A8 (a8_codes) was written.
+bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),
 // any number of rows (above 8 a tiled kernel with the same lane classes and butterfly, so the same bits).
 struct F16RowsView {
