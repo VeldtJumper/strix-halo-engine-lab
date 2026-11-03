@@ -149,6 +149,10 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_ROUTER_STAGE_ACT", YarnEnvironmentClass::off_switch, "0"},
     // Verify-window score over already-rotated queries and keys (hip_indexed_attention_launcher.hip:6652).
     YarnEnvironmentRule{"STRIX_QSA_WINDOW_ATTN_V2", YarnEnvironmentClass::off_switch, "0|1"},
+    // Chunk-16 GDN core (unset = auto by call length, "1" = every eligible call, "0" = the 8-row kernels): the same
+    // recurrence, conv and gated norm of linear-attention layers in 16-row chunks (src/hip_gdn_qpf2k_prefill.inc);
+    // RoPE lives in the QSA layers it does not touch. Bit-identical outputs in every arm.
+    YarnEnvironmentRule{"STRIX_QPF2K_GDN_CHUNK16", YarnEnvironmentClass::off_switch, "0|1"},
     // OFF only; caching itself stays refused by the route guard.
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE", YarnEnvironmentClass::off_switch, "0"},
     // Host-only diagnostics: steady_clock spans, stderr lines and host counters; no device work or synchronization.

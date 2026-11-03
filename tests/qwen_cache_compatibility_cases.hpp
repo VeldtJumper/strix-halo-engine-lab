@@ -78,7 +78,7 @@ inline std::string without_added_prefill_reports(std::string text) {
 // Long-context items added after the frozen table ({"enabled":..,"suppression":..} objects): each is
 // reported and tested on its own, so strip it from the frozen comparison.
 inline std::string without_added_long_context_items(std::string text) {
-    for(const char* key:{"STRIX_QSA_CACHE_ONLY"}) {
+    for(const char* key:{"STRIX_QSA_CACHE_ONLY","STRIX_QPF2K_GDN_CHUNK16"}) {
         // Only inside "long_context_items" (the requested environment may carry the same name).
         const auto object=text.find("\"long_context_items\":{");
         if(object==std::string::npos) return text;

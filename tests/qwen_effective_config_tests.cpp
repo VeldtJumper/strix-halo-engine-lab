@@ -1387,7 +1387,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         }
         for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC",
                 "STRIX_QPF2K_WMMA_PIN", "STRIX_QPF2K_HC_UPCOPY", "STRIX_PREFILL_ROUTER_SELECT", "STRIX_ROUTER_STAGE_ACT",
-                "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE"}) {
+                "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE", "STRIX_QPF2K_GDN_CHUNK16"}) {
             auto off = request; off.environment[name] = "0";
             const auto admitted = resolve(off, memory);
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty() && admitted.admitted,
@@ -3867,6 +3867,7 @@ int main(int argc, char** arguments) {
             has(plain, "\"STRIX_QSA_DECODE_POOL_BF16\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_PREFILL_MOE_MERGE_VEC\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_QSA_CACHE_ONLY\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"STRIX_QPF2K_GDN_CHUNK16\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"qsa_decode_pool_key_bytes\":2,"), "effective config resolves the long-context items as on");
         ::setenv("STRIX_QSA_DECODE_SELECT", "0", 1);
         ::setenv("STRIX_QSA_DECODE_POOL_BF16", "0", 1);

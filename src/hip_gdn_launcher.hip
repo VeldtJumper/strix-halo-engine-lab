@@ -5104,16 +5104,26 @@ bool gdn_fp16_chunk_enabled(const GdnKnownWindowRow& first, const GdnPrefillRows
 }
 // Fused core resources: the norm exchange (per stream) and the q/k segment-boundary side buffer.
 constexpr unsigned kQpf2kSegments = 8U, kQpf2kCoreWaves = 4U;
-struct Qpf2kCoreScratch { qpf2k_gdn::NormExchange exchange{}; std::uint16_t* side = nullptr; std::uint64_t side_bytes = 0; };
+// Chunk-16 core default (STRIX_QPF2K_GDN_CHUNK16 unset): calls of at most this many rows. Exact either way; receipts
+// (tight padded Chunk-16 vs 8-row dispatch core, gdn_core, ABBA): T 1024 -4.6 %, T 2048 -1.1 %, T 4096 -0.8 %,
+// T 8192 +0.4 %, T 16384 +5 %: 4096 is the last measured winning point. STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS overrides it
+// for crossover measurements.
+constexpr std::uint32_t kQpf2kChunk16MaxRows = 4096U;
+struct Qpf2kCoreScratch {
+    qpf2k_gdn::NormExchange exchange{}; std::uint16_t* side = nullptr; std::uint64_t side_bytes = 0;
+    unsigned ring_rows = 8U;   // rows per norm ring slot (16 only once a Chunk-16 core call needed it)
+};
 // Returned by value: the pool may grow under a concurrent caller.
-Qpf2kCoreScratch qpf2k_core_scratch(hipStream_t stream, std::uint32_t value_heads, std::uint64_t side_bytes) {
+Qpf2kCoreScratch qpf2k_core_scratch(hipStream_t stream, std::uint32_t value_heads, std::uint64_t side_bytes, unsigned ring_rows = 8U) {
     static std::mutex mutex;
     static std::vector<std::pair<hipStream_t, Qpf2kCoreScratch>> pool;
     std::lock_guard<std::mutex> lock(mutex);
     for (auto& [s, scratch] : pool)
-        if (s == stream && scratch.side_bytes >= side_bytes) return scratch;
+        if (s == stream && scratch.side_bytes >= side_bytes && scratch.ring_rows >= ring_rows) return scratch;
+    for (auto& [s, scratch] : pool)
+        if (s == stream) ring_rows = std::max(ring_rows, scratch.ring_rows);
     Qpf2kCoreScratch x;
-    const std::uint64_t partial = std::uint64_t{value_heads} * 2U * qpf2k_gdn::kNormRing * 8U * 32U * 4U;
+    const std::uint64_t partial = std::uint64_t{value_heads} * 2U * qpf2k_gdn::kNormRing * ring_rows * 32U * 4U;
     void* p = nullptr;
     if (hipMalloc(&p, partial + std::uint64_t{value_heads} * 2U * 8U + 16U + side_bytes) != hipSuccess)
         throw std::runtime_error("qpf2k GDN core scratch allocation failed");
@@ -5125,6 +5135,7 @@ Qpf2kCoreScratch qpf2k_core_scratch(hipStream_t stream, std::uint32_t value_head
     x.exchange.witness = x.exchange.consumed + value_heads * 2U + 1U;  // PARTS bit 128: the NaN witness (next word, zeroed too)
     x.side = reinterpret_cast<std::uint16_t*>(x.exchange.consumed + value_heads * 2U + 4U);
     x.side_bytes = side_bytes;
+    x.ring_rows = ring_rows;
     for (auto& [s, scratch] : pool)
         if (s == stream) { scratch = x; return scratch; }  // grown (the old block stays allocated: in-flight launches)
     pool.emplace_back(stream, x);
@@ -5193,11 +5204,13 @@ bool qpf2k_kr_fits(std::uint32_t blocks) {
     return capacity >= blocks;
 }
 // All 2 * value_heads blocks of gdn_core_kernel must be co-resident (cooperative launch); decided once, before any
-// q/k row is rewritten.
-template <GdnRecurrentStorage S, unsigned Lean = 0U, unsigned Cc = 2U, unsigned Nan = 3U, bool F16 = false>
+// q/k row is rewritten. Rows: chunk rows (0 = the column count's default: 4 for 4 columns, else 8); OptBits: added to Opt.
+template <GdnRecurrentStorage S, unsigned Lean = 0U, unsigned Cc = 2U, unsigned Nan = 3U, bool F16 = false, unsigned Rows = 0U,
+    unsigned OptBits = 0U>
 bool qpf2k_core_fits(std::uint32_t blocks) {
     // Opt 6 (post-order tree) for the 4-column core and for the dispatched kernels (Nan 1 / 2); Opt 2 for the default Nan 3
-    constexpr unsigned Waves = Cc == 4U ? 2U : kQpf2kCoreWaves, Chunk = Cc == 4U ? 4U : 8U, Opt = Cc == 4U || Nan == 1U || Nan == 2U ? 6U : 2U;
+    constexpr unsigned Waves = Cc == 4U ? 2U : kQpf2kCoreWaves, Chunk = Rows != 0U ? Rows : Cc == 4U ? 4U : 8U,
+        Opt = (Cc == 4U || Nan == 1U || Nan == 2U ? 6U : 2U) | OptBits;
     static const bool fits = [&] {
         int device = 0, cooperative = 0, units = 0, per_unit = 0;
         if (hipGetDevice(&device) != hipSuccess) return false;
@@ -5207,8 +5220,9 @@ bool qpf2k_core_fits(std::uint32_t blocks) {
                 reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, Cc, Waves, Chunk, Opt, false, Lean, Nan, F16>),
                 static_cast<int>(Waves * 32U), 0) != hipSuccess) return false;
         const bool ok = static_cast<std::uint64_t>(units) * static_cast<std::uint64_t>(per_unit) >= blocks;
-        std::fprintf(stderr, "QPF2K GDN core residency (%u columns per lane group, nan %u): units %d blocks/unit %d need %u -> %s\n", Cc,
-            Nan, units, per_unit, blocks, ok ? "fused core" : "unfused kernels");
+        std::fprintf(stderr, "QPF2K GDN core residency (%u columns per lane group, nan %u%s): units %d blocks/unit %d need %u -> %s\n", Cc,
+            Nan, Rows != 16U ? "" : (OptBits & 2048U) != 0U ? ", chunk 16 single stage unpadded" : ", chunk 16 single stage",
+            units, per_unit, blocks, ok ? "fused core" : Rows == 16U ? "not this variant" : "unfused kernels");
         return ok;
     }();
     return fits;
@@ -5369,10 +5383,41 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                 ? (dispatch ? fits16.template operator()<4U, 1U>() && fits16.template operator()<4U, 2U>() : fits16.template operator()<4U, 3U>())
                 : (dispatch ? fits16.template operator()<2U, 1U>() && fits16.template operator()<2U, 2U>() : fits16.template operator()<2U, 3U>())));
             if (f16) core16->a16 = qpf2k_core16_scratch(stream, count);
+            // Chunk-16 core: the dispatched 2-column block pairs (Nan 2 / Nan 1) with 16-row chunks and one stage (half the
+            // barriers and norm exchanges per row; the same per-row work, bit-identical outputs, so the choice is per call)
+            // when the call's rows are a multiple of 16 and both kernels are co-resident: padded rows (Opt 6) if they fit,
+            // else (forced only) unpadded (Opt 2054); else the 8-row kernels. The norm ring is sized for 16 rows only for such a call.
+            // STRIX_QPF2K_GDN_CHUNK16: unset = auto (calls of at most kQpf2kChunk16MaxRows rows, or
+            // STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS), 1 = every eligible call, 0 = off (8-row kernels). Off under the baseline,
+            // STRIX_QPF2K_DEFAULTS=0 and GSQ models (code-default exact item, --print-effective-config long_context_items).
+            static const bool chunk16_on = qpf2k::long_context_item_enabled("STRIX_QPF2K_GDN_CHUNK16", false);
+            static const bool chunk16_forced = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CHUNK16"); return v && v[0] == '1'; }();
+            static const std::uint32_t chunk16_max_rows = [] {
+                const char* v = std::getenv("STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS");
+                const long long n = v ? std::atoll(v) : static_cast<long long>(kQpf2kChunk16MaxRows);
+                return n >= 0 && n <= 0xffffffffLL ? static_cast<std::uint32_t>(n) : kQpf2kChunk16MaxRows;
+            }();
+            const auto chunk16_fits = [&]<GdnRecurrentStorage S, bool F16, unsigned Bits>() {
+                return qpf2k_core_fits<S, 1U, 2U, 1U, F16, 16U, Bits>(blocks) && qpf2k_core_fits<S, 1U, 2U, 2U, F16, 16U, Bits>(blocks);
+            };
+            const auto chunk16_fits_of = [&]<unsigned Bits>() {
+                return vk ? (f16 ? chunk16_fits.template operator()<GdnRecurrentStorage::value_key, true, Bits>()
+                                 : chunk16_fits.template operator()<GdnRecurrentStorage::value_key, false, Bits>())
+                          : (f16 ? chunk16_fits.template operator()<GdnRecurrentStorage::key_value, true, Bits>()
+                                 : chunk16_fits.template operator()<GdnRecurrentStorage::key_value, false, Bits>());
+            };
+            const bool chunk16_route = chunk16_on && !qpf2k::gsq_model && !qpf2k::suppressed(qpf2k::Item::gdn) && dispatch && !four &&
+                !witness_ok && lean && count % 16U == 0U && (chunk16_forced || count <= chunk16_max_rows);
+            const bool chunk16_padded = chunk16_route && chunk16_fits_of.template operator()<0U>();
+            // the unpadded rows (bank conflicts) measured slower than the 8-row kernels: only when forced (STRIX_QPF2K_GDN_CHUNK16=1)
+            const bool chunk16_unpadded = chunk16_route && chunk16_forced && !chunk16_padded && chunk16_fits_of.template operator()<2048U>();
+            const bool chunk16 = chunk16_padded || chunk16_unpadded;
             const auto qk_channels = first.key_heads * 2U * 128U;
             const unsigned segs = count >= 64U * kQpf2kSegments ? kQpf2kSegments : 1U;
             const unsigned seg_rows = (count / segs + 31U) / 32U * 32U, nseg = (count + seg_rows - 1U) / seg_rows;
-            const auto scratch = qpf2k_core_scratch(stream, first.value_heads, std::uint64_t{kQpf2kSegments} * 3U * qk_channels * 2U);
+            const auto scratch = chunk16
+                ? qpf2k_core_scratch(stream, first.value_heads, std::uint64_t{kQpf2kSegments} * 3U * qk_channels * 2U, 16U)
+                : qpf2k_core_scratch(stream, first.value_heads, std::uint64_t{kQpf2kSegments} * 3U * qk_channels * 2U);
             auto* conv_state = reinterpret_cast<std::uint16_t*>(first.conv_state.address);
             const void* conv_w = reinterpret_cast<const void*>(first.tensors.conv.runtime->address);
             const auto conv_kind = small_weight_kind(first.tensors.conv.manifest->ggml_type);
@@ -5421,6 +5466,14 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                 // t1 (bench): the post-order tree (Opt 6, 201 VGPRs) is faster than Opt 2 at 2 columns too (9.92 vs 10.10 ms per 8K call)
                 return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 8U, 6U, false, 1U, Nan>);
             };
+            const auto chunk16_variant = [&]<GdnRecurrentStorage S, unsigned Nan>() -> const void* {
+                if (chunk16_unpadded) {
+                    if (f16) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 16U, 2054U, false, 1U, Nan, true>);
+                    return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 16U, 2054U, false, 1U, Nan>);
+                }
+                if (f16) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 16U, 6U, false, 1U, Nan, true>);
+                return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 16U, 6U, false, 1U, Nan>);
+            };
             const unsigned threads = four ? 64U : kQpf2kCoreWaves * 32U;
             if (witness_ok) {
                 const std::uint64_t state_elems = witness_state_elems;
@@ -5459,7 +5512,16 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                                                : "recurrence gdn_core_kernel<4,2,4,8,118,lean,witness> + pinned fallback (fused conv + norm)", count);
                 return;
             }
-            if (dispatch) {
+            if (chunk16) {
+                const void* pinned = vk ? chunk16_variant.template operator()<GdnRecurrentStorage::value_key, 2U>()
+                                        : chunk16_variant.template operator()<KV::value, 2U>();
+                const void* paired = vk ? chunk16_variant.template operator()<GdnRecurrentStorage::value_key, 1U>()
+                                        : chunk16_variant.template operator()<KV::value, 1U>();
+                check_hip(hipLaunchCooperativeKernel(pinned, dim3(blocks), dim3(threads), args, 0, stream),
+                    "qpf2k GDN fused core cooperative launch (chunk 16 pinned)");
+                check_hip(hipLaunchCooperativeKernel(paired, dim3(blocks), dim3(threads), args, 0, stream),
+                    "qpf2k GDN fused core cooperative launch (chunk 16 paired)");
+            } else if (dispatch) {
                 const void* pinned = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 2U>() : variant.template operator()<KV::value, 2U>();
                 const void* paired = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 1U>() : variant.template operator()<KV::value, 1U>();
                 check_hip(hipLaunchCooperativeKernel(pinned, dim3(blocks), dim3(threads), args, 0, stream), "qpf2k GDN fused core cooperative launch (pinned)");
@@ -5470,7 +5532,10 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             } else
             check_hip(hipLaunchCooperativeKernel(kernel, dim3(blocks), dim3(kQpf2kCoreWaves * 32U), args, 0, stream),
                 "qpf2k GDN fused core cooperative launch");
-            if (four || dispatch)
+            if (chunk16)
+                qpf2k_gdn_witness(chunk16_unpadded ? "recurrence gdn_core_kernel<4,2,4,16,2054,lean> x decay-NaN dispatch (chunk 16, single stage, unpadded)"
+                                                   : "recurrence gdn_core_kernel<4,2,4,16,6,lean> x decay-NaN dispatch (chunk 16, single stage)", count);
+            else if (four || dispatch)
                 qpf2k_gdn_witness(four && dispatch ? "recurrence gdn_core_kernel<4,4,2,4,6,lean> x decay-NaN dispatch (fused conv + norm)"
                                   : four ? "recurrence gdn_core_kernel<4,4,2,4,6,lean> (fused conv + norm, 4 columns per lane group)"
                                          : "recurrence gdn_core_kernel<4,2,4,8,6,lean> x decay-NaN dispatch (fused conv + norm)", count);

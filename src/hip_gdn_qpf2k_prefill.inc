@@ -105,10 +105,21 @@ template <unsigned G, unsigned Cc, unsigned W> struct ColsShape {
     static constexpr unsigned keys = 128U / G, pitch = 128U / G + 4U, threads = W * 32U, groups = threads / G,
         columns = groups * Cc;
 };
-template <unsigned G, unsigned Cc, unsigned W, unsigned Chunk> struct ColsStage {
+// Pad: floats after each key / query row (4: Shape::pitch, every kernel but the unpadded Chunk-16 core, Opt bit 2048)
+template <unsigned G, unsigned Cc, unsigned W, unsigned Chunk, unsigned Pad = 4U> struct ColsStage {
     using Shape = ColsShape<G, Cc, W>;
-    alignas(16) float key[Chunk][G][Shape::pitch];
-    alignas(16) float query[Chunk][G][Shape::pitch];
+    alignas(16) float key[Chunk][G][Shape::keys + Pad];
+    alignas(16) float query[Chunk][G][Shape::keys + Pad];
+    alignas(16) float value[Chunk][Shape::columns];
+    float beta[Chunk], decay[Chunk];
+};
+// Chunk-16 padded core (Opt 6): a key / query row keeps the sub bases 0 / 36 / 72 / 108 floats (bank-spread) but drops
+// the last sub's pad - 512 B less, so the stage fits 5 blocks per unit (25,600 B kernel LDS).
+template <unsigned G, unsigned Cc, unsigned W, unsigned Chunk> struct ColsStageTight {
+    using Shape = ColsShape<G, Cc, W>;
+    static constexpr unsigned row = G * Shape::pitch - 4U;
+    alignas(16) float key[Chunk][row];
+    alignas(16) float query[Chunk][row];
     alignas(16) float value[Chunk][Shape::columns];
     float beta[Chunk], decay[Chunk];
 };
@@ -567,6 +578,11 @@ __device__ __forceinline__ float gdn_v_conv_silu(const std::uint16_t (&vraw)[Rin
 // peer; same values, same expressions, same order. Bits 16/32 are timing-only diagnostics of the microbench (wrong
 // outputs; compiled only with QPF2K_GDN_BENCH_DIAG): 16 = no pair wait (the peer sums are replaced by the own sums),
 // 32 = no norm (the raw outputs are stored).
+// Chunk 16 (STRIX_QPF2K_GDN_CHUNK16, block-pair decay-NaN dispatch kernels only): 16-row chunks with ONE stage (LDS for
+// 5 blocks per WGP), so the epilogue commits the next chunk's q/k/beta/decay and v rows after a barrier that follows every
+// wave's last token-loop read, and forms its v conv after every wave has read its outputs (kept in registers for the norm).
+// Opt bit 2048: unpadded key / query rows (bank layout only). Same per-row arithmetic, norm order and stores.
+// LDS (G 4, Cc 2, W 4): 25,600 B padded (ColsStageTight), 24,064 B unpadded; the 8-row kernels keep 25,216 B.
 template <GdnRecurrentStorage Storage, unsigned G, unsigned Cc, unsigned W, unsigned Chunk, unsigned Opt, bool Pipe = false,
     unsigned Lean = 0U, unsigned Nan = 3U, bool F16 = false>
 __global__ __launch_bounds__(W * 32U) __attribute__((amdgpu_waves_per_eu(5, 16)))
@@ -591,12 +607,21 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     static_assert((374U | 1024U) == 1398U);
     [[maybe_unused]] bool nan_seen = false;   // Nan 4 only
     using Shape = ColsShape<G, Cc, W>;
-    constexpr unsigned Threads = Shape::threads, Columns = Shape::columns, K = Shape::keys, Ring = 12U;
+    // Chunk 16: one stage; v ring of Chunk + 3 rows (the 3 conv history rows plus the chunk); Opt bit 2048 unpadded rows.
+    constexpr bool Single = Chunk == 16U;
+    static_assert(!Single || (G == 4U && Cc == 2U && W == 4U && (Opt == 6U || Opt == 2054U) && !Pipe && Lean == 1U &&
+        (Nan == 1U || Nan == 2U)), "Chunk 16 is built for the block-pair decay-NaN dispatch kernels only");
+    static_assert(Chunk <= 8U || Single);
+    static_assert((Opt & 2048U) == 0U || Single);
+    constexpr unsigned Pad = (Opt & 2048U) != 0U ? 0U : 4U, Pitch = 128U / G + Pad;
+    constexpr bool Tight = Single && Pad != 0U;   // ColsStageTight rows: sub s at s * Pitch, row G * Pitch - 4 floats
+    constexpr unsigned Threads = Shape::threads, Columns = Shape::columns, K = Shape::keys, Ring = Single ? Chunk + 3U : 12U;
     static_assert(Columns == 64U && Chunk + 3U <= Ring && Chunk % W == 0U);
     constexpr unsigned KeyQuads = (Chunk * 64U + Threads - 1U) / Threads;
     constexpr unsigned ValueQuads = (Chunk * Columns / 4U + Threads - 1U) / Threads;
-    using Stage = std::conditional_t<Witness, KrStage<G, Chunk>, ColsStage<G, Cc, W, Chunk>>;
-    __shared__ Stage stage[2];
+    using Stage = std::conditional_t<Witness, KrStage<G, Chunk>,
+        std::conditional_t<Tight, ColsStageTight<G, Cc, W, Chunk>, ColsStage<G, Cc, W, Chunk, Pad>>>;
+    __shared__ Stage stage[Single ? 1U : 2U];
     __shared__ std::uint16_t vraw[Ring][Columns];
     __shared__ float vweight[Columns][kGdnWindowKernel];
     const auto thread = static_cast<std::uint32_t>(threadIdx.x), lane = thread % 32U, wave = thread / 32U;
@@ -647,6 +672,9 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                 if constexpr (Witness) {
 #pragma unroll
                     for (unsigned c = 0; c < 4U; ++c) target[(key + c) / G / 4U][(key + c) % G][(key + c) / G % 4U] = parts[c];
+                } else if constexpr (Tight) {
+#pragma unroll
+                    for (unsigned c = 0; c < 4U; ++c) target[(key + c) % G * Pitch + (key + c) / G] = parts[c];
                 } else {
 #pragma unroll
                 for (unsigned c = 0; c < 4U; ++c) target[(key + c) % G][(key + c) / G] = parts[c];
@@ -810,17 +838,20 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     if constexpr (!PackedValue) convolve(stage[0], 0U);
     __syncthreads();
     unsigned n = 0;
-    for (std::uint32_t first = 0, buffer = 0; first < count; first += Chunk, buffer ^= 1U, ++n) {
+    for (std::uint32_t first = 0, buffer = 0; first < count; first += Chunk, buffer ^= Single ? 0U : 1U, ++n) {
         const bool more = first + Chunk < count;
         if (more) fetch(first + Chunk);
         const Stage& s = stage[buffer];
         // Witness (compact stage): a lane's key quads are G float4 apart, rows 32 float4 apart.
-        constexpr unsigned QuadStep = Witness ? G : 1U, RowStep = Witness ? 32U : G * Shape::pitch / 4U;
+        constexpr unsigned QuadStep = Witness ? G : 1U, RowStep = Witness ? 32U : (G * Pitch - (Tight ? 4U : 0U)) / 4U;
         const float4* key;
         const float4* query;
         if constexpr (Witness) {
             key = reinterpret_cast<const float4*>(&s.key[0][0][sub][0]);
             query = reinterpret_cast<const float4*>(&s.query[0][0][sub][0]);
+        } else if constexpr (Tight) {
+            key = reinterpret_cast<const float4*>(&s.key[0][sub * Pitch]);
+            query = reinterpret_cast<const float4*>(&s.query[0][sub * Pitch]);
         } else {
             key = reinterpret_cast<const float4*>(s.key[0][sub]);
             query = reinterpret_cast<const float4*>(s.query[0][sub]);
@@ -1040,6 +1071,64 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
 #pragma unroll
                 for (unsigned i = 0; i < PerWave; ++i)
                     zv[i][part] = rows.z[static_cast<std::uint64_t>(first + wave + i * W) * rows.stride + value_head * 128U + channel];
+            }
+            if constexpr (Single) {
+                // One stage (buffer 0): the lean sequence with the commit after a barrier and the conv after the outputs
+                // are in registers. Ring slot reuse waits for the peer's consumed counter, as below.
+                if (n >= kNormRing && thread == 0U)
+                    while (load_acquire(peer_con) < xch.base + n - kNormRing + 1U) __builtin_amdgcn_s_sleep(1);
+                __syncthreads();   // every token-loop read of the stage and every output write done; ring slot n free
+                if (more) commit(stage[0], first + Chunk);   // next chunk's q/k/beta/decay and v rows (slots of rows first-3..)
+                float mine[PerWave], own[PerWave][2];
+#pragma unroll
+                for (unsigned i = 0; i < PerWave; ++i) {
+                    const unsigned r = wave + i * W;
+                    own[i][0] = outs[r][lane]; own[i][1] = outs[r][32U + lane];
+                    const float lo = own[i][0], hi = own[i][1];
+                    mine[i] = gdn_window_add(lo * lo, hi * hi);
+                    my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = mine[i];
+                }
+                __syncthreads();   // ring rows and the commit complete; every read of the outputs done
+                if (thread == 0U) { __threadfence(); store_release(my_pub, xch.base + n + 1U); }
+                // next chunk's v conv while the peer publishes (overwrites the value slots: the outputs are in own)
+                if (more) convolve(stage[0], first + Chunk);
+                if (thread == 0U) while (load_acquire(peer_pub) < xch.base + n + 1U) __builtin_amdgcn_s_sleep(1);
+                __syncthreads();   // peer sums published; the conv complete before the next token loop
+#pragma unroll
+                for (unsigned i = 0; i < PerWave; ++i) {
+                    const unsigned r = wave + i * W;
+                    const float peer = __hip_atomic_load(&peer_ring[((n % kNormRing) * Chunk + r) * 32U + lane], __ATOMIC_RELAXED,
+                        __HIP_MEMORY_SCOPE_AGENT);
+                    float sum = half == 0U ? gdn_window_add(mine[i], peer) : gdn_window_add(peer, mine[i]);
+                    sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
+                    sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
+                    sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
+                    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
+                    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+                    sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
+                    float head_dim_f;   // opaque divisor: the production runtime IEEE division (see finish)
+                    asm volatile("v_mov_b32 %0, 0x43000000" : "=v"(head_dim_f));
+                    const float inv = rsqrtf(sum / head_dim_f + epsilon);
+                    const std::uint64_t base = static_cast<std::uint64_t>(first + r) * rows.stride + value_head * 128U;
+#pragma unroll
+                    for (unsigned part = 0; part < 2U; ++part) {
+                        const auto channel = part * 64U + 32U * half + lane;
+                        const float gate_value = 1.0F / (1.0F + expf(-zv[i][part]));
+                        const float normed = gated_norm_product(own[i][part], inv, nw[part], gate_value);   // outs[r][part * 32 + lane]
+                        if constexpr (F16) {
+                            // Same FP32 value and RNE conversion as tiled kF32 staging; no FP32 reader on this route.
+                            xch.core16[static_cast<std::uint64_t>(first + r) * xch.core16_pitch + value_head * 128U + channel] =
+                                static_cast<_Float16>(normed);
+                            // Each aligned 8-lane group is one row's 8 consecutive channels (including across heads).
+                            const auto bad = __ballot(isfinite(normed) && !(fabsf(normed) <= 65504.0F));
+                            if (bad != 0ULL && lane % 8U == 0U && ((bad >> lane) & 0xffULL) != 0ULL)
+                                atomicAdd(xch.core16_overflow, 1U);
+                        } else rows.core[base + channel] = normed;
+                    }
+                }
+                __syncthreads();   // every peer ring read done before the consumed release
+                if (thread == 0U) store_release(my_con, xch.base + n + 1U);
+                continue;
             }
             if (more) commit(stage[buffer ^ 1U], first + Chunk);
             if constexpr ((Lean & 32U) != 0U) {
