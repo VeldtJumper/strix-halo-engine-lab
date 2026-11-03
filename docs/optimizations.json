@@ -2183,13 +2183,13 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill MLA scores v6",
+    "name": "Prefill MLA scores v7",
     "flag_or_env": "STRIX_GLM_PF_SCORES",
-    "default": "6",
-    "exact": "Bitwise equal to v5/v4/v3 and the decode kernel on the prefill gate.",
-    "gain": "3.40 / 8.27 / 10.38 vs v5 4.57 / 9.27 / 11.39 us/row per DSA layer at chunk positions 0 / 4096 / 28672; with KDA scan v3, 32K pair TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
+    "default": "7",
+    "exact": "Bitwise equal to v6/v5/v4/v3 and the decode kernel on the prefill gate.",
+    "gain": "v7 (v6 in 256-row launch groups) 4.90 / 6.08 / 7.87 / 9.89 vs v6 4.96 / 8.42 / 9.41 / 10.46 us/row per DSA layer at chunk positions 0 / 4096 / 12288 / 28672; rank-0 32K scores 2.6 -> 2.27 s, 32K pair TTFT 65.68 -> 65.54 s (-0.2 %, both orders); v6: 3.40 / 8.27 / 10.38 vs v5 4.57 / 9.27 / 11.39 us/row per DSA layer at chunk positions 0 / 4096 / 28672; with KDA scan v3, 32K pair TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
     "preconditions": "Exact chunked prefill and supported score geometry (heads 32; heads 64 keep v5).",
-    "off_switch": "STRIX_GLM_PF_SCORES=5 (or 4, 3, 2)",
+    "off_switch": "STRIX_GLM_PF_SCORES=6 (or 5, 4, 3, 2)",
     "doc_anchor": "docs/optimizations.md#glm-pf-scores-v3"
   },
   {
