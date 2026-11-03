@@ -25,12 +25,14 @@
 #include <sys/resource.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -124,6 +126,10 @@ int main(int argc, char** argv) try {
     const bool hot_gap = env("STRIX_PROBE_HOT_GAP", "0") == "1";
     const bool staged_ready = env("STRIX_PROBE_STAGED_READY", "0") == "1";
     const double outlier_us = std::stod(env("STRIX_PROBE_OUTLIER_US", "10000"));
+    // STRIX_PROBE_SYNC (default 1, =0 off): before every iteration both ranks exchange an untimed (bytes, i) token over
+    // the control transport, so each timed exchange starts with both ranks ready (without it the ranks drift and take turns
+    // waiting, and a p50 over a half-short / half-long set flips on a few samples).
+    const bool rendezvous = env("STRIX_PROBE_SYNC", "1") != "0";
     const auto run = [&](strix::dist::Communicator& c, const char* name) {
         Load background(load);
         for (const auto size : sizes) {
@@ -173,6 +179,12 @@ int main(int argc, char** argv) try {
 #endif
                     }
                 } else if (pause_us) std::this_thread::sleep_for(std::chrono::microseconds(pause_us));
+                if (rendezvous) {
+                    const std::uint64_t mine[2] = {size, i};
+                    std::uint64_t peer[2] = {};
+                    control->exchange(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
+                    if (peer[0] != mine[0] || peer[1] != mine[1]) throw std::runtime_error("probe rendezvous: the ranks are at different iterations");
+                }
                 const double c0 = cpu_seconds();
                 const auto s0 = direct_stats ? direct_stats->stats() : strix::dist::DeviceExchangeStats{};
                 const auto wall0 = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -222,9 +234,23 @@ int main(int argc, char** argv) try {
                 }
             }
             if (bad) throw std::runtime_error(std::string(name) + ": received bytes differ (" + std::to_string(bad) + " exchanges)");
+            // both ranks' per-iteration times, paired by iteration (untimed exchange after the loop)
+            std::vector<double> peer_us(us.size());
+            control->exchange(std::as_bytes(std::span(us)), std::as_writable_bytes(std::span(peer_us)));
+            std::vector<double> pair_max(us.size());
+            for (std::size_t k = 0; k < us.size(); ++k) pair_max[k] = std::max(us[k], peer_us[k]);
+            const auto lo = *std::min_element(us.begin(), us.end()), hi = *std::max_element(us.begin(), us.end());
+            std::array<std::size_t, 10> hist{};
+            for (const double t : us) ++hist[std::min<std::size_t>(9U, hi > lo ? static_cast<std::size_t>((t - lo) / (hi - lo) * 10.0) : 0U)];
             std::cout << "{\"label\":\"" << label << "\",\"rank\":" << rank << ",\"path\":\"" << name << "\",\"load\":" << (load ? 1 : 0) << ",\"pause_us\":" << pause_us << ",\"bytes\":" << size
                       << ",\"p50_us\":" << at(us, 0.5) << ",\"p99_us\":" << at(us, 0.99) << ",\"max_us\":" << worst << ",\"over_1ms\":" << over1
-                      << ",\"over_10ms\":" << over10 << ",\"n\":" << us.size() << ",\"cpu_us\":" << cpu * 1e6 / iterations;
+                      << ",\"over_10ms\":" << over10 << ",\"n\":" << us.size() << ",\"cpu_us\":" << cpu * 1e6 / iterations
+                      << ",\"rendezvous\":" << (rendezvous ? 1 : 0) << ",\"p10_us\":" << at(us, 0.1) << ",\"p90_us\":" << at(us, 0.9)
+                      << ",\"peer_p10_us\":" << at(peer_us, 0.1) << ",\"peer_p50_us\":" << at(peer_us, 0.5) << ",\"peer_p90_us\":" << at(peer_us, 0.9)
+                      << ",\"pair_max_p50_us\":" << at(pair_max, 0.5) << ",\"pair_max_p90_us\":" << at(pair_max, 0.9) << ",\"hist_lo_us\":" << lo
+                      << ",\"hist_hi_us\":" << hi << ",\"hist\":[";
+            for (std::size_t k = 0; k < hist.size(); ++k) std::cout << (k ? "," : "") << hist[k];
+            std::cout << "]";
             if (staged_ready)
                 std::cout << ",\"staged_ready\":" << (used_staged_ready ? 1 : 0)
                           << ",\"available_p50_us\":" << at(available_us, 0.5)

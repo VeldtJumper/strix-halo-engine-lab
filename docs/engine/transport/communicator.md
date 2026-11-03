@@ -236,7 +236,10 @@ the same with and without overlap.
 ## Measurements, GPU-direct on 2 rings (data1 of both cables) vs the host path on 2 streams (data0)
 
 Probe `strix-dist-gpu-probe`: GPU producer, exchange, stream synchronize; every received word is checked, and all
-exchanges were byte-exact.
+exchanges were byte-exact. The probe synchronises the two ranks before every timed exchange (`STRIX_PROBE_SYNC=0`
+restores the former free-running loop) and reports both ranks' percentiles and the pair maximum, so the 1 MiB figures
+no longer flip between runs: host path, 1 MiB, pair maximum p50 300-318 µs (26.4-27.9 Gb/s per direction, three
+fresh-process runs) with the rendezvous, against a bimodal 168-521 µs spread without it.
 
 | p50 µs | 64 B | 20 KB | 160 KB | 21 MB |
 |---|---|---|---|---|
