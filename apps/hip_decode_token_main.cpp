@@ -3853,9 +3853,10 @@ static int run_decode_entry(
                 policy.min_probability = strix::decode_cli::mtp_draft_min_probability(options.mtp);
                 policy.timing_independent_schedule =
                     strix::decode_cli::mtp_sampling(options.mtp) && !options.mtp.sample_timing_schedule;
-                // Persisted window costs (off unless STRIX_COST_TABLE_DIR is set; the verifier checks it): the
+                // Persisted window costs (cost_table_directory_from_env; OFF: STRIX_COST_TABLE=0): the
                 // configuration is filled once the route and HTTP capacity are resolved (below).
                 policy.cost_table_configuration = cost_table_config;
+                policy.cost_table_baseline = options.baseline;
                 auto verifier = std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(owners),
                     request_parents->resources, request_parents, policy, generations);
                 request_parents->window_setup = {union_steps, union_total, union_generation, retained_total};

@@ -443,7 +443,7 @@ struct Options {
     std::uint64_t session_first_generate = 0, session_capture_host_bytes = 8ULL << 30;
     std::string session_effective_cli;
     // session_effective_cli without per-run outputs, prompts and HTTP front-end settings: the policy part of the
-    // persisted window-cost table key (STRIX_COST_TABLE_DIR).
+    // persisted window-cost table key (cost_table_cache.hpp).
     std::string cost_table_cli;
     std::string session_dir;
     bool session_management_requested = false;

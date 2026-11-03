@@ -188,17 +188,54 @@ bool cost_table_directory_admitted(const std::filesystem::path& directory) {
     }
     return true;
 }
-std::optional<std::filesystem::path> cost_table_directory_from_env() {
-    const char* v=std::getenv("STRIX_COST_TABLE_DIR");
-    if(!v || !*v) return std::nullopt;
-    std::filesystem::path path(v);
-    if(!cost_table_directory_admitted(path)) {
-        static std::atomic<bool> warned{false};
-        if(!warned.exchange(true)) std::fprintf(stderr,"cost-table: STRIX_COST_TABLE_DIR refused (empty or inside a source checkout); off\n");
-        return std::nullopt;
-    }
-    return path;
+std::optional<std::filesystem::path> cost_table_default_directory() {
+    const auto absolute=[](const char* v)->std::optional<std::filesystem::path> {
+        if(!v || !*v) return std::nullopt;
+        std::filesystem::path p(v);
+        if(!p.is_absolute()) return std::nullopt;
+        return p;
+    };
+#ifdef _WIN32
+    if(const auto base=absolute(std::getenv("LOCALAPPDATA"))) return *base/"strix"/"cost-tables";
+#else
+    if(const auto base=absolute(std::getenv("XDG_CACHE_HOME"))) return *base/"strix"/"cost-tables";
+    if(const auto home=absolute(std::getenv("HOME"))) return *home/".cache"/"strix"/"cost-tables";
+#endif
+    return std::nullopt;
 }
+const char* cost_table_source_name(CostTableSource s) noexcept {
+    switch(s) {
+    case CostTableSource::explicit_dir: return "env";
+    case CostTableSource::default_dir: return "default";
+    case CostTableSource::off: return "off";
+    case CostTableSource::baseline: return "baseline";
+    case CostTableSource::refused: return "refused";
+    case CostTableSource::unavailable: return "unavailable";
+    }
+    return "unknown";
+}
+CostTableDirectory cost_table_directory_resolve(bool baseline) {
+    if(const char* s=std::getenv("STRIX_COST_TABLE"); s && std::string_view(s)=="0") return {std::nullopt,CostTableSource::off};
+    CostTableDirectory out;
+    if(const char* v=std::getenv("STRIX_COST_TABLE_DIR")) { // explicit: wins, also under baseline
+        const std::string_view value(v);
+        if(value.empty() || value=="off" || value=="0") return {std::nullopt,CostTableSource::off};
+        out={std::filesystem::path(v),CostTableSource::explicit_dir};
+    } else {
+        const char* b=std::getenv("STRIX_BASELINE");
+        const char* d=std::getenv("STRIX_QPF2K_DEFAULTS");
+        if(baseline || (b && std::string_view(b)=="1") || (d && d[0]=='0')) return {std::nullopt,CostTableSource::baseline};
+        out={cost_table_default_directory(),CostTableSource::default_dir}; // created on the first store
+        if(!out.path) return {std::nullopt,CostTableSource::unavailable};
+    }
+    if(!cost_table_directory_admitted(*out.path)) {
+        static std::atomic<bool> warned{false};
+        if(!warned.exchange(true)) std::fprintf(stderr,"cost-table: table directory refused (inside a source checkout); off\n");
+        return {std::nullopt,CostTableSource::refused};
+    }
+    return out;
+}
+std::optional<std::filesystem::path> cost_table_directory_from_env() {return cost_table_directory_resolve(false).path;}
 CostTableOptions cost_table_options_from_env() {
     CostTableOptions out;
     double v=0.0;
