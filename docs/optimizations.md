@@ -2675,7 +2675,7 @@ The rank app now switches on its prefill exchange module, whose copy kernels and
 - **Automatic selection:** Unset = on; `load` = constructed and off; `off` = not constructed.
 - **Fallback notice:** Startup line names the module state.
 - **Exactness evidence:** Exact: prefill state, final rows and tokens identical on both ranks in-process (1K, 8K) and across fresh processes in any order.
-- **Off switch:** STRIX_MM_PFX=load (previous default) or =off
+- **Off switch:** STRIX_MM_PFX=load (previous default) or =off; STRIX_MM_BASELINE=1 also leaves it loaded but off
 - **Measured gain:** TTFT 1K -3.5 %, 8K -1.5 % (in-process A/B/A, two Strix Halo nodes).
 - **Implementation / evidence:** [rank app](../apps/minimax_rank_main.cpp), [module](../src/minimax/pfx/pf_exchange.hpp)
 
