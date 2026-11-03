@@ -3,12 +3,15 @@
 #include "internal.hpp"
 #include "a8_ops.hpp"
 #include "weight_policy.hpp"
+#include "capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
 #include <algorithm>
 #include <cfenv>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <set>
 #include <string_view>
 
@@ -17,6 +20,13 @@ namespace {
 bool enabled(const char* name) {
     const auto* p = std::getenv(name);
     return !p || std::string_view(p) != "0";
+}
+// STRIX_G4_GRAPH_CACHE (read per pass): the decode graph cache is cleared at 32 graphs; =0 restores the previous
+// cap of 8. Keys are (rows, attention stride bucket, single_rows); drafting windows of several sizes otherwise
+// recapture.
+std::size_t graph_cache_entries() {
+    const auto* p = std::getenv("STRIX_G4_GRAPH_CACHE");
+    return p && std::string_view(p) == "0" ? 8 : 32;
 }
 bool output_tiling() {
     const auto* p = std::getenv("STRIX_G4_OUTPUT_TILE");
@@ -612,12 +622,15 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
         b.partials.resize(std::max(partial_bytes, b.partials.size()));
     }
     bool capturing = false;
+    std::optional<CaptureSlot> capture_slot; // held from the capture's begin to its end
     Impl::Graph pending;
     b.a8_source[0] = b.a8_source[1] = nullptr;
     try {
         for (auto& [tx, p] : transactions) {
             tx->rows += p.size();
             tx->evaluated = false;
+            // KV_QUEUE: the commit publishes this pass's rows on the queue that wrote them.
+            if (tx->stream->writer_queue) tx->stream->queue = b.queue;
             for (std::size_t l = 0; l < tx->overlay.size(); ++l) {
                 const auto bytes = (tx->stream->pooled ? 8ULL : tx->rows) * tx->stream->cache[l].width * sizeof(float);
                 if (!tx->reserved && (!tx->stream->pooled || bytes > tx->overlay[l].k.size())) {
@@ -651,13 +664,23 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
         b.stats.graphs = b.options.graphs;
         if (b.options.graph_timing)
             hip_checked(hipEventRecord(b.start, b.queue));
+        auto& counters = capture_guard_state();
+        auto capture_begin = std::chrono::steady_clock::now();
         if (b.options.graphs && cached != b.graphs.end()) {
+            counters.target_replays.fetch_add(1);
             b.stats.pass_weight_bytes = cached->second.traffic;
             hip_checked(hipGraphLaunch(cached->second.executable, b.queue));
         } else {
-            if (b.graphs.size() >= 8)
-                b.clear_graphs();
+            // No new capture while a prefill pass runs on another thread: this pass then runs the same
+            // kernels with the same arguments eagerly (bitwise identical) and caches no graph.
             if (b.options.graphs) {
+                capture_slot.emplace();
+                if (!capture_slot->granted()) capture_slot.reset();
+            }
+            if (capture_slot && b.graphs.size() >= graph_cache_entries())
+                b.clear_graphs();
+            if (capture_slot) {
+                capture_begin = std::chrono::steady_clock::now();
                 hip_checked(hipStreamBeginCapture(b.queue, hipStreamCaptureModeThreadLocal));
                 capturing = true;
             }
@@ -898,8 +921,12 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             if (capturing) {
                 const auto status = hipStreamEndCapture(b.queue, &pending.graph);
                 capturing = false;
+                capture_slot.reset();
                 hip_checked(status);
                 hip_checked(hipGraphInstantiate(&pending.executable, pending.graph, nullptr, nullptr, 0));
+                counters.target_captures.fetch_add(1);
+                counters.target_capture_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - capture_begin).count()));
                 pending.traffic = b.stats.pass_weight_bytes;
                 b.graphs.emplace(key, pending);
                 pending = {};

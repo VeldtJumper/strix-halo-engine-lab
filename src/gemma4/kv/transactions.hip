@@ -4,6 +4,7 @@
 #include "strix/model_content_hash.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <string>
 #include <string_view>
 
 namespace strix::gemma4::gpu {
@@ -43,7 +44,22 @@ __global__ void store_kernel(const float* k, const float* v, const KvWrite* dst,
         dst[r].v[std::size_t(dst[r].row) * width + i] = v[std::size_t(r) * width + i];
     }
 }
+void stream_checked(hipError_t e) {
+    if (e != hipSuccess)
+        throw std::runtime_error(std::string("gemma4 device KV stream: ") + hipGetErrorString(e));
+}
+// Copy between host and device on the stream's queue (or synchronously on the null stream when it has none).
+void stream_copy(Queue q, void* dst, const void* src, std::size_t bytes, hipMemcpyKind kind) {
+    if (!bytes) return;
+    if (!q) { stream_checked(hipMemcpy(dst, src, bytes, kind)); return; }
+    stream_checked(hipMemcpyAsync(dst, src, bytes, kind, static_cast<hipStream_t>(q)));
+    stream_checked(hipStreamSynchronize(static_cast<hipStream_t>(q)));
+}
 } // namespace
+DeviceStream::Impl::~Impl() {
+    if (pinned_publication)
+        (void)hipHostFree(pinned_publication);
+}
 void store_overlay(const float* k, const float* v, const KvWrite* dst, unsigned rows, unsigned width, Queue q) {
     hipLaunchKernelGGL(store_kernel, dim3(rows), dim3(128), 0, static_cast<hipStream_t>(q), k, v, dst, width);
     launch_checked();
@@ -79,8 +95,16 @@ void DeviceStream::Impl::Txn::commit(std::size_t count) {
                 descriptors[l] = {c.k.as<float>(), c.v.as<float>(), c.tags.as<std::uint64_t>(),
                                   overlay[l].k.as<float>(), overlay[l].v.as<float>(), c.slots, c.width, c.global};
             }
-            stream->publication.upload(descriptors.data(), descriptors.size() * sizeof(detail::Publication));
-            hipLaunchKernelGGL(publish_batch_kernel, dim3(unsigned(descriptors.size())), dim3(128), 0, nullptr,
+            const auto bytes = descriptors.size() * sizeof(detail::Publication);
+            if (stream->queue && stream->pinned_publication) {
+                // Pinned staging: the copy is ordered on the stream's queue before the kernel that reads it.
+                std::copy(descriptors.begin(), descriptors.end(), static_cast<detail::Publication*>(stream->pinned_publication));
+                stream_checked(hipMemcpyAsync(stream->publication.data(), stream->pinned_publication, bytes,
+                                              hipMemcpyHostToDevice, static_cast<hipStream_t>(stream->queue)));
+            } else
+                stream->publication.upload(descriptors.data(), bytes);
+            hipLaunchKernelGGL(publish_batch_kernel, dim3(unsigned(descriptors.size())), dim3(128), 0,
+                               static_cast<hipStream_t>(stream->queue),
                                stream->publication.as<detail::Publication>(), start, unsigned(count));
             launch_checked();
         } else if (count)
@@ -88,12 +112,13 @@ void DeviceStream::Impl::Txn::commit(std::size_t count) {
                 auto& c = stream->cache[l];
                 if (!c.width)
                     continue;
-                hipLaunchKernelGGL(publish_kernel, dim3(1), dim3(128), 0, nullptr, c.k.as<float>(), c.v.as<float>(),
+                hipLaunchKernelGGL(publish_kernel, dim3(1), dim3(128), 0, static_cast<hipStream_t>(stream->queue),
+                                   c.k.as<float>(), c.v.as<float>(),
                                    c.tags.as<std::uint64_t>(), overlay[l].k.as<float>(), overlay[l].v.as<float>(),
                                    start, unsigned(count), c.slots, c.width, c.global);
                 launch_checked();
             }
-        synchronize();
+        synchronize(stream->queue);
     } catch (...) {
         // Hardware failure can leave partial writes; never offer that stream for continued execution.
         stream->poisoned = true;
@@ -136,6 +161,16 @@ DeviceStream::DeviceStream(const ModelConfig& config, unsigned admitted) : impl_
     impl_->publish_batch = publish_batch;
     if (publish_batch)
         impl_->publication.resize(std::size_t(config.layers) * sizeof(detail::Publication));
+    // Read per stream (cheap, once per request), so an in-process A/B can switch it between requests.
+    const bool own_queue = [] {
+        const auto* p = std::getenv("STRIX_G4_KV_QUEUE");
+        return !p || std::string_view(p) != "0";
+    }();
+    impl_->writer_queue = own_queue;
+    if (own_queue) {
+        if (publish_batch)
+            stream_checked(hipHostMalloc(&impl_->pinned_publication, impl_->publication.size(), hipHostMallocDefault));
+    }
     impl_->cache.resize(config.layers);
     for (unsigned l = 0; l < config.layers; ++l)
         if (config.layer[l].producer == l) {
@@ -147,7 +182,7 @@ DeviceStream::DeviceStream(const ModelConfig& config, unsigned admitted) : impl_
             c.v.resize(c.k.size());
             c.tags.resize(std::size_t(c.slots) * sizeof(std::uint64_t));
             std::vector<std::uint64_t> tags(c.slots, UINT64_MAX);
-            c.tags.upload(tags.data(), c.tags.size());
+            stream_copy(impl_->queue, c.tags.data(), tags.data(), c.tags.size(), hipMemcpyHostToDevice);
         }
 }
 DeviceStream::~DeviceStream() = default;
@@ -180,8 +215,17 @@ std::unique_ptr<DeviceStream> DeviceStream::fork(std::uint32_t admitted) const {
     if (impl_->busy || impl_->poisoned || admitted < impl_->frontier)
         throw std::runtime_error("device stream cannot be forked");
     auto out = std::make_unique<DeviceStream>(impl_->config, admitted);
-    // Publication runs on the target queue; the copy starts after all of it.
-    fork_checked(hipDeviceSynchronize());
+    // With a writer queue every publication of this stream already completed on it (commit synchronizes that queue
+    // and the stream is not busy), so the copy runs there without waiting for other queues; the fork inherits it.
+    // Without one, publication ran on the null stream; the copy starts after all device work.
+    const auto q = static_cast<hipStream_t>(impl_->queue);
+    if (!q)
+        fork_checked(hipDeviceSynchronize());
+    out->impl_->queue = impl_->queue;
+    const auto copy = [&](void* dst, const void* src, std::size_t bytes) {
+        fork_checked(q ? hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, q)
+                       : hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice));
+    };
     for (std::size_t l = 0; l < impl_->cache.size(); ++l) {
         const auto& from = impl_->cache[l];
         auto& to = out->impl_->cache[l];
@@ -189,34 +233,65 @@ std::unique_ptr<DeviceStream> DeviceStream::fork(std::uint32_t admitted) const {
             continue;
         const auto slots = from.global ? impl_->frontier : std::uint64_t(from.slots);
         const auto bytes = slots * from.width * sizeof(float);
-        fork_checked(hipMemcpy(to.k.data(), from.k.data(), bytes, hipMemcpyDeviceToDevice));
-        fork_checked(hipMemcpy(to.v.data(), from.v.data(), bytes, hipMemcpyDeviceToDevice));
-        fork_checked(hipMemcpy(to.tags.data(), from.tags.data(), slots * sizeof(std::uint64_t), hipMemcpyDeviceToDevice));
+        copy(to.k.data(), from.k.data(), bytes);
+        copy(to.v.data(), from.v.data(), bytes);
+        copy(to.tags.data(), from.tags.data(), slots * sizeof(std::uint64_t));
     }
+    if (q)
+        fork_checked(hipStreamSynchronize(q));
     out->impl_->frontier = impl_->frontier;
     return out;
 }
 std::string DeviceStream::digest() const {
     if (impl_->poisoned)
         throw std::runtime_error("failed device stream has no canonical state");
+    // STRIX_G4_DIGEST_BATCH (default on, read per call): one copy per cache array; =0 restores the reads of three
+    // values per position. Both hash the same bytes in the same order.
+    const auto* batch_switch = std::getenv("STRIX_G4_DIGEST_BATCH");
+    const bool batched = !batch_switch || std::string_view(batch_switch) != "0";
     strix::Sha256Fast h;
     h.update({reinterpret_cast<const std::byte*>(&impl_->frontier), sizeof(impl_->frontier)});
     for (const auto& c : impl_->cache)
         if (c.width) {
             const auto first =
                 c.global || impl_->frontier < impl_->config.window ? 0 : impl_->frontier - impl_->config.window;
-            std::vector<float> k(c.width), v(c.width);
+            if (!batched) {
+                std::vector<float> k(c.width), v(c.width);
+                for (auto p = first; p < impl_->frontier; ++p) {
+                    const auto slot = c.global ? p : p % c.slots;
+                    std::uint64_t tag = UINT64_MAX;
+                    c.tags.download(&tag, sizeof(tag), std::size_t(slot) * sizeof(tag));
+                    if (tag != p)
+                        throw std::runtime_error("committed device KV tag missing");
+                    c.k.download(k.data(), k.size() * sizeof(float), std::size_t(slot) * k.size() * sizeof(float));
+                    c.v.download(v.data(), v.size() * sizeof(float), std::size_t(slot) * v.size() * sizeof(float));
+                    h.update({reinterpret_cast<const std::byte*>(&tag), sizeof(tag)});
+                    h.update({reinterpret_cast<const std::byte*>(k.data()), k.size() * sizeof(float)});
+                    h.update({reinterpret_cast<const std::byte*>(v.data()), v.size() * sizeof(float)});
+                }
+                continue;
+            }
+            // One copy per array of the slots the committed range occupies (the whole sliding ring, global slots
+            // [0, frontier)) on the stream's writer queue (null stream without one), one synchronization, then the
+            // same per-position hash input as position-by-position reads.
+            const auto q = static_cast<hipStream_t>(impl_->queue);
+            const std::size_t used = c.global ? std::size_t(impl_->frontier) : std::size_t(c.slots);
+            std::vector<std::uint64_t> tags(used);
+            std::vector<float> ks(used * c.width), vs(used * c.width);
+            if (used) {
+                stream_checked(hipMemcpyAsync(tags.data(), c.tags.data(), used * sizeof(std::uint64_t), hipMemcpyDeviceToHost, q));
+                stream_checked(hipMemcpyAsync(ks.data(), c.k.data(), ks.size() * sizeof(float), hipMemcpyDeviceToHost, q));
+                stream_checked(hipMemcpyAsync(vs.data(), c.v.data(), vs.size() * sizeof(float), hipMemcpyDeviceToHost, q));
+                stream_checked(hipStreamSynchronize(q));
+            }
             for (auto p = first; p < impl_->frontier; ++p) {
-                const auto slot = c.global ? p : p % c.slots;
-                std::uint64_t tag = UINT64_MAX;
-                c.tags.download(&tag, sizeof(tag), std::size_t(slot) * sizeof(tag));
+                const auto slot = std::size_t(c.global ? p : p % c.slots);
+                const std::uint64_t tag = tags[slot];
                 if (tag != p)
                     throw std::runtime_error("committed device KV tag missing");
-                c.k.download(k.data(), k.size() * sizeof(float), std::size_t(slot) * k.size() * sizeof(float));
-                c.v.download(v.data(), v.size() * sizeof(float), std::size_t(slot) * v.size() * sizeof(float));
                 h.update({reinterpret_cast<const std::byte*>(&tag), sizeof(tag)});
-                h.update({reinterpret_cast<const std::byte*>(k.data()), k.size() * sizeof(float)});
-                h.update({reinterpret_cast<const std::byte*>(v.data()), v.size() * sizeof(float)});
+                h.update({reinterpret_cast<const std::byte*>(ks.data() + slot * c.width), c.width * sizeof(float)});
+                h.update({reinterpret_cast<const std::byte*>(vs.data() + slot * c.width), c.width * sizeof(float)});
             }
         }
     return strix::model_content_identity_hex(h.finalize());

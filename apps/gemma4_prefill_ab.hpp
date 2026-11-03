@@ -6,6 +6,7 @@
 // state digest and receipt (timings and the prefill_levers counters excepted).
 // Prefill levers read their switch per chunk; nothing else reads it.
 #include "gemma4/engine/runtime.hpp"
+#include "gemma4/kernels/capture_guard.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -38,7 +39,7 @@ inline std::vector<std::string> split(const std::string& text) {
 inline std::string comparable(const Json& receipt) {
     Json out = Json::object();
     for (const auto& [key, value] : receipt.as_object())
-        if (key != "timings" && key != "prefill_levers" && key != "prefill_taps" && key != "ab_run_ms") out.set(key, value);
+        if (key != "timings" && key != "prefill_levers" && key != "prefill_taps" && key != "ab_run_ms" && key != "ab_graphs") out.set(key, value);
     return out.dump();
 }
 inline double number(const Json& j, const char* object, const char* key) {
@@ -87,6 +88,10 @@ inline int run(int argc, char** argv) {
                 for (std::size_t i = 0; i < length; ++i) request.prompt[i] = source[(i + std::size_t(k) * 97U) % source.size()];
                 slots.push_back(coordinator.submit(std::move(request)));
             }
+            auto& graphs = strix::gemma4::gpu::capture_guard_state();
+            const std::uint64_t before[7] = {graphs.target_captures.load(), graphs.target_capture_ns.load(), graphs.target_replays.load(),
+                                             graphs.draft_captures.load(), graphs.draft_capture_ns.load(), graphs.draft_replays.load(),
+                                             graphs.eager_passes.load()};
             const auto begin = std::chrono::steady_clock::now();
             coordinator.run();
             const double run_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
@@ -103,6 +108,16 @@ inline int run(int argc, char** argv) {
             receipt.set("ids", ids);
             if (streams > 1) receipt.set("state_digest", digests);
             receipt.set("ab_run_ms", run_ms); receipt.set("ab_generated", generated);
+            // Graph work of this run (timing evidence, excluded from receipt equality).
+            auto counted = Json::object();
+            counted.set("target_captures", graphs.target_captures.load() - before[0]);
+            counted.set("target_capture_ms", double(graphs.target_capture_ns.load() - before[1]) / 1e6);
+            counted.set("target_replays", graphs.target_replays.load() - before[2]);
+            counted.set("draft_captures", graphs.draft_captures.load() - before[3]);
+            counted.set("draft_capture_ms", double(graphs.draft_capture_ns.load() - before[4]) / 1e6);
+            counted.set("draft_replays", graphs.draft_replays.load() - before[5]);
+            counted.set("eager_passes", graphs.eager_passes.load() - before[6]);
+            receipt.set("ab_graphs", counted);
             return receipt;
         };
         for (unsigned w = 0; w < warmup; ++w) (void)run(groups.front(), std::min<std::size_t>(lengths.front(), 512), true);
@@ -137,6 +152,7 @@ inline int run(int argc, char** argv) {
                     line.set("prefill_host_ms", number(receipt, "timings", "prefill_host_ms"));
                 line.set("context_ms", number(receipt, "timings", "context_ms")); line.set("commit_ms", number(receipt, "timings", "commit_ms"));
                     line.set("target_calls", *receipt.find("target_calls"));
+                    line.set("graphs", *receipt.find("ab_graphs"));
                     line.set("state_digest", state); line.set("state_equal", equal_state); line.set("receipt_equal", equal_receipt);
                     if (const auto* levers = receipt.find("prefill_levers")) line.set("prefill_levers", *levers);
                 if (const auto* taps = receipt.find("prefill_taps")) line.set("prefill_taps", *taps);

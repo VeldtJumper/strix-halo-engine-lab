@@ -109,6 +109,18 @@ struct DeviceStream::Impl {
     bool pooled = true;
     bool publish_batch = true;
     Buffer publication;
+    // STRIX_G4_KV_QUEUE (default on, read when the stream is created): the stream has no queue of its own. Each pass
+    // that writes its overlay (decode target, many-row prefill) names its own queue here, and the commit publishes
+    // on that queue (descriptors staged in pinned memory) and synchronizes only it; the prefix-cache fork and the
+    // digest reads use it too. No null-stream work, no synchronous copy and no extra HIP queue. Off: the previous
+    // null-stream path.
+    bool writer_queue = false;
+    Queue queue = nullptr; // borrowed: the queue of the last pass that wrote this stream (never created or destroyed here)
+    void* pinned_publication = nullptr;
+    Impl() = default;
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+    ~Impl();
     std::vector<detail::Cache> cache;
     std::vector<detail::Overlay> spare_overlay;
     struct Txn final : KvTxn {
