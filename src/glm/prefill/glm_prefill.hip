@@ -37,6 +37,21 @@ template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float 
     __syncthreads();
     return r;
 }
+// lds_tree<256>'s sum for lane 0 only, one barrier: wave 0 forms levels 128 / 64 / 32 from LDS in the same pairing, then
+// levels 16 .. 1 by __shfl_down (lane l < h receives lane l + h). Other lanes return an unspecified value.
+__device__ __forceinline__ float lds_tree256_lane0(float* s, float part) {
+    const unsigned l = threadIdx.x;
+    s[l] = part;
+    __syncthreads();
+    float w = 0.0F;
+    if (l < 32) {
+        const float t0 = s[l] + s[l + 128], t1 = s[l + 64] + s[l + 192], t2 = s[l + 32] + s[l + 160], t3 = s[l + 96] + s[l + 224];
+        w = (t0 + t1) + (t2 + t3);
+#pragma unroll
+        for (unsigned h = 16; h > 0; h >>= 1U) w = w + __shfl_down(w, h, 32);
+    }
+    return w;
+}
 
 // ---------------------------------------------------------------- KDA
 // 4a for C rows of one slot: grid (head, row). The conv of row r reads the pre-conv inputs of positions t - 3 .. t - 1
@@ -1867,6 +1882,56 @@ __global__ __launch_bounds__(256) void hc_norm_rows_kernel(const float* X, float
     const float rr = inv_sqrt(ss / static_cast<float>(n) + kEps);
     for (unsigned i = l; i < n; i += 256) Fr[i] = Xr[i] * rr;
 }
+// hc_norm_rows_kernel's factor only (same chain and tree), for the split form STRIX_GLM_PF_HC_FUSE=2: F is not written.
+__global__ __launch_bounds__(256) void hc_norm_factor_rows_kernel(const float* X, float* rr_out) {
+    constexpr unsigned n = kHc * kHidden;
+    __shared__ float s[256];
+    const unsigned r = blockIdx.x, l = threadIdx.x;
+    const float* Xr = X + static_cast<std::size_t>(r) * n;
+    float a = 0.0F;
+    for (unsigned i = l; i < n; i += 256) a = __builtin_fmaf(Xr[i], Xr[i], a);
+    const float ss = lds_tree256_lane0(s, a);
+    if (l == 0) rr_out[r] = inv_sqrt(ss / static_cast<float>(n) + kEps);
+}
+// hc_expand (dev::hc_expand_kernel expressions) fused with the next site's hc_norm_rows_kernel: lane l keeps the 64
+// outputs it owns in the norm (element l + 256 j, j = stream * 16 + block) and runs the same fmaf chain in ascending j
+// and the same lds_tree; it stores rr per row and F is never materialised: the chain kernel forms F = X * rr on load
+// (one product, as hc_norm_rows writes it). The file is built with -ffp-contract=off, as is the expand kernel.
+__global__ __launch_bounds__(256) void hc_expand_norm_rows_kernel(const float* X, const float* mix, const float* y, float* Xo,
+                                                                  float* rr_out, unsigned* flag) {
+    constexpr unsigned n = kHc * kHidden, B = kHidden / 256;
+    __shared__ float s[256];
+    const unsigned r = blockIdx.x, l = threadIdx.x;
+    const float* m = mix + static_cast<std::size_t>(r) * kHcMix;
+    const float* c = m + 2 * kHc;
+    const float* Xr = X + static_cast<std::size_t>(r) * n;
+    float* Xor = Xo + static_cast<std::size_t>(r) * n;
+    float v[kHc - 1][B];  // streams 1 .. 3; stream 0 enters the chain as produced (its terms come first in ascending j)
+    float a = 0.0F;
+    bool bad = false;
+#pragma unroll
+    for (unsigned b = 0; b < B; ++b) {
+        const unsigned d = b * 256 + l;
+        const float yd = y[static_cast<std::size_t>(r) * kHidden + d];
+#pragma unroll
+        for (unsigned i = 0; i < kHc; ++i) {
+            const float mx = ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) +
+                             c[3 * kHc + i] * Xr[3 * kHidden + d];
+            const float o = m[kHc + i] * yd + mx;
+            bad = bad || !is_finite(o);
+            Xor[i * kHidden + d] = o;
+            if (i == 0) a = __builtin_fmaf(o, o, a);
+            else v[i - 1][b] = o;
+        }
+    }
+    if (flag && bad) atomicOr(flag, 1U);
+#pragma unroll
+    for (unsigned i = 0; i < kHc - 1; ++i)
+#pragma unroll
+        for (unsigned b = 0; b < B; ++b) a = __builtin_fmaf(v[i][b], v[i][b], a);
+    const float ss = lds_tree256_lane0(s, a);
+    if (l == 0) rr_out[r] = inv_sqrt(ss / static_cast<float>(n) + kEps);
+}
 // Serial R6, shared by both work placements. Preserve every expression and loop order.
 __device__ __forceinline__ void hc_mix_r6(const float* z, const float* base, const float* scale, float* m) {
     for (unsigned j = 0; j < kHc; ++j) m[j] = sigmoid(z[j] * scale[0] + base[j]) + kHcEps;
@@ -1920,8 +1985,9 @@ constexpr unsigned kHcK = 32, kHcMixRows = 16;
 static_assert(kHc * kHidden == 16384 && kHcMix == 24);
 // Rows-row tiles (64 / 32 / 16), 2 * Rows threads, 4 x 3 chains per thread: smaller tiles give more CTAs (the K chain
 // cannot be split), e.g. 2048 rows -> 32 / 64 / 128 CTAs. Every tile size gives the same bits (one fmaf chain per
-// (row, output), k ascending from +0).
-template <unsigned Rows>
+// (row, output), k ascending from +0). Cols = 24 (all outputs per CTA) or 8 (grid.y = 3 output groups, 4 x 1 chains per
+// thread: three times the CTAs for short calls, activations loaded once per group; same bits).
+template <unsigned Rows, bool FromX = false, unsigned Cols = kHcMix>
 __device__ __forceinline__ void hc_chain_prefetch(const float* F, const float* fn, float* next_a, float* next_w,
                                                  unsigned r0, unsigned rows, unsigned k0) {
     constexpr unsigned n = kHc * kHidden, T = 2 * Rows;
@@ -1929,63 +1995,76 @@ __device__ __forceinline__ void hc_chain_prefetch(const float* F, const float* f
 #pragma unroll
     for (unsigned q = 0; q < Rows * kHcK / T; ++q) {
         const unsigned v = tid + q * T, r = v / kHcK, k = v % kHcK;
+        // FromX: raw X here; the stage forms F = X * rr when it publishes to LDS, so the loads stay in flight
+        // behind the current tile's FMAs
         next_a[q] = r0 + r < rows ? F[static_cast<std::size_t>(r0 + r) * n + k0 + k] : 0.0F;
     }
 #pragma unroll
-    for (unsigned q = 0; q < kHcMix * kHcK / T; ++q) {
-        const unsigned v = tid + q * T, o = v / kHcK, k = v % kHcK;
+    for (unsigned q = 0; q < Cols * kHcK / T; ++q) {
+        const unsigned v = tid + q * T, o = (Cols == kHcMix ? 0U : blockIdx.y * Cols) + v / kHcK, k = v % kHcK;
         next_w[q] = fn[static_cast<std::size_t>(o) * n + k0 + k];
     }
 }
-template <unsigned Rows>
+template <unsigned Rows, unsigned Cols = kHcMix, bool FromX = false>
 __device__ __forceinline__ void hc_chain_stage(const float* next_a, const float* next_w,
-                                              float as[][kHcK + 1], float ws[][kHcMix + 1]) {
+                                              float as[][kHcK + 1], float ws[][Cols + 1], const float* rrq = nullptr) {
     constexpr unsigned T = 2 * Rows;
     const unsigned tid = threadIdx.x;
 #pragma unroll
     for (unsigned q = 0; q < Rows * kHcK / T; ++q) {
         const unsigned v = tid + q * T;
-        as[v / kHcK][v % kHcK] = next_a[q];
+        // F = X * rr exactly as hc_norm_rows_kernel stores it (rrq[q]: this element's row factor; padding rows 0 * 0 = +0)
+        if constexpr (FromX) as[v / kHcK][v % kHcK] = next_a[q] * rrq[q];
+        else as[v / kHcK][v % kHcK] = next_a[q];
     }
 #pragma unroll
-    for (unsigned q = 0; q < kHcMix * kHcK / T; ++q) {
+    for (unsigned q = 0; q < Cols * kHcK / T; ++q) {
         const unsigned v = tid + q * T;
         ws[v % kHcK][v / kHcK] = next_w[q];
     }
 }
-template <unsigned Rows>
-__global__ __launch_bounds__(2 * Rows) void hc_chain_rows_v2_kernel(const float* F, const float* fn, float* z, unsigned rows) {
-    constexpr unsigned n = kHc * kHidden, T = 2 * Rows;
-    static_assert(kHcMix * kHcK % T == 0 && Rows * kHcK % T == 0);
+template <unsigned Rows, bool FromX = false, unsigned Cols = kHcMix>
+__global__ __launch_bounds__(2 * Rows) void hc_chain_rows_v2_kernel(const float* F, const float* fn, float* z, unsigned rows,
+                                                                    const float* rr = nullptr) {
+    constexpr unsigned n = kHc * kHidden, T = 2 * Rows, J = Cols / 8;
+    static_assert(Cols * kHcK % T == 0 && Rows * kHcK % T == 0 && Cols % 8 == 0);
     __shared__ float as[2][Rows][kHcK + 1];
-    __shared__ float ws[2][kHcK][kHcMix + 1];
-    const unsigned r0 = blockIdx.x * Rows, tid = threadIdx.x, tr = tid / 8, tc = tid % 8;
-    float acc[4][3];
+    __shared__ float ws[2][kHcK][Cols + 1];
+    const unsigned r0 = blockIdx.x * Rows, tid = threadIdx.x, tr = tid / 8, tc = tid % 8, c0 = Cols == kHcMix ? 0U : blockIdx.y * Cols;
+    float acc[4][J];
 #pragma unroll
     for (unsigned i = 0; i < 4; ++i)
 #pragma unroll
-        for (unsigned j = 0; j < 3; ++j) acc[i][j] = 0.0F;
-    float next_a[Rows * kHcK / T], next_w[kHcMix * kHcK / T];
-    hc_chain_prefetch<Rows>(F, fn, next_a, next_w, r0, rows, 0);
-    hc_chain_stage<Rows>(next_a, next_w, as[0], ws[0]);
+        for (unsigned j = 0; j < J; ++j) acc[i][j] = 0.0F;
+    float next_a[Rows * kHcK / T], next_w[Cols * kHcK / T];
+    float rrq[Rows * kHcK / T] = {};  // a thread's rows are the same at every k0: load their factors once
+    if constexpr (FromX) {
+#pragma unroll
+        for (unsigned q = 0; q < Rows * kHcK / T; ++q) {
+            const unsigned r = (tid + q * T) / kHcK;
+            rrq[q] = r0 + r < rows ? rr[r0 + r] : 0.0F;
+        }
+    }
+    hc_chain_prefetch<Rows, FromX, Cols>(F, fn, next_a, next_w, r0, rows, 0);
+    hc_chain_stage<Rows, Cols, FromX>(next_a, next_w, as[0], ws[0], rrq);
     __syncthreads();
     for (unsigned k0 = 0; k0 < n; k0 += kHcK) {
         const unsigned stage = (k0 / kHcK) % 2;
         if (k0 + kHcK < n)
-            hc_chain_prefetch<Rows>(F, fn, next_a, next_w, r0, rows, k0 + kHcK);
+            hc_chain_prefetch<Rows, FromX, Cols>(F, fn, next_a, next_w, r0, rows, k0 + kHcK);
 #pragma unroll 4
         for (unsigned k = 0; k < kHcK; ++k) {
-            float a[4], b[3];
+            float a[4], b[J];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) a[i] = as[stage][tr * 4 + i][k];
 #pragma unroll
-            for (unsigned j = 0; j < 3; ++j) b[j] = ws[stage][k][tc * 3 + j];
+            for (unsigned j = 0; j < J; ++j) b[j] = ws[stage][k][tc * J + j];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
 #pragma unroll
-                for (unsigned j = 0; j < 3; ++j) acc[i][j] = __builtin_fmaf(a[i], b[j], acc[i][j]);
+                for (unsigned j = 0; j < J; ++j) acc[i][j] = __builtin_fmaf(a[i], b[j], acc[i][j]);
         }
-        if (k0 + kHcK < n) hc_chain_stage<Rows>(next_a, next_w, as[1 - stage], ws[1 - stage]);
+        if (k0 + kHcK < n) hc_chain_stage<Rows, Cols, FromX>(next_a, next_w, as[1 - stage], ws[1 - stage], rrq);
         __syncthreads();
     }
 #pragma unroll
@@ -1993,8 +2072,23 @@ __global__ __launch_bounds__(2 * Rows) void hc_chain_rows_v2_kernel(const float*
         const unsigned r = r0 + tr * 4 + i;
         if (r < rows)
 #pragma unroll
-            for (unsigned j = 0; j < 3; ++j) z[static_cast<std::size_t>(r) * kHcMix + tc * 3 + j] = acc[i][j];
+            for (unsigned j = 0; j < J; ++j) z[static_cast<std::size_t>(r) * kHcMix + c0 + tc * J + j] = acc[i][j];
     }
+}
+bool hc_cols8() {  // STRIX_GLM_PF_HC_COLS = 8 (opt-in, same bits): three output groups per row tile; default 24
+    static const bool on = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_HC_COLS");
+        if (e == nullptr || *e == '\0' || std::string(e) == "24") return false;
+        if (std::string(e) != "8") throw std::invalid_argument("STRIX_GLM_PF_HC_COLS must be 24 or 8");
+        return true;
+    }();
+    return on;
+}
+// One launch of the v2 chain for a tile size and column split (the launch shape follows the template arguments).
+template <unsigned Rows, bool FromX>
+void hc_chain_launch(const float* F, const float* fn, float* z, unsigned rows, const float* rr, bool cols8, hipStream_t s) {
+    if (cols8) hc_chain_rows_v2_kernel<Rows, FromX, 8><<<dim3((rows + Rows - 1) / Rows, kHcMix / 8), 2 * Rows, 0, s>>>(F, fn, z, rows, rr);
+    else hc_chain_rows_v2_kernel<Rows, FromX><<<(rows + Rows - 1) / Rows, 2 * Rows, 0, s>>>(F, fn, z, rows, rr);
 }
 unsigned hc_rows_tile() {  // STRIX_GLM_PF_HC_TILE = 64 | 32 | 16 (same bits), default 32
     static const unsigned t = [] {
@@ -2217,9 +2311,9 @@ void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const fl
     hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F);
     ok(hipGetLastError(), "glm pf hc_norm_rows v2");
     const unsigned t = hc_rows_tile();
-    if (t == 64) hc_chain_rows_v2_kernel<64><<<(rows + 63) / 64, 128, 0, s>>>(F, fn, z, rows);
-    else if (t == 16) hc_chain_rows_v2_kernel<16><<<(rows + 15) / 16, 32, 0, s>>>(F, fn, z, rows);
-    else hc_chain_rows_v2_kernel<32><<<(rows + 31) / 32, 64, 0, s>>>(F, fn, z, rows);
+    if (t == 64) hc_chain_launch<64, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
+    else if (t == 16) hc_chain_launch<16, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
+    else hc_chain_launch<32, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
     ok(hipGetLastError(), "glm pf hc_chain_rows v2");
     hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
     ok(hipGetLastError(), "glm pf hc_mix_rows v2");
@@ -2229,6 +2323,48 @@ void hc_pre_rows(const float* X, const float* fn, const float* base, const float
                  unsigned rows, hipStream_t s) {
     if (hc_version() == 2) hc_pre_rows_v2(X, fn, base, scale, F, z, mix, xc, rows, s);
     else hc_pre_rows_v1(X, fn, base, scale, F, z, mix, xc, rows, s);
+}
+
+namespace {
+unsigned hc_fuse_mode() {
+    static const unsigned m = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_HC_FUSE");
+        if (e == nullptr || *e == '\0') return 1U;  // default on: exact, pair ABBA -1.0 % 1K / -1.4 % 8K; 0 restores the unfused sites
+        const std::string v(e);
+        if (v != "0" && v != "1" && v != "2") throw std::invalid_argument("STRIX_GLM_PF_HC_FUSE must be 0, 1 or 2");
+        return static_cast<unsigned>(v[0] - '0');
+    }();
+    return m;
+}
+}  // namespace
+
+bool hc_expand_norm_enabled() { return hc_fuse_mode() != 0 && hc_version() == 2; }
+bool hc_expand_norm_split() { return hc_fuse_mode() == 2; }
+
+void hc_norm_factor_rows(const float* X, float* rr, unsigned rows, hipStream_t s) {
+    if (rows == 0) return;
+    hc_norm_factor_rows_kernel<<<rows, 256, 0, s>>>(X, rr);
+    ok(hipGetLastError(), "glm pf hc_norm_factor_rows");
+}
+
+void hc_expand_norm_rows(const float* X, const float* mix, const float* y, float* Xo, float* rr, unsigned* flag, unsigned rows,
+                         hipStream_t s) {
+    if (rows == 0) return;
+    hc_expand_norm_rows_kernel<<<rows, 256, 0, s>>>(X, mix, y, Xo, rr, flag);
+    ok(hipGetLastError(), "glm pf hc_expand_norm_rows");
+}
+
+void hc_pre_rows_normed(const float* X, const float* fn, const float* base, const float* scale, const float* rr, float* z, float* mix,
+                        float* xc, unsigned rows, hipStream_t s) {
+    if (rows == 0) return;
+    if (hc_version() != 2) throw std::logic_error("glm pf hc_pre_rows_normed: v2 sites only");
+    const unsigned t = hc_rows_tile();
+    if (t == 64) hc_chain_launch<64, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    else if (t == 16) hc_chain_launch<16, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    else hc_chain_launch<32, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    ok(hipGetLastError(), "glm pf hc_chain_rows normed");
+    hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
+    ok(hipGetLastError(), "glm pf hc_mix_rows normed");
 }
 
 namespace {

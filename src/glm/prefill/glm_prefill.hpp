@@ -73,8 +73,21 @@ void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsig
 // ---- mHC pre for many rows: = dev::hc_pre bit for bit (same outputs F, mix, x_collapsed), with the 24 R1 chains over
 // the 16384 normalized values as a VALU GEMM. z: workspace [rows][24]. F remains materialized on both paths.
 // STRIX_GLM_PF_HC is read once: 2 opts into v2; 1 / unset / other values select v1 pending native qualification.
+// v2 chain shape (same bits): STRIX_GLM_PF_HC_TILE = 64 | 32 | 16 rows per CTA, STRIX_GLM_PF_HC_COLS = 24 | 8 outputs per CTA.
 void hc_pre_rows(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix, float* xc,
                  unsigned rows, hipStream_t s);
+
+// STRIX_GLM_PF_HC_FUSE (default 1, v2 sites only; =0 restores the unfused sites): hc_expand also computes the next site's norm factor rr
+// per row (the hc_norm_rows expressions and order); that site runs hc_pre_rows_normed (chains on X * rr, + mix) and F
+// is never materialised. Same bits. STRIX_GLM_PF_HC_FUSE=2 (split form, a profiling control): the unfused hc_expand, then
+// hc_norm_factor_rows computes rr alone from the expanded X; the next site is the same hc_pre_rows_normed.
+bool hc_expand_norm_enabled();
+bool hc_expand_norm_split();
+void hc_norm_factor_rows(const float* X, float* rr, unsigned rows, hipStream_t s);
+void hc_expand_norm_rows(const float* X, const float* mix, const float* y, float* Xo, float* rr, unsigned* flag, unsigned rows,
+                         hipStream_t s);
+void hc_pre_rows_normed(const float* X, const float* fn, const float* base, const float* scale, const float* rr, float* z, float* mix,
+                        float* xc, unsigned rows, hipStream_t s);
 
 // Explicit versions for bitwise gates and paired timing, independent of the cached environment selector.
 void hc_pre_rows_v1(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix, float* xc,

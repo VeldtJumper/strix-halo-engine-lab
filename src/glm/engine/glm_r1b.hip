@@ -540,7 +540,9 @@ void hc_pre(const float* X, const float* fn, const float* base, const float* sca
 bool hc_norm_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("STRIX_GLM_HC_NORM");
-        return v != nullptr && std::string(v) == "1";
+        // The fused finish is hc_pre variant 4 (the default); any other STRIX_GLM_R1B_HC keeps its own unfused path.
+        const char* hc = std::getenv("STRIX_GLM_R1B_HC");
+        return v != nullptr && std::string(v) == "1" && (hc == nullptr || std::atoi(hc) == 4);
     }();
     return enabled;
 }
