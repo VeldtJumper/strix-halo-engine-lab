@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <optional>
 #include <string>
 #include <cstdint>
 #include <stdexcept>
@@ -34,6 +35,37 @@ struct MtpPrefillReservation {
     bool prefix = false;
 };
 struct PrefillReservationGrowth { std::uint64_t retained = 0, temporary = 0; };
+// Host-compiled counterpart of the caller/native prompt owners. The base
+// runtime is allocated between registration and prompt admission; caller_live
+// includes the D1 shadow, PLE row cache and the caller's primary plan vectors.
+struct RegisteredPrefillPlan {
+    std::uint64_t base_runtime = 0, caller_live = 0, growth = 0, temporary = 0;
+};
+struct RegisteredPrefillEnvelope {
+    UmaReservationEstimate reservation;
+    std::uint64_t incremental = 0;
+};
+// resident <= live: at registration only the model is charged to the
+// observation; at prompt admission all caller/base owners are already live.
+// The rotary table remains in the runtime growth envelope in both checks.
+inline RegisteredPrefillEnvelope registered_prefill_envelope(const UmaOwnerInventory& live,
+    std::uint64_t resident, RegisteredPrefillPlan plan, std::optional<std::uint64_t> phase_peak,
+    std::uint64_t rolling, PrefillReservationGrowth mtp, std::uint64_t credit,
+    UmaReservationLimits limits) {
+    if (resident > live.reservation_upper_bound_bytes)
+        throw std::invalid_argument("registered prefill resident exceeds live envelope");
+    auto growth=prefill_reservation_add(plan.growth,prefill_reservation_add(rolling,mtp.retained));
+    auto temporary=prefill_reservation_add(plan.temporary,mtp.temporary);
+    if (phase_peak) {
+        if (live.reservation_upper_bound_bytes > *phase_peak)
+            throw std::runtime_error("MTP actual live inventory exceeds phased owner envelope");
+        growth=*phase_peak-live.reservation_upper_bound_bytes;
+        temporary=0;
+    }
+    return {plan_uma_reservation_growth(live,growth,temporary,limits,credit),
+        prefill_reservation_add(live.reservation_upper_bound_bytes-resident,
+            prefill_reservation_add(growth,temporary))};
+}
 // Caps bound owners; they are not allocations. The window factory enforces one
 // combined arena cap across all R2/R4/R8 owners and four capture pools per owner.
 // Prefix commit uses deferred GDN/PLE snapshots and allocates no full checkpoint.

@@ -10,6 +10,7 @@
 #include "strix/memory_plan.hpp"
 #include "strix/session_state_cache.hpp"
 #include "../apps/qwen_yarn_owner_inventory.hpp"
+#include "../apps/qwen_yarn_registered_admission.hpp"
 #include "../apps/qwen_mtp_owner_plan.hpp"
 #include "../apps/known_prefill_reservation.hpp"
 #include "../apps/ple_resident_fallback.hpp"
@@ -234,6 +235,15 @@ void resident_fallback_tests() {
         --*edge.available;bool refused=false;
         try {(void)resident_prefill_admission(route,required,edge);}catch(const std::runtime_error&){refused=true;}
         expect(refused,"native/YaRN resident MemAvailable minus 4 GiB short by one byte refuses in both reserve modes");
+    }
+    {
+        // A refused physical check reports its inputs and the shortfall on each side.
+        const auto m=prefill_physical_margin;
+        const auto detail=prefill_physical_margin_detail(100U*gib_bytes,m+5U,10U*gib_bytes,8U);
+        expect(detail.find(" incremental_shortfall=3")!=std::string::npos && detail.find(" retained_shortfall=0 ")!=std::string::npos &&
+            detail.find("mem_available="+std::to_string(m+5U)+" ")!=std::string::npos,"physical margin detail names the short side");
+        expect(prefill_physical_margin_detail(m-1U,0U,1U,1U).find(" retained_shortfall=2 incremental_shortfall="+std::to_string(m+1U))!=std::string::npos,
+            "below-margin observations include the missing margin in the shortfall");
     }
     for(unsigned fault=0;fault<4;++fault) {
         auto observed=memory; auto owners=required;
@@ -761,6 +771,345 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         }
     }
     std::cout << "serve prefill admission: " << failures << " failures\n";
+}
+
+void yarn_owner_inventory_regression(RequestedOptions request, const gguf::FileInfo& info,
+    const ModelManifest& manifest) {
+    auto model = ModelContract::qwen38_flash_next();
+    model.qwen_rotary_table = mock_rotary(4U);
+    auto& o = request.options;
+    o.rotary = RotaryDescriptor::yarn(4U); o.context_tokens = 1048576U;
+    o.tokens.assign(1048320U,1U); o.generate_tokens = 128U;
+    o.known_prefix_prefill_rows = 2048U;
+    o.known_prefix_tail_rows.clear(); o.known_prefix_ladder_tail_rows = {1024U,256U,64U,16U};
+    o.yarn_mtp_pipeline = false;
+    SerialSessionStateLayoutRequest layout_request; layout_request.context_tokens = o.context_tokens;
+    const auto state = build_serial_session_state_layout(model,layout_request);
+    const auto inventory = [&](const Options& candidate) {
+        PrefillRequirements r;
+        r.state_d1 = state.device_total_bytes + state.host_total_bytes * 2U + state.host_alignment - 1U;
+        r.model_backing = 111334654400ULL;
+        r.workspace = 639172624ULL + 167772160U + 993280U;
+        append_yarn_owner_requirements(candidate,model,state,r.model_backing,r,
+            {true,167772160U,993280U,0U,168765440U});
+        return r;
+    };
+    // Project-owned regression operands, with unrelated owners aggregated.
+    // Both historical columns are estimates at T2048, not native allocations.
+    struct Row { const char* name; std::uint64_t before, inflated; };
+    const std::array rows{
+        Row{"dense_tiled_f16",33816576U,337641472U},
+        Row{"gdn_core16",25427968U,101711872U},
+        Row{"hc_fold_workspaces",173015040U,692060160U},
+        Row{"merged_routed_csr",291584U,1274624U},
+        Row{"ple_projections_and_gates",104890368U,419561472U},
+        Row{"ple_snapshot_and_hashes",790528U,2609152U},
+        Row{"ple_staging",67108864U,268435456U},
+        Row{"prefill_workspace_and_status",664338448U,639172624U},
+        Row{"routed_csr",332544U,1315584U},
+        Row{"native_setup_growth_peak",0U,168820736U},
+        Row{"ple_packed_growth_peak",0U,41943040U},
+        Row{"shared_pre_f16",0U,11534336U}};
+    std::uint64_t before = 0, inflated = 0, corrected = 0;
+    const auto sized = inventory(o);
+    for (const auto& row : rows) {
+        before += row.before; inflated += row.inflated;
+        corrected += sized.owners.at(row.name);
+    }
+    constexpr auto unchanged = 150639567943ULL - 1070011920ULL;
+    expect(unchanged + before == 150639567943ULL && unchanged + inflated == 152255636551ULL &&
+        inflated - before == 1616068608ULL,"1M f4 T2048 historical prompt totals and complete delta");
+    expect(sized.owners.at("ple_staging") == 67108864U &&
+        sized.owners.at("ple_projections_and_gates") == 104890368U &&
+        sized.owners.at("gdn_core16") == 25427968U &&
+        sized.owners.at("hc_fold_workspaces") == 173015040U &&
+        sized.owners.at("routed_csr") == 332544U && sized.owners.at("merged_routed_csr") == 291584U,
+        "call-sized allocations use chosen T, including the merged tail remainder");
+    expect(sized.owners.at("dense_tiled_f16") == 33816576U &&
+        sized.owners.at("native_setup_growth_peak") == 0U &&
+        sized.owners.at("shared_pre_f16") == 2883584U &&
+        sized.owners.at("ple_packed_growth_peak") == 20971520U && // one T2048 slab: no replacement on a fresh MTP CLI
+        sized.owners.at("hc_f16_weights_low_norm_inverse") == 187302144U &&
+        sized.owners.at("moe_f16_input_and_da16") == 146800640U,
+        "stream scratch, retained packed slab and fixed setup pools are counted separately");
+    for (const bool native : {false,true}) {
+        auto untouched = o;
+        if (native) untouched.rotary = RotaryDescriptor::native();
+        else untouched.mtp.enabled = false;
+        const auto original = inventory(untouched);
+        for (const auto& row : rows)
+            expect(original.owners.at(row.name) == row.inflated,"serial and non-YaRN owner accounting unchanged");
+    }
+    // Preserve the actual inventory's T dependence; hold the other phase
+    // owners fixed to isolate admission from compiler/workspace variation.
+    for (const auto context : {262144U,1048576U}) for(const bool mtp : {false,true})
+        for (const auto tile : {8192U,4096U,2048U}) {
+            auto candidate=o;candidate.context_tokens=context;
+            candidate.rotary=RotaryDescriptor::yarn(context==262144U?2U:4U);
+            candidate.known_prefix_prefill_rows=tile;candidate.known_prefix_tail_rows={1024U,256U,16U};
+            candidate.mtp.enabled=mtp;
+            candidate.resolved_prefill_option_mask=prefill_option_bit(PrefillOption::gdn_fp16_chunk);
+            const auto charged=inventory(candidate);
+            candidate.resolved_prefill_option_mask=0U;
+            const auto off=inventory(candidate);
+            std::uint64_t delta=0;
+            const auto check=[&](const std::string& prefix,std::uint64_t count) {
+                const auto n=(count+31U)/32U,padded=n*32U;
+                // Allocation expressions in hip_gdn_fp16_chunk.inc, including
+                // a partial chunk tail, with tiled_in's projection width.
+                const auto projection=2U*count*((2U*16U+48U)*128U+48U*128U);
+                const auto scratch=2U*(2U*16U*padded*128U+48U*n*2U*32U*32U)+
+                    8U*48U*n*32U+2U*48U*padded*128U;
+                expect(charged.owners.at(prefix+"gdn_fp16_chunk_projection_bf16")==projection &&
+                    charged.owners.at(prefix+"gdn_fp16_chunk_scratch")==scratch &&
+                    !off.owners.contains(prefix+"gdn_fp16_chunk_scratch"),
+                    "candidate ON charges exact primary/tail allocation formulas; OFF adds no owner");
+                for(const auto* suffix:{"gdn_fp16_chunk_projection_bf16","gdn_fp16_chunk_scratch"})
+                    expect(charged.owner_phases.at(prefix+suffix)==(mtp_prompt|mtp_decode|mtp_drain),
+                        "candidate slots survive prompt retirement and are absent during setup/calibration");
+                delta+=projection+scratch;
+            };
+            check("",tile);
+            expect(delta==static_cast<std::uint64_t>(tile)*59776U,
+                "candidate primary scales from 467 MiB at T8192 to 116.75 MiB at T2048");
+            for(const auto tail:candidate.known_prefix_tail_rows) check("tail_"+std::to_string(tail)+"_",tail);
+            expect(charged.device_base==off.device_base+delta,"all persistent chunk stream owners enter GTT once");
+            for(const auto& [name,bytes]:off.owners)
+                expect(charged.owners.at(name)==bytes,"candidate charge leaves other owners unchanged");
+        }
+    request.environment = {{"STRIX_PLE_ROLLING","0"}};
+    PrefillMemory memory;
+    memory.total = 127473287168ULL; memory.available = 110231265280ULL;
+    memory.gtt_limit = 125829120000ULL; memory.gtt_used = 18231255040ULL;
+    memory.verify_ple_credit = [](const Options&,const Environment&) { return 28000000000ULL; };
+    memory.estimate = [&](const Options& candidate) {
+        auto r = inventory(candidate);
+        std::uint64_t variable = 0;
+        for (const auto& row : rows) variable += r.owners.at(row.name);
+        r.owners = {{"model_backing",r.model_backing},
+            {"other_phase_owners",unchanged-r.model_backing-candidate.rotary.table_bytes()},{"prefill_owners",variable}};
+        r.device_base = 40ULL << 30U; r.metadata = 1U;
+        return r;
+    };
+    const auto resolve = [&](const PrefillMemory& mem) {
+        return resolve_effective_config(request,model,info,manifest,validated_model_content_identity,{true,true,true},mem);
+    };
+    const auto admitted = resolve(memory);
+    if (!admitted.admitted) std::cerr << "inventory admission: " << admitted.error << '\n';
+    expect(admitted.admitted && admitted.options.known_prefix_prefill_rows == 4096U,
+        "1M f4 full census admits a smaller exact tile instead of serial");
+    expect(admitted.options.context_tokens == o.context_tokens &&
+        admitted.options.prefill_numerical_profile == DecodeNumericalProfile::fast_prefill_f16wmma_v1,
+        "tile storage fallback preserves context and numerical profile");
+    auto ample = memory; ample.total = ample.available = ample.gtt_limit = 1ULL << 40U; ample.gtt_used = 0U;
+    for(const auto context:{262144U,1048576U}) for(const bool mtp:{false,true}) {
+        auto candidate=request;
+        if(!mtp) {
+            candidate.options=Options{};
+            candidate.options.context_explicit=true;
+            candidate.options.generate_tokens=128U;
+        }
+        auto candidate_model=model;candidate_model.qwen_rotary_table=mock_rotary(context==262144U?2U:4U);
+        candidate.options.rotary=RotaryDescriptor::yarn(context==262144U?2U:4U);
+        candidate.options.context_tokens=context;candidate.options.tokens.resize(context-256U);
+        if(mtp) candidate.options.prefill_numerical_profile=DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+        candidate.options.prefill_disabled=prefill_option_bit(PrefillOption::hc_output_wmma);
+        candidate.environment["STRIX_QPF2K_GDN_FP16_CHUNK"]="1";
+        auto chunk_memory=ample;
+        const auto original_estimate=memory.estimate;
+        chunk_memory.estimate=[&](const Options& trial) {
+            auto required=original_estimate(trial);
+            const auto real=inventory(trial);
+            for(const auto& [name,bytes]:real.owners) if(name.find("gdn_fp16_chunk_")!=std::string::npos) {
+                required.owners[name]=bytes;
+                required.owner_phases[name]=mtp_prompt|mtp_decode|mtp_drain;
+                required.device_base=prefill_checked_add(required.device_base,bytes);
+            }
+            return required;
+        };
+        const auto run=[&](const RequestedOptions& arm) {
+            return resolve_effective_config(arm,candidate_model,info,manifest,
+                validated_model_content_identity,{true,true,true},chunk_memory);
+        };
+        const auto roomy=run(candidate);
+        if(!roomy.admitted) std::cerr << "chunk admission C=" << context << " mtp=" << mtp << ": " << roomy.error << '\n';
+        expect(roomy.admitted && roomy.prefill_option_mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk),
+            "candidate ON is admitted on serial and explicit-profile MTP");
+        // Give the smaller tile exactly the physical incremental room it needs.
+        auto small=roomy.options;small.known_prefix_prefill_rows=2048U;
+        apply_default_known_prefill_tails(small,"12");
+        auto needed=chunk_memory.estimate(small);needed.owners["rotary_table"]=small.rotary.table_bytes();
+        const auto peak=prefill_owner_phase_peaks(needed.owners,needed.owner_phases);
+        chunk_memory.available=*std::max_element(peak.begin(),peak.end())-needed.model_backing+prefill_physical_margin;
+        const auto fit=run(candidate);
+        expect(fit.admitted && fit.options.known_prefix_prefill_rows==2048U &&
+            fit.admission.at("owner_gdn_fp16_chunk_projection_bf16_bytes")+
+                fit.admission.at("owner_gdn_fp16_chunk_scratch_bytes")==122421248U,
+            "262K f2 / 1M f4 candidate-on ladder charges the allocation formula and fits T2048");
+        if(mtp) expect(fit.admission.at("storage_ladder_step")==4U,"candidate-on MTP reaches the final fitting storage step");
+        for(const bool master:{false,true}) {
+            auto disabled=candidate;
+            if(master) disabled.options.prefill_exact_fp16=true;
+            else disabled.environment["STRIX_QPF2K_GDN_FP16_CHUNK"]="0";
+            const auto off=run(disabled);
+            expect(off.admitted && !off.admission.contains("owner_gdn_fp16_chunk_scratch_bytes"),
+                "individual and master OFF preserve candidate-free admission");
+        }
+    }
+    const auto initial = resolve(ample);
+    if (!initial.admitted) { std::cerr << "inventory initial: " << initial.error << '\n'; return; }
+    expect(initial.admitted && initial.options.known_prefix_prefill_rows == 8192U,"late retry starts at T8192");
+    auto post = memory;
+    auto pinned_tile = initial.options; pinned_tile.known_prefix_prefill_rows = 4096U;
+    apply_default_known_prefill_tails(pinned_tile,"12");
+    const auto pinned_required = memory.estimate(pinned_tile);
+    std::uint64_t pinned_payload = 0;
+    for (const auto& [name,bytes] : pinned_required.owners) { (void)name; pinned_payload += bytes; }
+    post.available = pinned_payload - pinned_required.model_backing + prefill_physical_margin;
+    post.verify_ple_credit = [](const Options&,const Environment&) -> std::uint64_t {
+        throw std::runtime_error("late retry must reuse the verified live lease");
+    };
+    const auto late = readmit_registered_yarn_mtp(request,initial,model,info,manifest,
+        validated_model_content_identity,{true,true,true},post);
+    if (!late.admitted || late.options.known_prefix_prefill_rows != 4096U)
+        std::cerr << "late inventory retry T=" << late.options.known_prefix_prefill_rows << " " << late.error
+                  << " late incremental=" << late.admission.at("incremental_bytes")
+                  << " expected=" << admitted.admission.at("incremental_bytes")
+                  << " fallback=" << late.tile_fallback << '\n';
+    expect(late.admitted && late.options.known_prefix_prefill_rows == 4096U &&
+        late.admission.at("storage_ladder_step") == 3U && late.admission.at("post_registration_readmission") == 1U &&
+        late.ple_reclaim_credit == initial.ple_reclaim_credit,"post-registration retry shrinks before state allocation");
+    expect(yarn_mtp_storage_receipt(late).find("\"window_capacity_rows\":4096") != std::string::npos &&
+        effective_config_json(late).find("\"storage_ladder_step\":3") != std::string::npos,
+        "final receipt and inspection carry chosen T and step");
+    expect(late.environment.at("STRIX_QSA_SCORE_RING_ROWS") == std::to_string(initial.admission.at("qsa_score_ring_rows")) &&
+        late.environment.at("STRIX_PREFILL_PIPE") == std::to_string(initial.admission.at("prefill_pipe")),
+        "late retry pins implicit step-zero storage and keeps the live pipeline");
+    post.available = 1U;
+    const auto late_refusal = readmit_registered_yarn_mtp(request,initial,model,info,manifest,
+        validated_model_content_identity,{true,true,true},post);
+    expect(!late_refusal.admitted,"late retry cannot admit absent physical margin");
+    expect(late_refusal.admission.at("available_bytes")==1U &&
+        late_refusal.admission.at("observed_mem_available_bytes")==1U &&
+        late_refusal.admission.at("gtt_used_bytes")==*post.gtt_used &&
+        late_refusal.admission.at("resident_rotary_table_bytes")==o.rotary.table_bytes() &&
+        late_refusal.admission.at("remaining_incremental_bytes")==
+            late_refusal.admission.at("incremental_bytes")-o.rotary.table_bytes() &&
+        late_refusal.admission.at("remaining_device_growth_bytes")==
+            late_refusal.admission.at("device_growth_bytes")-o.rotary.table_bytes(),
+        "late refusal reports raw observations and remaining allocation");
+    // Registration can pass the older estimate yet miss the runtime growth
+    // margin by only a few MiB. Use the same host envelope as the runtime.
+    auto physical_post=memory;
+    physical_post.total=physical_post.gtt_limit=1ULL<<40U;
+    physical_post.gtt_used=o.rotary.table_bytes();
+    physical_post.available=pinned_payload-pinned_required.model_backing+o.rotary.table_bytes()+
+        prefill_physical_margin-(8U<<20U);
+    expect(prefill_physical_margin_fits(*physical_post.total,*physical_post.available,
+        pinned_payload+o.rotary.table_bytes()-late.ple_reclaim_credit,
+        pinned_payload-pinned_required.model_backing),"step 3 passes the older table-adjusted estimate");
+    std::vector<std::uint32_t> tried;
+    const auto physical_estimate=[&](const Options& trial) {
+        tried.push_back(trial.known_prefix_prefill_rows);
+        auto required=memory.estimate(trial);
+        std::uint64_t payload=0;
+        for (const auto& [name,bytes]:required.owners) { (void)name; payload+=bytes; }
+        required.registered_plan=RegisteredPrefillPlan{0,0,payload-required.model_backing+(8U<<20U),0};
+        return required;
+    };
+    physical_post.estimate=physical_estimate;
+    const auto physical_fit=readmit_registered_yarn_mtp(request,late,model,info,manifest,
+        validated_model_content_identity,{true,true,true},physical_post);
+    expect(physical_fit.admitted && physical_fit.admission.at("storage_ladder_step")==4U &&
+        physical_fit.options.known_prefix_prefill_rows==2048U && tried==std::vector<std::uint32_t>{4096U,2048U},
+        "step 3 estimate fits but physical margin refusal advances to step 4 without a larger T");
+    expect(physical_fit.admission.at("refused_step_3_T4096_incremental_shortfall")==8U<<20U &&
+        physical_fit.tile_fallback.find("incremental_shortfall=8388608")!=std::string::npos,
+        "every refused step retains its exact physical shortfall in admission and fallback diagnostics");
+    for (const auto* name:{"STRIX_PLE_ROLLING_POSITIONS","STRIX_PLE_ROLLING_CAP_BYTES","STRIX_QSA_SCORE_RING_ROWS","STRIX_PREFILL_PIPE"})
+        expect(physical_fit.environment.at(name)==late.environment.at(name),"allocated storage pins survive physical-margin retry");
+    expect(physical_fit.options.context_tokens==late.options.context_tokens &&
+        physical_fit.options.prefill_numerical_profile==late.options.prefill_numerical_profile &&
+        physical_fit.ple_reclaim_credit==late.ple_reclaim_credit,"physical retry preserves identity, capacity and verified credit");
+    const auto physical_2048=physical_estimate(physical_fit.options);
+    physical_post.available=physical_fit.admission.at("registered_physical_incremental_bytes")+
+        prefill_physical_margin-(4U<<20U);
+    tried.clear();
+    const auto physical_refusal=readmit_registered_yarn_mtp(request,late,model,info,manifest,
+        validated_model_content_identity,{true,true,true},physical_post);
+    expect(!physical_refusal.admitted && tried==std::vector<std::uint32_t>{4096U,2048U} &&
+        physical_refusal.admission.at("refused_step_4_T2048_incremental_shortfall")==4U<<20U &&
+        physical_refusal.error.find("refused_step_3_T4096_incremental_shortfall")!=std::string::npos &&
+        physical_refusal.error.find("refused_step_4_T2048_incremental_shortfall")!=std::string::npos,
+        "final physical refusal is bounded and lists both shortfalls for serial fallback");
+    bool serial_called=false;
+    MtpBundleSetupRetry bundle; bundle.selected=true;
+    const auto fallback=retry_mtp_bundle_setup(bundle,std::runtime_error(physical_refusal.error),[&] {
+        serial_called=yarn_bundle_serial_retry; return 23;
+    });
+    expect(fallback==23 && serial_called && !yarn_bundle_serial_retry,"exhausted ladder uses clean existing serial fallback");
+    // A later observation can invalidate an already admitted step. The next
+    // retry must skip it, preserve its refusal and terminate at T2048.
+    auto raced=late;
+    record_registered_yarn_refusal(raced,"prefill physical admission",physical_post,
+        physical_fit.admission.at("registered_physical_retained_bytes"),physical_2048.registered_plan->growth,
+        physical_2048.registered_plan->growth);
+    physical_post.available=1ULL<<40U;
+    tried.clear();
+    const auto continued=readmit_registered_yarn_mtp(request,raced,model,info,manifest,
+        validated_model_content_identity,{true,true,true},physical_post,true);
+    expect(continued.admitted && tried==std::vector<std::uint32_t>{2048U} &&
+        continued.admission.contains("refused_step_3_T4096_incremental_shortfall"),
+        "runtime refusal re-reads memory and resumes strictly at the next step");
+    tried.clear();
+    const auto exhausted=readmit_registered_yarn_mtp(request,continued,model,info,manifest,
+        validated_model_content_identity,{true,true,true},physical_post,true);
+    expect(!exhausted.admitted && tried.empty(),"no retry remains after T2048");
+    unsigned samples=0;
+    physical_post.refresh_registered=[&](PrefillMemory& sample) {
+        ++samples;
+        sample.available=samples==1U?pinned_payload-pinned_required.model_backing+o.rotary.table_bytes()+
+            prefill_physical_margin-(8U<<20U):1ULL<<40U;
+    };
+    tried.clear();
+    const auto refreshed=readmit_registered_yarn_mtp(request,late,model,info,manifest,
+        validated_model_content_identity,{true,true,true},physical_post);
+    expect(refreshed.admitted && samples==2U && tried==std::vector<std::uint32_t>{4096U,2048U} &&
+        refreshed.admission.at("post_registration_available_bytes")==1ULL<<40U,
+        "each registered trial takes a new observation and reports the admitted sample");
+    physical_post.refresh_registered={};
+    physical_post.yarn_registered_base_complete=true;
+    physical_post.yarn_registered_base=pinned_required.model_backing;
+    physical_post.gtt_limit=*physical_post.gtt_used+
+        physical_fit.admission.at("refused_step_3_T4096_registered_physical_incremental_bytes")-(1U<<20U);
+    const auto gtt_retry=readmit_registered_yarn_mtp(request,late,model,info,manifest,
+        validated_model_content_identity,{true,true,true},physical_post);
+    expect(gtt_retry.admitted && gtt_retry.admission.at("storage_ladder_step")==4U &&
+        gtt_retry.admission.at("refused_step_3_T4096_gtt_shortfall")==1U<<20U,
+        "runtime GTT refusal advances without charging the resident base state twice");
+    {
+        // Runtime diagnostics match the trial when GTT usage is already over its limit.
+        auto over=late; auto observed=physical_post;
+        observed.gtt_limit=1U<<30U; observed.gtt_used=(1U<<30U)+(3U<<20U);
+        record_registered_yarn_refusal(over,"prefill physical admission",observed,0U,0U,5U<<20U);
+        expect(over.admission.at("refused_step_3_T4096_gtt_shortfall")==8U<<20U,
+            "runtime GTT shortfall adds usage already above the limit to the requested growth");
+    }
+    {
+        // Non-separated runtime: retained includes setup temporary storage,
+        // while physical growth never receives the verified file credit.
+        UmaOwnerInventory live; live.reservation_upper_bound_bytes=1000; live.known_file_mapping_bytes=800;
+        const RegisteredPrefillPlan plan{0,0,100,50};
+        const auto registration=registered_prefill_envelope(live,800,plan,{},20,{30,40},200,{});
+        const auto runtime=registered_prefill_envelope(live,1000,plan,{},20,{30,40},200,{});
+        expect(registration.reservation.retained_reserved_bytes==950 &&
+            registration.reservation.setup_peak_reserved_bytes==1040 && registration.incremental==440 &&
+            runtime.reservation.setup_peak_reserved_bytes==1040 && runtime.incremental==240,
+            "non-separated registration/runtime share retained, temporary and uncredited incremental arithmetic");
+    }
+    std::cout << "YaRN owner inventory corrected prompt=" << unchanged+corrected
+              << " modeled T=" << admitted.options.known_prefix_prefill_rows
+              << " spare=" << *memory.total-admitted.admission.at("required_bytes") << '\n';
 }
 
 void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manifest) {
@@ -1449,6 +1798,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     mm.window_arena_bytes=mm.window_capture_bytes=mm.window_checkpoint_bytes=4096;mm.window_total_bytes=UINT64_C(2)<<30U;mm.window_history_intervals=4096;
     mm.draft_chain=true;mo.known_prefix_window=mo.known_prefix_full_rows=true;mo.known_prefix_prefill_rows=8192;
     const auto ym=resolve(mtp,memory);
+    yarn_owner_inventory_regression(mtp,info,manifest);
     expect(ym.admitted && ym.admission.at("mtp_enabled")==1,"explicit YaRN MTP admitted after resolved target organization");
     {
         constexpr auto key = "STRIX_QPF2K_MOE_ROUTE_BF16";
@@ -2540,6 +2890,19 @@ int main(int argc, char** arguments) {
     manifest.layout_identity = model_manifest_layout_identity(manifest);
     if (argc==2 && std::string_view(arguments[1])=="--serve-prefill-admission") {
         serve_prefill_admission_tests(model,manifest);
+        return failures ? 1 : 0;
+    }
+    if (argc==2 && std::string_view(arguments[1])=="--yarn-owner-inventory") {
+        RequestedOptions request; request.options = parse(mtp_fixture());
+        request.options.context_explicit = true;
+        auto& mtp = request.options.mtp;
+        mtp.window_rows = 8U; mtp.window_rows_set = {2U,4U,8U};
+        mtp.candidate_depth = 7U;
+        mtp.window_prefix = mtp.window_qsa_rows = mtp.draft_chain = true;
+        mtp.window_arena_bytes = mtp.window_capture_bytes = mtp.window_checkpoint_bytes = 4096U;
+        mtp.window_total_bytes = UINT64_C(2)<<30U; mtp.window_history_intervals = 4096U;
+        request.options.known_prefix_window = request.options.known_prefix_full_rows = true;
+        yarn_owner_inventory_regression(request,info,manifest);
         return failures ? 1 : 0;
     }
     yarn_admission_tests(info,manifest);

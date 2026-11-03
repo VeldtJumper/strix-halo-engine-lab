@@ -109,6 +109,12 @@ junto al modelo, un comando YaRN sin más opciones selecciona MTP exacto automá
 Use el factor 4 con `--context 1048576` para una capacidad de 1M. `--prompt-ids` evita los límites de argumentos del shell.
 El pool MTP confirmado de QSA y el PLE rodante están activados por defecto en las rutas admitidas. La admisión de memoria prueba
 la escalera de almacenamiento antes que tiles de prompt más pequeños e informa de `storage_ladder_step` y `yarn_mtp_storage`.
+Un rechazo por margen físico tras el registro avanza la escalera y mantiene fijo el almacenamiento ya asignado.
+La escalera termina con un conjunto de almacenamiento ajustado a 8,192, después 4,096 y después 2,048 filas; una ejecución MTP de 1M en un nodo se admite a 8,192 filas antes del
+registro y se queda en 2,048 filas con el conjunto ajustado después de él, sin recurrir a la ruta serial. En la ruta MTP la
+estimación cuenta una sola imagen FP16 densa y ningún slab PLE de reemplazo, solo mientras se procesa el prompt; con la opción de
+prefill `gdn_fp16_chunk` activada, se cuentan sus búferes persistentes (489.7 MB a 8,192 filas).
+Un rechazo informa de la memoria libre observada y del déficit.
 Un bundle ausente o no válido antes de la mutación recurre a YaRN serial con un aviso; un `--mtp` explícito
 conserva su contrato de assets fijados. `STRIX_QWEN_YARN_MTP=0` selecciona YaRN serial.
 
@@ -120,12 +126,21 @@ ajustes manuales de almacenamiento). El TTFT va desde el arranque del proceso ha
 La celda de prefill a 262K procede de la rama main pública `669bcb83` (prompt de 262,144 tokens, tiempo de prefill sin la
 carga del modelo, `--profile default` y `--profile fast` intercalados, dos pares: 179.07 s y 174.18 s); las celdas de decode a
 262K proceden del build `7b2453fe`; las demás celdas de la fila proceden del build indicado arriba.
+Las celdas serial de la fila de 1M proceden de la rama main pública `fdc39faba` con Linux 7.3; sus celdas MTP y su gate
+exacto proceden del cambio de admisión MTP (#288) con Linux 7.4. Ambos conjuntos se midieron con kernels distintos, por lo
+que cada celda indica su kernel y la fila no da una relación entre serial y MTP.
 
 | Contexto (factor YaRN) | Gate exacto (MTP == serial == pool desactivado) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | Aceptación MTP |
 |---|---|---|---|---|---|
 | 262,400 (2) | Alcance completo | 219 s / 224 s | **1,464 tok/s** `--profile default`; 1,505 tok/s `--profile fast` (`669bcb83`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
 | 524,288 (2) | Alcance objetivo | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
-| 1,048,576 (4) | Alcance completo, más el recibo de la ruta por defecto | 1,005 s / 1,096 s | 1,081 tok/s (ruta MTP unos 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
+| 1,048,576 (4) | Alcance completo (MTP frente a serial con las dos rutas de prefill indicadas abajo desactivadas) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); ruta MTP 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
+
+Desde que la ruta de salida HC en FP16 pasó a ser la aritmética de prefill por defecto, el prefill serial de
+YaRN la usa, mientras que la ruta MTP de YaRN mantiene la aritmética anterior de salida HC y de proyección de
+índices. Cada ruta es exacta frente a su propia referencia: la ruta MTP coincide con YaRN serial ejecutado con
+`--prefill-disable hc_output_wmma --prefill-disable index_proj_wmma`. Las filas MTP == serial de 262K y 524K de
+la tabla se midieron antes de ese cambio; el gate de la fila de 1M es la comparación con esas dos rutas desactivadas.
 
 Véanse [MTP con YaRN y bundles](../../engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli),
 la [matriz de rutas de pool/PLE](../../engine/qsa-committed-pool.md) y

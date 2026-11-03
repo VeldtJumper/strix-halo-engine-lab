@@ -47,7 +47,21 @@ struct PrefillRequirements {
     std::string owner_error{};
     std::map<std::string, std::uint64_t> organization{};
     std::uint64_t external_host = 0, external_device = 0;
+    std::optional<RegisteredPrefillPlan> registered_plan{};
 };
+inline RegisteredPrefillEnvelope yarn_registered_prefill_envelope(const Options& o,
+    const PrefillRequirements& required,const std::array<std::uint64_t,5>& peaks,
+    const UmaOwnerInventory& live,std::uint64_t resident,std::uint64_t rolling,std::uint64_t credit,
+    bool enforce_limits=true) {
+    if (!required.registered_plan) throw std::logic_error("YaRN MTP runtime admission plan missing");
+    PrefillReservationGrowth mtp{required.mtp_post_setup_peak,0};
+    for (const auto* name:{"mtp_m1_keys","mtp_m1_scratch_metadata"})
+        if (required.owners.contains(name)) mtp.retained=prefill_reservation_add(mtp.retained,required.owners.at(name));
+    const std::optional<std::uint64_t> peak=mtp_prompt_phase_separation(o)
+        ? std::optional<std::uint64_t>(*std::max_element(peaks.begin()+1,peaks.end())) : std::nullopt;
+    return registered_prefill_envelope(live,resident,*required.registered_plan,peak,rolling,mtp,credit,
+        enforce_limits?UmaReservationLimits{o.known_prefill_uma_budget,o.known_prefill_uma_budget}:UmaReservationLimits{});
+}
 // Future bridge commitments, excluding the already charged primary stack/prefill.
 struct PrefillMemory {
     std::optional<std::uint64_t> available, gtt_limit, gtt_used;
@@ -63,6 +77,19 @@ struct PrefillMemory {
     std::uint64_t observation_id=0, end_steady_ns=0;
     std::optional<std::uint64_t> usable_ceiling{}, cache_available{}, gfx_target{}, resident{};
     bool cache_limits_known=false;
+    // YaRN MTP only: a late observation may continue the existing tile ladder
+    // before any prompt/state allocation, without retrying a larger T.
+    std::uint32_t yarn_mtp_max_prefill_rows = 8192U;
+    // Already resident table; post-registration observations remain raw.
+    std::uint64_t yarn_registered_rotary_bytes = 0U;
+    // Actual model inventory before state allocation, actual base inventory
+    // afterwards. The compiler supplies the not-yet-allocated caller owners.
+    std::optional<std::uint64_t> yarn_registered_base{};
+    bool yarn_registered_base_complete = false;
+    std::optional<std::uint64_t> yarn_registered_rolling_owner{};
+    std::optional<std::uint64_t> yarn_registered_storage_step{};
+    // Runtime supplies a fresh physical/GTT sample before each registered trial.
+    std::function<void(PrefillMemory&)> refresh_registered{};
 };
 // Both inspection and execution validate explicit-T assets before the inspection exit.
 inline void validate_http_serving_memory(const Options& o,const PrefillMemory& memory) {
@@ -1730,11 +1757,15 @@ inline std::string yarn_mtp_storage_receipt(const EffectiveConfig& config) {
     std::string out = "\"yarn_mtp_storage\":{\n";
     bool first = true;
     for (const char* name : {"storage_ladder_step", "ple_rolling_positions", "ple_rolling_cap_bytes",
-            "qsa_score_ring_rows", "prefill_pipe"})
+            "qsa_score_ring_rows", "prefill_pipe", "window_capacity_rows"})
     {
         out += (first ? "" : ",") + std::string("\"") + name + "\":" + std::to_string(config.admission.at(name));
         first = false;
     }
+    for (const auto& [name,bytes]:config.admission)
+        if (name.starts_with("refused_step_") || name.starts_with("registered_physical_"))
+            out += ",\""+name+"\":"+std::to_string(bytes);
+    out += ",\"tile_fallback\":"+serve::Json(config.tile_fallback).dump();
     return out + "},\n\"storage_ladder_step\":" + std::to_string(config.admission.at("storage_ladder_step")) + ",\n";
 }
 inline std::string effective_config_json(const EffectiveConfig& config) {
@@ -1832,8 +1863,8 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     if (config.ple_rolling_cap && !config.ple_rolling_h) out << "\"ple_rolling_cap_bytes\":" << config.ple_rolling_cap << ',';
     if (o.http_serve) out << "\"serve_prefill_notice\":" << serve::Json(config.serve_prefill_notice).dump() << ',';
     out << "\"admitted\":" << (config.admitted ? "true" : "false") << ",\"reason\":\"" << config.reason
-        << "\",\"tile_fallback\":\"" << config.tile_fallback
-        << "\",\"error\":\"" << (o.rotary.mode() == RotaryMode::yarn ? yarn_json_error(config.error) : config.error)
+        << "\",\"tile_fallback\":" << serve::Json(config.tile_fallback).dump()
+        << ",\"error\":\"" << (o.rotary.mode() == RotaryMode::yarn ? yarn_json_error(config.error) : config.error)
         << "\",\"ple_reclaim_credit_bytes\":" << config.ple_reclaim_credit
         << ",\"arithmetic_fallback\":\"" << config.arithmetic_fallback
         << "\",\"longer_context_qualified\":" << (o.context_tokens > 8192U ? "false" : "null")

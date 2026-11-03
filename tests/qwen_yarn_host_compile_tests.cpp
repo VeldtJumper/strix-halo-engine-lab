@@ -187,7 +187,11 @@ void run(unsigned factor, unsigned capacity, unsigned count, const ModelManifest
     descriptors(model,requests.catalog,serial,manifest,access,capacity);
     const auto pair = numerical_profile_pair(effective.options);
     require(pair.split(),"production split prefill lineage");
-    requests.binding.prefill_arithmetic_identity = numerical_profile_pair_identity(pair);
+    // Admission and the runtime bind the governed prefill identity (option mask, GSQ arithmetic).
+    if (numerical_profile_fast_prefill(pair.prefill))
+        requests.binding.prefill_arithmetic_identity = prefill_arithmetic_identity(pair,
+            effective.options.resolved_prefill_option_mask.value_or(effective.prefill_option_mask),
+            qpf2k::has_gsq_gate(manifest));
     requests.catalog.numerical_profile = pair.prefill;
     requests.catalog.fast_prefill_components = pair.fast_components;
     kernels::KernelRegistry prefill_registry;
@@ -436,6 +440,41 @@ void mtp_receipt_admission(const ModelManifest& original) {
                 require(needed.owner_error.empty(),"1M payload caps pass independently of physical fit");
                 require(residual.admitted,residual.error);
                 const auto rolling_owner=prefill_rolling_owner_bytes(residual.options,model,manifest,fit.environment,memory.ple_reclaim_page);
+                for (const bool separated:{false,true}) {
+                    auto candidate=residual.options; candidate.mtp_cli_phase_retirement=separated;
+                    const auto required=memory.estimate(candidate);
+                    require(required.registered_plan.has_value(),"host compiler emits the runtime admission geometry");
+                    auto owners=required.owners; owners["rotary_table"]=candidate.rotary.table_bytes();
+                    owners["ple_rolling_owner"]=rolling_owner;
+                    const auto peaks=prefill_owner_phase_peaks(owners,required.owner_phases,candidate.known_prefill_host_headroom);
+                    UmaOwnerInventory live;
+                    live.known_file_mapping_bytes=required.model_backing;
+                    live.reservation_upper_bound_bytes=required.model_backing+required.registered_plan->base_runtime+
+                        required.registered_plan->caller_live;
+                    const auto early=yarn_registered_prefill_envelope(candidate,required,peaks,live,
+                        required.model_backing,rolling_owner,residual.ple_reclaim_credit,false);
+                    const auto runtime=yarn_registered_prefill_envelope(candidate,required,peaks,live,
+                        live.reservation_upper_bound_bytes,rolling_owner,residual.ple_reclaim_credit,false);
+                    require(early.reservation.setup_peak_reserved_bytes==runtime.reservation.setup_peak_reserved_bytes &&
+                        early.incremental==runtime.incremental+required.registered_plan->base_runtime+required.registered_plan->caller_live,
+                        "registration and runtime use identical retained/growth definitions and charge unpaid live owners once");
+                    auto growth=required.registered_plan->growth+rolling_owner+required.mtp_post_setup_peak;
+                    for (const auto* name:{"mtp_m1_keys","mtp_m1_scratch_metadata"})
+                        if(required.owners.contains(name)) growth+=required.owners.at(name);
+                    auto temporary=required.registered_plan->temporary;
+                    if (mtp_prompt_phase_separation(candidate)) {
+                        growth=*std::max_element(peaks.begin()+1,peaks.end())-live.reservation_upper_bound_bytes;
+                        temporary=0;
+                    }
+                    const auto bridge=plan_known_prefill_reservation(live,growth,temporary,{},residual.ple_reclaim_credit,0);
+                    require(bridge.setup_peak_reserved_bytes==runtime.reservation.setup_peak_reserved_bytes &&
+                        growth+temporary==runtime.incremental,"shared envelope preserves the runtime UMA ledger and physical growth");
+                    const auto total=early.reservation.setup_peak_reserved_bytes+prefill_physical_margin;
+                    const auto available=early.incremental+prefill_physical_margin;
+                    require(prefill_physical_margin_fits(total,available,early.reservation.setup_peak_reserved_bytes,early.incremental) &&
+                        !prefill_physical_margin_fits(total,available-1U,early.reservation.setup_peak_reserved_bytes,early.incremental),
+                        "same physical helper admits exact margin and refuses one byte short");
+                }
                 require(residual.admission.at("owner_ple_rolling_owner_bytes")==rolling_owner,
                     "complete shared reader/ledger owner included in every phase");
                 for(const auto* phase:{"setup","calibration","prompt","decode","drain"}) {
@@ -462,16 +501,21 @@ void mtp_receipt_admission(const ModelManifest& original) {
                 require(admitted.options.known_prefix_prefill_rows==8192U && admitted.options.yarn_mtp_pipeline &&
                     admitted.options.yarn_mtp_q4_all && admitted.environment.at("STRIX_PREFILL_PIPE")=="255",
                     "candidate retains T8192, production PIPE 255, Q4 and f4 identity");
-                const std::array<std::uint64_t,5> expected_spare{5689874725ULL,2362357721ULL,552951069ULL,5546445661ULL,5546445661ULL};
+                // Relative to the original pins: +11 MiB shared-pre image (all phases), +80 MiB packed PLE slab
+                // (prompt phases only) and -96 MiB compact QSA output image (prompt arena).
+                const std::array<std::uint64_t,5> expected_spare{5695117605ULL,2367600601ULL,558193949ULL,5534911325ULL,5534911325ULL};
                 const std::array candidate_phases{"setup","calibration","prompt","decode","drain"};
+                // Every phase is reported before the check, so one failure shows the whole spare profile.
+                bool spare_ok=true;std::string spare_report;
                 for(unsigned i=0;i<candidate_phases.size();++i) {
                     const auto gross=admitted.admission.at(std::string("phase_")+candidate_phases[i]+"_gross_bytes");
                     const auto net=gross-admitted.ple_reclaim_credit;
-                    require(net<=127473287168ULL && 127473287168ULL-net==expected_spare[i] && expected_spare[i]>=500000000ULL,
-                        "production candidate admission leaves at least 0.5 decimal GB spare in every phase: "+
-                        std::string(candidate_phases[i])+" actual="+std::to_string(127473287168ULL-net)+
-                        " expected="+std::to_string(expected_spare[i]));
+                    spare_ok=spare_ok && net<=127473287168ULL && 127473287168ULL-net==expected_spare[i] && expected_spare[i]>=500000000ULL;
+                    spare_report+=" "+std::string(candidate_phases[i])+" actual="+
+                        (net<=127473287168ULL?std::to_string(127473287168ULL-net):"-"+std::to_string(net-127473287168ULL))+
+                        " expected="+std::to_string(expected_spare[i])+";";
                 }
+                require(spare_ok,"production candidate admission leaves at least 0.5 decimal GB spare in every phase:"+spare_report);
                 // The plain 1M command chooses storage, without inheriting the process ring.
                 auto automatic=candidate;automatic.environment.clear();
                 ::unsetenv("STRIX_QSA_SCORE_RING_ROWS");
@@ -503,7 +547,10 @@ void mtp_receipt_admission(const ModelManifest& original) {
                 tight_memory.total=tight_memory.available=*memory.total-(UINT64_C(1)<<28U);
                 const auto tight=resolve(automatic,tight_memory);
                 std::cout << "YMTP_STORAGE auto-tight\n" << effective_config_json(tight);
-                require(tight.admitted && tight.admission.at("storage_ladder_step")==2U &&
+                // The 4 GiB physical margin refuses the tight set at T8192 and T4096 (prompt phase binds); the
+                // ladder numbers each (T, storage set) trial, so the tight set at T2048 is step 4.
+                require(tight.admitted && tight.admission.at("storage_ladder_step")==4U &&
+                    tight.options.known_prefix_prefill_rows==2048U &&
                     tight.ple_rolling_h==256U && tight.ple_rolling_cap==33554432U &&
                     tight.host_compilation.at("qsa_score_ring_rows")==64U && !tight.options.yarn_mtp_pipeline,
                     "physical-memory refusal advances to tight set");
@@ -549,7 +596,8 @@ void mtp_receipt_admission(const ModelManifest& original) {
                 auto old=fit;old.environment["STRIX_QWEN_YARN_HOST_RESERVE"]="1";
                 const auto legacy=resolve(old,memory);
                 require(!legacy.admitted && legacy.options.known_prefix_prefill_rows==2048U &&
-                    legacy.admission.at("required_bytes")==130648668579ULL+rolling_owner,
+                    // The single fresh-CLI PLE slab lowers the old peak phase by 1310720 bytes.
+                    legacy.admission.at("required_bytes")==130647357859ULL+rolling_owner,
                     "reserve off switch restores old 1M T2048 refusal plus separately charged rolling owner; actual="+
                     std::to_string(legacy.admission.at("required_bytes"))+" rolling="+std::to_string(rolling_owner));
                 auto legacy_t=legacy.options;legacy_t.known_prefill_host_headroom=0;
