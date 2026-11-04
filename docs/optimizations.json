@@ -2227,6 +2227,17 @@
   },
   {
     "engine": "glm",
+    "name": "Prefill dense rows v2",
+    "flag_or_env": "STRIX_GLM_PF_DENSE_ROWS",
+    "default": "2",
+    "exact": "Device test v2 == v1 bitwise over the production shapes (80/80); logits and state bitwise equal v1 on both ranks at 1K and 8K.",
+    "gain": "8K TTFT 15.06 -> 14.92 s (544 -> 549 tok/s, -0.9 %), 1K warm 2.80 -> 2.75 s (366 -> 372 tok/s, -1.9 %)",
+    "preconditions": "Exact chunked prefill.",
+    "off_switch": "STRIX_GLM_PF_DENSE_ROWS=1",
+    "doc_anchor": "docs/optimizations.md#glm-pf-dense-rows-v2"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill MLA scores v7",
     "flag_or_env": "STRIX_GLM_PF_SCORES",
     "default": "7",

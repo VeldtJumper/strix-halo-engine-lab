@@ -3454,6 +3454,25 @@ The MLA query absorption and output projection GEMMs keep every output's chain (
 - **Measured gain:** absorb 6.1 -> 4.6 and output 4.1 -> 3.3 us/row per DSA layer (32 heads per rank)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
+<a id="glm-pf-dense-rows-v2"></a>
+
+### Prefill dense rows v2
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS`. **Default:** 2.
+
+Exact dense-row GEMV tiles of the chunked prefill with a new schedule: 8 x 4 independent chains per thread, packed F16 /
+BF16 weight loads and 32- / 64-column tiles chosen by shape. Each output keeps its chain (acc = +0, ascending k, fmaf
+with the same weight conversion). Calls with more than 4096 inputs (the 16384-long F32 chains of the legacy mHC path,
+`STRIX_GLM_PF_HC=1`) keep the v1 tile.
+
+- **Preconditions:** Exact chunked prefill.
+- **Automatic selection:** Unset resolves to 2; the engine default provides it; the resolver reports it. Explicit values win.
+- **Fallback notice:** None.
+- **Exactness evidence:** Device test v2 == v1 bitwise over the production shapes (80/80); logits and state bitwise equal v1 on both ranks of the pair at 1K and 8K.
+- **Off switch:** STRIX_GLM_PF_DENSE_ROWS=1
+- **Measured gain:** 8K TTFT 15.06 -> 14.92 s (544 -> 549 tok/s, -0.9 %), 1K warm 2.80 -> 2.75 s (366 -> 372 tok/s, -1.9 %), every v2 arm faster than every v1 arm; KDA f_b / g_b (128 -> 4096) 1.19-1.21x at 8192 rows
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+
 <a id="glm-pf-scores-v3"></a>
 
 ### Prefill MLA scores v7

@@ -15,6 +15,7 @@
 //     + MLA of the last 96 rows (P up to 8250) incl. all-tie queries.
 //   Timing (informational, only after a clean gate).
 // usage: hip_glm_prefill_tests CASES_DIR [--no-timing]
+// Fixture-free dense gate: STRIX_GLM_PF_TEST_ONLY=dense; opt-in 8K paired timing: STRIX_GLM_PF_DENSE_BENCH=1.
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 #include "glm/prefill/glm_prefill.hpp"
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -670,6 +672,118 @@ void test_dense_rows(const std::string& cases, std::mt19937& g) {
     }
 }
 
+// Fixture-free dense v2 gate. Explicit selectors keep the reference independent of the cached production knob.
+// STRIX_GLM_PF_TEST_ONLY=dense runs only this gate; STRIX_GLM_PF_DENSE_BENCH=1 adds paired 8K timing after PASS.
+void test_dense_rows_v2(std::mt19937& g, bool bench) {
+    struct Shape { unsigned in, n, o0; D::WType wt; const char* type; bool unaligned = false; };
+    const Shape shapes[] = {{4096, 128, 0, D::WType::F16, "F16"}, {4096, 32, 3, D::WType::F16, "F16"},
+                            {128, 4096, 0, D::WType::F16, "F16"}, {4096, 128, 0, D::WType::BF16, "BF16"},
+                            {4096, 32, 3, D::WType::BF16, "BF16"}, {128, 4096, 0, D::WType::BF16, "BF16"},
+                            {4096, 288, 0, D::WType::F16, "F16"}, {16384, 24, 0, D::WType::F32, "F32"}, {256, 129, 1, D::WType::F32, "F32"},
+                            {128, 31, 1, D::WType::F16, "F16-unaligned", true}};
+    unsigned passed = 0, total = 0;
+    hipStream_t stream;
+    hok(hipStreamCreate(&stream), "dense stream");
+    for (unsigned phase = 0; phase < (bench ? 2U : 1U); ++phase) {
+        if (phase == 1 && failures != 0) {
+            std::printf("dense_rows timing skipped: gate failed\n");
+            break;
+        }
+        for (const auto& d : shapes) {
+            if (phase == 1 && failures != 0) break;
+            const std::size_t wn = static_cast<std::size_t>(d.n + d.o0) * d.in + (d.unaligned ? 1U : 0U);
+            // Both signs of zero, smallest/largest subnormals and large finite weights; no NaN payload allowances.
+            void* dw;
+            if (d.wt == D::WType::F32) {
+                auto w = rnd(wn, g, 0.05F);
+                const float special[] = {-0.0F, 0.0F, 0x1p-149F, -0x1p-126F, 0x1p20F, -0x1p20F};
+                for (std::size_t i = 0; i < wn; i += 257) w[i] = special[(i / 257) % 6];
+                dw = up(w);
+            } else {
+                auto w = rnd_half(wn, g, 0.05F, d.wt == D::WType::BF16);
+                const std::uint16_t special[] = {0x8000, 0, 1, 0x8001,
+                    static_cast<std::uint16_t>(d.wt == D::WType::F16 ? 0x03FF : 0x007F),
+                    static_cast<std::uint16_t>(d.wt == D::WType::F16 ? 0x7BFF : 0x4980)};
+                for (std::size_t i = 0; i < wn; i += 257) w[i] = special[(i / 257) % 6];
+                dw = up(w);
+                if (d.unaligned) dw = static_cast<std::uint16_t*>(dw) + 1;
+            }
+            // Keep weights across row counts, but release each large row/output allocation before the next count.
+            const std::size_t keep = g_allocs.size();
+            for (unsigned R : {1U, 7U, 63U, 64U, 65U, 513U, 4096U, 8192U}) {
+                if (phase == 1 && R != 8192) continue;
+                std::vector<float> x(static_cast<std::size_t>(R) * d.in + (d.unaligned ? 1U : 0U));
+                for (auto& f : x) {
+                    // Random finite magnitudes through 2^60, plus explicit signed subnormals below.
+                    const auto u = static_cast<std::uint32_t>((g() & 0x807FFFFFU) | ((1U + g() % 187U) << 23));
+                    std::memcpy(&f, &u, 4);
+                }
+                const float special[] = {-0.0F, 0.0F, 0x1p-149F, -0x1p-149F, 0x1p-126F, -0x1p60F};
+                for (std::size_t i = 0; i < x.size(); i += 131) x[i] = special[(i / 131) % 6];
+                float* dx = up(x);
+                if (d.unaligned) ++dx;
+                const std::size_t count = static_cast<std::size_t>(R) * d.n;
+                float *ya = poison<float>(count + 64), *yb = poison<float>(count + 64);
+                auto launch = [&](unsigned v) { P::dense_rows_versioned(dx, dw, d.wt, d.in, d.o0, d.n,
+                                                                       v == 1 ? ya : yb, R, stream, v); };
+                launch(1);
+                launch(2);
+                const auto a = down(ya, count + 64), b = down(yb, count + 64);
+                bool equal = bits_eq(a, b);
+                for (std::size_t i = 0; i < count; ++i) equal &= is_finite(a[i]) && is_finite(b[i]);
+                for (std::size_t i = count; i < count + 64; ++i) {
+                    std::uint32_t u;
+                    std::memcpy(&u, &b[i], 4);
+                    equal &= u == 0xFFFFFFFFU;
+                }
+                if (phase == 0) {
+                    ++total;
+                    passed += equal;
+                    check(equal, "dense_rows v2 == v1 " + std::string(d.type) + " " + std::to_string(d.in) + "->" +
+                          std::to_string(d.n) + " R=" + std::to_string(R) + " o0=" + std::to_string(d.o0) + " + guards");
+                } else if (!equal) {
+                    check(false, "dense_rows benchmark input bitwise gate");
+                } else {
+                    hipEvent_t start, stop;
+                    hok(hipEventCreate(&start), "dense event");
+                    hok(hipEventCreate(&stop), "dense event");
+                    launch(1);
+                    launch(2);
+                    std::vector<float> times[2];
+                    for (unsigned round = 0; round < 7; ++round) {
+                        for (unsigned arm = 0; arm < 2; ++arm) {
+                            const unsigned v = 1 + ((round + arm) % 2);
+                            hok(hipEventRecord(start, stream), "dense start");
+                            launch(v);
+                            hok(hipEventRecord(stop, stream), "dense stop");
+                            times[v - 1].push_back(ms_between(start, stop));
+                        }
+                    }
+                    for (auto& t : times) std::sort(t.begin(), t.end());
+                    const double flop = 2.0 * R * d.in * d.n;
+                    std::printf("dense_rows bench %s %u->%u R=%u: v1 %.3f ms, v2 %.3f ms, %.3fx, v2 %.3f TF/s (7 paired medians)\n",
+                                d.type, d.in, d.n, R, times[0][3], times[1][3], times[0][3] / times[1][3],
+                                flop / (times[1][3] * 1e9));
+                    hok(hipEventDestroy(start), "dense event destroy");
+                    hok(hipEventDestroy(stop), "dense event destroy");
+                }
+                while (g_allocs.size() > keep) {
+                    hok(hipFree(g_allocs.back()), "dense free");
+                    g_allocs.pop_back();
+                }
+            }
+            free_all();
+        }
+        if (phase == 0) std::printf("dense_rows v2: %u/%u bitwise\n", passed, total);
+    }
+    // Zero work must not touch device pointers for either explicit route.
+    for (unsigned v : {1U, 2U}) {
+        P::dense_rows_versioned(nullptr, nullptr, D::WType::F16, 4096, 0, 32, nullptr, 0, stream, v);
+        P::dense_rows_versioned(nullptr, nullptr, D::WType::F16, 4096, 0, 0, nullptr, 7, stream, v);
+    }
+    hok(hipStreamDestroy(stream), "dense stream destroy");
+}
+
 // mHC pre for many rows: pf::hc_pre_rows == dev::hc_pre bit for bit (F, mix, collapsed x), real L3 hc fn/base/scale;
 // row 0 = the real case stream, other rows random.
 void test_hc_rows(const std::string& cases, std::mt19937& g) {
@@ -1194,12 +1308,20 @@ int main(int argc, char** argv) {
     }
     const bool want_timing = !(argc > 2 && std::string(argv[2]) == "--no-timing");
     std::mt19937 g(20261025);
+    const char* dense_bench = std::getenv("STRIX_GLM_PF_DENSE_BENCH");
+    const bool bench_dense = want_timing && dense_bench != nullptr && std::string(dense_bench) == "1";
+    if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "dense") {
+        test_dense_rows_v2(g, bench_dense);  // fixture-free; CASES_DIR may be a placeholder
+        std::printf("checks: %d failures: %d\n", checks, failures);
+        return failures ? 1 : 0;
+    }
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "hcfuse") {
         test_hc_expand_norm(g);  // fixture-free
         std::printf("checks: %d failures: %d\n", checks, failures);
         return failures ? 1 : 0;
     }
     test_dense_rows(argv[1], g);
+    test_dense_rows_v2(g, bench_dense);
     test_hc_rows(argv[1], g);
     test_hc_rows_v2(argv[1], g);
     test_hc_expand_norm(g);

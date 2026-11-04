@@ -1878,6 +1878,113 @@ __global__ __launch_bounds__(256) void dense_rows_kernel(const float* x, const v
     }
 }
 
+// Dense v2: 8 x 4 independent ascending chains per thread, transposed/padded LDS for three b128 reads per k.
+// C=64: 256 threads, 25 KiB LDS; C=32: 128 threads, 21 KiB LDS (24/32-column projections).
+template <unsigned C, dev::WType WT>
+__global__ __launch_bounds__(C * 4) void dense_rows_v2_kernel(const float* x, const void* w, unsigned in, unsigned o0,
+                                                           unsigned n, float* y, unsigned rows) {
+    constexpr unsigned R = 128, K = 32, NT = C * 4;
+    __shared__ alignas(16) float as[K][R + 4];
+    __shared__ alignas(16) float ws[K][C + 4];
+    const unsigned tid = threadIdx.x, tr = tid / (C / 4), tc = tid % (C / 4);
+    const unsigned r0 = blockIdx.x * R, c0 = blockIdx.y * C;
+    float acc[8][4];
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) acc[i][j] = 0.0F;
+    for (unsigned k0 = 0; k0 < in; k0 += K) {
+        __syncthreads();
+        for (unsigned v = tid; v < R * K / 4; v += NT) {
+            const unsigned rr = v / (K / 4), kk = 4 * (v % (K / 4)), r = r0 + rr;
+            float4 a{0.0F, 0.0F, 0.0F, 0.0F};
+            if (r < rows) {
+                const float* p = x + static_cast<std::size_t>(r) * in + k0 + kk;
+                if ((reinterpret_cast<std::uintptr_t>(x) & 15U) == 0)
+                    a = *reinterpret_cast<const float4*>(p);
+                else
+                    a = float4{p[0], p[1], p[2], p[3]};
+            }
+            as[kk][rr] = a.x;
+            as[kk + 1][rr] = a.y;
+            as[kk + 2][rr] = a.z;
+            as[kk + 3][rr] = a.w;
+        }
+        for (unsigned v = tid; v < C * K / 2; v += NT) {
+            const unsigned cc = v / (K / 2), kk = 2 * (v % (K / 2)), o = c0 + cc;
+            float a = 0.0F, b = 0.0F;
+            if (o < n) {
+                const std::size_t at = static_cast<std::size_t>(o0 + o) * in + k0 + kk;
+                if constexpr (WT == dev::WType::F32) {
+                    // F32 needs only its original scalar alignment; no new public pointer-alignment contract.
+                    a = static_cast<const float*>(w)[at];
+                    b = static_cast<const float*>(w)[at + 1];
+                } else {
+                    const auto* wp = static_cast<const std::uint16_t*>(w) + at;
+                    const std::uint32_t p = (reinterpret_cast<std::uintptr_t>(w) & 3U) == 0
+                        ? *reinterpret_cast<const std::uint32_t*>(wp)
+                        : static_cast<std::uint32_t>(wp[0]) | (static_cast<std::uint32_t>(wp[1]) << 16);
+                    const auto lo = static_cast<std::uint16_t>(p), hi = static_cast<std::uint16_t>(p >> 16);
+                    if constexpr (WT == dev::WType::F16) {
+                        a = f16_to_float(lo);
+                        b = f16_to_float(hi);
+                    } else {
+                        a = bf16_to_float(lo);
+                        b = bf16_to_float(hi);
+                    }
+                }
+            }
+            ws[kk][cc] = a;
+            ws[kk + 1][cc] = b;
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (unsigned kk = 0; kk < K; ++kk) {
+            const float4 a0 = *reinterpret_cast<const float4*>(&as[kk][tr * 8]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&as[kk][tr * 8 + 4]);
+            const float4 b4 = *reinterpret_cast<const float4*>(&ws[kk][tc * 4]);
+            const float a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float b[4] = {b4.x, b4.y, b4.z, b4.w};
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i)
+#pragma unroll
+                for (unsigned j = 0; j < 4; ++j) acc[i][j] = __builtin_fmaf(a[i], b[j], acc[i][j]);
+        }
+    }
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+        const unsigned r = r0 + tr * 8 + i;
+        if (r >= rows) continue;
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned o = c0 + tc * 4 + j;
+            if (o < n) y[static_cast<std::size_t>(r) * n + o] = acc[i][j];
+        }
+    }
+}
+
+template <unsigned C>
+void dense_rows_v2_launch(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y,
+                          unsigned rows, hipStream_t s) {
+    const dim3 grid((rows + 127) / 128, (n + C - 1) / C);
+    if (wt == dev::WType::F16)
+        dense_rows_v2_kernel<C, dev::WType::F16><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows);
+    else if (wt == dev::WType::BF16)
+        dense_rows_v2_kernel<C, dev::WType::BF16><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows);
+    else
+        dense_rows_v2_kernel<C, dev::WType::F32><<<grid, C * 4, 0, s>>>(x, w, in, o0, n, y, rows);
+}
+
+unsigned dense_rows_version() {
+    static const unsigned v = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_DENSE_ROWS");
+        if (e == nullptr || std::string(e) == "2") return 2U;
+        if (std::string(e) == "1") return 1U;
+        throw std::invalid_argument("STRIX_GLM_PF_DENSE_ROWS must be 1 or 2");
+    }();
+    return v;
+}
+
 // hc_pre split in three launches (expressions of hc_pre_kernel): (1) per-row unweighted norm -> F; (2) the 24 chains
 // z = F . fn as dense_rows; (3) per-row R6 on lane 0 + R7 collapse.
 __global__ __launch_bounds__(256) void hc_norm_rows_kernel(const float* X, float* F) {
@@ -2300,9 +2407,21 @@ void indexer_select_rows_versions(const DsaSlot& slot, unsigned t0, const float*
 
 void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y, unsigned rows,
                 hipStream_t s) {
+    dense_rows_versioned(x, w, wt, in, o0, n, y, rows, s, dense_rows_version());
+}
+
+void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y,
+                          unsigned rows, hipStream_t s, unsigned version) {
+    if (version != 1 && version != 2) throw std::invalid_argument("glm pf dense_rows version must be 1 or 2");
     if (rows == 0 || n == 0) return;
     if (in == 0 || in % kGK) throw std::runtime_error("glm pf dense_rows: in must be a positive multiple of 32");
-    dense_rows_kernel<<<dim3((rows + kGT - 1) / kGT, (n + kGT - 1) / kGT), 256, 0, s>>>(x, w, wt, in, o0, n, y, rows);
+    // v2 for in <= 4096 (KDA / indexer / router shapes); the 16384-long F32 chains of the legacy mHC path keep the v1 tile.
+    if (version == 1 || in > 4096)
+        dense_rows_kernel<<<dim3((rows + kGT - 1) / kGT, (n + kGT - 1) / kGT), 256, 0, s>>>(x, w, wt, in, o0, n, y, rows);
+    else if (n >= 128)
+        dense_rows_v2_launch<64>(x, w, wt, in, o0, n, y, rows, s);
+    else
+        dense_rows_v2_launch<32>(x, w, wt, in, o0, n, y, rows, s);
     ok(hipGetLastError(), "glm pf dense_rows");
 }
 
