@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <iostream>
 
 #include "glm/rtxpf/import/glm_import_socket.hpp"
@@ -49,6 +50,47 @@ void units() {
     auto parsed = Begin::parse(br);
     check(parsed.encode() == bytes);
     check(layout(b).size() == 116);  // 34 KDA x2 + 12 DSA x4
+    // Version 2 ('DSA once'): rank 0 keeps every component, rank 1 the 68 KDA components only; same encoding.
+    {
+        auto v2 = b;
+        v2.version = 2;
+        const auto all = layout(b), r0 = layout(v2);
+        check(r0.size() == all.size());
+        for (std::size_t i = 0; i < all.size(); ++i)
+            check(r0[i].layer == all[i].layer && r0[i].id == all[i].id && r0[i].rows == all[i].rows && r0[i].stride == all[i].stride);
+        v2.rank = 1;
+        const auto r1 = layout(v2);
+        check(r1.size() == 68);
+        for (const auto& c : r1) check(c.id < 2 && c.layer < 45 && c.layer % 4 != 3);
+        auto v1r1 = b;
+        v1r1.rank = 1;
+        check(layout(v1r1).size() == 116);
+        auto enc = v2.encode();
+        Reader vr{enc};
+        check(vr.number(4) == 1);
+        auto back = Begin::parse(vr);
+        check(back.version == 2 && back.encode() == enc);
+        check(hash(v2.encode(true)) != hash(b.encode(true)));  // the version is in the ranks' binding digest
+        Staging s1(v2);
+        auto v2r0 = b;
+        v2r0.version = 2;
+        rejects([&] { validate(b, v2r0); });  // a v1 sender to a receiver expecting v2
+        rejects([&] { agree(hash(v2r0.encode(true)), true, vote(hash(b.encode(true)), true)); });  // mixed-version ranks
+        for (unsigned layers : {45u, 46u})
+            for (std::uint64_t n : {1ULL, 3ULL, 4ULL, 8ULL}) {  // pooled rows 0 and > 0
+                auto q = v2;
+                q.layers = layers;
+                q.frontier = n;
+                q.total = n + 1;
+                auto full = q;
+                full.version = 1;
+                std::vector<std::pair<unsigned, unsigned>> kept, want;
+                for (const auto& c : layout(full))
+                    if (!omitted(q.version, q.rank, c.id)) kept.push_back({c.layer, c.id});
+                for (const auto& c : layout(q)) want.push_back({c.layer, c.id});
+                check(kept == want);  // the producer's filter of the full export == rank 1's v2 layout
+            }
+    }
     // The same helpers size/reset/serialize/restore the engine's actual allocations.
     // Exercise all pool boundaries, including a capacity different from the frontier.
     namespace sl = strix::glm::state_layout;
@@ -87,7 +129,7 @@ void units() {
     invalid.rank = 2;
     rejects([&] { Staging s(invalid); });
     invalid = b;
-    invalid.version = 2;
+    invalid.version = 3;
     rejects([&] { Staging s(invalid); });
     for (unsigned field = 0; field < 9; ++field) {
         auto x = b;
@@ -260,6 +302,7 @@ int main(int argc, char** argv) {
         b.node = "r1";
         b.prompt = unhex(argv[3]);
         b.model = unhex(argv[4]);
+        if (const char* v = std::getenv("GLM_TEST_WIRE_VERSION")) b.version = unsigned(std::stoul(v));  // 2 = DSA once
         auto s = receive(argv[1], read_key(argv[2]), b);
         strix::Sha256Fast sha;
         s->apply([&](const Frame&, auto data) { sha.update(std::as_bytes(data)); });

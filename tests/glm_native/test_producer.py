@@ -118,7 +118,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(sum('hc_attn_fn' in k for k in s), 45)
 
 
-def loopback(rank=0, cases=('success', 'abort', 'corrupt', 'duplicate')):
+def loopback(rank=0, cases=('success', 'abort', 'corrupt', 'duplicate'), version=1):
     exe = BUILD/'glm_native_receiver.exe'
     subprocess.run([str(exe)], check=True)
     with tempfile.TemporaryDirectory(dir=BUILD) as td:
@@ -128,17 +128,19 @@ def loopback(rank=0, cases=('success', 'abort', 'corrupt', 'duplicate')):
         model = '22'*32
         expected = hashlib.sha256()
         for layer in range(46):
-            components = [(0, 32*65536), (1, 32*4608)] if layer < 45 and layer % 4 != 3 else [(2, 5*1024), (3, 5*256), (4, 5*256), (5, 512)]
+            # wire version 2 ('DSA once'): rank 1 receives the KDA components only
+            components = [(0, 32*65536), (1, 32*4608)] if layer < 45 and layer % 4 != 3 else [] if version == 2 and rank == 1 else [(2, 5*1024), (3, 5*256), (4, 5*256), (5, 512)]
             for c, n in components:
                 expected.update(bytes([(layer*7+c)%256])*n)
+        env = dict(os.environ, GLM_TEST_WIRE_VERSION=str(version))
         for case in cases:
             with socket.socket() as s:
                 s.bind(('127.0.0.1', 0))
                 endpoint = '127.0.0.1:'+str(s.getsockname()[1])
-            receiver = subprocess.Popen([str(exe), endpoint, str(td/'key'), prompt, model, str(rank)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            receiver = subprocess.Popen([str(exe), endpoint, str(td/'key'), prompt, model, str(rank)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
             try:
                 for _ in range(100):
-                    sender = subprocess.run([str(BUILD/'glm_native_sender.exe'), endpoint, str(td/'key'), prompt, model, case, str(rank)], capture_output=True, text=True, timeout=30)
+                    sender = subprocess.run([str(BUILD/'glm_native_sender.exe'), endpoint, str(td/'key'), prompt, model, case, str(rank)], capture_output=True, text=True, timeout=30, env=env)
                     if 'sender connect' not in sender.stderr:
                         break
                     time.sleep(.02)
@@ -149,7 +151,7 @@ def loopback(rank=0, cases=('success', 'abort', 'corrupt', 'duplicate')):
                     assert 'LOCALLY_SEALED' in sender.stdout
                 else:
                     assert receiver.returncode != 0 and 'REJECT' in err, (out, err)
-                print('PASS production sender -> node CPU staging:', case, 'rank', rank)
+                print('PASS production sender -> node CPU staging:', case, 'rank', rank, 'wire version', version)
             finally:
                 if receiver.poll() is None:
                     receiver.kill()
@@ -176,3 +178,6 @@ if __name__ == '__main__':
         for job in paired:
             job.result()
     loopback(0, ('abort', 'corrupt', 'duplicate'))
+    for rank in (0, 1):
+        loopback(rank, ('success',), version=2)  # DSA once: rank 0 every component, rank 1 KDA only
+    loopback(1, ('extra_dsa', 'premature', 'corrupt'), version=2)  # rank 1 at v2 refuses a DSA frame and an early commit

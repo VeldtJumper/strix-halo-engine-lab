@@ -341,10 +341,27 @@ NVML cannot tell, the runtime's own device check refuses such a card after it
 starts (as before `--dgpu` existed).
 
 ```powershell
+# Recommended: prefill through the tierstream expert cache (unit file + whole-device budget).
+BUILD_DIR/glm_native_service.exe --model MODEL_DIR --key-file import.key --bind 127.0.0.1 --port 8097 `
+  --enable-generate --capacity 32768 --row-tile 8192 --max-device-layers 0 --max-pinned-layers 0 `
+  --expert-tier tierstream --unit-file UNIT_FILE --unit-manifest-sha256 UNIT_MANIFEST_SHA256 `
+  --vram-total-gib VRAM_GIB --ram-total-gib RAM_GIB --expert-residency none --allow-gpu
+# Without the cache: whole expert layers resident or staged from the model shards on every request (slower).
 BUILD_DIR/glm_native_service.exe --model MODEL_DIR --key-file import.key --capacity 8192 --row-tile auto --bind 127.0.0.1 --port 8097 --allow-gpu
-# Optional faster persistent cache, after its disk budget is approved:
-BUILD_DIR/glm_native_service.exe --cache CACHE_DIR --cache-manifest-sha256 MANIFEST_SHA256 --key-file import.key --capacity 8192 --row-tile auto --bind 127.0.0.1 --port 8097 --allow-gpu
 ```
+
+The serve mode opens the tierstream cache only with `--enable-generate` (it also
+enables the authenticated `POST /v1/generate`), even when clients use only
+`/v1/prefill`; without it, `--vram-total-gib` / `--ram-total-gib` are refused and
+the prefill stages whole expert layers from the model shards on every request.
+`--decode-commands` is for the stdin harness and does not serve HTTP. Check
+`GET /health`: `residency.prefill_mode` must be `cache` and
+`residency.decode.tier_plan.budget_mode` `whole-device caps` (a profile that
+only names tierstream does not prove the cache was opened). The cache changes
+expert placement only: tokens, logits and exported state are the same bytes.
+`--cache CACHE_DIR --cache-manifest-sha256 MANIFEST_SHA256` (a persistent,
+head-capable producer cache, after its disk budget is approved) needs the same
+`--enable-generate` and unit-file options.
 
 `GET /health` returns capacity, identity, draft qualification and residency.
 `POST /v1/prefill` accepts this JSON shape:
@@ -366,6 +383,15 @@ digests, raw bytes only. Per-layer state is released as soon as attention state
 is final; bounded sender queues overlap the rest of the producer. KDA heads
 are split 32 per rank; convolution selects each TP slice separately within
 q/k/v. DSA histories/pools are replicated to both ranks. Pooled tails are omitted.
+With `"dsa_once": true` in `handoff` (wire Begin version 2, the same encoding with
+the version in the ranks' binding digest), rank 0 receives every component and
+rank 1 the KDA components only, so the DSA bytes (about 20 KB per prompt token)
+cross the producer's link once. Version 2 is usable only with a pair importer
+that relays rank 0's DSA components to rank 1 and has restored them before the
+collective commit (a separate pair-side change); both receivers must expect
+version 2, and a rank 1 without the relayed components must fail the import.
+ACK 1 stays a local seal of what each rank received. The receipt
+reports `dsa_once`, `wire_version` and `wire_bytes_rank0` / `wire_bytes_rank1`.
 
 Both sender queues must drain before either commit is sent. On failure,
 unsealed transactions abort or disconnect. ACK 1 is only a **local seal**:
