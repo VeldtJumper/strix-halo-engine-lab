@@ -120,16 +120,16 @@ YaRN, not native rotary, and do not qualify general 1M model fidelity or complet
 Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
 real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
 overrides). TTFT runs from process launch to the first token and includes model load.
-The 262K prefill cell is from public main `669bcb83` (262,144-token prompt, prefill time without model load,
-`--profile default` and `--profile fast` interleaved, two pairs: 179.07 s and 174.18 s); the 262K decode cells are from
-build `7b2453fe`; the row's other cells are from the build above.
+The 262K prefill cell and the 262K serial decode cell are from public main `17b9c57b8` (262,144-token prompt,
+prefill time without model load, `--profile default`, one run: 176.60 s); the 262K MTP decode cell is from build
+`7b2453fe`; the row's other cells are from the build above.
 The 1M row's serial cells are from public main `fdc39faba` on Linux 7.3; its MTP cells and exact gate are from the
 MTP admission change (#288) on Linux 7.4. The two sets were measured on different kernels, so each cell states its
 kernel and the row gives no serial-to-MTP ratio.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
-| 262,400 (2) | Full scope | 219 s / 224 s | **1,464 tok/s** `--profile default`; 1,505 tok/s `--profile fast` (`669bcb83`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
+| 262,400 (2) | Full scope | 219 s / 224 s | **1,484 tok/s** `--profile default` (`17b9c57b8`) | 21.82 (`17b9c57b8`) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Full scope (MTP against serial with the two prefill paths below off) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); MTP route 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
 
@@ -168,8 +168,9 @@ speculative decoding with windows 2/4/8, dense A8 profile, thinking off, 256 gen
 
 | Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Build |
 |---|---|---|---:|---:|---:|---|
-| MTP decode | 1 node | 1K, code, auto windows | 1 | **59.59 tok/s** (69 % of 86.8 tok/s byte ceiling) | prose: 55.7 tok/s (`0117a140`) | `702bc074` |
+| MTP decode | 1 node | 1K, code, auto windows | 1 | **62.44 tok/s** (72 % of 86.8 tok/s byte ceiling) | prose: 55.7 tok/s (`0117a140`) | main `85353311b` |
 | MTP decode | 1 node | 8K | 1 | **54.00 tok/s** (code, auto windows) | prose: 49.58 tok/s (`226bb691`, exact draft attention) | code `702bc074`; prose `226bb691` |
+| MTP decode | 1 node | 16K | 1 | **50.69 tok/s** (code, auto windows) | prose: 50.31 tok/s | main `85353311b` |
 | MTP decode | 1 node | 32K | 1 | **47.9 tok/s** (code; observed range 44.5–52.6) | median of 4 | `0117a140` |
 | MTP + copy windows (opt-in), long copy-edit | 1 node | Markdown document (~10 KB) to fix, 2,047-token answer | 1 | **183.5 tok/s** | | `e1b115a2` |
 | MTP + copy windows (opt-in), long copy-edit | 1 node | Python file + diff to apply, 1,417-token answer | 1 | **163.9 tok/s** | | `e1b115a2` |
@@ -208,12 +209,12 @@ node decodes; 64 generated tokens identical to the node-only run at every length
 
 | Mode | Hardware | 1K | 4K | 8K | 16K | 32K | Build |
 |---|---|---:|---:|---:|---:|---:|---|
-| Prefill, TTFT | 1 node | **1.12 s** | **3.02 s** | | **14.64 s** | **22.95 s** | `0117a140` (1K/16K); combined profile below (default on) |
+| Prefill, TTFT | 1 node | **0.77 s** | **2.42 s** | | **9.47 s** | **19.13 s** | main `85353311b`, plain command |
 | Prefill offload, TTFT | RTX PRO + 1 node | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | `70b93af3` |
 | Same server without the RTX, TTFT | 1 node | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | same server build |
 
 The offload compares against the same production server it forwards to (2,048-row prompt tiles), which reads
-prompts more slowly than the one-node prefill row above (8,192-row tiles). At 32K the RTX path is 4.9× faster than
+prompts more slowly than the one-node prefill row above (automatic row tiles). At 32K the RTX path is 4.9× faster than
 that server. With the offload enabled, the router sends prompts of 1K tokens or more to the RTX PRO; shorter ones
 are read on the node.
 
@@ -242,6 +243,9 @@ Prompt kind is unspecified for the length sweep.
 Two runs per arm at 4K / 17,700; 32K has one baseline and two default runs; longer rows are single runs.
 Prompt tiles: 4,096 at 4K / 128K, 8,192 at 17,700 / 32K / 64K, 2,048 with 256/16-row tails at 262,143.
 Run-to-run and node-to-node spread reaches ~5 %; single comparisons are indicative.
+Re-measured on public main `85353311b` (plain command, one node): 4,096 **1,695 tok/s**, 17,700 **1,665**,
+32,768 **1,713** (19.13 s), 131,072 **1,617** (81.08 s), 262,143 **1,509** (173.74 s) = 54.0 / 53.9 / 55.7 / 55.6 / 56.2 %
+of the same ceilings; 65,536 was not re-measured.
 
 [PR #49](https://github.com/hyukudan/strix-halo-engine-lab/pull/49) ships combined prefill, GDN gates batching/core16,
 and router selection/activation staging as defaults. [PR #50](https://github.com/hyukudan/strix-halo-engine-lab/pull/50)
@@ -259,8 +263,8 @@ on the published build, 32K in four ABBA pairs **−0.17 s** on average (every p
 These timings are separate comparisons, not a new full-length sweep.
 
 The plain CLI now resolves to the measured production route. On one Strix Halo node, the fast FP16
-prefill identity measured **22.03 s / 1,487 tok/s at 32K**, **100.3 s at 131,072 tokens**, and
-**202.8 s / 1,293 tok/s at 262,143 tokens** (T8192 at the long lengths, PLE page reclaim admitted).
+prefill identity measured **19.13 s / 1,713 tok/s at 32K**, **81.08 s at 131,072 tokens**, and
+**173.74 s / 1,509 tok/s at 262,143 tokens** (public main `85353311b`, automatic T16384 from 32K).
 Digests match that identity's reference at 32K/64K/128K/262K; this is not dense-A8 serial bit equality
 or a new long-context model-fidelity qualification. See the [catalog](../../optimizations.md#qwen-tiled).
 
