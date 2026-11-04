@@ -24,6 +24,11 @@ at most eight. Committed KV, taps and hidden rows equal the eight-row
 `STRIX_G4_PREFILL_EXACT_MANYROW=0` (recorded in `off_switches`, with
 `prefill_route` in the backend identity) restores the eight-row passes.
 
+`STRIX_G4_PREFILL_IDENTITY=a8` opts into `a8-many-row` prompt prefill only with
+decode `STRIX_G4_IDENTITY=g4-a8-v1`; otherwise prefill-exact runs with a log line.
+Prompt KV and logits equal the a8 decode of the same rows, byte for byte,
+on 512-row chunks. `STRIX_G4_PREFILL_EXACT_MANYROW=0` keeps the eight-row passes.
+
 Each step calls `forward_rows` once with at most eight total rows. Every live
 stream reserves at least one row; remaining capacity goes to exact prompt chunks
 or explicitly enabled verify windows. Prompt ingestion processes all but the

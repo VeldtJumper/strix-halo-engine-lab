@@ -197,15 +197,15 @@ void product_table() {
         check(r.qualification() == "qualified", "fast without --allow-pending is qualified");
     }
     r = pr::resolve(pr::Name::fast, pr::App::engine, in());
-    // The fast prompt prefill follows its receipt (profile.cpp): named -> the Q4_K_M-gated v1 route; empty -> pending,
-    // prefill-exact runs and the receipt names the target. Qualified either way.
+    // The fast prompt prefill follows its receipt (profile.cpp): named -> the a8 route (byte-identical to the qualified
+    // g4-a8-v1 decode rows); empty -> pending, prefill-exact runs and the receipt names the target. Qualified either way.
     const bool fast_prefill_ready = [] {
         for (const auto& lever : pr::levers()) if (lever.name == "prefill_route") return lever.ready[1];
         return false;
     }();
     if (fast_prefill_ready)
-        check(status(r, "prefill_route") == pr::Status::set && value(r, "prefill_route") == "fast" && r.active("prefill_route") &&
-              r.qualification() == "qualified", "fast runs the qualified v1 prefill");
+        check(status(r, "prefill_route") == pr::Status::set && value(r, "prefill_route") == "a8" && r.active("prefill_route") &&
+              r.qualification() == "qualified", "fast runs the qualified a8 prefill");
     else
         check(status(r, "prefill_route") == pr::Status::pending && value(r, "prefill_route") == "exact" && !r.active("prefill_route") &&
               r.qualification() == "qualified", "fast prefill pending: prefill-exact runs");
@@ -221,6 +221,29 @@ void product_table() {
           "explicit v1/v2 select the route on any non-EXL3 pack");
     check(pr::prefill_route("", 15, false) == "exact" && pr::prefill_route("exact", 15, false) == "exact", "exact prefill");
     refuses([] { (void)pr::prefill_route("wmma", 15, false); }, "STRIX_G4_PREFILL_IDENTITY", "unknown prefill route refused");
+    for (const auto type : {15, 14, -1})
+        check(pr::prefill_route("a8", type, false) == "a8", "explicit a8 on any non-EXL3 pack");
+    check(pr::prefill_route("a8", 15, true) == "exact", "a8 leaves EXL3 prefill unchanged");
+    {
+        auto choice = pr::prefill_route_for_decode("a8", "g4-a8-v1");
+        check(choice.route == "a8" && choice.notice.empty(), "a8 prefill matches a8 decode");
+        choice = pr::prefill_route_for_decode("a8", "");
+        check(choice.route == "exact" && choice.notice ==
+              "gemma4 prefill: STRIX_G4_PREFILL_IDENTITY=a8 needs decode identity g4-a8-v1 (decode is g4-v1); prefill-exact runs",
+              "a8 with unset decode falls back with a notice");
+        choice = pr::prefill_route_for_decode("a8", "g4-v1");
+        check(choice.route == "exact" && choice.notice.find("decode is g4-v1") != std::string::npos,
+              "a8 with g4-v1 decode falls back");
+        choice = pr::prefill_route_for_decode("a8", "other");
+        check(choice.route == "exact" && choice.notice.find("decode is other") != std::string::npos,
+              "a8 fallback names the decode identity");
+        choice = pr::prefill_route_for_decode("v1", "g4-v1");
+        check(choice.route == "v1" && choice.notice.empty(), "v1 prefill unchanged");
+        for (const auto decode : {"", "g4-v1", "g4-a8-v1"}) {
+            choice = pr::prefill_route_for_decode("exact", decode);
+            check(choice.route == "exact" && choice.notice.empty(), "exact prefill unchanged");
+        }
+    }
     {
         const auto lines = r.notices();
         unsigned pending = 0;
@@ -258,8 +281,8 @@ void product_table() {
           "receipt stamped unqualified");
     // --allow-pending changes nothing for a qualified row.
     r = pr::resolve(pr::Name::fast, pr::App::engine, allow);
-    check(value(r, "prefill_route") == "fast" && status(r, "prefill_route") ==
-          (fast_prefill_ready ? pr::Status::set : pr::Status::unqualified), "allow-pending runs the fast v1 route");
+    check(value(r, "prefill_route") == "a8" && status(r, "prefill_route") ==
+          (fast_prefill_ready ? pr::Status::set : pr::Status::unqualified), "allow-pending runs the fast a8 route");
     // OFF: STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact under fast.
     r = pr::resolve(pr::Name::fast, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_PREFILL_IDENTITY", "exact"}})));
     check(status(r, "prefill_route") == pr::Status::explicit_env && value(r, "prefill_route") == "exact", "explicit exact prefill");

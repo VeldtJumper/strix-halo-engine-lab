@@ -95,12 +95,16 @@ struct Inputs {
 // (never asset or off-switch levers). Call before anything reads (and caches) those switches.
 void apply(const Resolution& resolution);
 
-// Prompt prefill route for STRIX_G4_PREFILL_IDENTITY (exact|v1|v2|fast) and the pack: "fast" (the fast
+// Prompt prefill route for STRIX_G4_PREFILL_IDENTITY (exact|v1|v2|a8|fast) and the pack: "fast" (the fast
 // profile's value) runs g4-wmma-pf-v1 only on a GGUF pack whose general.file_type is 15 (MOSTLY_Q4_K_M), the
 // pack type its held-out qualification covers, and prefill-exact on any other pack (Q4_K_S, BF16, ...); EXL3
-// packs keep their own route. Returns "exact", "v1" or "v2"; throws on an unknown value.
+// packs keep their own route. Returns "exact", "v1", "v2" or "a8"; throws on an unknown value.
 inline constexpr std::int32_t gguf_file_type_q4_k_m = 15;
 [[nodiscard]] std::string_view prefill_route(std::string_view requested, std::int32_t gguf_file_type, bool exl3_pack);
+struct PrefillRouteChoice { std::string_view route; std::string notice; };
+// A8 prefill requires g4-a8-v1 decode; empty decode identity means g4-v1. (Under a FAST decode attention such as
+// g4-dattn-f2 the route still runs, but its prompt rows no longer equal the decode rows: prefill_matches_decode is false.)
+[[nodiscard]] PrefillRouteChoice prefill_route_for_decode(std::string_view route, std::string_view decode_identity);
 
 // Argument helper for apps whose legacy bare `--profile` means kernel profiling:
 // `--profile default|fast|quality` consumes the value and returns true; a bare

@@ -91,6 +91,8 @@ struct Args {
     bool after_benchmark_checks = false, profile_comparison = false, canonical_ab = false;
     pf::Linears linears = pf::Linears::wmma; // --linears exact|wmma
     bool exact_ab = false;                   // --exact-ab: exact prefill versus eight-row decode passes
+    bool a8_gate = false;                    // --a8-gate: every row's logits + KV digest, a8 prefill vs a8 decode
+    unsigned gate_chunk = 512, ref_rows = 1; // --gate-chunk N (prefill chunk), --ref-rows N (decode rows per pass; 0 = 1 and 8)
     std::optional<g4::profile::Name> product; // --profile default|fast|quality
     bool allow_pending = false;               // --allow-pending (benchmarking only)
 };
@@ -106,6 +108,7 @@ Args arguments(int argc, char** argv) {
         if (key == "--profile" || key == "--kernel-profile") { a.profile = true; continue; }
         if (key == "--canonical-kernel-ab") { a.canonical_ab = true; continue; }
         if (key == "--exact-ab") { a.exact_ab = true; continue; }
+        if (key == "--a8-gate") { a.a8_gate = true; continue; }
         if (key == "--check-c4") { a.c4 = true; continue; }
         if (key == "--allow-pending") { a.allow_pending = true; continue; }
         if (++i >= argc) throw std::invalid_argument("missing argument value");
@@ -122,9 +125,11 @@ Args arguments(int argc, char** argv) {
         else if (key == "--linear-policy") a.linear_policy = value;
         else if (key == "--split") { a.split = number(value); a.check_split = true; }
         else if (key == "--continuation") a.continuation = number(value);
+        else if (key == "--gate-chunk") a.gate_chunk = number(value);
+        else if (key == "--ref-rows") a.ref_rows = number(value);
         else if (key == "--linears") {
-            if (value != "exact" && value != "wmma") throw std::invalid_argument("--linears expects exact or wmma");
-            a.linears = value == "exact" ? pf::Linears::exact : pf::Linears::wmma;
+            if (value != "exact" && value != "wmma" && value != "a8") throw std::invalid_argument("--linears expects exact, wmma or a8");
+            a.linears = value == "exact" ? pf::Linears::exact : value == "a8" ? pf::Linears::a8 : pf::Linears::wmma;
         }
         else throw std::invalid_argument("unknown argument");
     }
@@ -141,8 +146,10 @@ Args arguments(int argc, char** argv) {
         throw std::invalid_argument("attention profile comparison requires STRIX_G4_PREFILL_ATTN=wmma");
     if (a.canonical_ab && (a.lengths.empty() || a.profile || a.profile_comparison || pf::attention_mode() != pf::AttentionMode::canonical))
         throw std::invalid_argument("--canonical-kernel-ab needs explicit lengths, canonical attention and no other profile mode");
-    if (a.exact_ab && (a.lengths.empty() || a.linears != pf::Linears::exact || a.canonical_ab || a.profile_comparison))
+    if (a.exact_ab && (a.lengths.empty() || a.linears == pf::Linears::wmma || a.canonical_ab || a.profile_comparison))
         throw std::invalid_argument("--exact-ab needs explicit lengths and --linears exact");
+    if (a.a8_gate && (a.lengths.empty() || a.linears != pf::Linears::a8 || !a.gate_chunk || a.gate_chunk > pf::max_chunk_rows || a.ref_rows > 8))
+        throw std::invalid_argument("--a8-gate needs explicit lengths, --linears a8, --gate-chunk 1..1024 and --ref-rows 0..8");
     return a;
 }
 void equal(std::span<const float> a, std::span<const float> b) {
@@ -269,6 +276,68 @@ void exact_ab(pf::DevicePrefill& prefill, gpu::DeviceTarget& target, const g4::M
     std::cout << "{\"gate\":\"exact-manyrow-vs-rows8\",\"rows\":" << n << ",\"runs\":" << repetitions << ",\"tap_rows\":" << kept
               << ",\"kv_digest\":\"" << digest << "\",\"verdict\":\"EXACT\"}\n";
 }
+std::uint64_t row_hash(const float* p, std::size_t n) {
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto* b = reinterpret_cast<const unsigned char*>(p);
+    for (std::size_t i = 0; i < n * sizeof(float); ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    return h;
+}
+// The NF2 byte gate: every prompt row's full-vocabulary logits (bytes, via a 64-bit FNV-1a of the row) and
+// the committed KV digest of the a8 prefill route, chunked by `chunk`, against the g4-a8-v1 decode target of
+// the same build in passes of `ref_rows` rows. Any differing row = not the a8 identity.
+// ref_rows = 0 runs the decode target twice, one-row serial passes and 8-row passes, and first requires those
+// two to agree on every row and on the KV digest (the decode gate 'R1..8 == serial'); the prefill is then
+// compared with them.
+void a8_gate(pf::DevicePrefill& prefill, gpu::DeviceTarget& target, const g4::ModelConfig& config,
+             std::span<const unsigned> tokens, unsigned chunk, unsigned ref_rows) {
+    const auto n = tokens.size();
+    std::vector<std::uint64_t> expected(n), actual(n);
+    const auto reference_pass = [&](unsigned rows, std::vector<std::uint64_t>& hashes) {
+        gpu::DeviceStream reference(config, unsigned(n));
+        for (std::size_t p = 0; p < n; p += rows) {
+            const auto count = std::min<std::size_t>(rows, n - p);
+            const auto out = decode(target, reference, tokens.subspan(p, count));
+            for (std::size_t r = 0; r < count; ++r) hashes[p + r] = row_hash(out.logits.data() + r * config.vocab, config.vocab);
+        }
+        return reference.digest();
+    };
+    auto start = Clock::now();
+    const auto digest = reference_pass(ref_rows ? ref_rows : 1U, expected);
+    const auto decode_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    if (!ref_rows) {
+        std::vector<std::uint64_t> batched(n);
+        const auto batched_digest = reference_pass(8U, batched);
+        std::size_t differing = 0;
+        for (std::size_t r = 0; r < n; ++r) differing += batched[r] != expected[r];
+        const bool same = differing == 0 && batched_digest == digest;
+        std::cout << "{\"gate\":\"a8-decode-rows8-vs-serial\",\"rows\":" << n << ",\"rows_differing\":" << differing
+                  << ",\"kv_digest_serial\":\"" << digest << "\",\"kv_digest_rows8\":\"" << batched_digest
+                  << "\",\"verdict\":\"" << (same ? "BYTE-IDENTICAL" : "DIFFERENT") << "\"}\n";
+        if (!same) throw std::runtime_error("a8 decode: 8-row passes differ from one-row serial passes");
+    }
+    gpu::DeviceStream stream(config, unsigned(n));
+    start = Clock::now();
+    for (std::size_t p = 0; p < n; p += chunk) {
+        const auto count = std::min<std::size_t>(chunk, n - p);
+        auto tx = stream.begin();
+        const auto out = prefill.forward(*tx, tokens.subspan(p, count), true);
+        tx->commit(count);
+        for (std::size_t r = 0; r < count; ++r) actual[p + r] = row_hash(out.all_logits.data() + r * config.vocab, config.vocab);
+    }
+    const auto prefill_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    const auto state = stream.digest();
+    std::size_t differing = 0, first = n;
+    for (std::size_t r = 0; r < n; ++r)
+        if (expected[r] != actual[r]) { ++differing; first = std::min(first, r); }
+    const bool same = differing == 0 && state == digest;
+    std::cout << "{\"gate\":\"a8-prefill-vs-a8-decode\",\"rows\":" << n << ",\"chunk\":" << chunk << ",\"ref_rows\":" << ref_rows
+              << ",\"rows_compared\":" << n << ",\"rows_differing\":" << differing
+              << ",\"first_differing_row\":" << (differing ? std::to_string(first) : std::string("null"))
+              << ",\"kv_digest_decode\":\"" << digest << "\",\"kv_digest_prefill\":\"" << state
+              << "\",\"decode_s\":" << decode_seconds << ",\"prefill_all_logits_s\":" << prefill_seconds
+              << ",\"verdict\":\"" << (same ? "BYTE-IDENTICAL" : "DIFFERENT") << "\"}\n";
+    if (!same) throw std::runtime_error("a8 prefill differs from the a8 decode target");
+}
 void telemetry() {
 #if defined(__linux__)
     utsname info{};
@@ -313,14 +382,18 @@ int main(int argc, char** argv) try {
     if (args.canonical_reference)
         canonical_reference = std::make_unique<pf::DevicePrefill>(prefill.borrow_device_weights(), tables.view, pf::Residency::device, false, pf::AttentionMode::canonical);
     std::unique_ptr<gpu::DeviceTarget> decoder;
-    if (args.same_weight || args.continuation || args.c4 || args.exact_ab || !args.draft_model.empty()) decoder = std::make_unique<gpu::DeviceTarget>(weights, tables.view);
+    // --linears a8 compares against the decode target running g4-a8-v1 (eight-row passes).
+    gpu::DeviceOptions decoder_options;
+    if (args.linears == pf::Linears::a8) decoder_options.identity = g4::a8::arithmetic_id;
+    if (args.same_weight || args.continuation || args.c4 || args.exact_ab || args.a8_gate || !args.draft_model.empty())
+        decoder = std::make_unique<gpu::DeviceTarget>(weights, tables.view, decoder_options);
     std::unique_ptr<pf::DevicePrefill> profiled, canonical_profile;
     if (args.profile_comparison) {
         profiled = std::make_unique<pf::DevicePrefill>(prefill.borrow_device_weights(), tables.view, pf::Residency::device, true, prefill.stats().attention);
         canonical_profile = std::make_unique<pf::DevicePrefill>(prefill.borrow_device_weights(), tables.view, pf::Residency::device, true, pf::AttentionMode::canonical);
     }
-    std::cout << "{\"decode_identity\":\"g4-v1\",\"prefill_identity\":\""
-              << (args.linears == pf::Linears::exact ? "prefill-exact" : pf::identity) << "\",\"model_hash\":\"" << model.model_hash
+    std::cout << "{\"decode_identity\":\"" << (args.linears == pf::Linears::a8 ? g4::a8::arithmetic_id : "g4-v1") << "\",\"prefill_identity\":\""
+              << (args.linears == pf::Linears::exact ? "prefill-exact" : args.linears == pf::Linears::a8 ? "prefill-a8" : pf::identity) << "\",\"model_hash\":\"" << model.model_hash
               << "\",\"rope_hash\":\"" << tables.view.hash << "\",\"cache_dtype\":\"F32\",\"chunk_rows\":512,\"shared_tiling\":"
               << (prefill.stats().tiled ? "true" : "false") << ",\"prepared_weights\":" << (prefill.stats().prepared ? "true" : "false")
               << ",\"direct_mode\":" << prefill.stats().direct
@@ -349,6 +422,7 @@ int main(int argc, char** argv) try {
             }
             if (args.canonical_ab) { canonical_ab(prefill, model.config, tokens, args.repetitions); continue; }
             if (args.exact_ab) { exact_ab(prefill, *decoder, model.config, tokens, args.repetitions); continue; }
+            if (args.a8_gate) { a8_gate(prefill, *decoder, model.config, tokens, args.gate_chunk, args.ref_rows); continue; }
             pf::Result result;
             auto stream = std::make_unique<gpu::DeviceStream>(model.config, count + args.continuation);
             std::vector<double> timings;

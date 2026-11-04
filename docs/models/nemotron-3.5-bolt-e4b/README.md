@@ -23,7 +23,7 @@ build does not contain.
 | Profile | Decode | Prefill | Guarantee |
 |---|---|---|---|
 | `default` | `g4-v1` (FP32 activations, Q4_K_M weights) + MTP drafter at C1 | `prefill-exact` | Exact: output bytes equal the declared serial path for every batch size (C4 == C1) and with the drafter on or off |
-| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter; decode attention at depth `g4-dattn-f2` (int8 KV copies for the global layers): qualification pending, exact attention runs until then | `prefill-exact` (v1 prompt prefill for `fast`: qualification of the pair v1 prefill + a8 decode pending) | Named profile, qualified against frozen fidelity bands |
+| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter; decode attention at depth `g4-dattn-f2` (int8 KV copies for the global layers): qualification pending, exact attention runs until then | `a8` prompt prefill: `g4-a8-v1` linears on 512-row chunks; prompt rows equal the a8 decode of the same rows, so the `g4-a8-v1` qualification covers them (not bitwise vs exact prefill; `STRIX_G4_PREFILL_IDENTITY=exact` restores exact prefill) | Named profile, qualified against frozen fidelity bands |
 | `quality` | EXL3 pack (`--exl3-arm DIR`), identity chosen once per pack and session (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exact within its EXL3 identity; higher fidelity than Q4_K_M at similar size |
 
 The identity of the EXL3 route is fixed at startup from the pack and `--streams`, never per step, so a session's
@@ -84,7 +84,7 @@ was measured in the same turn as the row it is compared with.
 | Profile | C1 shipped ([MTP drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) + prompt lookup) | C1, drafting off | C4 | C8 | Prefill 512 / 2K / 8K |
 |---|---:|---:|---:|---:|---:|
 | `default` (exact, `g4-v1`) | **91.9** | 55.8 | 169.8 | 237.9 | 532 / 535 / 509 |
-| `fast` (`g4-a8-v1`, qualified) | **99.5** | 54.0 | 206.5 | 340.6 | 551 / 538 / 509 |
+| `fast` (`g4-a8-v1`, qualified) | **99.5** | 54.0 | 206.5 | 340.6 | 551 / 538 / 509 exact; `a8` prefill: see below |
 | `quality` ([EXL3 M4 pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **96.4** | 50.2 | 184.8 | 303.0 | 794 / 815 / 746 |
 | llama.cpp `74a4fb00`, same Q4_K_M | — | 55.5 | 193.3 | 279.9 | 2,077 / 2,062 / 1,881 |
 
@@ -161,17 +161,19 @@ Later, on main `d7069831d` (short chat prompts, 128 tokens, prefix cache off, `d
 While other requests decode, a prompt is processed in chunks of at most 64 rows (`STRIX_G4_SERVE_PREFILL_ROWS`,
 `0` = whole 512-row chunks), so a long prompt pauses them for shorter stretches: with the mixed prompts above the
 longest pause between two tokens of a request went from 1.05-1.12 s to 0.41-0.42 s and the 99th percentile from
-0.44 / 1.08 s to 0.17 / 0.20 s (4 / 8 clients); throughput and token ids are unchanged. With `fast`
-(int8-activation decode beside the exact prompt processing) prompt chunks keep their full size, since where a chunk
-ends decides which prompt rows a decode pass writes.
+0.44 / 1.08 s to 0.17 / 0.20 s (4 / 8 clients); throughput and token ids are unchanged. `fast` (`a8` prompt rows equal
+its decode rows) shortens chunks the same way; with `STRIX_G4_PREFILL_IDENTITY=exact` under `fast` (exact prompt
+processing beside the int8-activation decode) prompt chunks keep their full size, since where a chunk ends decides
+which prompt rows a decode pass writes.
 
 The server also keeps the committed state at the end of each prompt and of each finished request and reuses it
 when a later prompt starts with exactly those tokens, typically the next turn of a conversation, which re-sends the
 conversation so far: only the new rows are processed. Turn-2 time to first token (`default`, six conversations in
 parallel): 4K-token document **0.20 s** vs 12.59 s without the cache, 1K-token document **0.19 s** vs 3.48 s, chat
 0.39-0.51 s vs 1.31-1.66 s; both turns' token ids equal the cache off. Up to 16 states within 4 GB
-(`STRIX_G4_SERVE_PREFIX_MB`); `STRIX_G4_SERVE_PREFIX=0` turns it off. With `fast`, whose int8-activation decode differs from the exact prompt
-processing, only states at a 512-row prompt boundary written by prompt processing are reused, never an answer. Two different conversations that share a long
+(`STRIX_G4_SERVE_PREFIX_MB`); `STRIX_G4_SERVE_PREFIX=0` turns it off. `fast` reuses any state, as `default` does (its
+`a8` prompt rows equal its decode rows); with `STRIX_G4_PREFILL_IDENTITY=exact` under `fast` only states at a 512-row
+prompt boundary written by prompt processing are reused, never an answer. Two different conversations that share a long
 document but diverge after it do not share it yet.
 
 **MTP drafter** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). A small assistant model (Google's
@@ -250,13 +252,31 @@ Exact prefill uses FP32 arithmetic without contraction, so token ids and state a
 `quality` runs the exact many-row EXL3 prefill. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restores the eight-row passes with
 the same bytes.
 
-Selectable prompt prefill routes (non-EXL3 packs; every profile keeps exact prefill unless one is selected):
+`fast` prompt prefill: `a8` (`STRIX_G4_PREFILL_IDENTITY=a8`, valid only with the `g4-a8-v1` decode; with another decode
+identity exact prefill runs and one stderr line says so). The prompt runs in 512-row chunks on the same `g4-a8-v1`
+linears as decode (IU8 WMMA for long chunks, the decode kernels for up to 8 rows), canonical attention: every prompt
+row's KV and logits equal the a8 decode of the same rows, byte for byte, so the `g4-a8-v1` qualification covers it
+and served token ids equal those of the same prompts fed through decode rows (C1 and C4). It is not bitwise equal to
+exact prefill. The server prints `gemma4 prefill route a8-many-row (g4-a8-v1 linears, 512-row chunks)` when it runs.
+`STRIX_G4_PREFILL_IDENTITY=exact` turns it off. Q4_K_M, one node, prefill tok/s, the same binary for all three
+routes, fresh process per run, both run orders, `g4-a8-v1` decode:
+
+| Prompt | exact (many-row) | **`a8` (`fast`)** | `g4-wmma-pf-v1` + flash attention (not qualified) |
+|---|---:|---:|---:|
+| 512 | 542 | **1,871** | 2,756 |
+| 2K | 516 | **1,733** | 2,656 |
+| 8K | 477 | **1,498** | 2,591 |
+
+Through the engine (8K-token prompt, one fresh process each, same binary): exact 16.19 s, **`a8` 5.13 s**, v1 + flash
+2.97 s.
+
+Other selectable prompt prefill routes (non-EXL3 packs; `default` and `quality` keep exact prefill unless one is selected):
 `STRIX_G4_PREFILL_IDENTITY=v1` runs `g4-wmma-pf-v1`: the linears run on the WMMA prefill GEMMs with FP16 operands over
 weight panels decoded once at load; attention stays canonical; decode is unchanged. `=v2` runs `g4-wmma-pf-v2` (hi/lo
 split activations). Either route runs the prompt bulk: the last <= 8 prompt tokens and the anchor (the final prompt
 position, whose logits pick the first token) run the decode arithmetic (`g4-v1` under `default`), as decode rows do.
-Both change logits, so they are not exact. v1 prompt prefill for `fast`: qualification of the pair v1 prefill + a8 decode pending; `fast` keeps exact prefill
-until then. Q4_K_M, one node, prefill tok/s, interleaved runs in one session:
+Both change logits, so they are not exact. v1 prompt prefill for `fast`: qualification of the pair v1 prefill + a8 decode pending; `fast` runs `a8`
+prefill until then. Q4_K_M, one node, prefill tok/s, interleaved runs in one session:
 
 | Prompt | exact | `g4-wmma-pf-v1` (`=v1`) | `g4-wmma-pf-v2` (`=v2`) |
 |---|---:|---:|---:|
