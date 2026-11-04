@@ -464,6 +464,8 @@ struct Engine::Impl {
     bool index_conc = false;  // STRIX_MM_INDEX_CONC=1 (runtime): decode index projection on a side stream, concurrent with q/k/v
     bool attend_diet = false;  // STRIX_MM_ATTEND_DIET (default ON via mm_defaults): v3 at its 32 KB LDS on route::attend_n2_sparse grids
     bool attend4_decode = false;  // STRIX_MM_ATTEND4_DECODE (default ON via mm_defaults): v4, one head per wave, on the same grids
+    std::uint64_t select_once_calls = 0;  // decode attention calls that took the selection-once route (diagnostic)
+    bool select_once = false;  // STRIX_MM_SELECT_ONCE (default ON via mm_defaults): one selection launch per (row, KV head) on route::select_once calls
     // decode fused exchange boundary (decode, module path; qualification notes), same bits:
     bool xb_wait = false;     // STRIX_MM_XB_WAIT=1: post_exchange waits for the peer's partial in-kernel (recv_view) instead of a stream wait packet
     bool xb_inplace = false;  // STRIX_MM_XB_INPLACE=1: o_proj / FFN producers write the module's TX slot, a publish kernel replaces the copy
@@ -617,6 +619,7 @@ struct Engine::Impl {
         index_conc = env_flag("STRIX_MM_INDEX_CONC", true);  // ON (measurement: ids identical, 17/18 in-process block pairs faster, ~-0.2 ms/token); =0
         attend_diet = env_flag("STRIX_MM_ATTEND_DIET", true);  // ON on the N2/W1 sparse >= 8K grids only (t9: exact, 8K 83.9 -> 76.2 us); =0
         attend4_decode = env_flag("STRIX_MM_ATTEND4_DECODE", true);  // ON on the same grids (t12: exact, 8K 78.6 -> 75.2 us); =0
+        select_once = env_flag("STRIX_MM_SELECT_ONCE", true);  // ON on sparse calls of >= route::kSelectOnceRows rows (exact, same IDs); =0
         xb_wait = env_flag("STRIX_MM_XB_WAIT", true);         // ON (exchange boundary 0f1d0818: exact, 1K 48.56 -> 44.40 ms/token with the set); =0 disables
         xb_inplace = env_flag("STRIX_MM_XB_INPLACE", true);   // ON (exchange boundary 0f1d0818: exact, 1K 48.56 -> 44.40 ms/token with the set); =0 disables
         xb_prep = env_flag("STRIX_MM_XB_PREP", false);        // OFF (decode: not part of the measured default set)
@@ -1612,6 +1615,8 @@ struct Engine::Impl {
                         dv.heads_per_wave = 1;
                     }
                 }
+                dv.select_once = route::select_once(select_once, static_cast<unsigned>(rows.size()), dense, min_pos);
+                if (dv.select_once) ++select_once_calls;
                 mfused::enqueue_decode(dv, nullptr);
             } else {
                 for (std::size_t r = 0; r < n; ++r) {  // each row in its own slot: one-row K1-K4 on that slot's caches
@@ -2915,6 +2920,9 @@ void Engine::set_attend_diet(bool on) { impl_->attend_diet = on; }  // decode on
 bool Engine::attend_diet() const { return impl_->attend_diet; }
 void Engine::set_attend4_decode(bool on) { impl_->attend4_decode = on; }  // decode only
 bool Engine::attend4_decode() const { return impl_->attend4_decode; }
+void Engine::set_select_once(bool on) { impl_->select_once = on; }  // decode only
+bool Engine::select_once() const { return impl_->select_once; }
+std::uint64_t Engine::select_once_count() const { return impl_->select_once_calls; }
 void Engine::set_xb_wait(bool on) { impl_->xb_wait = on; }
 bool Engine::xb_wait() const { return impl_->xb_wait; }
 void Engine::set_xb_inplace(bool on) { impl_->xb_inplace = on; }

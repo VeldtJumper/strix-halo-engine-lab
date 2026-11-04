@@ -71,6 +71,9 @@ struct DecodeView {
     // instead of the 43008-byte floor, four 16-wave blocks per WGP instead of three. Per call; the engine sets it only on
     // the measured winning grids (route::attend_n2_sparse, STRIX_MM_ATTEND_DIET). Same bits.
     bool lds_diet = false;
+    // Sparse enqueue_decode: one selection launch per (row, KV head) writes idx / idx_count, then the attend launch runs
+    // with select = false, instead of every chunk block repeating the selection. Same IDs, same bits.
+    bool select_once = false;
     // Dense: the caller guarantees every row's pos < kTopK * kBlock (2048): every block is attended, no scores are
     // needed, and enqueue_decode is ONE launch (the attend blocks write the new K/V/index-key rows themselves).
     // scores / idx / idx_count are not written in this mode.
@@ -113,7 +116,7 @@ std::size_t prefill_window_bytes(std::uint32_t max_blocks);
 void enqueue_index(const DecodeView& v, hipStream_t stream);
 // K3 (select = true: from v.scores; false: v.idx / v.idx_count are inputs) + K4 + combine.
 void enqueue_attend(const DecodeView& v, bool select, hipStream_t stream);
-// index + attend (select), or the single dense launch when v.dense.
+// index + attend (select; with select_once: index + selection + attend), or the single dense launch when v.dense.
 void enqueue_decode(const DecodeView& v, hipStream_t stream);
 unsigned attend_heads(const DecodeView& v);    // heads per attend block the launch will use
 unsigned attend_version(const DecodeView& v);  // attend kernel version the launch will use

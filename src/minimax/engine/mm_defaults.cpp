@@ -61,6 +61,9 @@ constexpr Item kItems[] = {
     {"attend4_decode", "STRIX_MM_ATTEND4_DECODE", "1", "0",
      "Attention measurement t12: bitwise, v4 one head per wave vs v3-full at sparse N2/W1 8K 78.6 -> 75.2, 32K 132.2 -> "
      "128.3, 128K 346.4 -> 340.6 us; only on those grids (1K N1/N8, 8K N4 slower keep v3)"},
+    {"select_once", "STRIX_MM_SELECT_ONCE", "1", "0",
+     "Attention measurement s1b/s2: bitwise (decode suite, v3/diet/v4), selection launch + attend select=false on sparse "
+     "calls of >= 4 rows at >= 16K: index+attend 32K N8 455.3 -> 436.0, N4 241.5 -> 237.1, W8 220.4 -> 206.4 us"},
     {"xfer_crc_deferred", "STRIX_MMX_CRC", "deferred", "1",
      "Measurement: tokens identical in 7 processes, each deferred arm below its inline neighbours by 0.04-0.12 ms/token"},
     {"xb_wait", "STRIX_MM_XB_WAIT", "1", "0", "Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token"},

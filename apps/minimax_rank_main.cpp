@@ -23,6 +23,7 @@
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
+//   --sel-check PROMPT.u32:K:N[:v]               selection-once check: decode logits with STRIX_MM_SELECT_ONCE off / on bitwise equal at >= 16K (STRIX_MM_SEL_CHECK_LEN)
 //   --xb-check PROMPT.u32:K:N[:v]                exchange boundary check: decode logits of the 4 (wait, inplace) configurations bitwise == 00 (N slots, or :v one N-row verify window)
 //                                                    (pfcore: prefill MoE WMMA core, off = lib, on = STRIX_MM_AB_PFCORE, default 3 = v4)
 //                                                    (pfgufuse: single-split gate/up fusion off/on; 7 prefills with state and final-row hashes)
@@ -1639,6 +1640,48 @@ void xb_check(mm::Engine& eng, const std::string& name, const std::vector<std::u
     if (!all_same) g_exact_fail = true;
 }
 
+// selection-once exactness at long context (--sel-check PROMPT.u32:K:N[:v]): per arm (STRIX_MM_SELECT_ONCE off, then on)
+// one prefill of slot 0 with the first P tokens (P = STRIX_MM_SEL_CHECK_LEN, default 17000, so every row is past the
+// route's 16K threshold), slots 1..N-1 = copies of its first P - i positions, then K teacher-forced decode steps of N rows
+// (or ':v' one slot, an N-row verify window per step); this rank's logits of every step must be bitwise equal across arms.
+void sel_check(mm::Engine& eng, const std::string& name, const std::vector<std::uint32_t>& prompt, std::size_t k, unsigned n, bool verify) {
+    const char* lenv = std::getenv("STRIX_MM_SEL_CHECK_LEN");
+    const std::size_t want = lenv != nullptr ? std::strtoull(lenv, nullptr, 10) : 17000;
+    const std::size_t need = verify ? k * n : k + n;
+    const std::size_t P = std::min(want, prompt.size() > need ? prompt.size() - need : 0);
+    if (n == 0 || n > 8 || P < n) throw std::invalid_argument("--sel-check: 1 <= N <= 8 and the prompt must be longer than the window");
+    const bool s0 = eng.select_once();
+    std::uint64_t ref = 0;
+    bool same = true;
+    for (int arm = 0; arm < 2; ++arm) {
+        eng.set_select_once(arm == 1);
+        const std::uint64_t c0 = eng.select_once_count();
+        (void)eng.prefill(0, std::span(prompt).first(P), 0);
+        if (!verify)
+            for (unsigned i = 1; i < n; ++i) eng.copy_slot(i, 0, P - i);
+        std::uint64_t h = 14695981039346656037ULL;
+        std::vector<mm::Row> rows(n);
+        for (std::size_t j = 0; j < k; ++j) {
+            for (unsigned i = 0; i < n; ++i) {
+                const std::size_t pos = verify ? P + j * n + i : P - i + j;
+                rows[i] = mm::Row{verify ? 0U : i, prompt[pos], pos};
+            }
+            (void)eng.step(rows);
+            const auto lg = eng.last_logits(n);
+            h = fnv(lg.data(), lg.size() * 4, h);
+        }
+        if (arm == 0) ref = h;
+        same &= h == ref;
+        std::printf("rank %u sel-check %s N%u%s K%zu P%zu select_once=%d: logits fnv %016llx %s (selection-once calls %llu)\n",
+                    eng.rank(), name.c_str(), n, verify ? " verify" : "", k, P, arm, static_cast<unsigned long long>(h),
+                    h == ref ? "== off" : "DIFFER", static_cast<unsigned long long>(eng.select_once_count() - c0));
+    }
+    eng.set_select_once(s0);
+    std::printf("rank %u sel-check %s N%u%s: %s\n", eng.rank(), name.c_str(), n, verify ? " verify" : "", same ? "ALL IDENTICAL" : "EXACTNESS FAILURE");
+    std::fflush(stdout);
+    if (!same) g_exact_fail = true;
+}
+
 int main(int argc, char** argv) {
     // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
     if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) return 0;
@@ -1661,7 +1704,7 @@ int main(int argc, char** argv) {
         unsigned gate_layers = 6;
         bool tf_write = false, session_hash_only = false;
         double deadline = 1e9;
-        std::vector<std::string> sessions, batches, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks;
+        std::vector<std::string> sessions, batches, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks, selchecks;
         std::vector<std::string> session_hash_files;
         std::string dspark_dir = std::string(argv[1]) + "/dspark", dspark_exl3;
         std::vector<std::string> dspark_heads;
@@ -1687,6 +1730,7 @@ int main(int argc, char** argv) {
             else if (a == "--dspark-prior") (void)next();
             else if (a == "--decode-check") dchecks.push_back(next());
             else if (a == "--xb-check") xbchecks.push_back(next());
+            else if (a == "--sel-check") selchecks.push_back(next());
             else if (a == "--spec") specs.push_back(next());
             else if (a == "--session-hash-file") session_hash_files.push_back(next());
             else if (a == "--session-hash-only") session_hash_only = true;
@@ -2033,6 +2077,18 @@ int main(int argc, char** argv) {
             const std::string path = y.substr(0, ck);
             xb_check(eng, path.substr(path.rfind('/') + 1), read_u32(path), std::stoul(y.substr(ck + 1, cn - ck - 1)),
                      static_cast<unsigned>(std::stoul(y.substr(cn + 1))), v);
+        }
+        for (const auto& x : selchecks) {  // PROMPT.u32:K:N[:v]
+            if (!in_time()) {
+                std::printf("rank %u: sel-check %s skipped (deadline)\n", opt.rank, x.c_str());
+                continue;
+            }
+            const bool v = x.size() > 2 && x.compare(x.size() - 2, 2, ":v") == 0;
+            const std::string y = v ? x.substr(0, x.size() - 2) : x;
+            const auto cn = y.rfind(':'), ck = y.rfind(':', cn - 1);
+            const std::string path = y.substr(0, ck);
+            sel_check(eng, path.substr(path.rfind('/') + 1), read_u32(path), std::stoul(y.substr(ck + 1, cn - ck - 1)),
+                      static_cast<unsigned>(std::stoul(y.substr(cn + 1))), v);
         }
         for (const auto& b : ab_runs) {
             if (g_exact_fail && b.rfind("xb", 0) == 0) {  // decode: no exchange boundary timing after an exactness failure

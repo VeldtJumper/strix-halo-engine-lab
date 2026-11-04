@@ -14,7 +14,7 @@
 # STRIX_MMX_PREFILL_GATHER_TOK, STRIX_MM_PF_DENSE_QKV, STRIX_MM_PF_ROUTER_ROWS, STRIX_MM_PF_MSA_SCRATCH_MB,
 # STRIX_MM_PF_DENSE_O, STRIX_MMX_PREFILL_TAIL_STREAM.
 # Decode items added with their own PAIR ABA receipts (in-process matched replay, logits bitwise across rows/verify):
-# STRIX_MM_XB_WARM_O, STRIX_MMX_MOE_TIGHT_GRID, STRIX_MMX_MOE_PIPE.
+# STRIX_MM_XB_WARM_O, STRIX_MMX_MOE_TIGHT_GRID, STRIX_MMX_MOE_PIPE, STRIX_MM_SELECT_ONCE (fresh process per arm at 32K).
 receipt rank
 argv $M 0 usb4-auto $OUT --slots 8 --capacity 8256 --max-rows 4096 --gate oracle-A --gate-layers 6 --decode-check prompts/p1k.u32:24 --decode-check prompts/chat-prose.u32:16 --session 1k:prompts/p1k.u32:64 --session 8k:prompts/p8k.u32:16 --batch prompts/p1k.u32:24:1,2,4,8 --session jtb:chat/json-table.u32:256 --session cpy:chat/code-py.u32:256 --session pen:chat/prose-en.u32:256 --dspark-exl3 minimax-drafts/dspark-exl3-K4fc --spec jtb:chat/json-table.u32:256:auto --spec cpy:chat/code-py.u32:256:auto --spec pen:chat/prose-en.u32:256:auto
 plain $M 0 usb4-auto $OUT
@@ -27,6 +27,7 @@ env STRIX_MMX_MOE_DOWN_SPLIT=1
 env STRIX_MM_INDEX_CONC=1
 env STRIX_MM_ATTEND_DIET=1
 env STRIX_MM_ATTEND4_DECODE=1
+env STRIX_MM_SELECT_ONCE=1
 env STRIX_MMX_CRC=deferred
 env STRIX_MM_XB_WAIT=1
 env STRIX_MM_XB_INPLACE=1
@@ -76,6 +77,7 @@ env STRIX_MMX_MOE_DOWN_SPLIT=1
 env STRIX_MM_INDEX_CONC=1
 env STRIX_MM_ATTEND_DIET=1
 env STRIX_MM_ATTEND4_DECODE=1
+env STRIX_MM_SELECT_ONCE=1
 env STRIX_MMX_CRC=deferred
 env STRIX_MM_XB_WAIT=1
 env STRIX_MM_XB_INPLACE=1

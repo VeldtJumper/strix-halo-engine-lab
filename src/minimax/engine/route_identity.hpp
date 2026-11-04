@@ -99,6 +99,15 @@ STRIX_MM_ROUTE_HD inline constexpr bool moe_down_split(unsigned mode, unsigned r
 inline bool attend_n2_sparse(unsigned seqs, unsigned rows_per_seq, bool dense, std::uint64_t min_pos) {
     return !dense && seqs == 2 && rows_per_seq == 1 && min_pos + 1 >= 8192;
 }
+// Decode selection once per (row, KV head) (STRIX_MM_SELECT_ONCE): a separate selection launch instead of every chunk
+// block of the attend launch repeating it; same IDs and bits. Sparse calls of >= kSelectOnceRows rows whose rows are all
+// at >= kSelectOncePos positions (s1b/s2: 32K N4/N8 -1.8/-4.3 %, W4/W8 -3.5/-6.4 %, 128K N8 -1.4 %; the extra launch
+// loses at N1 (+3..+8 %) and the selection is too cheap at 8K (N4 +1.1 %)).
+inline constexpr unsigned kSelectOnceRows = 4;
+inline constexpr std::uint64_t kSelectOncePos = 16384;
+inline bool select_once(bool enabled, unsigned rows, bool dense, std::uint64_t min_pos) {
+    return enabled && !dense && rows >= kSelectOnceRows && min_pos + 1 >= kSelectOncePos;
+}
 inline bool wide_for(unsigned rows, int mode) { return mode == 1 || (mode == 2 && rows >= 2 && rows <= 4); }
 inline int scheduled_linear_version(unsigned input, unsigned output, unsigned count, unsigned rows) {
     if (output >= 65536) return 4;

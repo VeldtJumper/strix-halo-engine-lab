@@ -1799,6 +1799,41 @@ __global__ __launch_bounds__(1024) void prefill_r16_kernel(PrefillView input) {
     }
 }
 
+// Selection once per (row, KV head) (DecodeView::select_once): the K3 work of the attend launch's selecting blocks,
+// done by one 256-thread block per (row, KV head) instead of by every chunk block. Same order keys, same choose_topk,
+// same ascending compaction with the newest block last, so idx / idx_count are the bytes the attend launch writes
+// with select; the attend launch then runs with select = false.
+template <unsigned NT> __global__ __launch_bounds__(NT) void select_kernel(DecodeView v) {
+    extern __shared__ uint4 dyn_smem[];
+    SelView<NT> sel(dyn_smem, v.max_blocks);
+    const unsigned tid = threadIdx.x, rg = blockIdx.x, r = rg / v.kv_heads;
+    const std::uint32_t nb = static_cast<std::uint32_t>(block_count(v.pos[r] + 1));
+    std::uint32_t* const idx = v.idx + static_cast<std::size_t>(rg) * kTopK;
+    if (nb <= kTopK) {
+        if (tid < nb) idx[tid] = tid;
+        if (tid == 0) v.idx_count[rg] = nb;
+        return;
+    }
+    const std::uint32_t rest = nb - 1;
+    const float* sc = v.scores + static_cast<std::size_t>(rg) * v.max_blocks;  // index head g = KV head g
+    for (unsigned b = tid; b < rest; b += NT) sel.keys[b] = order_key(sc[b]);
+    __syncthreads();
+    choose_topk<NT>(sel.keys, rest, kTopK - 1, sel.chosen, sel.hist, sel.wave_tot, sel.sh);
+    unsigned before = 0;
+    for (std::uint32_t base = 0; base < rest; base += NT) {
+        const std::uint32_t i = base + tid;
+        const bool ch = i < rest && sel.chosen[i] != 0U;
+        unsigned total = 0;
+        const unsigned rank = before + block_scan<NT>(ch, sel.wave_tot, total);
+        if (ch) idx[rank - 1] = i;
+        before += total;
+    }
+    if (tid == 0) {
+        idx[kTopK - 1] = rest;  // the newest block, always last
+        v.idx_count[rg] = kTopK;
+    }
+}
+
 void check(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
 }
@@ -2141,6 +2176,15 @@ void enqueue_decode(const DecodeView& v, hipStream_t stream) {
         return;
     }
     enqueue_index(v, stream);
+    if (v.select_once) {
+        const unsigned rows = v.seqs * v.rows_per_seq;
+        if (rows == 0 || rows > kMaxRows || v.max_blocks > kMaxBlocks || v.idx_heads != v.kv_heads || v.shard_count != 1)
+            throw std::invalid_argument("minimax fused select: bad view (context-parallel views select by candidates/merge)");
+        hipLaunchKernelGGL((select_kernel<256>), dim3(rows * v.kv_heads), dim3(256), sel_bytes(v.max_blocks, 256), stream, v);
+        check(hipGetLastError(), "minimax fused select");
+        enqueue_attend(v, false, stream);
+        return;
+    }
     enqueue_attend(v, true, stream);
 }
 

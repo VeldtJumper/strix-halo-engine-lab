@@ -52,6 +52,8 @@
 {"msa-attend", 'a', "MSA block128/chunk/FP32 combine contract", "msa_fused_tests.hip:run_case versions/head counts/graph replay", ""},
 // src/minimax/engine/engine.hip: route::attend_n2_sparse; src/minimax/attn/msa_fused.hip: launch_attend
 {"decode-attend-grid", 'a', "MSA block128/chunk/FP32 combine contract; seqs+rows_per_seq+dense+min position", "msa_fused_tests.hip:run_case v3 lds_diet and v4 heads_per_wave 1/2/4 bitwise (engine: v4 hpw1, else diet); bench_cell arms (STRIX_MMATTN_BENCH_DIET)", ""},
+// src/minimax/engine/engine.hip: route::select_once; src/minimax/attn/msa_fused.hip: select_kernel / enqueue_decode
+{"decode-select-once", 'a', "MSA top-k contract (order keys, choose_topk, ascending compaction, newest last); rows+dense", "msa_fused_tests.hip:run_case select_once with v3, lds_diet and v4 hpw1/2 bitwise (attention, caches, scores, selection); bench_cell arm (STRIX_MMATTN_BENCH_SELONCE)", ""},
 // src/minimax/attn/msa_fused.hip:1693
 {"msa-grid", 'a', "MSA query+block identity", "msa_fused_tests.hip fused grid3; index tests; same_out score bytes", ""},
 // src/minimax/attn/msa_fused.hip:1934

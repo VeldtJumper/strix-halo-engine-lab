@@ -1864,6 +1864,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Decode top-k selection once per (row, KV head)",
+    "flag_or_env": "STRIX_MM_SELECT_ONCE",
+    "default": "1",
+    "exact": "msa_fused_tests run_case: select_once with v3, the LDS diet and v4 one / two heads per wave bitwise vs the current kernels (attention, caches, scores, selection) on every decode case.",
+    "gain": "Same-binary bench, index + attend per layer and rank, v3 / select once: 32K N8 455.3 / 436.0 and 453.2 / 433.5, 32K N4 241.5 / 237.1, 32K verify windows of 8 / 4 rows 220.4 / 206.4 and 141.0 / 136.0, 128K N8 1304.7 / 1286.2 us",
+    "preconditions": "Sparse decode calls with at least four rows (users or verify-window rows), every row at 16,384 positions or more.",
+    "off_switch": "STRIX_MM_SELECT_ONCE=0",
+    "doc_anchor": "docs/optimizations.md#mm-select-once"
+  },
+  {
+    "engine": "minimax",
     "name": "MSA prefill index query tiles",
     "flag_or_env": "STRIX_MM_PF_IDX_TILE",
     "default": "1",
