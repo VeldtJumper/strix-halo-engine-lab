@@ -45,6 +45,16 @@ without changing instructions or values. Each build can be checked with
 
 ## Shipped defaults by engine
 
+Qwen's fused GDN recurrence cores use plain launches on the caller's stream instead of the cooperative queue. On
+Linux 7.4, an eviction/restore of the process queues while a cooperative core ran could leave it waiting forever and
+hang prefill. Blocks are paired in arrival order, so pairing does not depend on physical dispatch order. The two halves
+of each value head still exchange norm sums through a pair-local wait; a single-workgroup core with no inter-block wait
+is the follow-up. `STRIX_QPF2K_GDN_COOP_LAUNCH=1` restores the cooperative launch (read once per process); both arms
+keep the same variant selection, so only the launch call changes. Linux 7.4, 16K YaRN prompt: 0 hangs in 8 runs (3 in 4
+with the cooperative launch); terminal logits and tokens byte-identical to the previous build at 16K and 32K in both
+arms; 32K prefill unchanged (ABBA, +-0.0 %).
+See the [launch and byte-check contract](optimizations.md#qwen-gdn); historical Chunk-16 gains below predate this launch change.
+
 | Engine / optimization | What | Default | Gain | Exact? | Off switch |
 |---|---|---|---|---|---|
 | Qwen: PLE staged-gather acceptance | Accept ordered tail after successful row-0 consumption | Unconditional bug fix | Prefill 4K -1.1 %, 32K -1.9 %, 262K (YaRN) 198.19 -> 185.49 s (-6.4 %, two pairs), staged vs earlier rule, one binary | Full logits equal at 4K/32K; tokens equal at 4K/32K/262K | No switch |

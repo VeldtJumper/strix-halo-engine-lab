@@ -154,6 +154,8 @@ inline constexpr std::array yarn_environment_rules{
     // recurrence, conv and gated norm of linear-attention layers in 16-row chunks (src/hip_gdn_qpf2k_prefill.inc);
     // RoPE lives in the QSA layers it does not touch. Bit-identical outputs in every arm.
     YarnEnvironmentRule{"STRIX_QPF2K_GDN_CHUNK16", YarnEnvironmentClass::off_switch, "0|1"},
+    // Core launch scheduling only (src/hip_gdn_launcher.hip): ticket pairing in both arms, no rotary work.
+    YarnEnvironmentRule{"STRIX_QPF2K_GDN_COOP_LAUNCH", YarnEnvironmentClass::off_switch, "0|1"},
     // OFF only; caching itself stays refused by the route guard.
     YarnEnvironmentRule{"STRIX_PREFIX_CACHE", YarnEnvironmentClass::off_switch, "0"},
     // Host-only diagnostics: steady_clock spans, stderr lines and host counters; no device work or synchronization.

@@ -421,9 +421,9 @@ void gdn_qpf2k_gates_kernel(const std::uint16_t* input, std::uint64_t input_stri
 // gdn_prefill_norm_rows_kernel's gated RMSNorm in the chunk epilogue. A value head is split over a block pair: block
 // half h owns columns {32h..32h+31} and {64+32h..64+32h+31}, so the norm tree's first level (c with c + 64) is block
 // local; the pair exchanges the 32 first-level sums of each row through a small ring with release/acquire counters
-// (zeroed by a stream-ordered memset before each launch; ring slots reused only after the peer's consumed counter
+// (zeroed by a stream-ordered memset before each call; witness replay advances base; ring slots reused after the peer's consumed counter
 // passes them) and both blocks finish the production tree ((p0+p2)+(p1+p3), shuffles 16..1, readfirstlane), rsqrtf,
-// sigmoid and products. The kernel is launched cooperatively, so all 96 blocks are co-resident (partner progress).
+// sigmoid and products. Arrival tickets pair fresh dispatches; norm exchange still requires partner progress.
 // Norm exchange of a block pair (see above).
 constexpr unsigned kNormRing = 4U;          // chunks in flight per block in the exchange ring
 struct NormExchange {
@@ -438,6 +438,7 @@ struct NormExchange {
     float* state_out;                        // Nan 4 (witness): final recurrent state written here (live layout)
     std::uint16_t* conv_out;                 // Nan 4: v conv history written here (conv_state layout)
     unsigned* witness;                       // Nan 4: set to 1 when a NaN arose (the pinned fallback then runs)
+    unsigned* arrival;                       // one zeroed ticket word per core launch (two reserved per call)
 };
 __device__ __forceinline__ bool is_nan_bits(float x) { return (__float_as_uint(x) & 0x7fffffffU) > 0x7f800000U; }
 // Nan 4 commit: when the witness is clear, the scratch state and v conv history become the live ones.
@@ -571,7 +572,7 @@ __device__ __forceinline__ float gdn_v_conv_silu(const std::uint16_t (&vraw)[Rin
 // chunk in a BF16 ring and forms their conv/SiLU (gdn_prefill_conv_kernel's v expressions) into the stage; the block
 // updates the conv history of its 64 v channels at the end (no other block owns them).
 // Pipe: the norm of chunk n is finished after the recurrence of chunk n + 1 (its partial sums are published right
-// after its own recurrence), so the pair exchange never waits on the peer; same values, same order.
+// after its own recurrence), overlapping the pair-local wait with recurrence; the final drain still needs the peer.
 // Lean (bit 1, not with Pipe): the chunk epilogue keeps each row's own first-level norm sums in registers (the peer
 // reads them from the ring; this block no longer reads its own back), loads the chunk's z and norm weights before the
 // exchange (their latency overlaps it), and forms the next chunk's v conv between publishing and waiting for the
@@ -582,7 +583,8 @@ __device__ __forceinline__ float gdn_v_conv_silu(const std::uint16_t (&vraw)[Rin
 // 5 blocks per WGP), so the epilogue commits the next chunk's q/k/beta/decay and v rows after a barrier that follows every
 // wave's last token-loop read, and forms its v conv after every wave has read its outputs (kept in registers for the norm).
 // Opt bit 2048: unpadded key / query rows (bank layout only). Same per-row arithmetic, norm order and stores.
-// LDS (G 4, Cc 2, W 4): 25,600 B padded (ColsStageTight), 24,064 B unpadded; the 8-row kernels keep 25,216 B.
+// LDS (G 4, Cc 2, W 4): Chunk 16 25,600 B padded (ColsStageTight), 24,064 B unpadded; Chunk 8 25,216 B.
+// Cc 4 / W 2 / Chunk 4: 13,888 B; compact witness (G 4/8/16): 23,168 B. The ticket reuses stage[0].beta[0].
 template <GdnRecurrentStorage Storage, unsigned G, unsigned Cc, unsigned W, unsigned Chunk, unsigned Opt, bool Pipe = false,
     unsigned Lean = 0U, unsigned Nan = 3U, bool F16 = false>
 __global__ __launch_bounds__(W * 32U) __attribute__((amdgpu_waves_per_eu(5, 16)))
@@ -591,8 +593,6 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     NormExchange xch) {
 #pragma clang fp contract(off)
     static_assert(!F16 || Lean == 1U, "FP16 output requires the lean gated-norm epilogue");
-    // Nan 1/2: both blocks of a pair read the same flag, so a pair always runs (or skips) together.
-    if (decay_nan_skip<Nan>(xch.decay_nan)) return;
     constexpr bool Witness = Nan == 4U;
     static_assert(!Witness || (Lean == 1U && !Pipe && Chunk == 8U && G >= 4U));
     constexpr bool DeferNorm = Witness && (Opt & 256U) != 0U;
@@ -626,7 +626,16 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     __shared__ float vweight[Columns][kGdnWindowKernel];
     const auto thread = static_cast<std::uint32_t>(threadIdx.x), lane = thread % 32U, wave = thread / 32U;
     const auto sub = thread % G, local = thread / G * Cc;
-    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / 2U, half = static_cast<std::uint32_t>(blockIdx.x) % 2U;
+    // Arrival tickets pair fresh dispatches independently of physical block order or whole-grid co-residency.
+    // Norm exchange still waits for the other half; arbitrary preemption/restore can strand an assigned partner.
+    // A single-workgroup core containing both halves is the follow-up to remove that inter-block wait.
+    // The barrier before the first commit below separates every wave's ticket read from beta's first normal write.
+    if (thread == 0U) stage[0].beta[0] = __uint_as_float(atomicAdd(xch.arrival, 1U));
+    __syncthreads();
+    const auto block = static_cast<std::uint32_t>(__builtin_amdgcn_readfirstlane(__float_as_int(stage[0].beta[0])));
+    // Nan 1/2: every block takes a ticket, then the launch-wide flag makes all blocks run (or skip) together.
+    if (decay_nan_skip<Nan>(xch.decay_nan)) return;
+    const auto value_head = block / 2U, half = block % 2U;
     const auto column_of = [&](unsigned lc) { return lc < 32U ? 32U * half + lc : 64U + 32U * half + (lc - 32U); };
     const auto column = column_of(local);
     const auto key_width = key_heads * 128U, key_offset = value_head % key_heads * 128U;
