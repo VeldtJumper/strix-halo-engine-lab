@@ -163,6 +163,8 @@ ranuras (ocho), así que un paquete M5 selecciona `g4-exl3-v3` en lugar de `v1`;
 | Prompts de chat cortos, 256 tokens: batching activado / servidor de llama.cpp | — | — | **160.4** / 244.1 |
 
 La tabla anterior se midió antes de los dos cambios de servicio que siguen (fragmentos de prompt mientras otras peticiones decodifican y la caché de prefijos de prompt).
+Después, en main `d7069831d` (prompts de chat cortos, 128 tokens, caché de prefijos desactivada, `default`): C1 / C4 / C8
+**92.1 / 143.8 / 187.4 tok/s** agregados, tiempo hasta el primer token p50 0.10 / 0.19 / 0.37 s.
 
 Mientras otras peticiones decodifican, un prompt se procesa en fragmentos de como mucho 64 filas
 (`STRIX_G4_SERVE_PREFILL_ROWS`, `0` = fragmentos completos de 512 filas), así que un prompt largo las pausa durante
