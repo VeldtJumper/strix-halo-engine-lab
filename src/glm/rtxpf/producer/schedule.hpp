@@ -13,7 +13,9 @@ inline bool valid_schedule(unsigned capacity,unsigned tile){return capacity>=4&&
 // at 8K, 4 at 32K) rounded down to 32 and halve (rounded down to 32) to 32, each a
 // valid schedule; the first one is used that the whole-device plan admits AND whose
 // activation + workspace growth over tile 2048 is at most 5% of the expert arena
-// planned at tile 2048 (tiles <= 2048 have no growth). 0 ends the list.
+// planned at tile 2048 (tiles <= 2048 have no growth). Larger tiles adding file
+// homes must also pass tile_file_admission below. Explicit --row-tile bypasses both
+// percentage rules; the whole-device plan must still fit. 0 ends the list.
 inline constexpr unsigned default_max_row_tile=8192,baseline_row_tile=2048,tile_arena_share_percent=5;
 // MTP prefill runs in pieces of at most 2048 rows whatever the trunk tile (its per-row arithmetic does not
 // depend on the piece: per-row router, GEMM K order and absolute DSA positions; pieces stay 4-aligned).
@@ -22,6 +24,19 @@ inline unsigned mtp_row_tile(unsigned tile){return tile<mtp_max_row_tile?tile:mt
 inline unsigned first_tile_candidate(unsigned capacity,unsigned cap_tile=max_row_tile){return std::min({capacity,max_row_tile,cap_tile})/32*32;}
 inline unsigned next_tile_candidate(unsigned tile){return tile>32?std::max(32u,tile/2/32*32):0u;}
 inline bool tile_growth_within(std::uint64_t growth,std::uint64_t baseline_arena){return growth*100<=std::uint64_t(tile_arena_share_percent)*baseline_arena;}
+// Full-card receipts: ~1.5-4.6% of routed units on file at 2048, ~2.4% more at
+// 8192; TTFT -30% at 32K, -9% / -5% at 8K, bitwise equal. Outside these bounds
+// retain the old veto on extra file homes.
+inline constexpr unsigned tile_base_max_file_percent=15,tile_extra_max_file_percent=5;
+struct TileFileAdmission {bool admitted;const char* reason;};
+inline TileFileAdmission tile_file_admission(std::uint64_t baseline_file,std::uint64_t candidate_file,std::uint64_t keys){
+    if(candidate_file<=baseline_file)return {true,"no additional file units"};
+    if(!keys||baseline_file*100>keys*tile_base_max_file_percent)
+        return {false,"additional file units outside the 2048 file-share bound (15%)"};
+    if((candidate_file-baseline_file)*100>keys*tile_extra_max_file_percent)
+        return {false,"additional file units exceed 5% of routed units"};
+    return {true,"additional file units within the 15% / 5% bounds"};
+}
 template<class Fits> unsigned largest_fitting_tile(unsigned capacity,Fits fits,unsigned cap_tile=max_row_tile){
     for(unsigned t=first_tile_candidate(capacity,cap_tile);t;t=next_tile_candidate(t))if(fits(t))return t;return 0;
 }

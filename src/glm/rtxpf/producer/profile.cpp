@@ -28,7 +28,8 @@ constexpr Lever kTable[] = {
      .source = "arena spares 5% of the arena (retained misses; placement only)"},
     {.name = "row_tile", .options = {{{"--row-tile", "*"}}}, .value = {"auto", "auto", "auto"}, .builtin = "auto",
      .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
-     .source = "the planner rule: the largest tile <= 8192 whose growth over 2048 costs <= 5% of the expert arena"},
+     .source = "largest tile <= 8192, growth over 2048 <= 5% of its expert arena; extra file units require "
+               "2048 file share <= 15% and increase <= 5% of routed units; explicit --row-tile bypasses these bounds"},
     {.name = "prefill_tile_crossover", .options = {{{"--prefill-tile-crossover", "*"}}}, .value = {"0", "0", "0"},
      .builtin = "0", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "per-request prefill tile inside the allocation: prefill rows below the crossover run at min(4096, allocated), "

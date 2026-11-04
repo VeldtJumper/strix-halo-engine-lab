@@ -278,6 +278,16 @@ void prefill_spares_tests(){
         check(x>=prefill_spares_needed(slots-x)&&x<slots,"plan-sized spares converge to a fixed point");}
 }
 void prefill_tile_selection_tests(){
+    // Allocation file-home admission: all shares count routed units, not arena slots.
+    {auto choose=[](std::uint64_t base,std::uint64_t extra){return largest_fitting_tile(32768,[&](unsigned t){
+         return t<=2048||tile_file_admission(base,base+extra,10000).admitted;},default_max_row_tile);};
+     check(choose(900,230)==8192,"full-card-like 9% baseline, +2.3% routed units admits 8192");
+     check(choose(7600,1)==2048,"low-RAM 76% baseline vetoes larger tiles adding file units");
+     check(choose(7600,0)==8192,"outside the regime, larger tiles without extra file homes still fit");
+     check(tile_file_admission(1500,2000,10000).admitted,"15% baseline and +5% inclusive boundaries");
+     check(!tile_file_admission(1501,1502,10000).admitted,"one unit above 15% baseline vetoes extra file homes");
+     check(!tile_file_admission(1500,2001,10000).admitted,"one unit above +5% vetoes extra file homes");
+     check(!tile_file_admission(0,1,0).admitted,"unknown routed unit count cannot admit extra file homes");}
     check(default_prefill_tile_crossover==0&&small_prefill_tile==4096,"crossover default 0 (always the allocated tile), small tile 4096");
     check(select_prefill_tile(8191,8192,default_prefill_tile_crossover)==8192&&select_prefill_tile(31999,8192,default_prefill_tile_crossover)==8192,"default: every request at the allocation");
     check(select_prefill_tile(8191,8192,16384)==4096&&select_prefill_tile(16383,8192,16384)==4096,"rows below the crossover: 4096");
@@ -426,6 +436,34 @@ void tier_budget_tests(){
      const auto f=tier_budget(e);check(f.refuse.empty()&&f.three_tier&&f.disk_readers==0&&resolved_disk_queue(0,f.disk_readers)==1,("auto readers that do not fit: queue 1 plan ("+f.refuse+")").c_str());
      auto el=e;el.landing_blocks=4;check(!tier_budget(el).refuse.empty(),"auto readers + landing that do not fit: refused");
      e.host_bytes=27*unit;const auto g=tier_budget(e);check(g.refuse.empty()&&g.three_tier&&g.disk_readers==8&&g.host_bytes(unit)<=e.host_bytes,("auto readers that fit: billed within the RAM budget (three_tier "+std::to_string(g.three_tier)+", readers "+std::to_string(g.disk_readers)+", pinned "+std::to_string(g.pinned)+", spares "+std::to_string(g.host_spares)+", staging "+std::to_string(g.staging)+", disk "+std::to_string(g.disk)+", refuse '"+g.refuse+"')").c_str());}
+    // Regime is decided from the queue-1 homes, before readers shrink the pinned tier.
+    {const DecodeOptions d{};auto request=[&](TierBudgetIn t,const DecodeOptions& q){t.staging=q.tier_staging;t.disk_readers=disk_bounce_readers(q);t.disk_readers_auto=disk_auto_readers(q);t.disk_queue_request=q.tier_disk_queue;return tier_budget(t);};
+     TierBudgetIn t;t.keys=keys;t.unit_bytes=unit;t.device_bytes=(2000ULL+16+17)*unit;t.host_bytes=(972ULL+8+8)*unit;
+     const auto high=request(t,d);auto a=d;a.tier_disk_queue=0;const auto automatic=request(t,a);
+     check(high.refuse.empty()&&high.disk_readers==4&&high.disk==automatic.disk&&high.pinned==automatic.pinned&&resolved_disk_queue(d.tier_disk_queue,high.disk_readers)==0&&high.disk_queue_source=="default: regime auto (file share 76 %)","default at 76 % file share: same plan as explicit auto");
+     auto one=d;one.tier_disk_queue=1;const auto off=request(t,one);check(off.disk==9412&&off.disk_readers==0&&off.disk_queue_source=="explicit"&&resolved_disk_queue(1,off.disk_readers)==1,"explicit 1 at 76 % stays 1");
+     auto s=d;s.tier_staging=1;const auto staged=request(t,s);
+     check(staged.refuse.empty()&&staged.disk_readers==0&&resolved_disk_queue(s.tier_disk_queue,staged.disk_readers)==1&&staged.disk_queue_source=="default: 1 (file share 76 %, needs --tier-staging >= 2)","default in regime with staging 1 reports the staging limitation");
+     auto boundary=t;boundary.keys=10000;boundary.host_bytes=(1000ULL+8+8)*unit;const auto at_cut=request(boundary,d),cut_one=request(boundary,one);
+     check(cut_one.disk==7000&&at_cut.refuse.empty()&&at_cut.disk_readers==4&&at_cut.disk_queue_source=="default: regime auto (file share 70 %)","exactly 70 % of routed units: actual plan admits auto");
+     boundary.host_bytes+=unit;const auto below_cut=request(boundary,d);
+     check(below_cut.refuse.empty()&&below_cut.disk==6999&&below_cut.disk_readers==0&&resolved_disk_queue(d.tier_disk_queue,below_cut.disk_readers)==1&&below_cut.disk_queue_source=="default: 1 (file share 70 %, below 70 %)","one unit below 70 %: actual plan stays queue 1 despite rounded share");
+     auto middle=t;middle.host_bytes=(2884ULL+8+8)*unit;const auto mid=request(middle,d);
+     check(mid.refuse.empty()&&mid.disk==7500&&mid.disk_readers==0&&resolved_disk_queue(d.tier_disk_queue,mid.disk_readers)==1&&mid.disk_queue_source=="default: 1 (file share 61 %, below 70 %)","default at 61 % file share stays 1: slower cold-1K cell");
+     auto two_t=t;two_t.host_bytes=400ULL<<30;const auto two_plan=request(two_t,d);
+     check(two_plan.refuse.empty()&&!two_plan.three_tier&&two_plan.disk_readers==0&&resolved_disk_queue(d.tier_disk_queue,two_plan.disk_readers)==1&&two_plan.disk_queue_source=="default: 1 (file share 0 %, below 70 %)","default two-tier plan: below threshold, queue 1, no readers");
+     t.device_bytes=(10000ULL+16+17)*unit;t.host_bytes=(1286ULL+8+8)*unit;const auto low=request(t,d),low_auto=request(t,a);
+     check(low.refuse.empty()&&low.disk==1098&&low.disk_readers==0&&resolved_disk_queue(d.tier_disk_queue,low.disk_readers)==1&&low.disk_queue_source=="default: 1 (file share 9 %, below 70 %)","default at synthetic 9 % file share stays 1");
+     check(low_auto.refuse.empty()&&low_auto.disk_readers==4&&low_auto.disk==low.disk+4&&low_auto.disk_queue_source=="auto","explicit auto still bills readers below the regime threshold");
+     {auto larger=t;larger.device_bytes-=285*unit;const auto candidate=request(larger,d);
+      check(candidate.refuse.empty()&&candidate.disk==low.disk+285&&tile_growth_within(285*unit,low.slots*unit)&&tile_file_admission(low.disk,candidate.disk,keys).admitted,"full-card-like planned 8192: 9% baseline, +2.3% units passes growth and file admission");
+      larger.device_bytes=(2000ULL+16+17-285)*unit;larger.host_bytes=(972ULL+8+8)*unit;const auto low_ram=request(larger,d);
+      check(low_ram.refuse.empty()&&low_ram.disk>high.disk&&!tile_file_admission(high.disk,low_ram.disk,keys).admitted,"low-RAM planned larger tile: 76% baseline vetoes extra file homes");}
+     t.device_bytes=(2000ULL+16+17)*unit;t.host_bytes=20*unit;auto striped=d;striped.weight_dirs="D:/s;C:/s";const auto tight=request(t,striped);
+     const auto bare=request(t,one);
+     check(tight.refuse.empty()&&tight.disk_readers==0&&resolved_disk_queue(striped.tier_disk_queue,tight.disk_readers)==1&&tight.disk_queue_source=="default: 1 (file share 84 %, readers do not fit)","default: readers do not fit, queue 1 with original file share");
+     check(tight.resident==bare.resident&&tight.pinned==bare.pinned&&tight.disk==bare.disk&&tight.slots==bare.slots&&tight.spare_slots==bare.spare_slots&&tight.ring==bare.ring&&tight.staging==bare.staging&&tight.host_spares==bare.host_spares&&tight.disk_readers==bare.disk_readers&&tight.landing_blocks==bare.landing_blocks&&tight.host_bytes(unit)==bare.host_bytes(unit),"tight default fallback preserves the complete bare queue-1 placement and accounting");
+     check(disk_queue_regime_admits(7000,10000)&&!disk_queue_regime_admits(6999,10000),"regime threshold includes exactly 70 % of routed units, excludes one unit below");}
     // Landing with a spare share: the blocks are decided per spare count, so the chosen plan carries them exactly when
     // it is three-tier. Boundary case (host 80 units, staging 64, 5% spares): the charged share plan is refused,
     // the fallback is the two-tier minimum, which must carry no blocks.
@@ -435,8 +473,9 @@ void tier_budget_tests(){
          if(p.three_tier)check((p.pinned+p.host_spares+p.staging)*unit+16*unit<=s.host_bytes,"spare share + landing: blocks fit beside the pinned tier");}
      s.host_bytes=80*unit;const auto edge=tier_budget(s);check(!edge.three_tier&&edge.landing_blocks==0&&edge.host_bytes(unit)==(edge.pinned+edge.host_spares+edge.staging)*unit,"spare-share fallback: two-tier minimum, no blocks billed");}
     auto lib=library_budget(three,unit,keys,8);check(lib.ring_slots==17&&lib.device_bytes>=(three.slots+17)*unit&&lib.host_bytes>=three.host_bytes(unit),"library budget covers arena/ring and pinned blocks");
-    // Defaults: one read at a time (auto is opt-in: readers billed only on a three-tier plan), no stripes, no clean evict.
-    {const DecodeOptions d{};check(disk_bounce_readers(d)==0&&disk_auto_readers(d)==0&&d.weight_dirs.empty()&&d.drive_readers==0&&d.tier_disk_queue==1&&!d.tier_clean_evict&&!d.routes_prefill&&TierBudgetIn{}.disk_readers==0&&TierBudgetIn{}.disk_readers_auto==0,"defaults: one read at a time (auto opt-in), other options off");
+    // Defaults: regime auto, no stripes, no clean evict.
+    {const DecodeOptions d{};check(disk_bounce_readers(d)==0&&disk_auto_readers(d)==4&&d.weight_dirs.empty()&&d.drive_readers==0&&d.tier_disk_queue==disk_queue_regime&&!d.tier_clean_evict&&!d.routes_prefill&&TierBudgetIn{}.disk_readers==0&&TierBudgetIn{}.disk_readers_auto==0,"defaults: regime auto, other options off");
+     check(disk_queue_requested(disk_queue_regime)=="unset: regime"&&disk_queue_requested(0)=="auto"&&disk_queue_requested(1)=="1"&&disk_queue_requested(64)=="64","inspection formats requested regime, auto and numeric policy without planning");
      auto q=d;q.tier_disk_queue=8;check(disk_bounce_readers(q)==8&&disk_auto_readers(q)==0,"queue 8: eight reader bounce buffers, no auto");
      auto a=d;a.tier_disk_queue=0;check(disk_bounce_readers(a)==0&&disk_auto_readers(a)==4,"auto, one read location: tierstream starts at most 4 readers, 4 billed");
      auto a2=a;a2.weight_dirs="D:/s";auto a3=a;a3.weight_dirs="D:/s;C:/s";check(disk_auto_readers(a2)==6&&disk_auto_readers(a3)==8,"auto: 6 for two read locations, 8 for three");
@@ -779,6 +818,21 @@ void decode_budget_tests(){
     check(p.refuse.empty()&&p.device_planned<=24*gib&&p.host_planned<=32*gib&&p.tier.resident>0&&p.tier.resident+p.tier.pinned+p.tier.disk==c.size(),("whole-device 24/32 admitted within the caps: "+p.refuse).c_str());
     check(p.device_planned+in.vram_margin<=24*gib&&p.device_planned+in.vram_margin+stride>24*gib,"the arena is everything the VRAM cap leaves after the margin (one more slot would not fit)");
     check(p.min_vram_total<=24*gib&&p.min_ram_total<=32*gib,"minimum caps below the requested ones");
+    {auto w=in;w.tier.disk_queue_request=disk_queue_regime;w.tier.disk_readers_auto=4;
+     const auto automatic=plan_whole_device(w);const auto aj=whole_device_json(w,automatic);
+     check(automatic.refuse.empty()&&automatic.tier.three_tier&&automatic.tier.disk_readers==4&&automatic.tier.pinned+4==p.tier.pinned&&automatic.tier.disk==p.tier.disk+4&&automatic.tier.resident==p.tier.resident&&automatic.host_fixed==p.host_fixed+4*stride&&automatic.host_planned<=w.ram_total,"whole-device regime: readers billed under RAM cap, complete placement accounted");
+     check(aj.find("disk_queue_requested")->as_string()=="unset: regime"&&aj.find("disk_queue_resolved")->as_int()==0&&aj.find("disk_queue_billed_readers")->as_int()==4&&aj.find("disk_queue_source")->as_string()==automatic.tier.disk_queue_source,"plan JSON exposes requested, resolved (0 = auto), billed readers and source");
+     w.tier.staging=1;w.tier.disk_readers_auto=0;const auto staged=plan_whole_device(w);
+     check(staged.refuse.empty()&&staged.tier.disk_readers==0&&staged.tier.disk_queue_source.find("needs --tier-staging >= 2")!=std::string::npos,"whole-device regime reports staging limitation");
+     w=in;w.ram_total=0;w.host_avail=1000*gib;w.tier.disk_queue_request=disk_queue_regime;w.tier.disk_readers_auto=4;const auto two=plan_whole_device(w);
+     check(two.refuse.empty()&&!two.tier.three_tier&&two.tier.disk_readers==0&&resolved_disk_queue(w.tier.disk_queue_request,two.tier.disk_readers)==1&&two.tier.disk_queue_source.find("below 70 %")!=std::string::npos,"whole-device two-tier regime stays queue 1");
+     w=in;w.tier.disk_queue_request=disk_queue_regime;w.tier.disk_readers_auto=8;w.ram_total=0;w.host_avail=20*stride;
+     auto w0=w;w0.tier.disk_queue_request=1;w0.tier.disk_readers_auto=0;const auto bare=plan_whole_device(w0),fallback=plan_whole_device(w);
+     check(bare.refuse.empty()&&fallback.refuse.empty()&&fallback.tier.disk_readers==0&&fallback.tier.disk_queue_source.find("readers do not fit")!=std::string::npos,"whole-device tight regime falls back to bare plan");
+     auto fj=whole_device_json(w,fallback),bj=whole_device_json(w0,bare);
+     // Only the requested policy and selection source differ on an automatic fallback.
+     fj.set("disk_queue_requested",*bj.find("disk_queue_requested"));fj.set("disk_queue_source",*bj.find("disk_queue_source"));
+     check(fj.dump()==bj.dump(),"whole-device tight fallback preserves every placement, part, cap and accounting field");}
     {   // Landing blocks in the whole-device plan: billed only with a file tier, under the RAM cap and under the host
         // memory available (the planner sizes the pinned tier from host_avail without the pinned parts).
         const std::uint64_t lb=16*((stride+4095)/4096*4096);
@@ -818,7 +872,7 @@ void decode_budget_tests(){
             w.device.push_back({"workspaces (tile-scaled, representative)",(1600ULL<<20)+std::uint64_t(t)*(600ULL<<10)});return plan_whole_device(w);};
         auto cost=[](unsigned cap,unsigned t){return activation_bytes(cap,t)+(1600ULL<<20)+std::uint64_t(t)*(600ULL<<10);};
         auto choose=[&](unsigned cap,std::uint64_t vram,std::uint64_t* arena_out){const auto base=plan(cap,2048,vram);const std::uint64_t arena=base.refuse.empty()?base.tier.slots*stride:0;*arena_out=arena;
-            auto ok=[&](unsigned t){const auto p=plan(cap,t,vram);const auto c=cost(cap,t),c0=cost(cap,2048);return p.refuse.empty()&&(t<=2048||(arena&&tile_growth_within(c>c0?c-c0:0,arena)));};
+            auto ok=[&](unsigned t){const auto p=plan(cap,t,vram);const auto c=cost(cap,t),c0=cost(cap,2048);return p.refuse.empty()&&(t<=2048||(arena&&tile_growth_within(c>c0?c-c0:0,arena)&&tile_file_admission(base.tier.disk,p.tier.disk,in.tier.keys).admitted));};
             const auto t=largest_fitting_tile(cap,ok,default_max_row_tile);
             check(t&&t<=default_max_row_tile&&valid_schedule(cap,t)&&ok(t),("chosen tile obeys the rule (capacity "+std::to_string(cap)+", VRAM "+std::to_string(vram>>30)+" GiB, tile "+std::to_string(t)+")").c_str());
             for(unsigned x=first_tile_candidate(cap,default_max_row_tile);x>t;x=next_tile_candidate(x))check(!ok(x),"every larger candidate breaks the plan or the 5% rule");return t;};

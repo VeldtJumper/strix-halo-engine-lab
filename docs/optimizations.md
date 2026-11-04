@@ -3715,16 +3715,16 @@ out to the file, which the same prefill would read again. Decode keeps the open'
 
 ### RTX file reads in flight
 
-**Engine:** `glm-rtx`. **Control:** `--tier-disk-queue`. **Default:** 1 (`auto` opt-in).
+**Engine:** `glm-rtx`. **Control:** `--tier-disk-queue`. **Default:** regime auto.
 
 Unit-file reads in flight in a three-tier open; `auto` picks 4 / 6 / 8 from the read locations, at most the staging buffers.
 
 - **Preconditions:** Three-tier open that reads units from the unit file; each reader's bounce buffer is billed to pinned host memory.
-- **Automatic selection:** None by default; `auto` resolves from the unit file and the `--weight-dirs` stripe copies and uses 1 when the readers do not fit.
-- **Fallback notice:** Receipts report the resolved count; with `--tier-landing-blocks` a plan that does not fit is refused.
+- **Automatic selection:** Plan at queue 1 first. If `file_units * 100 >= total routed units * 70` (planner counters `disk` and `keys`), re-plan exactly as explicit `auto`, billing `auto_disk_queue_bound` readers; otherwise keep 1. Staging must be >= 2 and reader buffers must fit pinned host memory; otherwise fall back to 1. Explicit `auto` and numeric queues keep their meanings.
+- **Fallback notice:** Readers that do not fit fall back to 1. Receipts report the resolved count and selection source with the queue-1 file share rounded to a whole percent. Landing blocks require explicit `auto` or a queue > 1; a charged plan that does not fit is refused.
 - **Exactness evidence:** Same output bytes (tokens, logits, state) at any queue.
-- **Off switch:** --tier-disk-queue 1 (default)
-- **Measured gain:** Preliminary, `auto` vs 1 with 24 GiB VRAM + 32 GiB RAM on one drive: decode +11.9 % / +9.6 % at 1K cold / warm, +18.8 % at 8K cold, -3.4 % at 8K warm (drive read phases; not settled)
+- **Off switch:** `--tier-disk-queue 1`
+- **Measured gain:** Auto vs 1 at about 76 % file share (24 GiB VRAM + 32 GiB RAM) was never slower in the latest measured decode cell means: 1K cold / warm +42 / +35 %, 8K cold / warm +33 / +16 %. Earlier one-drive cells were +9..+42 % in seven of eight (remaining -3.4 % traced to drive read phases); two-drive stripes +26..+38 %. Single loads vary up to 2x, so the gain size is uncertain. At about 61 % (48 GiB + 32 GiB), one earlier night observed cold-1K decode -32 % against the queue-1 mean; warm 1K +3 %, cold 8K +7 %, warm 8K +1 %. A later set at the same budget reversed the cold-1K result: auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff: 61 % stays at 1. Full card (about 1-4 % at tile 2048) tied in TTFT (8K +0.6..+2 %, 32K equal), so it stays at 1.
 - **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md)
 
 ## Platform (kernel)

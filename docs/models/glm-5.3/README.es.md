@@ -131,10 +131,17 @@ los límites de intercambio requiere captura segmentada; los kernels de disposit
 compartidos se quedan en la tarjeta; los 43 x 288 expertos enrutados los sirve la caché con compuerta en el dispositivo
 de [tierstream](https://github.com/hyukudan/tierstream), y el prefill los lee a través de la misma caché, así que la
 tarjeta guarda una sola copia de cada experto. El prefill y el decode son exactos (digests bit a bit de logits y
-estado; estado del prefill igual con tiles de 2048 / 4096 / 8192 filas). Tarjeta completa, tile de 8192: TTFT **19.7 s** con 8K y
-**41.7 s** con 32K (exacto; la restauración de la residencia del decode se ejecuta ahora después del prefill, fuera del
-tiempo hasta el primer token, y solo cuando sigue un decode); decode de **6.00 / 6.15 tok/s** en caliente
-con 1K / 8K (3.75 / 3.70 en frío) con los kernels de decode de pocas filas activados por defecto, frente a 2.43 / 2.36
+estado; estado del prefill igual con tiles de 2048 / 4096 / 8192 filas). Tarjeta completa, tile de 8192: TTFT **11.4 s** con 8K y
+**30.5 s** con 32K (primera petición, media de dos cargas; 30.5 s con 32K frente a 43.7 s con tile de 2048, -30 %).
+Con 32K el prefill está limitado por el cómputo de la GPU: la preparación de expertos (unos 128 GB de host a
+dispositivo por prompt, 8-10 s de make-resident, unos 4 GB/s de media, muy por debajo de PCIe 5 x16) corre detrás
+de los kernels con 0.0-0.2 s de GPU ociosa, así que el -30 % viene de menos decodificaciones de pesos de expertos
+por prompt y filas de GEMM más largas por experto con el tile mayor, no de E/S; con 8K quedan expuestos 2-4 s de
+preparación. (Exacto; la restauración de la residencia del decode se ejecuta ahora después del prefill, fuera del
+tiempo hasta el primer token, y solo cuando sigue un decode); decode de **13.25 / 13.52 tok/s** en caliente
+con 1K / 8K (3.63 / 4.09 en frío) con los kernels de decode actuales (bench de 24 tokens, medias ABBA de una carga).
+Cuando se añadieron los kernels de decode de pocas filas, el decode midió 6.00 / 6.15 tok/s en caliente (3.75 / 3.70 en
+frío) con ellos activados por defecto, frente a 2.43 / 2.36
 tok/s con ellos desactivados en la misma carga del servicio (tarjeta completa; la RAM del host dejó 1,098 unidades de
 expertos en el archivo de unidades, así que se incluyen los fallos de archivo por token; prueba de 24 tokens). Los
 tokens, todos los digests de logits y el estado final de la sesión son iguales bit a bit con ellos activados y
@@ -148,12 +155,37 @@ tarjeta completa. Se desactiva con `--prefill-overlap 0`.
 La expulsión limpia en el prefill está activada por defecto: un residente de decode que el prefill desplaza sin
 bloque fijado libre vuelve al fichero de unidades en lugar de sacar una unidad fijada. En la tarjeta completa reduce
 el TTFT de 8K un 15 % / 12 % (primera / segunda petición), empata a 32K y lee un 60 % menos del fichero de unidades,
-idéntico bit a bit. Se desactiva con `--prefill-clean-evict 0`. Más lecturas de fichero simultáneas
-(`--tier-disk-queue auto`) siguen siendo opcionales hasta medir una elección por paso.
+idéntico bit a bit. Se desactiva con `--prefill-clean-evict 0`.
+Por defecto se asigna el mayor tile admitido hasta 8192, con crecimiento de activaciones + workspace
+sobre 2048 <= 5% de la arena de expertos a 2048. Un tile mayor solo puede añadir unidades al fichero
+si el plan de 2048 tiene <= 15% de las unidades enrutadas en fichero y el aumento es <= 5% de las
+unidades enrutadas. Se admite 8192 en el intervalo medido con tarjeta completa (con 2048, ~1.5-4.6%
+de las unidades enrutadas en fichero, ~2.4% más con 8192) y en planes dentro de estos límites si
+caben el plan y el crecimiento; fuera se
+conserva el veto anterior a unidades adicionales en fichero. Con tarjeta completa, 8192 frente a 2048
+redujo el TTFT un 30% a 32K y un 9% / 5% a 8K, idéntico bit a bit. No establece el mejor tile a 8K:
+en un par de cargas 4096 fue 1.3 / 2.0 s más rápido (primera / segunda petición), en el otro la
+diferencia fue menor de 0.3 s. `--row-tile` explícito omite las reglas
+automáticas de crecimiento y fichero (el plan debe caber), así como `row_tiles_tried`; los candidatos
+automáticos indican los motivos de admisión y `file_units_over_2048`.
+Las lecturas de fichero simultáneas usan por defecto auto según el régimen: se admite todo plan inicial
+de tres niveles con cola 1 y al menos el 70 % de unidades enrutadas en fichero si staging >= 2 y caben
+los lectores. Con aproximadamente el 76 % (24 GiB de VRAM + 32 GiB de RAM), auto nunca fue más lento
+en las últimas medias de decode por celda; una celda anterior dio -3.4 %, atribuido a fases de lectura
+de la unidad. Con aproximadamente el 61 % (48 GiB + 32 GiB), una noche anterior se observó un -32 %
+en decode 1K en frío frente a la media con cola 1; las otras celdas dieron +3 % a 1K en caliente,
++7 % a 8K en frío y +1 % a 8K en caliente. Un conjunto posterior con el mismo presupuesto invirtió
+el resultado de 1K en frío: auto +8.4 % agregado, todos los brazos auto más rápidos. El corte del
+70 % sigue siendo un umbral empírico conservador; el 61 % conserva la cola 1.
+Con tarjeta completa (aproximadamente el 1-4 % con tile 2048), el TTFT empató: 8K +0.6..+2 %, 32K igual;
+se conserva la cola 1. Staging < 2 o lectores que no caben también vuelven a 1.
+El `auto` explícito sigue siendo válido con cualquier proporción; `--tier-disk-queue 1` desactiva auto.
 Con 24 GiB de VRAM + 32 GiB de
 RAM del host (la mayoría de los expertos leídos del archivo de unidades en disco) también funciona de forma exacta: TTFT
 **60.3 s** con 1K y **62.4 s** con 8K con el solapamiento del prefill (63.4 / 73.7 s sin él en la misma ventana); decode
-de **0.67 tok/s** en caliente (0.63 en frío). Con el prefetch de archivo en dos etapas opcional
+de **0.67 tok/s** en caliente (0.63 en frío) con una lectura de fichero cada vez; con las lecturas de fichero
+simultáneas por defecto con este presupuesto (auto, 76 % de los expertos en el fichero de unidades) el decode es de
+**0.77 / 0.75 tok/s** en caliente / en frío con 1K (media de dos cargas, bench de 24 tokens). Con el prefetch de archivo en dos etapas opcional
 (`--tier-landing-blocks 16`, tres unidades en franjas) el decode fue un 20-40 % más rápido que sin él en las mismas
 ventanas, con salida idéntica (las repeticiones variaron entre un 15 y un 55 %). Compilación, archivo de unidades y
 opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).

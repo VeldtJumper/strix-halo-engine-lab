@@ -7,6 +7,7 @@
 // budget arithmetic of its own (the device-gated spare-slot rules below are
 // library constraints, not budget arithmetic).
 #include "tierstream_binding.hpp"
+#include "disk_queue.hpp"
 #include "tierstream/ts.h"
 #include <algorithm>
 #include <stdexcept>
@@ -54,9 +55,15 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
 // (queue 1). Applied to each spare count below, so the plan chosen carries blocks and readers only when it is three-tier.
 WholeDevicePlan run_plan_landing(const WholeDeviceIn& w,bool library_parts,bool caps){
     auto w0=w;w0.tier.landing_blocks=0;w0.tier.disk_readers=0;w0.tier.disk_readers_auto=0;auto bare=run_plan_once(w0,library_parts,caps);
+    const bool regime=w.tier.disk_queue_request==disk_queue_regime;const auto share=std::to_string(w.tier.keys?(100*bare.tier.disk+w.tier.keys/2)/w.tier.keys:0);
+    bare.tier.disk_queue_source=regime?"default: 1 (file share "+share+" %, below "+std::to_string(disk_queue_regime_min_file_percent)+" %)":(!w.tier.disk_queue_request||w.tier.disk_readers_auto)?"auto":"explicit";
+    // Counter: bare.tier.disk / w.tier.keys (all routed expert units, not slots or bytes).
+    if(regime&&(!bare.tier.three_tier||!disk_queue_regime_admits(bare.tier.disk,w.tier.keys)))return bare;
+    if(regime)bare.tier.disk_queue_source="default: 1 (file share "+share+" %, "+(w.tier.staging<2?"needs --tier-staging >= 2)":"readers do not fit)");
     if((!w.tier.landing_blocks&&!w.tier.disk_readers&&!w.tier.disk_readers_auto)||!bare.refuse.empty()||!bare.tier.three_tier)return bare;
     auto w1=w;if(w.tier.disk_readers_auto)w1.tier.disk_readers=w.tier.disk_readers_auto;
     auto charged=run_plan_once(w1,library_parts,caps);
+    charged.tier.disk_queue_source=regime?"default: regime auto (file share "+share+" %)":bare.tier.disk_queue_source;
     return charged.refuse.empty()||w.tier.landing_blocks||w.tier.disk_readers?charged:bare;
 }
 // Spares as a share of the arena: one more planner call with the larger count

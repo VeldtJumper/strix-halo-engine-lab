@@ -128,8 +128,13 @@ exchange boundaries requires segmented capture; device kernels and rank skew tak
 on the card; the 43 x 288 routed experts are served by the [tierstream](https://github.com/hyukudan/tierstream)
 device-gated cache, and prefill reads them through the same cache, so the card holds one copy of every expert.
 Prefill and decode are exact (bitwise digests of logits and state; prefill state equal across row tiles 2048 / 4096 /
-8192). Full card, tile 8192: TTFT **19.7 s** at 8K and **41.7 s** at 32K (exact; the decode-residency restore now runs
-after the prefill, outside time-to-first-token, only when decode follows); decode **6.00 / 6.15 tok/s** warm at 1K / 8K (3.75 / 3.70 cold) with the few-row decode kernels on by
+8192). Full card, tile 8192: TTFT **11.4 s** at 8K and **30.5 s** at 32K (first request, mean of two loads; 30.5 s at 32K vs
+43.7 s at tile 2048, -30 %). At 32K the prefill is bound by GPU compute: the expert staging (about 128 GB host-to-device
+per prompt, 8-10 s of make-resident, about 4 GB/s on average, far below PCIe 5 x16) runs behind the kernels with
+0.0-0.2 s of GPU idle, so the -30 % is the larger tile's fewer expert weight decodes per prompt and longer GEMM rows
+per expert, not an I/O gain; at 8K 2-4 s of staging stay exposed. (Exact; the decode-residency restore now runs
+after the prefill, outside time-to-first-token, only when decode follows); decode **13.25 / 13.52 tok/s** warm at 1K / 8K (3.63 / 4.09 cold) with the current decode kernels (24-token bench, ABBA
+means of one load). When the few-row decode kernels were added, decode measured 6.00 / 6.15 tok/s warm (3.75 / 3.70 cold) with them on by
 default, from 2.43 / 2.36 tok/s with them off in the same service load (full card; host RAM put 1,098 expert units on
 the unit file, so per-token file misses are included; 24-token bench). Tokens, every logits digest and the final
 session state are bitwise equal on and off, and the 1K/8K qualification passes with them on. The kernels decode each
@@ -141,11 +146,34 @@ state, tokens and logits are bitwise equal with it off. In same-window compariso
 Prefill clean eviction is on by default: a decode resident the prefill displaces while no pinned block is free goes
 back to the unit file instead of pushing a pinned unit out. On the full card it cuts 8K TTFT by 15 % / 12 % (first /
 second request), ties at 32K and reads 60 % fewer unit-file bytes, bitwise equal. Turn it off with
-`--prefill-clean-evict 0`. More file reads in flight (`--tier-disk-queue auto`) stay opt-in until a per-step choice
-is measured.
+`--prefill-clean-evict 0`.
+The default allocates the largest admitted tile up to 8192, with activation + workspace growth over
+2048 <= 5% of the expert arena at 2048. A larger tile may add file homes only when the 2048 plan has
+<= 15% of routed units on file and the increase is <= 5% of routed units. This admits 8192 at the
+measured full-card range (2048 baseline ~1.5-4.6% of routed units on file, ~2.4% more at 8192),
+and in plans within these bounds when the plan and growth gates pass; elsewhere the old veto on
+extra file units applies.
+Full card, 8192 vs 2048 reduced TTFT by 30% at 32K and 9% / 5% at 8K, bitwise equal. This does not
+establish the best tile at 8K: in one load pair 4096 was 1.3 / 2.0 s faster (first / second request),
+in the other within 0.3 s.
+Explicit `--row-tile` bypasses the automatic growth and file-home rules (the plan must still fit),
+and omits `row_tiles_tried`; automatic candidates report admission reasons and `file_units_over_2048`.
+File reads in flight default to regime auto: every queue-1 three-tier plan with at least 70 % of routed
+expert units file-homed is admitted when staging >= 2 and readers fit. At about 76 % file share
+(24 GiB VRAM + 32 GiB RAM), auto was never slower in the latest measured decode cell means; one earlier
+cell was -3.4 %, traced to drive read phases. At about 61 % (48 GiB + 32 GiB), one earlier night
+observed cold-1K decode -32 % against the queue-1 mean; the other cells were +3 % at warm 1K,
++7 % at cold 8K and +1 % at warm 8K. A later set at the same budget reversed the cold-1K result:
+auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff,
+so 61 % stays at 1.
+Full card (about 1-4 % at tile 2048) tied in TTFT: 8K +0.6..+2 %, 32K equal; it stays at 1.
+Staging < 2 or readers that do not fit also fall back to 1. Explicit `auto`
+still applies at any file share; `--tier-disk-queue 1` turns auto off.
 With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on disk) it also runs exact: TTFT
 **60.3 s** at 1K and **62.4 s** at 8K with the prefill overlap (63.4 / 73.7 s with it off in the same window); decode
-**0.67 tok/s** warm (0.63 cold). With the opt-in two-stage file prefetch (`--tier-landing-blocks 16`, three striped
+**0.67 tok/s** warm (0.63 cold) with one file read at a time; with the default file reads in flight at this budget
+(auto, 76 % of the experts on the unit file) decode is **0.77 / 0.75 tok/s** warm / cold at 1K (mean of two loads,
+24-token bench). With the opt-in two-stage file prefetch (`--tier-landing-blocks 16`, three striped
 drives) decode was 20-40 % faster than without it in the same windows, identical output (repeats varied by 15-55 %).
 Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
 

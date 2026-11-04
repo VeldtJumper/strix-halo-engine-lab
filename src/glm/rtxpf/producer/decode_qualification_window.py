@@ -1598,7 +1598,7 @@ def arguments(argv=None):
     p.add_argument('--tier-staging', type=int, choices=range(1, 65), metavar='1..64',
                    help='service: three-tier file staging buffers (pinned; one per read in flight)')
     p.add_argument('--tier-disk-queue', choices=['auto'] + [str(n) for n in range(1, 65)], metavar='auto|1..64',
-                   help='service: three-tier file reads in flight (<= --tier-staging; default 1 = one at a time; auto = '
+                   help='service: three-tier file reads in flight (<= --tier-staging; default = regime auto with at least 70 %% of the routed units file-homed; auto = '
                         '4 / 6 / 8 for 1 / 2 / 3+ read locations when the plan has a file tier)')
     p.add_argument('--disk-prefetch', choices=['0', '1'],
                    help='service: three-tier predicted units homed on the file are read ahead (dg_disk_prefetch; with --tier-predict 1)')
