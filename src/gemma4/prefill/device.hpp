@@ -108,7 +108,8 @@ bool canonical_attention(const float* q, std::span<const gpu::KvRead> reads, uns
 // bytes equal the decode target's eight-row passes, with canonical attention
 // and the same norms/RoPE/PLE stages, so the committed state is prefill-exact
 // (STRIX_G4_PREFILL_EXACT_MANYROW=0 runs the eight-row linears instead).
-enum class Linears { wmma, exact };
+// a8: g4-a8-v1 linears (a8_linear.hpp) on every quantized matrix, g4-v1 on BF16/F32 ones.
+enum class Linears { wmma, exact, a8 };
 // Per-op precision of WMMA linears (g4-wmma-pf-v2 development). fp16 is v1;
 // exact runs that op with the g4-v1 linear (diagnostic upper bound); hilo
 // splits activations into FP16 high and scaled low panels with independent

@@ -147,6 +147,11 @@ prompt (`prefill-exact`); `strix-gemma4-prefill-check --linears exact
 --exact-ab` checks exactly that. `STRIX_G4_PREFILL_EXACT_MANYROW=0` runs its
 linears as eight-row slices instead (same bytes, slower).
 
+The engine accepts `STRIX_G4_PREFILL_IDENTITY=a8` as an opt-in route only with
+decode `STRIX_G4_IDENTITY=g4-a8-v1`; otherwise prefill-exact runs with a log line.
+Prompt KV and logits equal the a8 decode of the same rows, byte for byte,
+on 512-row chunks. Attention stays canonical.
+
 `STRIX_G4_PREFILL_ATTN=wmma` (or `g4-wmma-attn-v1`) selects an additional,
 opt-in attention identity. Empty, `auto`, and `canonical` retain canonical
 attention; unknown settings fail. This setting is cached at startup. The

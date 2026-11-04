@@ -4,8 +4,10 @@
 #include "gemma4/prefill/device.hpp"
 #include "gemma4/exl3/device.hpp"
 #include "gemma4/kernels/a8.hpp"
+#include "gemma4/kernels/attention_fast_decode.hpp"
 
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <mutex>
 
@@ -53,8 +55,8 @@ public:
         const auto* depth = std::getenv("STRIX_G4_EXL3_COOP_DEPTH");
         switches.set("STRIX_G4_EXL3_COOP_DEPTH",std::string(depth && *depth ? depth : "4"));
         metadata_.set("off_switches",switches);
-        // Prompt prefill: exact many-row chunks (same bytes as the eight-row
-        // passes; EXL3 packs keep their identity's core order);
+        // Prompt prefill: exact or a8 many-row chunks match their decode linears;
+        // EXL3 packs keep their identity's core order.
         // STRIX_G4_PREFILL_EXACT_MANYROW=0 keeps the passes.
         const bool many_row = enabled("STRIX_G4_PREFILL_EXACT_MANYROW");
         // EXL3 packs: STRIX_G4_EXL3_PREFILL=wmma selects the pack's qualified held-out
@@ -68,19 +70,31 @@ public:
         // Non-EXL3 packs: STRIX_G4_PREFILL_IDENTITY=v1|v2 runs a WMMA prefill identity with canonical
         // attention: g4-wmma-pf-v1 (FP16 operands) or g4-wmma-pf-v2 (the declared hilo policy); "fast"
         // (the fast profile's value) runs v1 on Q4_K_M packs, the pack its qualification covers, and
-        // prefill-exact on others; exact (or unset) keeps prefill-exact.
+        // prefill-exact on others; exact (or unset) keeps prefill-exact. A8 requires g4-a8-v1 decode.
+        const auto* selected = std::getenv("STRIX_G4_IDENTITY");
+        const std::string decode_identity{selected && *selected ? selected : arithmetic_id};
+        // A FAST decode attention (STRIX_G4_DECODE_ATTN) changes decode rows: no prefill route equals them then
+        // (the a8 route still runs; prefill_matches_decode is false).
+        const std::string decode_attention{gpu::fast_decode_attention_name(gpu::fast_decode_attention_format())};
         const auto* identity = std::getenv("STRIX_G4_PREFILL_IDENTITY");
-        const std::string route{profile::prefill_route(identity ? identity : "",model.gguf_file_type,
-                                                       bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1)};
-        const bool wmma_route = many_row && !exl3_wmma && route != "exact";
+        const auto choice = profile::prefill_route_for_decode(profile::prefill_route(identity ? identity : "",model.gguf_file_type,
+            bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1),decode_identity);
+        if (!choice.notice.empty()) std::cerr << choice.notice << '\n';
+        const auto route = choice.route;
+        const bool a8_route = many_row && route == "a8";
+        const bool wmma_route = many_row && !exl3_wmma && (route == "v1" || route == "v2");
         const bool v2 = wmma_route && route == "v2";
         metadata_.set("prefill_route",exl3_wmma ? exl3::prefill_identity : v2 ? prefill::v2_identity : wmma_route ? prefill::identity
-                                       : many_row ? "many-row" : "rows8");
-        // The prefill linears decide whether prefill rows equal decode rows: any WMMA route never does.
-        const auto linears = exl3_wmma || wmma_route ? prefill::Linears::wmma : prefill::Linears::exact;
+                                       : a8_route ? "a8-many-row" : many_row ? "many-row" : "rows8");
+        if (a8_route) std::cerr << "gemma4 prefill route a8-many-row (g4-a8-v1 linears, 512-row chunks)\n";
+        // Exact and a8 linears match their decode identity; WMMA routes never do.
+        const auto linears = exl3_wmma || wmma_route ? prefill::Linears::wmma : a8_route ? prefill::Linears::a8 : prefill::Linears::exact;
         // Read-only inspection must never initialize HIP or upload weights.
         if (!inspect) {
-            target_ = std::make_unique<gpu::DeviceTarget>(bind_host_weights(model),tables);
+            gpu::DeviceOptions options; options.identity = selected && *selected ? selected : arithmetic_id;
+            target_ = std::make_unique<gpu::DeviceTarget>(bind_host_weights(model),tables,options);
+            if (a8_route && target_->stats().identity != a8::arithmetic_id)
+                throw std::logic_error("a8 prefill requires g4-a8-v1 decode");
             if (many_row)
                 prefill_ = std::make_unique<prefill::DevicePrefill>(target_->borrow_device_weights(),tables,
                     prefill::Residency::device,false,prefill::AttentionMode::canonical,linears);
@@ -89,17 +103,17 @@ public:
         }
         // Report the identity the device resolved (STRIX_G4_IDENTITY may select g4-a8-v1), not the static model one.
         if (target_) metadata_.set("identity",target_->stats().identity);
-        else if (const auto* selected = std::getenv("STRIX_G4_IDENTITY"); selected && *selected)
-            metadata_.set("identity",std::string(selected));
-        const auto* resolved = metadata_.find("identity");
-        prefill_matches_decode_ = linears == prefill::Linears::exact && !(resolved && resolved->as_string() == a8::arithmetic_id);
-        if (prefill_ && (prefill_->stats().linears == prefill::Linears::exact) != (linears == prefill::Linears::exact))
+        else metadata_.set("identity",decode_identity);
+        prefill_matches_decode_ = decode_attention == "exact" &&
+                                  ((linears == prefill::Linears::exact && decode_identity != a8::arithmetic_id) ||
+                                   (linears == prefill::Linears::a8 && decode_identity == a8::arithmetic_id));
+        if (prefill_ && prefill_->stats().linears != linears)
             throw std::logic_error("prefill linears differ from the declared prefill_matches_decode");
         metadata_.set("prefill_matches_decode",prefill_matches_decode_);
     }
     std::size_t prefill_chunk_rows() const override { return prefill_ ? prefill::chunk_rows : 0; }
-    // The exact many-row prefill (g4-v1 linears, or the EXL3 pack's own core order) equals the decode passes; a
-    // g4-a8-v1 decode (int8 activations) or the WMMA prefill identity does not.
+    // With the exact decode attention: exact many-row prefill matches non-a8 decode; a8 prefill matches g4-a8-v1 decode.
+    // EXL3 keeps its own core order; WMMA prefill never matches decode rows.
     bool prefill_matches_decode() const override { return prefill_matches_decode_; }
     PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
         if (!prefill_) throw std::logic_error("many-row prefill is off");

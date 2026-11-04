@@ -24,7 +24,7 @@ declarado y una línea de stderr lo indica. Un perfil solo rechaza por un asset 
 | Perfil | Decode | Prefill | Garantía |
 |---|---|---|---|
 | `default` | `g4-v1` (activaciones FP32, pesos Q4_K_M) + drafter MTP en C1 | `prefill-exact` | Exacto: los bytes de salida son iguales a la ruta serial declarada para cualquier tamaño de batch (C4 == C1) y con el drafter activado o desactivado |
-| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP; atención de decode en profundidad `g4-dattn-f2` (copias int8 de la KV de las capas globales): cualificación pendiente, hasta entonces se ejecuta la atención exacta | `prefill-exact` (prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente) | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
+| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP; atención de decode en profundidad `g4-dattn-f2` (copias int8 de la KV de las capas globales): cualificación pendiente, hasta entonces se ejecuta la atención exacta | prefill de prompts `a8`: lineales `g4-a8-v1` en bloques de 512 filas; las filas del prompt son iguales al decode a8 de las mismas filas, así que la cualificación de `g4-a8-v1` las cubre (no es idéntico bit a bit al prefill exacto; `STRIX_G4_PREFILL_IDENTITY=exact` restaura el prefill exacto) | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
 | `quality` | Paquete EXL3 (`--exl3-arm DIR`), identidad elegida una vez por paquete y sesión (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exacto dentro de su identidad EXL3; mayor fidelidad que Q4_K_M con un tamaño similar |
 
 La identidad de la ruta EXL3 se fija al arrancar a partir del paquete y de `--streams`, nunca por paso, así que la
@@ -88,7 +88,7 @@ compilación del motor, y cada valor de llama.cpp se midió en el mismo turno qu
 | Perfil | C1 publicado ([drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) + prompt lookup) | C1, sin draft | C4 | C8 | Prefill 512 / 2K / 8K |
 |---|---:|---:|---:|---:|---:|
 | `default` (exacto, `g4-v1`) | **91.9** | 55.8 | 169.8 | 237.9 | 532 / 535 / 509 |
-| `fast` (`g4-a8-v1`, cualificado) | **99.5** | 54.0 | 206.5 | 340.6 | 551 / 538 / 509 |
+| `fast` (`g4-a8-v1`, cualificado) | **99.5** | 54.0 | 206.5 | 340.6 | 551 / 538 / 509 exacto; prefill `a8`: ver abajo |
 | `quality` ([paquete EXL3 M4](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **96.4** | 50.2 | 184.8 | 303.0 | 794 / 815 / 746 |
 | llama.cpp `74a4fb00`, mismo Q4_K_M | — | 55.5 | 193.3 | 279.9 | 2,077 / 2,062 / 1,881 |
 
@@ -170,8 +170,10 @@ Mientras otras peticiones decodifican, un prompt se procesa en fragmentos de com
 (`STRIX_G4_SERVE_PREFILL_ROWS`, `0` = fragmentos completos de 512 filas), así que un prompt largo las pausa durante
 tramos más cortos: con los prompts mixtos de arriba, el mayor hueco entre dos tokens de una petición bajó de 1.05-1.12 s
 a 0.41-0.42 s y el percentil 99 de 0.44 / 1.08 s a 0.17 / 0.20 s (4 / 8 clientes); el rendimiento y los ids de tokens no
-cambian. Con `fast` (decode con activaciones int8 junto al procesamiento exacto del prompt) los fragmentos mantienen
-su tamaño completo, porque dónde termina un fragmento decide qué filas del prompt escribe una pasada de decode.
+cambian. `fast` (las filas del prompt `a8` son iguales a sus filas de decode) acorta los fragmentos igual; con
+`STRIX_G4_PREFILL_IDENTITY=exact` en `fast` (procesamiento exacto del prompt junto al decode con activaciones int8) los
+fragmentos mantienen su tamaño completo, porque dónde termina un fragmento decide qué filas del prompt escribe una
+pasada de decode.
 
 El servidor también guarda el estado confirmado al final de cada prompt y de cada petición terminada, y lo reutiliza
 cuando un prompt posterior empieza exactamente con esos tokens, normalmente el siguiente turno de una conversación, que
@@ -179,9 +181,9 @@ vuelve a enviar la conversación hasta ese punto: solo se procesan las filas nue
 turno 2 (`default`, seis conversaciones en paralelo): documento de 4K tokens **0.20 s** frente a 12.59 s sin caché,
 documento de 1K tokens **0.19 s** frente a 3.48 s, chat 0.39-0.51 s frente a 1.31-1.66 s; los ids de tokens de ambos
 turnos son iguales a los obtenidos sin caché. Hasta 16 estados dentro de 4 GB (`STRIX_G4_SERVE_PREFIX_MB`);
-`STRIX_G4_SERVE_PREFIX=0` la desactiva. Con `fast`, cuyo decode con activaciones int8 difiere del procesamiento exacto
-del prompt, solo se reutilizan estados en un límite de 512 filas escritos por el procesamiento del prompt, nunca una
-respuesta. Dos conversaciones distintas que comparten un documento largo pero divergen
+`STRIX_G4_SERVE_PREFIX=0` la desactiva. `fast` reutiliza cualquier estado, como `default` (sus filas de prompt `a8`
+son iguales a sus filas de decode); con `STRIX_G4_PREFILL_IDENTITY=exact` en `fast` solo se reutilizan estados en un
+límite de 512 filas escritos por el procesamiento del prompt, nunca una respuesta. Dos conversaciones distintas que comparten un documento largo pero divergen
 después todavía no lo comparten.
 
 **Drafter MTP** - [hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter). Un modelo asistente pequeño (el asistente MTP
@@ -265,13 +267,32 @@ El prefill exacto usa aritmética FP32 sin contracción, así que los ids de tok
 las longitudes; `quality` usa el prefill exacto de muchas filas de EXL3. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura
 las pasadas de ocho filas con los mismos bytes.
 
-Rutas de prefill de prompts seleccionables (paquetes no EXL3; todos los perfiles mantienen el prefill exacto salvo que
-se elija una): `STRIX_G4_PREFILL_IDENTITY=v1` usa `g4-wmma-pf-v1`: los lineales usan los GEMM WMMA del prefill con
+Prefill de prompts de `fast`: `a8` (`STRIX_G4_PREFILL_IDENTITY=a8`, válido solo con el decode `g4-a8-v1`; con otra
+identidad de decode se ejecuta el prefill exacto y una línea en stderr lo indica). El prompt se procesa en bloques de
+512 filas con los mismos lineales `g4-a8-v1` que el decode (IU8 WMMA en bloques largos, los kernels del decode hasta 8
+filas) y atención canónica: el KV y los logits de cada fila del prompt son iguales, byte a byte, al decode a8 de las
+mismas filas, así que la cualificación de `g4-a8-v1` lo cubre, y los ids servidos son iguales a los de los mismos
+prompts procesados con filas de decode (C1 y C4). No es idéntico bit a bit al prefill exacto. El servidor imprime
+`gemma4 prefill route a8-many-row (g4-a8-v1 linears, 512-row chunks)` cuando se usa. `STRIX_G4_PREFILL_IDENTITY=exact`
+lo desactiva. Q4_K_M, un nodo, tok/s de prefill, el mismo binario para las tres rutas, un proceso nuevo por ejecución,
+los dos órdenes de ejecución, decode `g4-a8-v1`:
+
+| Prompt | exacto (muchas filas) | **`a8` (`fast`)** | `g4-wmma-pf-v1` + atención flash (no cualificado) |
+|---|---:|---:|---:|
+| 512 | 542 | **1,871** | 2,756 |
+| 2K | 516 | **1,733** | 2,656 |
+| 8K | 477 | **1,498** | 2,591 |
+
+A través del motor (prompt de 8K tokens, un proceso nuevo cada uno, el mismo binario): exacto 16.19 s, **`a8` 5.13 s**,
+v1 + flash 2.97 s.
+
+Otras rutas de prefill de prompts seleccionables (paquetes no EXL3; `default` y `quality` mantienen el prefill exacto
+salvo que se elija una): `STRIX_G4_PREFILL_IDENTITY=v1` usa `g4-wmma-pf-v1`: los lineales usan los GEMM WMMA del prefill con
 operandos FP16 sobre paneles de pesos decodificados una vez al cargar; la atención sigue siendo canónica; el decode no
 cambia. `=v2` usa `g4-wmma-pf-v2` (activaciones divididas hi/lo). Ambas rutas procesan el grueso del prompt: los
 últimos <= 8 tokens del prompt y el ancla (la posición final del prompt, cuyos logits eligen el primer token) usan la
 aritmética del decode (`g4-v1` en `default`), como las filas de decode. Ambas cambian los logits, así que no son exactas.
-Prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente; `fast` mantiene el prefill exacto hasta entonces. Q4_K_M, un nodo, tok/s de prefill, ejecuciones intercaladas en una sesión:
+Prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente; `fast` usa el prefill `a8` hasta entonces. Q4_K_M, un nodo, tok/s de prefill, ejecuciones intercaladas en una sesión:
 
 | Prompt | exacto | `g4-wmma-pf-v1` (`=v1`) | `g4-wmma-pf-v2` (`=v2`) |
 |---|---:|---:|---:|

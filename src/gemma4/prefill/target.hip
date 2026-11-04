@@ -1,4 +1,6 @@
 #include "device.hpp"
+#include "a8_linear.hpp"
+#include "gemma4/kernels/a8_ops.hpp"
 #include "validation.hpp"
 #include "gemma4/kernels/rows_linear.hpp"
 #include "gemma4/kernels/capture_guard.hpp"
@@ -92,6 +94,8 @@ struct DevicePrefill::Impl {
     std::vector<Buffer> storage;
     std::map<const std::uint8_t*, LinearView> uploaded;
     std::map<const std::uint8_t*, std::unique_ptr<PreparedLinear>> prepared;
+    std::map<const std::uint8_t*, std::unique_ptr<A8Prepared>> a8_prepared;
+    Buffer a8_scratch;
     Buffer sliding, global, residual, x, q, k, v, att, out, gate, up, ple, logits, taps;
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, halves, maximum, attention_halves, global_halves, pair_halves, last_row;
     Buffer canonical_scores, canonical_denominators, canonical_packed, exl3_scratch;
@@ -143,7 +147,7 @@ struct DevicePrefill::Impl {
     // swapping queue and scratch, so every helper keeps its single-queue code.
     hipStream_t side_queue = nullptr;
     hipEvent_t forked = nullptr, joined = nullptr, ple_done = nullptr;
-    Buffer side_halves, side_exl3;
+    Buffer side_halves, side_exl3, side_a8;
     // Every EXL3 scratch a chunk may need, sized before the side queue copies its size.
     void reserve_exl3(unsigned rows) {
         std::size_t need = 0;
@@ -162,16 +166,16 @@ struct DevicePrefill::Impl {
         }
         if (side_halves.size() < halves.size()) side_halves.resize(halves.size());
         if (side_exl3.size() < exl3_scratch.size()) side_exl3.resize(exl3_scratch.size());
+        if (side_a8.size() < a8_scratch.size()) side_a8.resize(a8_scratch.size());
     }
     // body runs on the side queue after the queue's last fork() mark; done marks its end.
     void fork() { checked(hipEventRecord(forked, queue)); }
     template <class F> void on_side(hipEvent_t done, F body) {
         checked(hipStreamWaitEvent(side_queue, forked, 0));
-        std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3);
-        try { body(); } catch (...) {
-            std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3); throw;
-        }
-        std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3);
+        const auto swap = [&] { std::swap(queue, side_queue); std::swap(halves, side_halves); std::swap(exl3_scratch, side_exl3); std::swap(a8_scratch, side_a8); };
+        swap();
+        try { body(); } catch (...) { swap(); throw; }
+        swap();
         checked(hipEventRecord(done, side_queue));
     }
     bool split_panels = false;  // a hilo policy: conversion scratch holds high and low panels
@@ -180,6 +184,7 @@ struct DevicePrefill::Impl {
         const auto& c = w.config;
         const std::size_t hbytes = rows * std::size_t(c.hidden) * sizeof(float), abytes = rows * std::size_t(c.heads) * 512 * sizeof(float);
         for (auto* p : {&residual, &x, &out}) p->resize(hbytes);
+        if (stats.linears == Linears::a8) a8_scratch.resize(a8_scratch_bytes(rows, 10752));
         for (auto* p : {&q, &att}) p->resize(abytes);
         for (auto* p : {&k, &v}) p->resize(rows * std::size_t(c.kv_heads) * 512 * sizeof(float));
         gate.resize(rows * std::size_t(std::max(c.inter, c.ple_dim)) * sizeof(float)); up.resize(gate.size());
@@ -303,6 +308,48 @@ struct DevicePrefill::Impl {
     }
     // g4-v1 rows linear, or the EXL3 pack's own identity: many-row core for
     // chunks, its eight-row decode linear otherwise (same bytes either way).
+    // g4-a8-v1: up to eight rows take the decode target's a8 kernels, longer chunks the IU8 WMMA form
+    // (same bytes; panels prepared on first use).
+    // quantized: the queue's scratch already holds this input's codes (the previous a8 dot on this queue
+    // read the same rows and width).
+    void a8_dot(LinearView matrix, const float* input, unsigned rows, float* output, bool quantized = false) {
+        if (rows <= 8) {
+            const std::size_t need = std::size_t(rows) * (matrix.inputs + std::size_t(matrix.inputs / a8::group_width) * sizeof(a8::Meta));
+            if (a8_scratch.size() < need) throw std::logic_error("g4-a8-v1 scratch not sized");
+            const gpu::A8Rows q{a8_scratch.as<std::int8_t>(), reinterpret_cast<a8::Meta*>(a8_scratch.as<std::int8_t>() + std::size_t(rows) * matrix.inputs),
+                                matrix.inputs};
+            if (!quantized) gpu::a8_quantize(input, rows, matrix.inputs, q, queue);
+            if (!gpu::a8_linear(matrix, q, rows, output, {}, queue, failure.as<unsigned>())) throw std::logic_error("g4-a8-v1 decode linear refused");
+            return;
+        }
+        auto it = a8_prepared.find(matrix.data);
+        if (it == a8_prepared.end()) it = prepare_a8(matrix);
+        if (a8_scratch.size() < a8_scratch_bytes(rows, matrix.inputs)) throw std::logic_error("g4-a8-v1 scratch not sized");
+        a8_linear(*it->second, input, rows, output, a8_scratch.data(), failure.as<unsigned>(), queue, !quantized);
+    }
+    // FFN down under g4-a8-v1: the GELU product and its quantization in one launch, then the a8 linear.
+    void a8_down(const std::string& name, LinearView down, unsigned rows) {
+        ranges.push_back({name, 0.0F});
+        const auto before = stats.linear_ms;
+        auto it = a8_prepared.find(down.data);
+        if (it == a8_prepared.end()) it = prepare_a8(down);
+        timing(stats.linear_ms, [&] {
+            a8_product_linear(*it->second, gate.as<float>(), up.as<float>(), rows, out.as<float>(), a8_scratch.data(), failure.as<unsigned>(), queue);
+        });
+        if (profile) {
+            auto& p = stats.kernels[name]; ++p.calls; p.ms += stats.linear_ms - before; p.matrix_ms += stats.linear_ms - before;
+            p.flops += 2.0 * rows * down.inputs * down.outputs;
+        }
+    }
+    // The second of two consecutive a8 dots over the same input reuses its codes.
+    bool a8_same(LinearView first, LinearView second) const {
+        return stats.linears == Linears::a8 && a8::quantized(first.format) && a8::quantized(second.format) && first.inputs == second.inputs;
+    }
+    std::map<const std::uint8_t*, std::unique_ptr<A8Prepared>>::iterator prepare_a8(LinearView matrix) {
+        auto p = std::make_unique<A8Prepared>(matrix, queue);
+        stats.prepared_bytes += p->panels().size() + p->scales().size();
+        return a8_prepared.emplace(matrix.data, std::move(p)).first;
+    }
     void exact_linear(LinearView matrix, const float* input, unsigned rows, float* output) {
         if (matrix.format != WeightFormat::exl3_mul1) {
             gpu::linear_rows(matrix, input, rows, output, queue, failure.as<unsigned>());
@@ -343,7 +390,16 @@ struct DevicePrefill::Impl {
         const auto index = unsigned(ranges.size());
         ranges.push_back({name, 0.0F});
         const auto before = stats.linear_ms;
-        const auto precision = stats.linears == Linears::exact ? LinearPrecision::exact : precision_of(name);
+        if (stats.linears == Linears::a8 && a8::quantized(matrix.format)) {
+            timing(stats.linear_ms, [&] { a8_dot(matrix, input, rows, output, preconverted); });
+            if (profile) {
+                auto& p = stats.kernels[name]; ++p.calls; p.ms += stats.linear_ms - before; p.matrix_ms += stats.linear_ms - before;
+                p.flops += 2.0 * rows * matrix.inputs * matrix.outputs;
+                p.bytes += double(rows) * (matrix.inputs + matrix.outputs) * sizeof(float) + double(matrix.inputs) * matrix.outputs;
+            }
+            return;
+        }
+        const auto precision = stats.linears != Linears::wmma ? LinearPrecision::exact : precision_of(name);
         if (precision == LinearPrecision::exact) {
             if (preconverted) throw std::logic_error("exact linear cannot read pre-converted panels");
             timing(stats.linear_ms, [&] { exact_linear(matrix, input, rows, output); });
@@ -375,7 +431,7 @@ struct DevicePrefill::Impl {
     // q's conversion left in halves (same FP16 operands, same bytes) when all
     // three run panel GEMMs of one precision on non-EXL3 packs.
     bool share_qkv_panels(const std::string& name, LinearView wq, LinearView wk, LinearView wv) {
-        if (stats.linears == Linears::exact || stats.direct < 3 || !qkv_share_enabled()) return false;
+        if (stats.linears != Linears::wmma || stats.direct < 3 || !qkv_share_enabled()) return false;
         const auto mode = precision_of(name + "q");
         if (mode == LinearPrecision::exact || precision_of(name + "k") != mode || precision_of(name + "v") != mode) return false;
         for (const auto& m : {wq, wk, wv})
@@ -451,6 +507,10 @@ DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency reside
         for (const auto& y : b.w.layer)
             for (auto matrix : {y.q, y.k, y.v, y.o, y.gate, y.up, y.down, y.ple_gate, y.ple_projection}) prepare(matrix);
     }
+    if (linears == Linears::a8)
+        for (const auto& y : b.w.layer)
+            for (auto matrix : {y.q, y.k, y.v, y.o, y.gate, y.up, y.down, y.ple_gate, y.ple_projection})
+                if (a8_prefill_supported(matrix) && !b.a8_prepared.contains(matrix.data)) b.prepare_a8(matrix);
     const auto& c = b.w.config;
     const std::size_t hbytes = chunk_rows * std::size_t(c.hidden) * sizeof(float), abytes = chunk_rows * std::size_t(c.heads) * 512 * sizeof(float);
     for (auto* p : {&b.residual, &b.x, &b.out}) p->resize(hbytes);
@@ -629,7 +689,7 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             const auto q_slot = unsigned(b.ranges.size());
             const auto kv = [&] {
                 if (share) { b.range_aliases.push_back({q_slot + 1, q_slot}); b.range_aliases.push_back({q_slot + 2, q_slot}); }
-                b.dot(name + "k", y.k, b.x.as<float>(), b.k.as<float>(), n, share); b.dot(name + "v", y.v, b.x.as<float>(), b.v.as<float>(), n, share);
+                b.dot(name + "k", y.k, b.x.as<float>(), b.k.as<float>(), n, share); b.dot(name + "v", y.v, b.x.as<float>(), b.v.as<float>(), n, share || b.a8_same(y.k, y.v));
                 b.head(b.k, y.k_norm, n, c.kv_heads, d, global);
                 gpu::norm(b.v.as<float>(), {}, b.v.as<float>(), n * c.kv_heads, d, b.queue, b.failure.as<unsigned>());
                 gpu::store_overlay(b.k.as<float>(), b.v.as<float>(), b.writes.as<gpu::KvWrite>() + std::size_t(l) * n, n, c.kv_heads * d, b.queue);
@@ -671,13 +731,18 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             if (!b.add(b.out, y.post_attention_norm, n, {}, y.pre_ffn_norm)) b.norm(b.residual, y.pre_ffn_norm, b.x, n, c.hidden);
             if (b.stats.linears == Linears::exact && b.exl3_ffn(name, y.gate, y.up, y.down, n)) {
                 // EXL3 many-row FFN, down included.
-            } else if (b.stats.linears == Linears::exact) {
+            } else if (b.stats.linears != Linears::wmma) {
                 // The decode target's gate_up: gelu_tanh(gate) * up stored per element.
-                if (y.gate.format == WeightFormat::exl3_mul1 || y.up.format == WeightFormat::exl3_mul1) {
+                bool down_done = false;
+                if (y.gate.format == WeightFormat::exl3_mul1 || y.up.format == WeightFormat::exl3_mul1 || b.stats.linears == Linears::a8) {
                     // EXL3 packs: separate linears (each profiled), then the decode target's gelu product.
                     b.dot(name + "gate", y.gate, b.x.as<float>(), b.gate.as<float>(), n);
-                    b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), n);
-                    b.record(name + "gelu_product", [&] { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue); });
+                    b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), n, b.a8_same(y.gate, y.up));
+                    if (b.stats.linears == Linears::a8 && n > 8 && a8_prefill_supported(y.down)) {
+                        b.a8_down(name + "down", y.down, n);
+                        down_done = true;
+                    } else
+                        b.record(name + "gelu_product", [&] { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue); });
                 } else {
                     b.ranges.push_back({name + "gate", 0.0F}); b.ranges.push_back({name + "up", 0.0F});
                     b.record(name + "gate_up", [&] {
@@ -685,7 +750,7 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                                           gpu::rows_linear_enabled(), -1, b.up.as<float>(), -1, b.fuse);
                     }, 4.0 * n * y.gate.inputs * y.gate.outputs, true);
                 }
-                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
+                if (!down_done) b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
             } else if (b.exl3_pair(name, y.gate, y.up, y.down, n)) {
                 b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);
             } else if (b.fused(name, y.gate, y.up, y.down)) {
