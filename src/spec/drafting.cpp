@@ -64,8 +64,15 @@ void ContextProposer::commit(std::span<const std::uint32_t> tokens) {
 
 Proposal ContextProposer::propose(std::span<const std::uint32_t> extra, std::uint32_t max_len) {
     Proposal p;
+    propose(p, extra, max_len);
+    return p;
+}
+
+void ContextProposer::propose(Proposal& p, std::span<const std::uint32_t> extra, std::uint32_t max_len) {
+    p.tokens.clear();
+    p.match_length = 0; p.distance = 0; p.resumed = false; p.run = 0;
     max_len = std::min(max_len, max_proposal);
-    if (max_len == 0 || index_->tokens() < 2) return p;
+    if (max_len == 0 || index_->tokens() < 2) return;
     std::array<std::uint32_t, max_proposal> buffer{};
     const std::span<std::uint32_t> out(buffer.data(), max_len);
     if (cursor_valid_) {
@@ -83,14 +90,14 @@ Proposal ContextProposer::propose(std::span<const std::uint32_t> extra, std::uin
                 p.distance = index_->tokens() - 1 - cursor_;
                 p.resumed = true;
                 p.run = run_id_;
-                return p;
+                return;
             }
         }
     }
     const auto m = index_->longest(extra, config_.min_match, strix::lookup::max_draft);
-    if (m.length == 0) return p;
+    if (m.length == 0) return;
     const auto n = index_->continuation(m.source_end, extra, out);
-    if (n == 0) return p;
+    if (n == 0) return;
     p.tokens.assign(buffer.begin(), buffer.begin() + std::ptrdiff_t(n));
     p.match_length = m.length;
     p.distance = m.distance;
@@ -100,7 +107,6 @@ Proposal ContextProposer::propose(std::span<const std::uint32_t> extra, std::uin
         run_ = m.length;
         p.run = ++run_id_;
     }
-    return p;
 }
 
 // ------------------------------------------------------------------------------------------------ Arbiter

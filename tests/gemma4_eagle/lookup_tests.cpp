@@ -200,7 +200,11 @@ struct GoodInner final : en::DraftSession {
         return c;
     }
 };
-struct Run { std::vector<std::vector<std::uint32_t>> ids; std::uint64_t cycles = 0, accepted = 0, proposed = 0; };
+struct Run {
+    std::vector<std::vector<std::uint32_t>> ids;
+    std::uint64_t cycles = 0, accepted = 0, proposed = 0;
+    std::vector<std::int64_t> spec_passes, confident;  // per prompt: spec_stats passes (-1: none), confidence cycles
+};
 Run decode(const en::DraftFactory& f, const std::vector<std::vector<std::uint32_t>>& prompts, std::size_t streams, en::DraftMode mode) {
     Run run;
     for (std::size_t i = 0; i < prompts.size(); i += streams) {
@@ -224,6 +228,11 @@ Run decode(const en::DraftFactory& f, const std::vector<std::vector<std::uint32_
                 run.accepted += std::uint64_t(p->find("accepted")->as_int());
                 run.proposed += std::uint64_t(p->find("proposed")->as_int());
             }
+            const auto* ss = receipt.find("spec_stats");
+            run.spec_passes.push_back(ss ? std::int64_t(ss->find("passes")->as_int()) : -1);
+            const auto* acc = receipt.find("acceptance");
+            const auto* cc = acc ? acc->find("confidence_cycles") : nullptr;  // present only with confidence on
+            run.confident.push_back(cc ? std::int64_t(cc->as_int()) : 0);
         }
     }
     return run;
@@ -286,6 +295,11 @@ void coordinator_tests() {
         const auto s = decode(lk::hybrid_factory(arm.inner, spec_cfg), prompts, arm.streams, en::DraftMode::automatic);
         for (std::size_t i = 0; i < prompts.size(); ++i)
             LK_CHECK(s.ids[i] == off.ids[i], "spec arbiter (%s) ids == OFF (prompt %zu)", arm.name, i);
+        // spec_stats count every pass the drafting layer decided (each confidence cycle), the final one included
+        if (arm.streams == 1)
+            for (std::size_t i = 0; i < prompts.size(); ++i)
+                LK_CHECK(s.spec_passes[i] == s.confident[i], "spec arbiter (%s) spec_stats passes %lld == confidence cycles %lld (prompt %zu)",
+                         arm.name, (long long)s.spec_passes[i], (long long)s.confident[i], i);
         if (arm.streams == 1 && !arm.strong) LK_CHECK(s.cycles > 0 && s.accepted > 0, "spec arbiter (%s) used lookup", arm.name);
         std::printf("lookup: spec arbiter, %s: ids == OFF, %llu lookup cycles, %llu/%llu accepted\n", arm.name,
                     (unsigned long long)s.cycles, (unsigned long long)s.accepted, (unsigned long long)s.proposed);
