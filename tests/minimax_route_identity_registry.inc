@@ -28,7 +28,9 @@
 {"prefill-tile", 'a', "matrix+fixed splits+WMMA chain", "mmx_prefill_core.hpp header contract; mmx_prefill.hip TILE comment", ""},
 // src/minimax/moe/mmx_prefill.hip:639
 {"prefill-mt", 'a', "matrix+fixed splits+per-row WMMA chain", "mm_defaults.cpp pf_mtfit bitwise gate; core contract", ""},
-// src/minimax/moe/mmx_prefill.hip:1155
+// src/minimax/moe/mmx_prefill.hip:1122
+{"prefill-pipe-pair", 'a', "matrix+fixed splits+per-row WMMA chain; paired bands decode half the B tiles and share them through LDS, same operands", "hip_mmx_moe_bench.hip check_prefill_core8 pipe pair cells (partials/xt/at/output bitwise); --ab pfpair PAIR state/final rows", ""},
+// src/minimax/moe/mmx_prefill.hip:1197
 {"prefill-tail-stream", 'a', "matrix+fixed splits+per-row WMMA chain; tail classes write disjoint partials, joined before the stage consumer", "hip_mmx_moe_bench.hip check_prefill_core8 tail stream cells (partials/xt/at/output bitwise); --ab pftails PAIR state/final rows", ""},
 // src/minimax/moe/mmx_prefill.hip:573
 {"prefill-core", 'a', "matrix+fixed splits+per-row WMMA chain", "mm_defaults.cpp pf_core_v4; every split partial bitwise gate", ""},

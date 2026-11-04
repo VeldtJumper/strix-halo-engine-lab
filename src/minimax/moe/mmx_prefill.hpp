@@ -76,6 +76,9 @@ void set_prefill_gufuse_debug(bool on, float* intermediates = nullptr, bool prod
 // PIPE is opt-in; -1 restores the environment. Getter preserves explicit overrides across A/B runs.
 void set_prefill_pipe(int value);
 int prefill_pipe_override();
+// Under PIPE: paired MT8 bands. -1 = STRIX_MMX_PREFILL_PIPE_PAIR (default auto: calls >= 2048 rows), 0 = off,
+// 1 = every call, 2 = auto.
+void set_prefill_pipe_pair(int value);
 // v4 + mtfit tail classes beside the MT8 launch on a side stream: -1 = STRIX_MMX_PREFILL_TAIL_STREAM (default on),
 // 0 = off, 1 = on. cleanup_ releases the side stream and its events (Engine teardown).
 void set_prefill_tail_stream(int on);

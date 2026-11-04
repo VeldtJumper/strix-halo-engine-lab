@@ -1770,6 +1770,21 @@ struct Bench {
                     std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
                 }
             }
+            {  // paired MT8 PIPE bands on every call vs off
+                struct RestorePair { ~RestorePair() { opt::set_prefill_pipe_pair(-1); } } restore_pair;
+                for (int pipe : {1, 2}) {
+                    opt::set_prefill_pipe_pair(0);
+                    const PfDump plain = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    opt::set_prefill_pipe_pair(1);
+                    const PfDump paired = run_dump(q, 3, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const bool exact = plain.part == paired.part && plain.xt == paired.xt && plain.at == paired.at &&
+                                       same_bits(plain.out, paired.out) && off.part == paired.part && same_bits(off.out, paired.out);
+                    const std::string cell = "pipe pair PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
+                    check(exact, cell + " raw partials/transformed inputs/down inputs/output");
+                    if (!exact) throw std::runtime_error(cell + " failed bitwise qualification");
+                    std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
+                }
+            }
             for (int core8 : {1, 2}) {
                 const PfDump on = run_dump(q, 3, mtfit, true, core8);
                 const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at;
@@ -2121,6 +2136,53 @@ struct Bench {
                             name.c_str(), mtfit, kPipe[arm], kTail[arm], times[arm][0], times[arm][1], times[arm][2], times[arm][3],
                             times[arm][4], total);
             }
+        }
+    }
+    // M4 auto-select receipt: whole MoE call, production PIPE (A) vs paired bands (B), 10 A B B A blocks per T, real
+    // routes. Per block delta = mean(B) / mean(A) - 1; mean and a normal 95 % interval over the blocks.
+    void bench_pair_abba() {
+        struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1); opt::set_prefill_core(-1); opt::set_prefill_mtfit(-1); } } restore;
+        for (unsigned T : {1024U, 2048U, 4096U}) {
+            const std::string cell = "pairabba T" + std::to_string(T);
+            if (!wanted(cell)) continue;
+            Prefill q = make_prefill_routes(T);
+            hipEvent_t e0, e1;
+            hip_ok(hipEventCreate(&e0), "abba event");
+            hip_ok(hipEventCreate(&e1), "abba event");
+            auto call = [&](int pair) {
+                opt::set_prefill_core(3);
+                opt::set_prefill_mtfit(1);
+                opt::set_prefill_pipe_pair(pair);
+                hip_ok(hipDeviceSynchronize(), "abba idle");
+                hip_ok(hipEventRecord(e0, nullptr), "abba e0");
+                for (int i = 0; i < 4; ++i) prefill_B(q);
+                hip_ok(hipEventRecord(e1, nullptr), "abba e1");
+                hip_ok(hipEventSynchronize(e1), "abba e1 sync");
+                float ms = 0;
+                hip_ok(hipEventElapsedTime(&ms, e0, e1), "abba elapsed");
+                return static_cast<double>(ms) / 4.0;
+            };
+            call(0);
+            call(1);  // warm both forms
+            std::vector<double> delta;
+            double sa = 0, sb = 0;
+            for (int b = 0; b < 10; ++b) {
+                const double a1 = call(0), b1 = call(1), b2 = call(1), a2 = call(0);
+                delta.push_back((b1 + b2) / (a1 + a2) - 1.0);
+                sa += a1 + a2;
+                sb += b1 + b2;
+            }
+            double mean = 0, var = 0;
+            for (double d : delta) mean += d / static_cast<double>(delta.size());
+            for (double d : delta) var += (d - mean) * (d - mean) / static_cast<double>(delta.size() - 1);
+            const double half = 1.96 * std::sqrt(var / static_cast<double>(delta.size()));
+            std::printf("%s: MoE call A %.3f ms B(pair) %.3f ms | per-block B/A-1 mean %+.2f %% (95 %% CI %+.2f..%+.2f %%), %d of %zu blocks faster\n",
+                        cell.c_str(), sa / 20.0, sb / 20.0, 100.0 * mean, 100.0 * (mean - half), 100.0 * (mean + half),
+                        static_cast<int>(std::count_if(delta.begin(), delta.end(), [](double d) { return d < 0; })), delta.size());
+            std::fflush(stdout);
+            (void)hipEventDestroy(e0);
+            (void)hipEventDestroy(e1);
+            free_prefill(q);
         }
     }
     void test_prefill_pipe() {
@@ -3041,6 +3103,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) section("bench_router_rows", [&] { b.bench_router_rows(); });
             if (!o.no_moe) section("bench_prefill", [&] { b.bench_prefill(); });
             if (!o.no_moe) section("bench_prefill_gufuse", [&] { b.bench_prefill_gufuse(); });
+            if (!o.no_moe) section("bench_pair_abba", [&] { b.bench_pair_abba(); });
             if (!o.no_moe) section("bench_prefill_v2", [&] { b.bench_prefill_v2(); });
             if (!o.no_moe) section("bench_prefill_gather", [&] { b.bench_prefill_gather(); });
             section("bench_prefill_dense", [&] { b.bench_prefill_dense(); });
