@@ -2,6 +2,7 @@
 
 // Prompt-lookup (n-gram) drafting for the gemma4 engine: the index is the engines' shared one (strix/lookup/index.hpp).
 #include "strix/lookup/index.hpp"
+#include "strix/spec/drafting.hpp"
 
 namespace strix::gemma4::engine::lookup {
 using strix::lookup::Index;
@@ -23,6 +24,7 @@ struct LookupConfig {
     std::uint32_t min_length = 2;    // STRIX_G4_LOOKUP_MIN (1..16): shortest match proposed
     double margin = 1.0;             // STRIX_G4_LOOKUP_MARGIN (1..2): lookup must beat the alternative by this factor
     std::uint32_t evidence = 4;      // shadow-scored candidates a match bucket needs before it may be used
+    bool spec_arbiter = false;       // STRIX_SPEC_ARBITER=1: the shared strix::spec proposer + arbiter decide (C1)
     IndexConfig index;               // STRIX_G4_LOOKUP_TOKENS (capacity)
     [[nodiscard]] static LookupConfig from_environment();
     [[nodiscard]] strix::serve::Json json() const;

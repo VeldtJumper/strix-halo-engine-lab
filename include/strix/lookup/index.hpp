@@ -25,6 +25,7 @@ struct Match {
     std::uint64_t distance = 0;                  // current end - earlier occurrence end (recency)
     std::array<std::uint32_t, max_draft> next{}; // continuation after the earlier occurrence
     std::uint32_t available = 0;                 // valid entries of `next`
+    std::uint64_t source_end = 0;                // stream(+extra) position of the earlier occurrence's last token
 };
 
 class Index {
@@ -36,6 +37,15 @@ public:
     // continuation is taken from the stream (+ extra) after that occurrence, up to `want` tokens.
     [[nodiscard]] virtual Match longest(std::span<const std::uint32_t> extra, std::uint32_t min_length,
                                         std::uint32_t want) const = 0;
+    // Tokens of stream + extra at positions source_end + 1, source_end + 2, ... (at most out.size(), never past the
+    // last position, never older than the ring): a continuation longer than `next`, e.g. a copy cursor. Returns the
+    // count written.
+    [[nodiscard]] virtual std::size_t continuation(std::uint64_t source_end, std::span<const std::uint32_t> extra,
+                                                   std::span<std::uint32_t> out) const = 0;
+    // Token at stream position `position` (committed tokens only; position < tokens() and within the ring).
+    [[nodiscard]] virtual std::uint32_t at(std::uint64_t position) const = 0;
+    // Oldest stream position still held by the ring.
+    [[nodiscard]] virtual std::uint64_t oldest() const = 0;
     [[nodiscard]] virtual std::uint64_t tokens() const = 0;
     [[nodiscard]] virtual std::size_t bytes() const = 0;
 };

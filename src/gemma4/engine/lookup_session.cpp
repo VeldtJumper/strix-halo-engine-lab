@@ -45,7 +45,14 @@ struct Moments {
 class HybridSession final : public DraftSession {
 public:
     HybridSession(std::unique_ptr<DraftSession> inner, const LookupConfig& config)
-        : inner_(std::move(inner)), config_(config), index_(make_ngram_index(config.index)) {}
+        : inner_(std::move(inner)), config_(config), index_(make_ngram_index(config.index)) {
+        if (config_.spec_arbiter) {
+            proposer_ = std::make_unique<strix::spec::ContextProposer>(spec_proposer_config());
+            arbiter_ = std::make_unique<strix::spec::Arbiter>();
+            // Seed: the release-bench row costs relative to R1 (re-learned from the stream's measured cycles).
+            for (std::uint32_t r = 1; r <= 8; ++r) arbiter_->seed_cost(r, 17.89 * (1 + extra_rows[r - 1]));
+        }
+    }
 
     std::array<std::uint32_t, 7> propose(std::uint32_t anchor, std::uint64_t position) override {
         return propose_window(anchor, position, max_draft);
@@ -55,7 +62,10 @@ public:
         close_cycle();
         if (inner_) return inner_->propose_window(anchor, position, k);
         std::array<std::uint32_t, 7> out{};
-        if (synced(anchor, position)) {
+        if (synced(anchor, position) && proposer_) {  // STRIX_SPEC_ARBITER=1: the shared proposer is the only index
+            const auto p = proposer_->propose({}, std::min(k, max_draft));
+            for (std::size_t i = 0; i < p.tokens.size(); ++i) out[i] = p.tokens[i];
+        } else if (synced(anchor, position)) {
             const auto m = index_->longest({}, config_.min_length, std::min(k, max_draft));
             for (std::uint32_t i = 0; i < m.available; ++i) out[i] = m.next[i];
             remember(m, position);
@@ -75,6 +85,7 @@ public:
                                 const ConfidenceConfig& config) override {
         close_cycle();
         cycle_start_ = Clock::now();
+        if (arbiter_) return propose_spec(anchor, position, kmax, config);
         Match m;
         if (synced(anchor, position)) m = index_->longest({}, config_.min_length, std::min(kmax, max_draft));
         const std::uint32_t cap = choose(m, kmax);
@@ -115,7 +126,10 @@ public:
     }
     void publish() override {
         for (std::size_t i = 0; i < staged_tokens_.size(); ++i) feed(staged_tokens_[i], staged_positions_[i] + 1);
-        if (kind_ != Kind::none) emitted_ = std::uint32_t(staged_tokens_.size());
+        if (kind_ != Kind::none) {
+            emitted_ = std::uint32_t(staged_tokens_.size());
+            emitted_tokens_ = staged_tokens_;
+        }
         staged_tokens_.clear(); staged_positions_.clear();
         if (inner_) inner_->publish();
     }
@@ -127,7 +141,8 @@ public:
         if (inner_) inner_->report(receipt);
         auto j = config_.json();
         j.set("cycles", lookup_cycles_); j.set("proposed", lookup_proposed_); j.set("accepted", lookup_accepted_);
-        j.set("index_tokens", index_->tokens()); j.set("index_bytes", std::uint64_t(index_->bytes()));
+        j.set("index_tokens", proposer_ ? proposer_->tokens() : index_->tokens());
+        j.set("index_bytes", std::uint64_t(proposer_ ? proposer_->bytes() : index_->bytes()));
         j.set("shadow_scored", scored_);
         auto per = strix::serve::Json::array();
         for (std::size_t b = 0; b < buckets; ++b) {
@@ -137,6 +152,11 @@ public:
         }
         j.set("bucket_survival", per); // buckets: match length 1, 2-3, 4-7, 8-15, 16+
         receipt.set("prompt_lookup", j);
+        if (arbiter_) {
+            auto stats = spec_stats_;
+            stats.index_bytes = proposer_->bytes();
+            receipt.set("spec_stats", strix::serve::parse_json(stats.json()));
+        }
     }
 
 private:
@@ -181,8 +201,17 @@ private:
         return cap;
     }
     void feed(std::uint32_t token, std::uint64_t position) {
-        if (have_last_ && position != last_position_ + 1) { index_ = make_ngram_index(config_.index); pending_.clear(); }
-        index_->append(token);
+        if (have_last_ && position != last_position_ + 1) {
+            index_ = make_ngram_index(config_.index);
+            pending_.clear();
+            if (arbiter_) {
+                proposer_ = std::make_unique<strix::spec::ContextProposer>(spec_proposer_config());
+                arbiter_->reset_pending();
+            }
+        }
+        // One n-gram index per stream: the legacy one only while the legacy selector decides.
+        if (proposer_) proposer_->commit(std::span<const std::uint32_t>(&token, 1));
+        else index_->append(token);
         last_token_ = token; last_position_ = position; have_last_ = true;
         // Shadow scoring: each pending candidate whose next unscored position is this one (censor-aware).
         for (auto it = pending_.begin(); it != pending_.end();) {
@@ -207,10 +236,63 @@ private:
         for (std::uint32_t i = 0; i < m.available; ++i) c.tokens[i] = m.next[i];
         if (pending_.size() < 64) pending_.push_back(c);
     }
+    [[nodiscard]] strix::spec::ProposerConfig spec_proposer_config() const {
+        strix::spec::ProposerConfig c;
+        c.index = config_.index;
+        c.min_match = config_.min_length;
+        return c;
+    }
+    // STRIX_SPEC_ARBITER=1 (C1 confidence path): the shared proposer + arbiter choose lookup(k) / the inner drafter
+    // (scored on its measured upper-bound rate, it picks its own window) / a plain step. Verify windows <= 8 rows.
+    Confident propose_spec(std::uint32_t anchor, std::uint64_t position, std::uint32_t kmax, const ConfidenceConfig& config) {
+        strix::spec::Proposal proposal;
+        if (synced(anchor, position)) {
+            const auto t = Clock::now();
+            proposal = proposer_->propose({}, std::min(kmax, max_draft));
+            spec_stats_.lookup_time(std::chrono::duration<double, std::micro>(Clock::now() - t).count());
+        }
+        strix::spec::StepInput in;
+        in.lookup = &proposal;
+        in.max_rows = std::min(kmax, max_draft) + 1;
+        in.context = position;
+        if (inner_) {
+            in.model_max_k = std::min(kmax, max_draft);
+            in.model_pass_ms = inner_stats_.n > 0 ? inner_stats_.mean_ms() : 1.0;
+            in.model_pass_tokens = inner_stats_.n > 0 ? inner_stats_.upper_rate() * inner_stats_.mean_ms() : 0.0;
+        }
+        const auto d = arbiter_->decide(in);
+        spec_bucket_ = proposal.bucket();
+        spec_context_ = position;
+        Confident out;
+        if (d.source == strix::spec::Source::lookup && d.k > 0) {
+            for (std::uint32_t i = 0; i < d.k; ++i) out.tokens[i] = proposal.tokens[i];
+            out.window = out.drafted = d.k;
+            kind_ = Kind::lookup; window_ = d.k;
+            ++lookup_cycles_; lookup_proposed_ += d.k;
+        } else if (d.source == strix::spec::Source::model && inner_) {
+            const auto t = Clock::now();
+            out = inner_->propose_confident(anchor, position, kmax, config);
+            draft_ms_ = std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+            kind_ = Kind::inner; window_ = out.window;
+        } else {
+            kind_ = Kind::plain; window_ = 0;
+        }
+        return out;
+    }
     // At the next cycle start: the previous cycle's measured wall time and emitted tokens.
     void close_cycle() {
         if (kind_ == Kind::none) return;
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - cycle_start_).count();
+        if (arbiter_ && emitted_ && ms > 0) {
+            namespace sp = strix::spec;
+            const auto source = kind_ == Kind::lookup ? sp::Source::lookup : kind_ == Kind::inner ? sp::Source::model
+                                                                                                    : sp::Source::serial;
+            const std::uint32_t accepted = std::min(window_, emitted_ - 1);
+            const sp::Outcome o{source, spec_bucket_, window_, accepted, window_ + 1, std::max(0.0, ms - draft_ms_),
+                                draft_ms_, spec_context_};
+            arbiter_->observe(o, emitted_tokens_);
+            spec_stats_.record(o, emitted_);
+        }
         if (emitted_ && ms > 0) {
             if (kind_ == Kind::inner) {
                 inner_stats_.add(emitted_, ms);
@@ -247,6 +329,12 @@ private:
     std::unique_ptr<DraftSession> inner_;
     LookupConfig config_;
     std::unique_ptr<Index> index_;
+    std::unique_ptr<strix::spec::ContextProposer> proposer_;  // STRIX_SPEC_ARBITER=1 only
+    std::unique_ptr<strix::spec::Arbiter> arbiter_;
+    strix::spec::SpecStats spec_stats_;
+    std::vector<std::uint32_t> emitted_tokens_;
+    std::uint32_t spec_bucket_ = 0;
+    std::uint64_t spec_context_ = 0;
     std::vector<std::uint32_t> staged_tokens_;
     std::vector<std::uint64_t> staged_positions_;
     std::vector<Pending> pending_;
@@ -276,11 +364,13 @@ LookupConfig LookupConfig::from_environment() {
     c.min_length = std::uint32_t(env_value("STRIX_G4_LOOKUP_MIN", c.min_length, 1, 16));
     c.margin = env_value("STRIX_G4_LOOKUP_MARGIN", c.margin, 1, 2);
     c.index.capacity = std::uint32_t(env_value("STRIX_G4_LOOKUP_TOKENS", c.index.capacity, 64, double(1U << 22)));
+    c.spec_arbiter = env_value("STRIX_SPEC_ARBITER", 0, 0, 1) == 1;
     return c;
 }
 strix::serve::Json LookupConfig::json() const {
     return strix::serve::Json(strix::serve::Json::Object{{"enabled", enabled}, {"min_length", std::uint64_t(min_length)},
-        {"margin", margin}, {"evidence", std::uint64_t(evidence)}, {"capacity", std::uint64_t(index.capacity)}});
+        {"margin", margin}, {"evidence", std::uint64_t(evidence)}, {"capacity", std::uint64_t(index.capacity)},
+        {"spec_arbiter", spec_arbiter}});
 }
 DraftFactory hybrid_factory(DraftFactory inner, LookupConfig config) {
     return [inner = std::move(inner), config]() -> std::unique_ptr<DraftSession> {

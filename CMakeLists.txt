@@ -132,6 +132,10 @@ add_library(strix_lookup STATIC src/lookup/index.cpp)
 target_include_directories(strix_lookup PUBLIC include)
 target_compile_features(strix_lookup PUBLIC cxx_std_20)
 strix_target_warnings(strix_lookup)
+# Shared drafting layer: context proposer (copy cursor, long proposals), lookup/drafter/serial arbiter, stats line.
+add_library(strix_spec STATIC src/spec/drafting.cpp)
+target_link_libraries(strix_spec PUBLIC strix_lookup)
+strix_target_warnings(strix_spec)
 
 if(STRIX_CUDA_DS41_ONLY)
 # Only what the deepseek41 family and the ds41 libraries link: GGUF reader, manifest, binding, content
@@ -495,6 +499,10 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-spec-drafting-tests tests/spec_drafting_tests.cpp)
+    target_link_libraries(strix-spec-drafting-tests PRIVATE strix_spec)
+    strix_target_warnings(strix-spec-drafting-tests)
+    add_test(NAME strix-spec-drafting-tests COMMAND strix-spec-drafting-tests)
     add_executable(strix-batch-nested-recipe-tests tests/batch_nested_recipe_tests.cpp)
     target_include_directories(strix-batch-nested-recipe-tests PRIVATE include)
     target_compile_features(strix-batch-nested-recipe-tests PRIVATE cxx_std_20)
