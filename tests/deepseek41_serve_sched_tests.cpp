@@ -275,20 +275,20 @@ void auto_rows() {
     r.own_weights = gib(7.62);
     r.drafter = sc::drafter_peak_bytes(7966294016ULL);
     expect(sc::auto_prefill_rows(49152, r) == 16384U, "auto rows: measured pair point -> 16384");
-    expect(sc::prefill_piece_bytes(16384, 49152) > gib(6.37), "auto rows: scratch estimate covers the measured 6.37 GiB at 16384 rows");
-    expect(sc::prefill_piece_bytes(32768, 49152) > gib(11.69), "auto rows: scratch estimate covers the measured 11.69 GiB at 32768 rows");
+    expect(sc::prefill_piece_bytes(16384, 49152) > gib(6.37 - 1.25), "auto rows: scratch estimate covers the measured 6.37 GiB at 16384 rows less the local-row streams");
+    expect(sc::prefill_piece_bytes(32768, 49152) > gib(11.69 - 2.50), "auto rows: scratch estimate covers the measured 11.69 GiB at 32768 rows less the local-row streams");
     expect(sc::drafter_peak_bytes(7966294016ULL) > gib(15.1), "auto rows: drafter peak covers the measured 15.1 GiB");
     auto t = r;
     t.mem_available = gib(31.0);  // the smaller of device free and MemAvailable limits
     expect(sc::auto_prefill_rows(49152, t) == 8192U, "auto rows: MemAvailable limits");
     t = r;
     t.drafter = 0;  // rank 1 without a drafter: room for 32768-row pieces
-    expect(sc::auto_prefill_rows(49152, t) == 32768U, "auto rows: no drafter -> 32768");
+    expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no drafter -> 16384 (32768 is not a candidate)");
     t = r;
     t.drafter = 0;  // the serve loads the drafter first: free memory already without its resident 10.4 GiB
     t.device_free = gib(24.0);
     t.mem_available = gib(27.8);
-    expect(sc::auto_prefill_rows(49152, t) == 32768U, "auto rows: drafter loaded first -> 32768");
+    expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: drafter loaded first -> 16384");
     t.wide_pieces = false;  // outside the measured envelope (large context, other window / slabs): at most 16384
     expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no 32768 outside the measured envelope");
     {
@@ -306,7 +306,7 @@ void auto_rows() {
     t = r;
     t.device_free = gib(20.0);
     expect(sc::auto_prefill_rows(49152, t) == 0U, "auto rows: nothing fits -> 0 (refuse, no unchecked 2048 floor)");
-    t.device_free = gib(26.46 + 2.0);  // reserve 26.46 GiB + the 2048-row piece (1.91 GiB at 49152): only the floor fits
+    t.device_free = gib(26.46 + 2.0);  // reserve 26.46 GiB + the 2048-row piece (1.75 GiB at 49152): only the floor fits
     expect(sc::auto_prefill_rows(49152, t) == 2048U, "auto rows: only the 2048 floor fits -> 2048");
     t.mem_available = 0;  // unknown MemAvailable: device free alone
     t.device_free = gib(34.4);

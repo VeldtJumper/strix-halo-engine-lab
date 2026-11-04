@@ -184,6 +184,14 @@ In `default`, dense prefill chunks of 896 rows or more now run o_b's two K-halve
 both run orders, same logits and generated ids: 8.4K 8.069 → 7.935 s (−1.7 %), 32.5K 27.41 → 27.18 s (−0.8 %).
 The table above predates this change and was not re-measured with it.
 
+`--prefill-rows auto` now stops at 16384-row pieces: since the deferred decoder cone, 32768-row pieces are slower on
+the pair (8.01 / 28.30 / 39.94 s vs 7.94 / 27.44 / 38.98 s at 8,399 / 32,499 / 44,699 tokens, same binary, one load per
+arm; 25.03 vs 24.44 s at 32,499 under `--profile fast`); an explicit `--prefill-rows 32768` still works. The residual
+streams now hold only this rank's rows (80 KiB per row less, 1.25 GiB at 16384-row pieces; speed neutral). Same logits
+and generated ids. With both, server TTFT, one client, cache off: **7.94 / 27.73 / 38.61 s** (1,057 / 1,172 / 1,158
+tok/s) in `default` and 7.05 / 24.32 / 32.95 s (1,192 / 1,336 / 1,357 tok/s) under `--profile fast` in the same run
+(−11.3 / −12.3 / −14.7 %).
+
 <a id="deepseek-rtx-pipeline"></a>
 
 ## Measured results: RTX PRO + pair (pipeline split)
