@@ -41,12 +41,13 @@ un tiempo de prefill un 2.3–2.6% menor con IDs de token completos idénticos; 
 
 | Modo | Prompt / contexto | Resultado medido | Build / exactitud |
 |---|---|---|---|
-| Decode greedy | prompts de benchmark de 1K / 8K, 256 tokens | **44.57 / 46.10 ms/token** (22.44 / 21.69 tok/s) | `8cc30ac0`; los ranks coinciden, IDs de referencia iguales |
-| Prefill combinado nuevo | prompt de benchmark de 8K | **17.731 s**, 462 tok/s; línea base 21.874 s (**−19 %**); **36–39 %** del suelo de kernel calculado de 6.3–7.0 s | `e0bad3d1`; el estado y los logits finales de ambos ranks son iguales a la producción archivada |
-| Prefill combinado nuevo | prompt de benchmark de 32K | **91.508 s**, 358 tok/s; **28–32 %** del suelo de kernel calculado de 26–29 s | `e0bad3d1`; referencia nueva, no una comparación de exactitud con una referencia archivada |
-| Prefill combinado, mismo proceso | 1K / 8K, tres pares alternos | **2.73–2.77 / 20.3–20.8 s**, **0.848–0.853× / 0.783–0.797×** el tiempo de la línea base | `561de319`; comprobaciones de estado/fila final y tokens iguales en ambos ranks |
+| Decode greedy | prompts de benchmark de 1K / 8K, en frío | **43.30 / 45.06 ms/token** (23.10 / 22.19 tok/s); 44.57 / 46.10 ms/token en `8cc30ac0` (256 tokens) | árbol público del PR #59; los ranks coinciden, IDs de referencia iguales |
+| Prefill combinado | prompt de benchmark de 8K | **14.04 s**, 583 tok/s (brazos alternos en un proceso, 13.85–14.29 s); **45–50 %** del suelo de kernel calculado de 6.3–7.0 s; 17.731 s en `e0bad3d1` (línea base 21.874 s) | #334 `c225cdaa2`; estado y filas finales de ambos ranks iguales a las referencias |
+| Prefill combinado nuevo | prompt de benchmark de 32K | **63.48 s**, 516 tok/s (tres ejecuciones por brazo, en ambos órdenes); **41–46 %** del suelo de kernel calculado de 26–29 s; 91.508 s en `e0bad3d1` | #334 `c225cdaa2`; hash de resultado igual en las seis ejecuciones, los ranks coinciden |
+| Prefill combinado, mismo proceso | 1K / 8K, brazos alternos | **2.49–2.52 / 13.85–14.29 s**; en `561de319`: 2.73–2.77 / 20.3–20.8 s, 0.848–0.853× / 0.783–0.797× el tiempo de la línea base | build del #334; comprobaciones de estado/fila final iguales en ambos ranks |
 | Batch, proceso nuevo por brazo | N=1 / N=8, benchmark de 1K | **43.92 / 130.24 ms/step** (N8: **61.4 tok/s agregados**, calculado) | `8cc30ac0`; cada fila es igual a ejecutarse sola; la invariancia de batch se cumple |
-| DSpark | JSON / Python / prosa, 256 tokens | **54.4 / 34.1 / 24.1 tok/s** | `8cc30ac0`; IDs iguales a greedy |
+| DSpark | JSON / Python / prosa | **59.96 / 36.93 / 27.05 tok/s**; 54.4 / 34.1 / 24.1 tok/s en `8cc30ac0` | PR #70 `fbd43423`; IDs iguales a greedy |
+| Servido, C1 / C2 / C4 / C8 | 8 prompts distintos de ~190 tokens, 256 tokens | **22.0 / 32.2 / 44.5 / 55.7 tok/s** agregados (repetición 22.1 / 32.5 / 45.1 / 56.1) | main `e6ce78571`; los IDs de cada petición son iguales a los de la petición sola |
 
 Los tipos de prompt no se especifican para los benchmarks de prefill y de batch. Las filas de prefill nuevo son ejecuciones únicas;
 el resultado del primer uso a 1K fue de **3.509 s**. La ejecución combinada alcanzó después su límite de tiempo en otro brazo; solo se citan
