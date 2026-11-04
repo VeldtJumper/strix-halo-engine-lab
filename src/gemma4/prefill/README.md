@@ -126,14 +126,15 @@ tiles fastest; attention 19.26 -> 16.51 s at 32K, 8K unchanged) in groups of 8 r
 off). The D512 values run in 512-thread blocks whose two 128-column halves share
 one staged probability tile (`STRIX_G4_PREFILL_CANON_WIDE=0` restores 256-thread
 blocks). On Strix Halo (gfx1151, Nemotron 3.5 Bolt E4B Q4_K_M, fast-profile
-linears, one chunk, `--kernel-profile`, fresh processes interleaved), the group
+linears, 512-row chunks, `--kernel-profile`, fresh processes interleaved), the group
 and wide values together take canonical attention from 1,333 to 1,265 ms at 8K
 (-5.3 %) and from 16.83 to 15.91 s at 32K (-5.5 %); OFF is
 `STRIX_G4_PREFILL_CANON_WIDE=0 STRIX_G4_PREFILL_CANON_GROUP=0`. Opt-in shapes:
 `STRIX_G4_PREFILL_CANON_VGROUP=G` groups the value grid likewise, and
 `STRIX_G4_PREFILL_CANON_TALL=1` lets the two halves of a D512 block take two
-16-row tiles that share one staged value tile (level at 8K, -1 % at 32K in one
-pair). The long-context value kernel waits on LDS loads: tighter dual-issue
+16-row tiles that share one staged value tile (level at 8K; at 32K -0.9 % forced
+on in one ABBA run, level when selected only for chunks with a key span of at
+least 8K in another, so it stays opt-in). The long-context value kernel waits on LDS loads: tighter dual-issue
 scheduling, 8 x 8 outputs per thread and register prefetch of the next key were
 measured slower or level and are not kept.
 
