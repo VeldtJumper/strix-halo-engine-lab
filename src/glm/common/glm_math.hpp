@@ -5,6 +5,7 @@
 //   declared_exp / declared_sqrt: copied verbatim from DS ds41_moe.hpp (Cody-Waite + degree-7 Horner, exp(x) = +inf
 //   above 88 and +0 below -103; sqrt correctly rounded, through double on the device).
 //   Reductions: R1 = ascending fmaf chain; R2 = lane-strided fmaf partials over L lanes + pairwise halving tree.
+#include "../rtxpf/import/glm_dims.hpp"  // the model dimensions (shared with the RTX import state layout)
 #include <cstddef>
 #include <cstdint>
 
@@ -17,12 +18,6 @@
 namespace strix::glm {
 
 // ---------------------------------------------------------------- model constants (checked against config.json at load)
-inline constexpr unsigned kHidden = 4096, kHc = 4, kHcMix = (2 + kHc) * kHc, kHcIters = 20;
-inline constexpr unsigned kLayers = 45, kMtpLayer = 45, kFirstMoe = 3, kVocab = 154880;
-inline constexpr unsigned kKdaHeads = 64, kKdaDim = 128, kKdaQkv = kKdaHeads * kKdaDim, kConvK = 4;
-inline constexpr unsigned kQLora = 1536, kKvLora = 512, kMlaHeads = 64, kMlaDim = 256;
-inline constexpr unsigned kIdxHeads = 32, kIdxDim = 128, kKpool = 4, kIdxTopk = 2048, kIdxPools = kIdxTopk / kKpool;
-inline constexpr unsigned kExperts = 288, kTopE = 8, kExpertI = 2048, kDenseI = 12288;
 inline constexpr float kEps = 1e-5F, kHcEps = 1e-6F, kL2Eps = 1e-6F, kLnEps = 1e-6F, kGateLow = -5.0F;
 inline constexpr float kClamp = 10.0F, kRouteScale = 2.5F, kRouteDenEps = 1e-20F;
 inline constexpr float kInvSqrt128 = 0.088388347648318F;   // RN32(128^-1/2): KDA q scale, indexer score scale

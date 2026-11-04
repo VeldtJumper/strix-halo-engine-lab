@@ -25,6 +25,17 @@
 //   Batched self-speculation (G2, with MTP on): every decoding slot's window (anchor + adaptive drafts) in ONE multi-slot
 //   verify of <= 8 rows when more than one request decodes; STRIX_GLM_SERVE_G2=0 = batched plain steps (the OFF switch).
 //   Needs an attention seam with multi-slot verify (Engine::verify_multi_supported; off otherwise, said at startup).
+// RTX prefill import (route off unless --rtx-prefill is set on rank 0):
+//   every rank: --import-listen IPV4:PORT (this rank's receiver, the address the RTX producer connects to)
+//               --import-key FILE (32 raw bytes, the producer's key) --import-model-sha HEX (the producer's model_sha256:
+//               an operator attestation compared with the producer's hand-off header, NOT computed from the tensors this
+//               rank loaded; every rank must pass the same one, the hello refuses a mismatch)
+//               [--import-node r1|r1b: must equal --identity; r1b-all cannot import]
+//   rank 0: --rtx-prefill HOST:PORT (producer, POST /v1/prefill) --import-peer IPV4:PORT (= rank 1's --import-listen)
+//           --import-min-tokens N (default 4096) --import-timeout-s S (default 120)
+//   rank 0: --import-gate P.u32[,P2.u32] [--import-gate-tokens N (64)]: no HTTP; per prompt file and decode mode (plain,
+//           + MTP when on) arm A imports from the RTX, arm B prefills itself; prints route, tokens, TTFT split, tok/s,
+//           I1 (A tokens == B tokens) and I0 (per-rank state digests per component after the prefill); exit 0 EQUAL, 3 DIFF
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
@@ -41,11 +52,15 @@
 
 #include "glm/engine/glm_mem.hpp"
 #include "glm/prefill/glm_pf_path.hpp"
+#include "glm/rtxpf/import/glm_import_socket.hpp"
 #include "glm/serve/glm_serve_control.hpp"
+#include "glm/serve/glm_serve_import.hpp"
 #include "glm/serve/glm_serve_lead.hpp"
 #include "glm/serve/glm_serve_selftest.hpp"
 #include "glm/spec/glm_spec_run.hpp"
 
+#include <netdb.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -56,9 +71,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -72,6 +91,7 @@ namespace gs = strix::glm::serve;
 namespace sv = strix::serve;
 namespace rd = strix::glm::rank_defaults;
 namespace sp = strix::glm::spec;
+namespace gi = strix::glm::import;
 
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_signal{0};
@@ -83,6 +103,97 @@ void on_signal(int sig) {
 // The engine calls of the control protocol (ge::Row and WireRow share their layout; converted field by field), the
 // same on both ranks. The MTP state (drafter seed, open decoder, merged control state) lives here: every decision of
 // the decoder comes from values merged across the ranks, so both ranks make the same engine calls.
+// One blocking HTTP/1.1 POST (Connection: close) to the RTX producer; returns the status code (0 = no answer) and the
+// response body in `reply` (when given).
+int http_post(const std::string& host_port, const std::string& path, const std::string& body, int timeout_s,
+              std::string* reply = nullptr) {
+    const auto colon = host_port.rfind(':');
+    if (colon == std::string::npos) throw std::invalid_argument("--rtx-prefill wants host:port");
+    const std::string host = host_port.substr(0, colon), port = host_port.substr(colon + 1);
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) return 0;
+    const int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return 0; }
+    timeval tv{timeout_s, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    const bool connected = connect(fd, res->ai_addr, res->ai_addrlen) == 0;
+    freeaddrinfo(res);
+    if (!connected) { close(fd); return 0; }
+    const std::string req = "POST " + path + " HTTP/1.1\r\nHost: " + host + "\r\nContent-Type: application/json\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+    for (std::size_t off = 0; off < req.size();) {
+        const auto n = send(fd, req.data() + off, req.size() - off, MSG_NOSIGNAL);
+        if (n <= 0) { close(fd); return 0; }
+        off += static_cast<std::size_t>(n);
+    }
+    std::string resp;
+    char buf[4096];
+    for (;;) {
+        const auto n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0) break;
+        resp.append(buf, static_cast<std::size_t>(n));
+        if (resp.size() > (1U << 20)) break;
+    }
+    close(fd);
+    if (resp.rfind("HTTP/1.", 0) != 0 || resp.size() < 12) return 0;
+    if (reply) {
+        const auto b = resp.find("\r\n\r\n");
+        *reply = b == std::string::npos ? std::string() : resp.substr(b + 4);
+    }
+    return std::atoi(resp.c_str() + 9);
+}
+
+// Import gate (I0): the components of Engine::state_bytes_upto(slot, frontier) in its order (per layer: KDA S / conv,
+// or DSA latent / index key / index gate / closed pools; layer 45 = MTP), sized for `world` ranks. Empty when the sizes
+// do not add up to `total` (the gate then digests the whole state as one component).
+struct StateComponent {
+    std::string name;
+    std::size_t bytes = 0;
+    bool mtp = false;
+};
+std::vector<StateComponent> state_components(std::size_t total, unsigned world, std::uint64_t frontier) {
+    const std::size_t heads = 64U / world, s = heads * 128U * 128U * 4U, conv = 3U * heads * 128U * 3U * 4U;
+    const std::size_t latent = frontier * 512U * 2U, idx = frontier * 128U * 2U, pooled = (frontier / 4U) * 128U * 4U;
+    std::vector<StateComponent> out;
+    std::size_t sum = 0;
+    for (unsigned l = 0; l < 46; ++l) {
+        if (l == 45 && sum == total) break;  // no MTP layer in this engine
+        const std::string ln = "L" + std::to_string(l) + (l == 45 ? "(mtp) " : " ");
+        if (l < 45 && l % 4 != 3) {
+            out.push_back({ln + "kda_S", s, false});
+            out.push_back({ln + "kda_conv", conv, false});
+        } else {
+            out.push_back({ln + "dsa_latent", latent, l == 45});
+            out.push_back({ln + "dsa_index_key", idx, l == 45});
+            out.push_back({ln + "dsa_index_gate", idx, l == 45});
+            out.push_back({ln + "dsa_pools", pooled, l == 45});
+        }
+        for (std::size_t k = out.size() - (l < 45 && l % 4 != 3 ? 2U : 4U); k < out.size(); ++k) sum += out[k].bytes;
+    }
+    if (sum != total) return {};
+    return out;
+}
+// FNV-1a over 64-bit words (the tail bytes as one more word), seeded with the size.
+std::uint64_t fnv64_words(const std::uint8_t* p, std::size_t n) {
+    std::uint64_t h = 14695981039346656037ULL ^ n;
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 1099511628211ULL;
+    }
+    if (i < n) {
+        std::uint64_t w = 0;
+        std::memcpy(&w, p + i, n - i);
+        h = (h ^ w) * 1099511628211ULL;
+    }
+    return h;
+}
+
 struct EngineOps {
     ge::Engine& eng;
     sp::DecodePolicy policy;           // kmax / adaptive / capacity of the CLI route
@@ -242,6 +353,171 @@ struct EngineOps {
         }
         return b.y0;
     }
+    // import: the payload staged under `id` (the RTX producer's per-rank state at frontier P = |tokens| - 1, the
+    // Engine::restore_state layout), then the last prompt token through the same call the slot's own prefill makes for
+    // it (prefill at P, or the MTP bootstrap from P with its seed kept). Returns the first generated token.
+    std::function<std::span<const std::uint8_t>(std::uint32_t id)> staged{};
+    std::unique_ptr<gs::ImportStager> stager{};  // --import-listen: this rank's RTX hand-offs (off: imports refused)
+    std::uint32_t import_last = 0;
+    unsigned world = 2;                                   // state component sizes (import gate)
+    double last_restore_ms = 0, last_token_ms = 0;        // this rank's last import_state: restore / last-token prefill
+    // Import gate (I0): per component of state_bytes_upto(slot, frontier): fnv64 lo/hi, size lo/hi. Reads only.
+    std::vector<std::uint32_t> state_digest(std::uint32_t slot, std::uint64_t frontier) {
+        const auto b = eng.state_bytes_upto(slot, frontier);
+        auto comps = state_components(b.size(), world, frontier);
+        if (comps.empty()) comps.push_back({"all", b.size(), false});
+        std::vector<std::uint32_t> out;
+        std::size_t o = 0;
+        for (const auto& c : comps) {
+            const std::uint64_t h = fnv64_words(b.data() + o, c.bytes), z = c.bytes;
+            out.insert(out.end(), {static_cast<std::uint32_t>(h), static_cast<std::uint32_t>(h >> 32), static_cast<std::uint32_t>(z),
+                                   static_cast<std::uint32_t>(z >> 32)});
+            o += c.bytes;
+        }
+        return out;
+    }
+    std::optional<gs::ImportReport> import_done{};  // import_state's outcome for import_last (restored / failed + token)
+    // Never throws (a rank that cannot stage reports failed; the lead falls back on both ranks).
+    void import_expect(std::uint32_t id, std::span<const std::uint32_t> tokens) {
+        if (stager && import_last != 0 && import_last != id) stager->drop(import_last);  // a fallen-back import's leftovers
+        import_last = id;
+        import_done.reset();
+        try {
+            if (!stager) throw std::runtime_error("this rank has no --import-listen");
+            // host-memory admission of the staging (the receive assembles this rank's full restore payload in RAM)
+            if (state_layout && import_mem_guard != 0 && tokens.size() >= 2) {
+                std::uint64_t need = 0;
+                for (const auto& c : state_layout(tokens.size() - 1, tokens.size())) need += c.bytes;
+                const auto avail = mem_available();
+                if (avail && *avail < need + import_mem_guard)
+                    throw std::runtime_error("host memory: " + std::to_string(*avail >> 20) + " MiB available, staging needs " +
+                                             std::to_string(need >> 20) + " MiB + the guard");
+            }
+            stager->expect(id, std::vector<std::uint32_t>(tokens.begin(), tokens.end()));
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "rank %u: import %u refused: %s\n", control.rank, id, e.what());
+            import_done = gs::ImportReport{id, static_cast<std::uint32_t>(gs::ImportStatus::failed), 0};
+        }
+    }
+    gs::ImportReport import_report() const {
+        if (import_done && import_done->id == import_last) return *import_done;
+        return {import_last, stager ? static_cast<std::uint32_t>(stager->status(import_last)) : 0U, 0};
+    }
+    // 'DSA once' (--import-dsa-once on every rank): the receivers expect hand-off version 2 and import_state relays rank
+    // 0's DSA components to rank 1 (relay: one pair exchange; layout: the full per-rank component list at frontier P).
+    bool dsa_once = false;
+    std::function<void(std::span<const std::byte> local, std::span<std::byte> remote, std::uint64_t seq)> relay{};
+    std::function<std::vector<gs::StateComponent>(std::uint64_t frontier, std::uint64_t total)> state_layout{};
+    std::size_t relay_chunk = 0;
+    gs::RelayStats last_relay{};
+    // Host-memory admission (staging, and the bytes the relay / merge still allocate on this rank): refused when
+    // MemAvailable minus them would drop below import_mem_guard (0 = no check). Only MISSING telemetry skips the check
+    // (no /proc/meminfo, or no MemAvailable line); a measured MemAvailable of 0 is refused like any short one.
+    std::uint64_t import_mem_guard = std::uint64_t{4} << 30;
+    static std::optional<std::uint64_t> mem_available() {
+        std::ifstream f("/proc/meminfo");
+        std::string k, unit;
+        std::uint64_t v = 0;
+        while (f >> k >> v >> unit)
+            if (k == "MemAvailable:") return v * 1024ULL;
+        return std::nullopt;
+    }
+    std::function<gs::Binding(std::uint32_t id)> staged_binding{};
+    // The pair vote / relay exchange (the communicator's host path, its own control layers; empty with one rank).
+    std::function<void(std::span<const std::byte> local, std::span<std::byte> remote, std::uint64_t seq)> vote{};
+    std::uint32_t import_state(std::uint32_t slot, std::uint32_t id, std::span<const std::uint32_t> tokens, bool mtp, bool dsa) {
+        plain_call();
+        // Prepare (local): staged under the announced id, the relay mode both ranks were started with, the binding the
+        // hand-off was authenticated under, and host memory for what the relay still allocates. The vote makes both
+        // ranks abort together on any of them (gs::import_transaction).
+        bool prepared = true;
+        std::string why;
+        gs::Binding binding{};
+        std::span<const std::uint8_t> mine;
+        std::vector<gs::StateComponent> comps;
+        const std::uint64_t p = tokens.size() >= 2 ? tokens.size() - 1 : 0;
+        try {
+            if (!staged || !staged_binding) throw std::runtime_error("no staging on this rank");
+            if (id != import_last) throw std::runtime_error("not the announced import");
+            if (tokens.size() < 2) throw std::runtime_error("prompt shorter than two tokens");
+            if (dsa != dsa_once) throw std::runtime_error(dsa ? "the lead asked for the DSA relay, this rank staged a v1 hand-off"
+                                                              : "this rank staged a 'DSA once' hand-off, the lead did not ask for the relay");
+            if (dsa && (!relay || !state_layout)) throw std::runtime_error("no pair relay on this rank");
+            mine = staged(id);
+            binding = staged_binding(id);
+            std::uint64_t need = 0;
+            if (dsa) {
+                comps = state_layout(p, tokens.size());
+                const auto d = gs::component_bytes(comps, true);
+                need = control.rank == 0 ? d : d + mine.size() + d;  // rank 1: DSA buffer + merged payload
+            }
+            if (import_mem_guard != 0 && need != 0) {
+                const auto avail = mem_available();
+                if (avail && *avail < need + import_mem_guard)
+                    throw std::runtime_error("host memory: " + std::to_string(*avail >> 20) + " MiB available, the relay needs " +
+                                             std::to_string(need >> 20) + " MiB + the guard");
+            }
+        } catch (const std::exception& e) {
+            prepared = false;
+            why = e.what();
+        }
+        last_relay = {};
+        std::vector<std::uint8_t> merged;  // rank 1 with the relay: its KDA payload + rank 0's DSA components
+        std::uint32_t y0 = 0;
+        std::chrono::steady_clock::time_point t0, t1;
+        y0 = gs::import_transaction(
+            prepared, why, binding, p, vote,
+            [&] {
+                if (!dsa) return;
+                merged = gs::dsa_relay(control.rank, true, mine, comps, relay_chunk, relay, &last_relay);
+                std::printf("rank %u: import %u DSA relay %s %llu bytes in %llu chunks, %.1f ms\n", control.rank, id,
+                            control.rank == 0 ? "sent" : "received", static_cast<unsigned long long>(last_relay.bytes),
+                            static_cast<unsigned long long>(last_relay.chunks), last_relay.ms);
+            },
+            [&] {
+                t0 = std::chrono::steady_clock::now();
+                if (!merged.empty()) eng.restore_state(slot, merged, p);
+                else eng.restore_state(slot, mine, p);
+                t1 = std::chrono::steady_clock::now();
+            },
+            [&]() -> std::uint32_t {
+                if (stager) stager->drop(id);  // both ranks restored: the engine holds the state now
+                std::vector<std::uint8_t>().swap(merged);  // release the merged copy (the engine holds the state now)
+                if (mtp) {
+                    seed = sp::bootstrap(eng, slot, tokens, bootstrap, control, p);
+                    seed_slot = slot;
+                    seed_slot_spec(slot, *seed);  // batched self-speculation starts from the same seed as after its own prefill
+                    return seed->y0;
+                }
+                spec.at(slot) = {};
+                return eng.prefill(slot, tokens.subspan(static_cast<std::size_t>(p)), p);
+            });
+        last_restore_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        last_token_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        std::printf("rank %u: import %u restored P=%llu rows (slot %u), last-token prefill pos %llu token %u%s -> first token %u"
+                    " (restore %.1f ms, last token %.1f ms)\n",
+                    control.rank, id, static_cast<unsigned long long>(p), slot, static_cast<unsigned long long>(p), tokens[p],
+                    mtp ? " (MTP bootstrap)" : "", y0, last_restore_ms, last_token_ms);
+        std::fflush(stdout);
+        import_done = gs::ImportReport{id, static_cast<std::uint32_t>(gs::ImportStatus::restored), y0};
+        return y0;
+    }
+    // import_drop (both ranks): forget the hand-off staged / still being received under `id` (fallback, cancel).
+    void import_drop(std::uint32_t id) {
+        if (stager) stager->drop(id);
+        if (import_last == id) import_done = gs::ImportReport{id, static_cast<std::uint32_t>(gs::ImportStatus::failed), 0};
+    }
+    // import_state failed on this rank (replay caught it): the slot is reset and the failure reported; a failing reset
+    // propagates (the engine is unusable).
+    void import_abort(std::uint32_t slot, std::uint32_t id, const std::string& why) {
+        std::fprintf(stderr, "rank %u: import %u not restored (slot %u reset, prefill fallback): %s\n", control.rank, id, slot, why.c_str());
+        if (dec) throw std::logic_error("import_abort while an MTP decoder is open");
+        seed.reset();
+        if (stager) stager->drop(id);
+        eng.reset(slot);
+        spec.at(slot) = {};
+        import_done = gs::ImportReport{id, static_cast<std::uint32_t>(gs::ImportStatus::failed), 0};
+    }
     // Seed from the last step's row r (it produced row.token at row.pos): the drafter pair (h_r, token) at row.pos,
     // as decode_greedy's catch-up does after a verify.
     // from_seed: the C1 decoder takes over the slot's batched-spec drafter seed (its first draft, h' row hp_row).
@@ -393,13 +669,21 @@ std::vector<std::vector<std::uint32_t>> selftest_long_prompts(const sv::BpeToken
 
 }  // namespace
 
+// --import-gate with no prompt file after parsing (e.g. ","): nothing would be qualified, so the verdict is FAIL.
+static int import_gate_empty(const std::string& list) {
+    std::printf("rank 0: import-gate: no prompt files in '%s', coverage FAIL, verdict FAIL, STOPPED\n", list.c_str());
+    return 4;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
-                                 "[--host H] [--port P] [--selftest N [--selftest-tokens M]]\n", argv[0]);
+                                 "[--host H] [--port P] [--selftest N [--selftest-tokens M]] "
+                                 "[--import-listen IP:PORT --import-key FILE --import-model-sha HEX (operator attestation of the producer's "
+                                 "model, compared with its hand-off header, not computed from the loaded tensors)]\n", argv[0]);
             return 2;
         }
         const auto t_start = std::chrono::steady_clock::now();
@@ -413,6 +697,15 @@ int main(int argc, char** argv) {
         bool serve_mtp = true;
         std::uint32_t max_tokens = 4096;
         bool serial = false, print_config = false;
+        // RTX prefill route: every rank receives its hand-off on --import-listen; rank 0 asks the RTX producer
+        // (--rtx-prefill host:port) for prompts of >= --import-min-tokens and names rank 1's --import-peer endpoint.
+        std::string import_listen, import_key_file, import_model_sha, import_node, rtx_prefill, import_peer;
+        std::uint64_t import_min_tokens = 4096;
+        double import_timeout_s = 120.0;
+        std::string import_gate;              // rank 0: PROMPT.u32[,PROMPT2.u32] (I0 / I1 gate, no HTTP)
+        bool import_gate_on = false;          // --import-gate given (an empty list is a gate that FAILs, not serving)
+        unsigned import_gate_tokens = 64;
+        bool import_dsa_once = false;         // every rank: hand-off v2, rank 0 relays the DSA components to rank 1
         std::vector<std::string> rank_args;  // the options the rank defaults depend on (rd::scan)
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
@@ -446,6 +739,20 @@ int main(int argc, char** argv) {
             else if (a == "--api-key-file") api_key_file = next();
             else if (a == "--selftest") selftest = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--selftest-tokens") selftest_tokens = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--import-listen") import_listen = next();
+            else if (a == "--import-key") import_key_file = next();
+            else if (a == "--import-model-sha") import_model_sha = next();
+            else if (a == "--import-node") import_node = next();
+            else if (a == "--rtx-prefill") rtx_prefill = next();
+            else if (a == "--import-peer") import_peer = next();
+            else if (a == "--import-min-tokens") import_min_tokens = std::stoull(next());
+            else if (a == "--import-timeout-s") import_timeout_s = std::stod(next());
+            else if (a == "--import-gate") {
+                import_gate = next();
+                import_gate_on = true;
+            }
+            else if (a == "--import-gate-tokens") import_gate_tokens = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--import-dsa-once") import_dsa_once = true;
             else throw std::invalid_argument("unknown option " + a);
         }
         if (const char* b = std::getenv("STRIX_GLM_SERVE_BATCH"); b != nullptr && std::string(b) == "0") serial = true;
@@ -457,6 +764,10 @@ int main(int argc, char** argv) {
         if (opt.capacity == 0 || opt.capacity % 4 != 0) throw std::invalid_argument("--capacity must be a positive multiple of 4");
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("--world 1|2");
         if (opt.rank >= opt.world) throw std::invalid_argument("--rank must be < --world");
+        if (import_gate_on && import_gate.find_first_not_of(',') == std::string::npos)
+            return import_gate_empty(import_gate);  // --import-gate "" or ",": an explicit empty suite FAILs before loading
+        if (import_gate_on && (opt.rank != 0 || rtx_prefill.empty()))  // before the follower dispatch: rank 1 must not exit 0
+            throw std::invalid_argument("--import-gate: rank 0 with --rtx-prefill (arm A imports, arm B prefills itself)");
         if (selftest > 32) throw std::invalid_argument("--selftest N: 1..32");
 
         // Engine configuration: the rank app's resolution of a normal decode (MTP self-speculation and its exact chunked
@@ -480,6 +791,11 @@ int main(int argc, char** argv) {
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", prefill_chunk,
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
+            // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
+            // prefill; off unless --rtx-prefill / --import-listen are given).
+            std::printf("serve import-route=%s import-listen=%s wire=v%u identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
+                        import_listen.empty() ? "off" : "on", import_dsa_once ? 2U : 1U,
+                        rtx_prefill.empty() && import_listen.empty() ? "exact" : "exact+FAST(glm-pf-rtx-native-v1, imported prompts)");
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
@@ -565,7 +881,100 @@ int main(int argc, char** argv) {
         ops.control.rank = opt.rank;
         ops.spec.assign(opt.slots, {});
         ops.hp_row.assign(opt.slots, 0);
+        ops.world = opt.world;
+        if (!import_listen.empty()) {
+            if (import_key_file.empty() || import_model_sha.empty())
+                throw std::invalid_argument("--import-listen needs --import-key and --import-model-sha (the RTX producer's model)");
+            // The hand-off's node identity is this engine's: r1 and r1b prefill prompts in R1 (the RTX producer's
+            // state); r1b-all prefills in R1b, so its state would differ: refused. --import-node, if given, must agree.
+            if (id != "r1" && id != "r1b")
+                throw std::invalid_argument("--import-listen: identity " + id + " cannot import RTX prefill state (r1 / r1b only)");
+            if (!import_node.empty() && import_node != id)
+                throw std::invalid_argument("--import-node " + import_node + " differs from this engine's identity " + id);
+            import_node = id;
+            const auto key = gi::read_key(import_key_file);
+            const auto model = gi::unhex(import_model_sha);
+            const unsigned rank = opt.rank;
+            const std::string ep = import_listen, node = import_node;
+            const unsigned version = import_dsa_once ? 2U : 1U;
+            // One hand-off per import_expect: the header must equal this rank's expectation (model, prompt hash,
+            // frontier, layout, rank, node); the frames' payloads, in order, are the Engine::restore_state bytes.
+            ops.stager = std::make_unique<gs::ImportStager>([key, model, rank, ep, node, version](std::uint32_t iid, std::span<const std::uint32_t> t,
+                                                                                                const std::atomic<bool>& cancel,
+                                                                                                const std::function<void()>& listening) {
+                gi::Begin b;
+                b.version = version;
+                b.rank = rank;
+                b.frontier = t.size() - 1;
+                b.total = t.size();
+                b.model = model;
+                b.prompt = gi::hash(std::as_bytes(t));
+                b.producer = "glm-pf-rtx-native-v1";
+                b.node = node;
+                try {
+                    auto st = gi::receive(ep, key, b, &cancel, listening);
+                    std::vector<std::uint8_t> out;
+                    out.reserve(static_cast<std::size_t>(st->raw_bytes));
+                    st->apply([&](const gi::Frame&, std::span<const std::uint8_t> p) { out.insert(out.end(), p.begin(), p.end()); });
+                    // the authenticated Begin's common fields (transaction included, rank excluded): both ranks compare
+                    // it before either applies its state
+                    const auto d = gi::hash(st->begin.encode(true));
+                    gs::Binding binding{};
+                    std::copy(std::begin(d.bytes), std::end(d.bytes), binding.begin());
+                    return gs::StagedPayload(std::move(out), binding);
+                } catch (const std::exception& e) {
+                    if (!cancel.load()) std::fprintf(stderr, "rank %u: import %u not staged: %s\n", rank, iid, e.what());
+                    throw;
+                }
+            });
+            ops.staged = [&ops](std::uint32_t iid) { return ops.stager->payload(iid); };
+            ops.staged_binding = [&ops](std::uint32_t iid) { return ops.stager->binding(iid); };
+            if (!mtp_on || !opt.mtp)
+                throw std::invalid_argument("--import-listen needs the engine loaded with its MTP layer (46 layers): the RTX hand-off "
+                                            "carries the MTP state; this engine resolved MTP off");
+            if (comm) {  // import commit votes: the communicator's host path, their own control layer ("GV")
+                ops.vote = [&comm](std::span<const std::byte> out, std::span<std::byte> in, std::uint64_t seq) {
+                    strix::dist::Tag tag;
+                    tag.kind = static_cast<std::uint32_t>(strix::dist::TagKind::control);
+                    tag.layer = 0x47560000U;
+                    tag.request = seq;
+                    comm->exchange_host(out, in, tag);
+                };
+            }
+            ops.dsa_once = import_dsa_once;
+            // The full per-rank component list of a v1 hand-off (= this rank's restore_state layout) at frontier P.
+            ops.state_layout = [rank](std::uint64_t frontier, std::uint64_t total) {
+                gi::Begin b;
+                b.rank = rank;
+                b.frontier = frontier;
+                b.total = total;
+                std::vector<gs::StateComponent> out;
+                for (const auto& c : gi::layout(b)) out.push_back({c.id >= 2, c.rows * c.stride});
+                return out;
+            };
+            if (import_dsa_once) {
+                if (!comm) throw std::invalid_argument("--import-dsa-once needs the pair (--world 2)");
+                // The relay rides the communicator's host path (its own control layer) inside import_state's replay:
+                // between engine calls, so the transport is idle. Chunks fit the communicator's buffers.
+                ops.relay_chunk = std::min<std::size_t>(comm->max_bytes(), std::size_t{32} << 20);
+                ops.relay = [&comm](std::span<const std::byte> out, std::span<std::byte> in, std::uint64_t seq) {
+                    strix::dist::Tag tag;
+                    tag.kind = static_cast<std::uint32_t>(strix::dist::TagKind::control);
+                    tag.layer = 0x47440000U;  // "GD": import DSA relay
+                    tag.request = seq;
+                    comm->exchange_host(out, in, tag);
+                };
+            }
+            std::printf("rank %u: import receiver on %s (node identity %s%s)\n", rank, ep.c_str(), node.c_str(),
+                        import_dsa_once ? ", DSA once: rank 0 relays the DSA components" : "");
+        }
 
+        // RTX import settings every rank must share: a mismatch refuses at hello, before serving.
+        if (!import_listen.empty()) {
+            hello.import_flags = 1U | (import_dsa_once ? 2U : 0U);
+            hello.import_wire = import_dsa_once ? 2U : 1U;
+            hello.import_model_hash = gs::attested_model_hash(import_model_sha);  // canonical: the parsed 32 bytes
+        }
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         std::signal(SIGPIPE, SIG_IGN);
@@ -593,8 +1002,235 @@ int main(int argc, char** argv) {
         lc.g2 = g2_on;
         lc.kmax = eff.kmax;
         lc.heartbeat_seconds = heartbeat_ms / 1000.0;
+        struct RtxState { std::mutex m; std::set<std::uint32_t> ids; std::string last_reply; };
+        auto rtx_state = std::make_shared<RtxState>();  // failed RTX requests; the producer's last receipt (gate)
+        lc.state_digest = import_gate_on;
+        if (!rtx_prefill.empty()) {
+            if (import_listen.empty() || import_peer.empty())
+                throw std::invalid_argument("--rtx-prefill needs --import-listen (this rank) and --import-peer (rank 1's endpoint)");
+            if (opt.world != 2) throw std::invalid_argument("--rtx-prefill needs --world 2 (the hand-off is the TP2 per-rank state)");
+            const auto key = gi::read_key(import_key_file);
+            static const char* hexd = "0123456789abcdef";
+            std::string key_hex;
+            for (const auto b : key) { key_hex += hexd[(static_cast<unsigned>(b) >> 4) & 15U]; key_hex += hexd[static_cast<unsigned>(b) & 15U]; }
+            auto failed = rtx_state;
+            const std::string rtx = rtx_prefill, ep0 = import_listen, ep1 = import_peer, node = import_node;
+            // The RTX producer prefills and sends each rank its state (POST /v1/prefill, the hand-off of service.cpp);
+            // it answers only after both ranks sealed, so the call runs off the lead's thread. Any non-200 marks the
+            // import failed and the slot prefills itself at once.
+            lc.rtx_prefill = [failed, rtx, ep0, ep1, node, key_hex, dsa_once = import_dsa_once](std::span<const std::uint32_t> prompt, std::uint32_t iid) {
+                std::string body = "{\"tokens\":[";
+                for (std::size_t i = 0; i < prompt.size(); ++i) body += (i ? "," : "") + std::to_string(prompt[i]);
+                body += "],\"identity\":\"glm-pf-rtx-native-v1\",\"handoff\":{\"rank0\":\"" + ep0 + "\",\"rank1\":\"" + ep1 + "\",\"key\":\"" +
+                        key_hex + "\",\"node_identity\":\"" + node + "\"" + (dsa_once ? ",\"dsa_once\":true" : "") + "}}";
+                std::thread([failed, rtx, body, iid] {
+                    int status = 0;
+                    std::string reply;
+                    try { status = http_post(rtx, "/v1/prefill", body, 600, &reply); } catch (...) {}
+                    {
+                        std::lock_guard<std::mutex> l(failed->m);
+                        failed->last_reply = reply;
+                    }
+                    if (status != 200) {
+                        std::fprintf(stderr, "import %u: RTX /v1/prefill answered %d; falling back to the pair prefill\n", iid, status);
+                        std::lock_guard<std::mutex> l(failed->m);
+                        failed->ids.insert(iid);
+                    }
+                }).detach();
+                return true;
+            };
+            lc.rtx_failed = [failed](std::uint32_t iid) { std::lock_guard<std::mutex> l(failed->m); return failed->ids.count(iid) != 0; };
+            lc.import_min_tokens = import_min_tokens;
+            lc.import_timeout_s = import_timeout_s;
+            lc.import_dsa_once = import_dsa_once;
+            std::printf("rank 0: RTX prefill route via %s for prompts >= %llu tokens\n", rtx.c_str(),
+                        static_cast<unsigned long long>(import_min_tokens));
+        }
         gs::Lead<EngineOps> lead(ops, ch, queue, lc, g_stop);
         if (selftest > 0) lead.set_trace(true);
+
+        if (import_gate_on) {
+            // Import gate: per prompt file (raw little-endian u32 token ids), per decode mode (plain; MTP when on), arm A
+            // through the RTX import and arm B with its own prefill, one at a time. I1: A's tokens == B's. I0: right after
+            // each arm's prefill both ranks digest the slot's state (per component); A == B on each rank.
+            std::vector<std::string> files;
+            for (std::size_t a = 0, b; a <= import_gate.size(); a = b + 1) {
+                b = import_gate.find(',', a);
+                if (b == std::string::npos) b = import_gate.size();
+                if (b > a) files.push_back(import_gate.substr(a, b - a));
+            }
+            if (files.empty()) return import_gate_empty(import_gate);  // a suite of zero prompts qualifies nothing
+            bool all_equal = true, gate_covered = true;
+            unsigned gate_arms = 0;  // completed, covered A/B arm pairs (the verdict needs at least one)
+            std::string driver_error;
+            auto fnv_tokens = [](const std::vector<std::uint32_t>& t) { return gs::fnv1a64(t.data(), t.size() * 4); };
+            auto print_coverage = [](const std::string& f, bool mtp, bool covered, const std::string& route_a, const std::string& fallback_a,
+                                     std::uint64_t imported_a, std::size_t want, const std::string& route_b) {
+                std::printf("import-gate %s %s coverage %s (arm A route %s fallback %s imported %llu of %zu, arm B route %s)\n",
+                            f.c_str(), mtp ? "mtp" : "plain", covered ? "OK" : "FAIL", route_a.c_str(), fallback_a.c_str(),
+                            static_cast<unsigned long long>(imported_a), want, route_b.c_str());
+            };
+            std::thread driver([&] {
+                try {
+                    for (const auto& f : files) {
+                        std::ifstream in(f, std::ios::binary);
+                        if (!in) throw std::runtime_error("--import-gate: cannot open " + f);
+                        std::string raw((std::istreambuf_iterator<char>(in)), {});
+                        if (raw.size() % 4 != 0 || raw.size() < 8) throw std::runtime_error("--import-gate: " + f + " is not u32 tokens");
+                        std::vector<std::uint32_t> prompt(raw.size() / 4);
+                        std::memcpy(prompt.data(), raw.data(), raw.size());
+                        if (prompt.size() + import_gate_tokens + 1 >= opt.capacity)
+                            throw std::runtime_error("--import-gate: " + f + " + tokens does not fit --capacity");
+                        if (prompt.size() < lc.import_min_tokens)
+                            throw std::runtime_error("--import-gate: " + f + " is shorter than --import-min-tokens");
+                        std::vector<bool> modes{false};
+                        if (mtp_on) modes.push_back(true);
+                        for (const bool mtp : modes) {
+                            lead.set_mtp(mtp);
+                            struct Arm {
+                                std::vector<std::uint32_t> tokens;
+                                std::vector<std::uint32_t> d0, d1;
+                                std::uint64_t frontier = 0;
+                            } arm[2];
+                            std::string arm_route[2] = {"-", "-"}, arm_fallback[2] = {"-", "-"};
+                            std::uint64_t arm_imported[2] = {0, 0};
+                            bool arm_ok[2] = {false, false};
+                            for (int k = 0; k < 2; ++k) {
+                                const bool routed = k == 0;
+                                lead.set_route(routed);
+                                {
+                                    std::lock_guard<std::mutex> l(rtx_state->m);
+                                    rtx_state->last_reply.clear();
+                                }
+                                (void)lead.take_digests();
+                                sv::GenerationJob j;
+                                j.prompt = prompt;
+                                j.max_tokens = import_gate_tokens;
+                                auto t = queue.submit(std::move(j));
+                                bool done = false;
+                                while (!done) {
+                                    auto g = t->wait(std::chrono::milliseconds(200), done);
+                                    arm[k].tokens.insert(arm[k].tokens.end(), g.begin(), g.end());
+                                }
+                                const auto st = t->stats();
+                                for (auto& d : lead.take_digests()) {
+                                    arm[k].d0 = std::move(d.rank0);
+                                    arm[k].d1 = std::move(d.rank1);
+                                    arm[k].frontier = d.frontier;
+                                }
+                                std::string route = "{}";
+                                for (const auto& [name, value] : st.engine_extra)
+                                    if (name == "prefill_route") route = value;
+                                const auto rj = sv::parse_json(route);
+                                auto num = [](const sv::Json& o, const char* key) {
+                                    const auto* v = o.is_object() ? o.find(key) : nullptr;
+                                    return v && v->is_number() ? v->as_double() : -1.0;
+                                };
+                                auto str = [](const sv::Json& o, const char* key) {
+                                    const auto* v = o.is_object() ? o.find(key) : nullptr;
+                                    return v && v->is_string() ? v->as_string() : std::string("-");
+                                };
+                                arm_route[k] = str(rj, "route");
+                                arm_fallback[k] = str(rj, "fallback");
+                                arm_imported[k] = st.imported_tokens;
+                                arm_ok[k] = st.error_code.empty() && st.finish != "cancelled" && st.finish != "error";
+                                const auto& tk = arm[k].tokens;
+                                std::string first8;
+                                for (std::size_t i = 0; i < tk.size() && i < 8; ++i) first8 += (i ? "," : "") + std::to_string(tk[i]);
+                                const double tps = st.decode_ms > 0 && tk.size() > 1 ? 1000.0 * static_cast<double>(tk.size() - 1) / st.decode_ms : 0.0;
+                                std::printf("import-gate %s %s arm %s (%s): route %s fallback %s, tokens %zu fnv64 %016llx first8 [%s], "
+                                            "TTFT %.1f ms, decode %.2f tok/s\n",
+                                            f.c_str(), mtp ? "mtp" : "plain", routed ? "A" : "B", routed ? "rtx import" : "own prefill",
+                                            str(rj, "route").c_str(), str(rj, "fallback").c_str(), tk.size(),
+                                            static_cast<unsigned long long>(fnv_tokens(tk)), first8.c_str(), st.prefill_ms, tps);
+                                if (str(rj, "route") == "rtx") {
+                                    std::string reply;
+                                    {
+                                        std::lock_guard<std::mutex> l(rtx_state->m);
+                                        reply = rtx_state->last_reply;
+                                    }
+                                    sv::Json pj;
+                                    try { pj = sv::parse_json(reply); } catch (...) {}
+                                    const double prod = num(pj, "producer_ms"), total = num(pj, "total_ms");
+                                    std::printf("import-gate   TTFT split: announce->listening %.1f ms, rtx prefill %.1f ms, transfer tail %.1f ms "
+                                                "(staged both %.1f ms after the request), restore %.1f ms, last-token prefill %.1f ms (rank 0), "
+                                                "commit round %.1f ms, wire %.0f bytes\n",
+                                                num(rj, "listen_ms"), prod, prod >= 0 && total >= 0 ? total - prod : -1.0, num(rj, "staged_ms"),
+                                                ops.last_restore_ms, ops.last_token_ms, num(rj, "commit_ms"), num(pj, "wire_bytes"));
+                                } else {
+                                    std::printf("import-gate   TTFT split: own prefill %.1f ms\n", st.prefill_ms);
+                                }
+                            }
+                            // Coverage: arm A must really have imported (RTX route, no fallback, every prompt token but the
+                            // last restored, the request completed); otherwise A == B would only compare two own prefills.
+                            const bool covered = arm_route[0] == "rtx" && arm_fallback[0] == "-" &&
+                                                 arm_imported[0] == prompt.size() - 1 && arm_ok[0] && !arm[0].tokens.empty() &&
+                                                 arm_route[1] != "rtx" && arm_ok[1] && !arm[1].tokens.empty();
+                            print_coverage(f, mtp, covered, arm_route[0], arm_fallback[0], arm_imported[0], prompt.size() - 1, arm_route[1]);
+                            gate_covered = gate_covered && covered;
+                            if (covered) ++gate_arms;
+                            const bool i1 = arm[0].tokens == arm[1].tokens && !arm[0].tokens.empty();
+                            std::printf("import-gate %s %s I1 %s\n", f.c_str(), mtp ? "mtp" : "plain", i1 ? "EQUAL" : "DIFF");
+                            // I0: per rank, A's components vs B's
+                            const auto comps = [&] {
+                                std::size_t total = 0;
+                                for (std::size_t i = 2; i + 1 < arm[1].d0.size(); i += 4)
+                                    total += static_cast<std::size_t>(arm[1].d0[i]) | (static_cast<std::size_t>(arm[1].d0[i + 1]) << 32);
+                                auto c = state_components(total, opt.world, arm[1].frontier);
+                                if (c.empty()) c.push_back({"all", total, false});
+                                return c;
+                            }();
+                            bool i0 = true;
+                            for (int r = 0; r < 2; ++r) {
+                                const auto& a = r == 0 ? arm[0].d0 : arm[0].d1;
+                                const auto& b = r == 0 ? arm[1].d0 : arm[1].d1;
+                                std::string first = "none";
+                                unsigned ndiff = 0, mtp_diff = 0;
+                                const bool shape = !a.empty() && a.size() == b.size() && a.size() == comps.size() * 4 &&
+                                                   arm[0].frontier == arm[1].frontier;
+                                for (std::size_t c = 0; shape && c < comps.size(); ++c) {
+                                    const auto o = static_cast<std::ptrdiff_t>(4 * c);
+                                    if (std::equal(a.begin() + o, a.begin() + o + 4, b.begin() + o)) continue;
+                                    // a plain own prefill does not write the MTP layer: compared, reported, not gating
+                                    if (comps[c].mtp && !mtp) {
+                                        ++mtp_diff;
+                                        continue;
+                                    }
+                                    if (ndiff++ == 0) first = comps[c].name;
+                                }
+                                const bool eq = shape && ndiff == 0;
+                                i0 = i0 && eq;
+                                std::printf("import-gate %s %s I0 rank %d: %s (%zu components, frontier %llu, %u differ, first %s%s)\n",
+                                            f.c_str(), mtp ? "mtp" : "plain", r, eq ? "EQUAL" : "DIFF", comps.size(),
+                                            static_cast<unsigned long long>(arm[0].frontier), ndiff, shape ? first.c_str() : "digest shape mismatch",
+                                            mtp_diff ? (", MTP layer differs: " + std::to_string(mtp_diff) + " components, not gating in plain mode").c_str() : "");
+                            }
+                            std::printf("import-gate %s %s I0 %s\n", f.c_str(), mtp ? "mtp" : "plain", i0 ? "EQUAL" : "DIFF");
+                            all_equal = all_equal && i0 && i1;
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    driver_error = e.what();
+                    all_equal = false;
+                }
+                g_stop.store(true);
+            });
+            try {
+                lead.loop();
+            } catch (...) {
+                queue.shutdown();
+                driver.join();
+                throw;
+            }
+            queue.shutdown();
+            driver.join();
+            if (!driver_error.empty()) std::printf("import-gate error: %s\n", driver_error.c_str());
+            // FAIL (exit 4) whenever an arm A did not import: equality alone is not a qualification of the import.
+            const bool pass = gate_covered && gate_arms > 0 && driver_error.empty();
+            std::printf("rank 0: import-gate %s, coverage %s, verdict %s, STOPPED\n", all_equal ? "EQUAL" : "DIFF",
+                        gate_covered ? "OK" : "FAIL", !pass ? "FAIL" : all_equal ? "PASS" : "DIFF");
+            return !pass ? 4 : all_equal ? 0 : 3;
+        }
 
         if (selftest > 0) {
             const auto prompts = selftest_prompts(*tokenizer, selftest);
@@ -684,7 +1320,12 @@ int main(int argc, char** argv) {
         config.engine_description = "GLM-5.3-Flash TP2 (" + std::to_string(opt.world) + " ranks), " + std::to_string(opt.slots) +
                                     " slots, " + (serial ? "serial" : "batched") + " decode" +
                                     (mtp_on ? ", MTP self-speculation at C1" : "") +
-                                    (g2_on ? " and in the batch" : "") + ", greedy, exact per request";
+                                    (g2_on ? " and in the batch" : "") + ", greedy, exact per request" +
+                                    (rtx_prefill.empty() ? std::string()
+                                                         : std::string("; prompts of >= ") + std::to_string(import_min_tokens) +
+                                                               " tokens may take the RTX prefill route (FAST identity glm-pf-rtx-native-v1, wire v" +
+                                                               (import_dsa_once ? "2" : "1") + ", not bitwise the pair's own prefill; "
+                                                               "each response's prefill_route names its route)");
         if (!api_key_file.empty()) {
             auto key = file_text(api_key_file);
             while (!key.empty() && (key.back() == '\n' || key.back() == '\r' || key.back() == ' ')) key.pop_back();
@@ -724,6 +1365,10 @@ int main(int argc, char** argv) {
             counter("strix_glm_serve_g2_rows_total", "Rows of the batched self-speculation verifies.", st.g2_rows);
             counter("strix_glm_serve_g2_drafts_total", "Drafts verified in batched self-speculation.", st.g2_drafts);
             counter("strix_glm_serve_g2_accepted_total", "Drafts accepted in batched self-speculation.", st.g2_accepted);
+            counter("strix_glm_serve_imports_total", "Prompts restored from the RTX prefill state (per request: strix.prefill_route).", st.imports);
+            counter("strix_glm_serve_import_fallbacks_total", "RTX imports abandoned for the pair's own prefill.", st.import_fallbacks);
+            counter("strix_glm_serve_imported_tokens_total", "Prompt tokens restored from the RTX prefill state.", st.imported_tokens);
+            counter("strix_glm_serve_import_wait_seconds_total", "Announce to both ranks staged, imported prompts.", st.import_wait_seconds);
             m << "# HELP strix_glm_serve_active Requests holding a slot.\n# TYPE strix_glm_serve_active gauge\nstrix_glm_serve_active "
               << st.active << '\n';
             return m.str();
