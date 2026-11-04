@@ -2,6 +2,7 @@
 #include "gemma4/exl3/device.hpp"
 #include "chunk.hpp"
 #include "weight_policy.hpp"
+#include <cstdint>
 #include <cstdlib>
 #include <string_view>
 
@@ -390,6 +391,104 @@ __global__ void prefetched_linear_kernel(LinearView w, LinearView up, const floa
     }
     }
 }
+// Several outputs per block share one copy of the inputs: each step the block
+// stages the next 32 lane chunks of every row in LDS (contiguous float4 loads,
+// double buffered), and the T outputs of a wave share every LDS read. Every
+// (output,row,lane) accumulator visits the same chunks and elements in the same
+// order from +0 with the same values, exactly as chunk_linear_kernel.
+template <unsigned Rows, bool Gate, WeightFormat Format, bool WideHeader, bool Streaming, unsigned Waves, unsigned T>
+__global__ void __launch_bounds__(Waves * 32U) staged_linear_kernel(LinearView w, LinearView up, const float* x,
+                                                                     float* out, unsigned* failure, LinearEpilogue ep) {
+    static_assert(T == 1U || T == 2U);
+    __shared__ float4 staged[2][Rows * 4U * 32U];
+    const unsigned wave = threadIdx.x / 32U, lane = threadIdx.x % 32U;
+    const unsigned first = select_matrix(ep, w, out) * (Waves * T) + wave * T;
+    const bool valid = first < w.outputs;
+    const auto chunks = w.inputs / 16U, steps = (chunks + 31U) / 32U;
+    const auto stage = [&](unsigned step, unsigned buffer) {
+        for (unsigned i = threadIdx.x; i < Rows * 128U; i += Waves * 32U) {
+            const unsigned r = i / 128U, group = i % 128U, c = step * 32U + group / 4U;
+            if (c < chunks)
+                staged[buffer][(r * 4U + group % 4U) * 32U + group / 4U] =
+                    *reinterpret_cast<const float4*>(x + std::size_t(r) * w.inputs + std::size_t(c) * 16U +
+                                                     4U * (group % 4U));
+        }
+    };
+    const std::uint8_t* wp[T];
+    const std::uint8_t* uptr[T];
+    if (valid) {
+#pragma unroll
+        for (unsigned t = 0; t < T; ++t) {
+            // Reuse a valid weight row for unused tail loads; never store it.
+            const auto o = min(first + t, w.outputs - 1U);
+            wp[t] = w.data + std::size_t(o) * w.row_bytes;
+            uptr[t] = Gate ? up.data + std::size_t(o) * up.row_bytes : wp[t];
+        }
+    }
+    float acc[T][Rows] = {}, uacc[T][Rows] = {};
+    stage(0U, 0U);
+    __syncthreads();
+    for (unsigned step = 0; step < steps; ++step) {
+        if (step + 1U < steps)
+            stage(step + 1U, (step + 1U) & 1U);
+        const unsigned c = step * 32U + lane;
+        if (valid && c < chunks) {
+            const auto start = c * 16U;
+            WeightChunk<Format, Streaming> a[T], b[T];
+#pragma unroll
+            for (unsigned t = 0; t < T; ++t) {
+                a[t] = WeightChunk<Format, Streaming>(wp[t], start, WideHeader, ep.hardware_half);
+                if constexpr (Gate)
+                    b[t] = WeightChunk<Format, Streaming>(uptr[t], start, WideHeader, ep.hardware_half);
+            }
+            const float4* in = staged[step & 1U];
+#pragma unroll
+            for (unsigned g = 0; g < 4; ++g) {
+                float4 input[Rows];
+#pragma unroll
+                for (unsigned r = 0; r < Rows; ++r)
+                    input[r] = in[(r * 4U + g) * 32U + lane];
+#pragma unroll
+                for (unsigned k = 0; k < 4; ++k) {
+                    const unsigned e = 4U * g + k;
+#pragma unroll
+                    for (unsigned t = 0; t < T; ++t) {
+                        const float v = a[t].at(e);
+                        float u = 0.0F;
+                        if constexpr (Gate)
+                            u = b[t].at(e);
+#pragma unroll
+                        for (unsigned r = 0; r < Rows; ++r) {
+                            const float value = k == 0   ? input[r].x
+                                                : k == 1 ? input[r].y
+                                                : k == 2 ? input[r].z
+                                                         : input[r].w;
+                            acc[t][r] = acc[t][r] + v * value;
+                            if constexpr (Gate)
+                                uacc[t][r] = uacc[t][r] + u * value;
+                        }
+                    }
+                }
+            }
+        }
+        if (step + 1U < steps)
+            __syncthreads();
+    }
+    if (valid) {
+#pragma unroll
+        for (unsigned t = 0; t < T; ++t) {
+#pragma unroll
+            for (unsigned r = 0; r < Rows; ++r) {
+                const float sa = wave_sum(acc[t][r]);
+                float sb = 0.0F;
+                if constexpr (Gate)
+                    sb = wave_sum(uacc[t][r]);
+                if (lane == 0 && first + t < w.outputs)
+                    store_fused(out, r, first + t, w.outputs, Gate ? gelu_tanh(sa) * sb : sa, ep, failure);
+            }
+        }
+    }
+}
 template <bool Gate, WeightFormat Format, bool WideHeader, bool Streaming>
 bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned rows, float* out, Queue q, unsigned* failure,
                          const LinearEpilogue& ep) {
@@ -438,6 +537,33 @@ bool chunk_dispatch_impl(LinearView w, LinearView up, const float* x, unsigned r
     if (prefetch && rows == 1U && w.inputs >= 1024U && w.inputs % 16U == 0) {
         hipLaunchKernelGGL((prefetched_linear_kernel<1, Gate, Format, WideHeader, Streaming>), dim3(grid_blocks(w, ep)), dim3(128), 0,
                            static_cast<hipStream_t>(q), w, up, x, out, failure, ep);
+        return true;
+    }
+    // The staged loads read x as float4, so x itself must be 16-byte aligned.
+    if (staged_input_enabled(rows) && w.inputs % 16U == 0 && reinterpret_cast<std::uintptr_t>(x) % 16U == 0) {
+        constexpr unsigned waves = 8U, per_block = waves * 2U;
+        auto pe = ep;
+        if (pe.extra_out[0]) {
+            // Block offsets of a shared grid in units of per_block outputs.
+            pe.extra_block[0] = (w.outputs + per_block - 1U) / per_block;
+            if (pe.extra_out[1])
+                pe.extra_block[1] = pe.extra_block[0] + (pe.extra[0].outputs + per_block - 1U) / per_block;
+        }
+#define G4_STAGED_LAUNCH(R, T)                                                                                             \
+    case R:                                                                                                                \
+        hipLaunchKernelGGL((staged_linear_kernel<R, Gate, Format, WideHeader, Streaming, waves, T>),                       \
+                           dim3(grid_blocks(w, pe, per_block)), dim3(waves * 32U), 0, static_cast<hipStream_t>(q), w,      \
+                           up, x, out, failure, pe);                                                                       \
+        break
+        switch (rows) {
+            G4_STAGED_LAUNCH(3, 2);
+            G4_STAGED_LAUNCH(4, 2);
+            G4_STAGED_LAUNCH(5, 2);
+            G4_STAGED_LAUNCH(6, 2);
+            G4_STAGED_LAUNCH(7, 2);
+            G4_STAGED_LAUNCH(8, 2);
+        }
+#undef G4_STAGED_LAUNCH
         return true;
     }
     if (pair_tile_enabled(rows) && w.inputs % 16U == 0) {
@@ -606,6 +732,17 @@ bool store_fusion_enabled() {
         return !p || std::string_view(p) != "0";
     }();
     return enabled;
+}
+// Unset or 1: shared passes of three to eight rows stage their inputs once per
+// block (staged_linear_kernel, 8 waves x 2 outputs; measured faster than the
+// chunk and pair kernels there, slower at two rows); 0 restores the previous
+// schedules (chunk kernel, pair kernel at eight rows).
+bool staged_input_enabled(unsigned rows) {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_STAGED_INPUT");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled && rows >= 3U && rows <= 8U;
 }
 // Unset: shared passes of eight rows (measured faster at C8, slower at C4);
 // 0 off; 1 every row count.
