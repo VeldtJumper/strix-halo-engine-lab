@@ -4,6 +4,7 @@
 #include "layout.hpp"
 
 namespace strix::gemma4::gpu {
+struct Fp16Mirror; // kv/fp16_mirror.hpp
 // One immutable snapshot and one unpublished overlay per transaction/producer.
 struct KvRead {
     const float* k = nullptr;
@@ -117,6 +118,9 @@ struct DeviceStream::Impl {
     bool writer_queue = false;
     Queue queue = nullptr; // borrowed: the queue of the last pass that wrote this stream (never created or destroyed here)
     void* pinned_publication = nullptr;
+    // FAST readers only (kv/fp16_mirror.hpp): FP16 halves of the committed global rows; empty on a new or forked
+    // stream, never read by the exact routes.
+    std::shared_ptr<Fp16Mirror> fp16_mirror;
     Impl() = default;
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;

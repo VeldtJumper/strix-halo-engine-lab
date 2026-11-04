@@ -23,7 +23,7 @@ build does not contain.
 | Profile | Decode | Prefill | Guarantee |
 |---|---|---|---|
 | `default` | `g4-v1` (FP32 activations, Q4_K_M weights) + MTP drafter at C1 | `prefill-exact` | Exact: output bytes equal the declared serial path for every batch size (C4 == C1) and with the drafter on or off |
-| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter | `prefill-exact` (v1 prompt prefill for `fast`: qualification of the pair v1 prefill + a8 decode pending) | Named profile, qualified against frozen fidelity bands |
+| `fast` | `g4-a8-v1` (int8 activations, qualified) + MTP drafter; decode attention at depth `g4-dattn-f2` (int8 KV copies for the global layers): qualification pending, exact attention runs until then | `prefill-exact` (v1 prompt prefill for `fast`: qualification of the pair v1 prefill + a8 decode pending) | Named profile, qualified against frozen fidelity bands |
 | `quality` | EXL3 pack (`--exl3-arm DIR`), identity chosen once per pack and session (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exact within its EXL3 identity; higher fidelity than Q4_K_M at similar size |
 
 The identity of the EXL3 route is fixed at startup from the pack and `--streams`, never per step, so a session's

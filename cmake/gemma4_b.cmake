@@ -35,8 +35,8 @@ endif()
 if(STRIX_ENABLE_HIP_RUNTIME)
     add_library(strix_gemma4_device_primitives STATIC src/gemma4/kernels/runtime.hip src/gemma4/kernels/linear.hip
         src/gemma4/kernels/rows_linear.hip src/gemma4/kernels/ple.hip src/gemma4/kernels/attention.hip
-        src/gemma4/kernels/a8.hip
-        src/gemma4/kv/transactions.hip)
+        src/gemma4/kernels/a8.hip src/gemma4/kernels/attention_fast_decode.hip
+        src/gemma4/kv/transactions.hip src/gemma4/kv/fp16_mirror.hip)
     target_link_libraries(strix_gemma4_device_primitives PUBLIC strix_gemma4_b_contracts "${STRIX_HIP_RUNTIME_LIBRARY}")
     target_include_directories(strix_gemma4_device_primitives PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
     set(gemma4_b_hip_targets strix_gemma4_device_primitives)
@@ -55,6 +55,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             add_executable(strix-gemma4-device-ops-tests tests/gemma4_gpu/operators.hip)
             target_link_libraries(strix-gemma4-device-ops-tests PRIVATE strix_gemma4_device)
             list(APPEND gemma4_b_hip_targets strix-gemma4-device-ops-tests)
+            # g4-dattn-f1 (FAST decode attention, global layers) and the per-stream FP16 KV mirror.
+            add_executable(strix-gemma4-device-fast-decode-attention-tests tests/gemma4_gpu/fast_decode_attention.hip)
+            target_link_libraries(strix-gemma4-device-fast-decode-attention-tests PRIVATE strix_gemma4_device)
+            list(APPEND gemma4_b_hip_targets strix-gemma4-device-fast-decode-attention-tests)
+            add_test(NAME strix-gemma4-device-fast-decode-attention-tests
+                COMMAND strix-gemma4-device-fast-decode-attention-tests)
+            set_tests_properties(strix-gemma4-device-fast-decode-attention-tests PROPERTIES TIMEOUT 120
+                LABELS "gpu;gemma4")
             add_executable(strix-gemma4-a8-device-tests tests/gemma4_a8/device.cpp)
             target_link_libraries(strix-gemma4-a8-device-tests PRIVATE strix_gemma4_device)
             strix_target_warnings(strix-gemma4-a8-device-tests)
