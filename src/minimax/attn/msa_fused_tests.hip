@@ -394,6 +394,22 @@ void run_case(const Case& c, std::mt19937& rng) {
             same_out(d, a, read_out(d, x), ("dense v4 heads/wave " + std::to_string(hpw)).c_str(), false, false);
         }
     }
+    // Selection once per (row, KV head) (separate launch, attend with select = false): every byte equal, for the
+    // default v3, the LDS diet and v4 one / two heads per wave.
+    if (c.idx_heads == c.kv_heads)
+        for (unsigned arm = 0; arm < 4; ++arm) {
+            reset_caches(d, x);
+            mf::DecodeView v = new_view(d, x);
+            v.select_once = true;
+            v.lds_diet = arm == 1;
+            if (arm >= 2) {
+                v.attend_version = 4;
+                v.heads_per_wave = arm == 2 ? 1U : 2U;
+            }
+            mf::enqueue_decode(v, nullptr);
+            hip_ok(hipDeviceSynchronize(), "sync select_once");
+            same_out(d, a, read_out(d, x), ("fused select_once arm " + std::to_string(arm)).c_str());
+        }
     for (unsigned ver : {1U, 2U, 3U})
         for (unsigned hw : {16U, 8U, 4U}) {
             reset_caches(d, x);
@@ -444,14 +460,18 @@ void run_case(const Case& c, std::mt19937& rng) {
         hip_ok(hipDeviceSynchronize(), "sync sel0");
         same_out(d, a, read_out(d, x), "fused select=false");
     }
-    // Graph capture, replayed 3 times from the same initial caches (tickets must come back to zero).
-    {
+    // Graph capture, replayed 3 times from the same initial caches (tickets must come back to zero); again with the
+    // selection once per (row, KV head) (three launches captured).
+    for (const bool sel_once : {false, true}) {
+        if (sel_once && c.idx_heads != c.kv_heads) break;
         hipStream_t st;
         hip_ok(hipStreamCreateWithFlags(&st, hipStreamNonBlocking), "stream");
         hipGraph_t g;
         hipGraphExec_t ge;
         hip_ok(hipStreamBeginCapture(st, hipStreamCaptureModeThreadLocal), "capture");
-        mf::enqueue_decode(new_view(d, x), st);
+        mf::DecodeView gv = new_view(d, x);
+        gv.select_once = sel_once;
+        mf::enqueue_decode(gv, st);
         hip_ok(hipStreamEndCapture(st, &g), "end capture");
         hip_ok(hipGraphInstantiate(&ge, g, nullptr, nullptr, 0), "instantiate");
         bool ok = true;
@@ -459,7 +479,7 @@ void run_case(const Case& c, std::mt19937& rng) {
             reset_caches(d, x);
             hip_ok(hipGraphLaunch(ge, st), "graph launch");
             hip_ok(hipStreamSynchronize(st), "graph sync");
-            ok &= same_out(d, a, read_out(d, x), "graph replay");
+            ok &= same_out(d, a, read_out(d, x), sel_once ? "graph replay select_once" : "graph replay");
         }
         const auto t = host(x.ticket, std::size_t(x.R) * c.kv_heads);
         check(std::all_of(t.begin(), t.end(), [](std::uint32_t y) { return y == 0; }), std::string(c.name) + " tickets reset");
@@ -1218,8 +1238,11 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
     // STRIX_MMATTN_BENCH_DIET=1 (sparse cells): arm 5 = v3-16 with lds_diet instead of v3-8, so v3 42 KB (arm 2),
     // v3 32 KB (5), v4-h1 (4) and v4-h2 (3) share one process, cache rotation and bracket order.
     const char* diet_env = std::getenv("STRIX_MMATTN_BENCH_DIET");
-    const bool diet_arm = !g_exp && !dense_ok && diet_env != nullptr && std::string(diet_env) == "1";
-    const unsigned arm_hw[6] = {0, 16, 16, 16, 16, diet_arm ? 16U : 8U}, arm_ver[6] = {0, 3, 3, 4, dense_ok ? 3U : 4U, dense_ok ? 4U : 3U};
+    // STRIX_MMATTN_BENCH_SELONCE=1 (sparse cells): arm 5 = v3-16 with select_once (selection launch + attend select = false).
+    const char* selonce_env = std::getenv("STRIX_MMATTN_BENCH_SELONCE");
+    const bool selonce_arm = !g_exp && !dense_ok && selonce_env != nullptr && std::string(selonce_env) == "1";
+    const bool diet_arm = !selonce_arm && !g_exp && !dense_ok && diet_env != nullptr && std::string(diet_env) == "1";
+    const unsigned arm_hw[6] = {0, 16, 16, 16, 16, diet_arm || selonce_arm ? 16U : 8U}, arm_ver[6] = {0, 3, 3, 4, dense_ok ? 3U : 4U, dense_ok ? 4U : 3U};
     const unsigned arm_hpw[6] = {0, 0, 0, 2, dense_ok ? 0U : 1U, dense_ok ? 2U : 0U};
     // Experiment mode: arm 3 = v2-16 again (repeatability), arm 4 = v2-16 with the selection precomputed (index launch
     // + attend select=false; idx from the previous select runs).
@@ -1231,6 +1254,7 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
         v.dense = (arm == 4 || arm == 5) && !g_exp && dense_ok;
         v.pv_full_tiles = arm == 1 ? 0U : 1U;  // arm 1 = version 3 as measured (predicated PV only)
         v.lds_diet = diet_arm && arm == 5;
+        v.select_once = selonce_arm && arm == 5;
         return v;
     };
     auto enqueue_arm = [&](int arm) {
@@ -1281,7 +1305,7 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
         return 1000.0 * ms / (double(reps) * L);
     };
     const char* names[6] = {"A(current)", "v3-pred", "v3-full", "v4-h2", g_exp ? "v3-presel" : dense_ok ? "D3(dense)" : "v4-h1",
-                            dense_ok ? "D4-h2(dense)" : diet_arm ? "v3-diet" : "v3-8"};
+                            dense_ok ? "D4-h2(dense)" : diet_arm ? "v3-diet" : selonce_arm ? "v3-sel1" : "v3-8"};
     for (int gm = 0; gm < 2; ++gm) {
         std::vector<double> t[6];
         std::string rounds;

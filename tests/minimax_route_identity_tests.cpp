@@ -146,6 +146,13 @@ void decode_and_verify() {
                         "verify windows keep the default attend");
                 compare_tuple("decode-attend-grid", {0,0,0,0}, {attend ? 1U : 0U,0,0,0});
             }
+        for (bool enabled : {false, true})
+            for (bool dense : {false, true})
+                for (std::uint64_t pos : {std::uint64_t{8191}, std::uint64_t{16382}, std::uint64_t{16383}, std::uint64_t{131071}}) {
+                    const bool once = route::select_once(enabled, n, dense, pos);
+                    require(once == (enabled && !dense && n >= 4 && pos >= 16383), "selection once: sparse >= 4 rows, >= 16K");
+                    compare_tuple("decode-select-once", {0,0,0,0}, {once ? 1U : 0U,0,0,0});
+                }
         compare_tuple("index-proj", {32,0,0,0}, {index.ring,index.rows_per_wave,0,0});
         compare_tuple("decode-wide", {0,0,0,0}, {route::wide_for(n, 2) ? 1U : 0U,0,0,0});
         for (const auto& shape : std::array<std::array<unsigned, 3>, 8>{{

@@ -227,6 +227,10 @@ public:
     // STRIX_MM_ATTEND4_DECODE (default ON): decode attend v4, one head per wave, on the same grids (before the diet).
     void set_attend4_decode(bool on);
     [[nodiscard]] bool attend4_decode() const;
+    // STRIX_MM_SELECT_ONCE (default ON): decode top-k selection once per (row, KV head) on sparse calls of >= 4 rows.
+    void set_select_once(bool on);
+    [[nodiscard]] bool select_once() const;
+    [[nodiscard]] std::uint64_t select_once_count() const;  // decode attention calls that took it (diagnostic)
     [[nodiscard]] bool index_concurrent() const;
     // decode fused exchange boundary (decode module path, same bits; qualification notes):
     // STRIX_MM_XB_WAIT=1: post_exchange waits for the peer's partial in-kernel; STRIX_MM_XB_INPLACE=1: the producers

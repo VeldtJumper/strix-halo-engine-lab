@@ -2844,6 +2844,22 @@ On two single-row sparse decode sequences at 8K positions or more, decode attent
 - **Measured gain:** Used on the same grids only when STRIX_MM_ATTEND_DIET=0 (the diet is faster there): same-binary bench v3-full / v4 one head per wave 8K 74.4 / 71.0, 32K 133.5 / 131.4, 128K 343.1 / 342.6 us/layer; earlier t12 8K 78.6 -> 75.2 us
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
+<a id="mm-select-once"></a>
+
+### Decode top-k selection once per (row, KV head)
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_SELECT_ONCE`. **Default:** 1 via the engine resolver; raw-library unset is 0.
+
+On sparse decode calls of four rows or more at 16K positions or more, one selection launch per (row, KV head) computes the top-k block list and the attend launch reads it, instead of every selecting chunk block of the attend launch repeating the same selection. Same order keys, same top-k, same ascending compaction with the newest block last: the block lists and every output are unchanged.
+
+- **Preconditions:** Sparse decode calls with at least four rows (users or verify-window rows), every row at 16,384 positions or more.
+- **Automatic selection:** Resolver supplies 1 only when unset; the engine sets the per-call view flag only on route::select_once calls; explicit values win.
+- **Fallback notice:** Calls of one to three rows and calls with a row below 16K positions keep the selection inside the attend launch (the extra launch costs more there: 8K / 32K / 128K N1 49.6 -> 53.7, 80.3 -> 84.0, 187.5 -> 193.8 us; 8K N4 123.1 -> 124.4 us); dense calls have no selection.
+- **Exactness evidence:** msa_fused_tests run_case: select_once with v3, the LDS diet and v4 one / two heads per wave bitwise vs the current kernels (attention, caches, scores, selection) on every decode case.
+- **Off switch:** STRIX_MM_SELECT_ONCE=0
+- **Measured gain:** Same-binary bench, index + attend per layer and rank, v3 / select once: 32K N8 455.3 / 436.0 and 453.2 / 433.5, 32K N4 241.5 / 237.1, 32K verify windows of 8 / 4 rows 220.4 / 206.4 and 141.0 / 136.0, 128K N8 1304.7 / 1286.2 us
+- **Implementation / evidence:** [resolver](../src/minimax/engine/mm_defaults.cpp), [MSA tests](../src/minimax/attn/msa_fused_tests.hip)
+
 <a id="mm-pf-idx-tile"></a>
 
 ### MSA prefill index query tiles
