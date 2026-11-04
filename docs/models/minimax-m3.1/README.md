@@ -41,12 +41,13 @@ grouped calls whose every member has at least 2048 rows. Balanced 7940-token pro
 
 | Mode | Prompt / context | Measured result | Build / exactness |
 |---|---|---|---|
-| Greedy decode | 1K / 8K benchmark prompts, 256 tokens | **44.57 / 46.10 ms/token** (22.44 / 21.69 tok/s) | `8cc30ac0`; ranks agree, reference IDs equal |
-| Fresh combined prefill | 8K benchmark prompt | **17.731 s**, 462 tok/s; baseline 21.874 s (**−19 %**); **36–39 %** of the calculated 6.3–7.0 s kernel floor | `e0bad3d1`; both ranks' state/final logits equal archived production |
-| Fresh combined prefill | 32K benchmark prompt | **91.508 s**, 358 tok/s; **28–32 %** of the calculated 26–29 s kernel floor | `e0bad3d1`; new reference, not an archived-reference exactness comparison |
-| Combined prefill, same process | 1K / 8K, three alternating pairs | **2.73–2.77 / 20.3–20.8 s**, **0.848–0.853× / 0.783–0.797×** baseline time | `561de319`; state/final-row checks and tokens equal on both ranks |
+| Greedy decode | 1K / 8K benchmark prompts, cold | **43.30 / 45.06 ms/token** (23.10 / 22.19 tok/s); 44.57 / 46.10 ms/token on `8cc30ac0` (256 tokens) | public tree of PR #59; ranks agree, reference IDs equal |
+| Combined prefill | 8K benchmark prompt | **14.04 s**, 583 tok/s (alternating arms in one process, 13.85–14.29 s); **45–50 %** of the calculated 6.3–7.0 s kernel floor; 17.731 s on `e0bad3d1` (baseline 21.874 s) | #334 `c225cdaa2`; both ranks' state/final rows equal the references |
+| Fresh combined prefill | 32K benchmark prompt | **63.48 s**, 516 tok/s (three runs per arm, both orders); **41–46 %** of the calculated 26–29 s kernel floor; 91.508 s on `e0bad3d1` | #334 `c225cdaa2`; result hash equal in all six runs, ranks agree |
+| Combined prefill, same process | 1K / 8K, alternating arms | **2.49–2.52 / 13.85–14.29 s**; on `561de319`: 2.73–2.77 / 20.3–20.8 s, 0.848–0.853× / 0.783–0.797× baseline time | #334 build; state/final-row checks equal on both ranks |
 | Batch, fresh process per arm | N=1 / N=8, 1K benchmark | **43.92 / 130.24 ms/step** (N8: **61.4 tok/s aggregate**, calculated) | `8cc30ac0`; each row equals running alone; batch invariance passes |
-| DSpark | JSON / Python / prose, 256 tokens | **54.4 / 34.1 / 24.1 tok/s** | `8cc30ac0`; IDs equal greedy |
+| DSpark | JSON / Python / prose | **59.96 / 36.93 / 27.05 tok/s**; 54.4 / 34.1 / 24.1 tok/s on `8cc30ac0` | PR #70 `fbd43423`; IDs equal greedy |
+| Served, C1 / C2 / C4 / C8 | 8 distinct ~190-token prompts, 256 tokens | **22.0 / 32.2 / 44.5 / 55.7 tok/s** aggregate (repeat run 22.1 / 32.5 / 45.1 / 56.1) | main `e6ce78571`; every request's IDs equal the request alone |
 
 Prompt kinds are unspecified for the prefill and batch benchmarks. Fresh-prefill rows are single runs;
 the 1K first-use result was **3.509 s**. The combined run later hit its time limit in another arm; only completed
