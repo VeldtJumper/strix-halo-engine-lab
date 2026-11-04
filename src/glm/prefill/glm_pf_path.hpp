@@ -6,6 +6,8 @@
 //     gemv (default, exact): the decode identity, so the chunked prefill equals the reference prefill
 //       (decode row by row) bit for bit. STRIX_GLM_PF_EXACT_LIN uses the tiled DOT2 graph for supported linears;
 //       STRIX_GLM_PF_EXACT_MOE uses grouped exact DOT2 for TP2 MoE. Both default ON (=0 off).
+//       With the exact linears the KDA q/k/v projections write [R][q | k | v] directly (strided output, same bits);
+//       STRIX_GLM_PF_KDA_PACK=1 restores contiguous projections + pack_qkv.
 //       STRIX_GLM_PF_EXACT_TM=16|32|64, default 32; STRIX_GLM_PF_EXACTMOE_V=1|2|3, default 3.
 //     wmma (STRIX_GLM_PF_TIERB=wmma, opt-in, glm-pf-wmma-v1): LinearRunner::run_pinned with the frozen split
 //       table (every GLM shape: s = 1), routed experts through the grouped core

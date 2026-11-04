@@ -3473,6 +3473,24 @@ with the same weight conversion). Calls with more than 4096 inputs (the 16384-lo
 - **Measured gain:** 8K TTFT 15.06 -> 14.92 s (544 -> 549 tok/s, -0.9 %), 1K warm 2.80 -> 2.75 s (366 -> 372 tok/s, -1.9 %), every v2 arm faster than every v1 arm; KDA f_b / g_b (128 -> 4096) 1.19-1.21x at 8192 rows
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
+<a id="glm-pf-kda-pack"></a>
+
+### Prefill KDA q/k/v projections in the packed layout
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_PACK`. **Default:** 0.
+
+With the exact linear core, each of the KDA attention's q, k and v projections writes its column block of the
+[R][q | k | v] layout the KDA scan reads (row stride 3C), so the separate pack kernel and its copy are gone. Same
+arithmetic per output; only the output placement changes.
+
+- **Preconditions:** Exact chunked prefill with the exact linear core (the default) and supported q/k/v weights; the WMMA tier and the non-exact linears keep contiguous projections + pack.
+- **Automatic selection:** Unset or 0 writes the packed layout directly; explicit values other than 0 and 1 are rejected.
+- **Fallback notice:** None.
+- **Exactness evidence:** Bitwise: every arm on both ranks of the pair equals the public exact anchors at 1K and 8K (logits digests).
+- **Off switch:** STRIX_GLM_PF_KDA_PACK=1 restores contiguous projections + pack
+- **Measured gain:** Two-node pair TTFT, five alternating fresh-process arms: 8,192 tokens 15.06 -> 14.92 s (544 -> 549 tok/s, -0.95 %), 1,024 tokens 2.80 -> 2.78 s (366 -> 368 tok/s, -0.7 %)
+- **Implementation / evidence:** [prefill path](../src/glm/prefill/glm_pf_path.hip)
+
 <a id="glm-pf-scores-v3"></a>
 
 ### Prefill MLA scores v7

@@ -2238,6 +2238,17 @@
   },
   {
     "engine": "glm",
+    "name": "Prefill KDA q/k/v projections in the packed layout",
+    "flag_or_env": "STRIX_GLM_PF_KDA_PACK",
+    "default": "0",
+    "exact": "Bitwise: every arm on both ranks of the pair equals the public exact anchors at 1K and 8K (logits digests).",
+    "gain": "Two-node pair TTFT, five alternating fresh-process arms: 8,192 tokens 15.06 -> 14.92 s (544 -> 549 tok/s, -0.95 %), 1,024 tokens 2.80 -> 2.78 s (366 -> 368 tok/s, -0.7 %)",
+    "preconditions": "Exact chunked prefill with the exact linear core (the default) and supported q/k/v weights; the WMMA tier and the non-exact linears keep contiguous projections + pack.",
+    "off_switch": "STRIX_GLM_PF_KDA_PACK=1 restores contiguous projections + pack",
+    "doc_anchor": "docs/optimizations.md#glm-pf-kda-pack"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill MLA scores v7",
     "flag_or_env": "STRIX_GLM_PF_SCORES",
     "default": "7",
