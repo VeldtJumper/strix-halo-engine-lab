@@ -30,6 +30,7 @@ default: [methodology](docs/methodology.md).
 | GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | R1b decode identity by default; exact MTP self-speculation by default; exact R1 chunked prefill; `--identity r1` restores R1; R≥3 fix verified on the pair; HTTP server `strix-glm5-serve` (OpenAI chat/completions + SSE, continuous batching) |
 | GLM-5.3 Flash on one RTX PRO 6000 (draft) | RTX PRO 6000 (96 GB, Windows) | **Opt-in** | Exact prefill and greedy decode; routed experts streamed through the [tierstream](https://github.com/hyukudan/tierstream) device-gated cache (device, pinned RAM, unit file); `--profile`; [guide](src/glm/rtxpf/README.md) |
 | Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 pack for `quality`) | 1 node | **Opt-in build** (`STRIX_FAMILY_GEMMA4=ON`) | `--profile default\|fast\|quality`; exact decode at every batch size; exact MTP drafter at C1; continuous-batching server |
+| **MiniMax H3** (audio + video; int8 DiT, nvfp4 text encoder pack) | 1 node; 2 nodes over USB4 | **Opt-in build** (`STRIX_FAMILY_H3=ON`) | 5 s 1344x768 clip + stereo audio in **405.5 s** on the pair; two nodes byte-identical to one node; dense reference and FAST-class levers (6-step LoRA, sparse attention, fast VAE) each with its own switch; [page](docs/models/minimax-h3/README.md) |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
 ([docs/models/model-families.md](docs/models/model-families.md)). Automatic routes admit model assets under their documented contracts; provenance and licenses are recorded in
@@ -86,11 +87,12 @@ conditions, repetition counts, exactness evidence and off switches.
 | Nemotron 3.5 Bolt E4B | 1 node | Selectable prompt prefill route `g4-wmma-pf-v1` (`STRIX_G4_PREFILL_IDENTITY=v1`; FP16 WMMA linears on the prompt bulk, the last <= 8 prompt tokens and the anchor on the decode arithmetic; not exact), 2K / 4K / 8K | **2,359 / 2,249 / 1,957** tok/s | exact prefill 526 / 509 / 481, `g4-wmma-pf-v2` (`=v2`) 1,537 / 1,478 / 1,349 in the same session; every profile keeps exact prefill by default | current |
 | Nemotron 3.5 Bolt E4B | 1 node | Exact prefill, 2K / 8K / 32K: `default` and `quality` | **535 / 509 / 397** and **815 / 746 / 533 tok/s** | 466 / 429 / 358 and 769 / 701 / 520 tok/s before the fused gate/up tile, linear tiles, 24-bit and shared Q6_K decode, EXL3 LDS pairs | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 node | HTTP server, `default`, 8 clients, mixed prompts (chat, code, one ~1.3K-token document), prefix cache off, 128 tokens: aggregate / TTFT p50 | **76.1 tok/s / 0.6 s** | one request at a time: 66.9 tok/s / 13.8 s | `f32aab24` |
+| **MiniMax H3** | 2 nodes over USB4 | Text to video + audio, 1344x768, 124 frames (5.17 s) + stereo audio, seed 42: 6-step LoRA, sparse attention tau 0.75, fast VAE | **405.5 s** (DiT 300.2 s, video VAE 42.4 s) | dense reference 8 steps: ~16 min on 1 node, ~8 min on the pair | h3 block `9d9d523b` |
 | llama.cpp `74a4fb00`, same machine, same Q4_K_M | 1 node | Reference: C1 plain / C4 / C8; prefill 2K / 8K / 32K; server at 8 clients | 55.5 / 193.3 / 279.9 tok/s; 2,062 / 1,881 / 1,376 tok/s; 227.1 tok/s | measured in the same session as the Nemotron rows | `74a4fb00` |
 
 Model pages: [Qwen](docs/models/qwen3.8/README.md) · [DeepSeek](docs/models/deepseek-v4.1/README.md) ·
 [MiniMax](docs/models/minimax-m3.1/README.md) · [GLM](docs/models/glm-5.3/README.md) ·
-[Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.md). The changelog of every shipped default with its measured
+[Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.md) · [MiniMax H3](docs/models/minimax-h3/README.md). The changelog of every shipped default with its measured
 gain and off switch is [measured gains](docs/measured-gains.md); the dated records are in
 [performance](docs/performance.md).
 
@@ -195,6 +197,15 @@ Requirements, one build or launch per route, what runs where, when a route does 
   cache across VRAM, pinned RAM and disk. Exact prefill and decode; TTFT 19.7 / 41.7 s at 8K / 32K on the full card,
   and it also runs exact with 24 GiB VRAM + 32 GiB host RAM.
   [Results](docs/models/glm-5.3/README.md#glm-rtx-results) · [guide](src/glm/rtxpf/README.md).
+
+## MiniMax H3 audio + video (opt-in build)
+
+**A 5 s 1344x768 video clip with stereo audio in 405.5 s on the USB4 pair.** Text to video + audio, 124 frames,
+seed 42, 6-step LoRA, sparse attention, fast VAE; one node, the two-node schedule on one node and the two nodes give
+the same bits for that identity. Build with `-DSTRIX_FAMILY_H3=ON` (nothing is built without it); each speed lever has
+its own flag, and without them the run is the dense reference.
+[Install, model files, one command per clip and rollback](docs/models/minimax-h3/README.md#h3-install) ·
+[stage breakdown](docs/models/minimax-h3/README.md#h3-result).
 
 ## Documentation
 

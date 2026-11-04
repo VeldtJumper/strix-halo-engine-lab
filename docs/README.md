@@ -18,6 +18,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [MiniMax M3.1 Flash](models/minimax-m3.1/README.md) ([Español](models/minimax-m3.1/README.es.md)): Results, quality gate and launch command on the USB4 pair.
 - [GLM-5.3 Flash](models/glm-5.3/README.md) ([Español](models/glm-5.3/README.es.md)): Results and launch commands for the USB4 pair and for one RTX PRO 6000.
 - [Nemotron 3.5 Bolt E4B](models/nemotron-3.5-bolt-e4b/README.md) ([Español](models/nemotron-3.5-bolt-e4b/README.es.md)): Profiles, assets, build and run, results and off switches on one node.
+- [MiniMax H3](models/minimax-h3/README.md) ([Español](models/minimax-h3/README.es.md)): Opt-in audio + video build: the 405.5 s pair clip with its stage breakdown, install, model files, one command per clip, rollback, packages and switches.
 - [Model families](models/model-families.md): Model-family registry in the core and how to add a family; deepseek41 as worked example.
 - [deepseek41 decode attention (CSA2)](models/deepseek-v4.1/attention.md): deepseek41 CSA2 decode attention on gfx1151: shapes, indexer, RoPE, declared arithmetic, host references.
 - [Sixteen-row BatchForward steps](models/deepseek-v4.1/batch-rows16.md): STRIX_DS41_BATCH_ROWS16: up to sixteen rows per BatchForward step.
