@@ -5,6 +5,8 @@
 #include "weight_policy.hpp"
 #include "capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
+#include "attention_fast_decode.hpp"
+#include <iostream>
 #include <algorithm>
 #include <cfenv>
 #include <chrono>
@@ -167,6 +169,11 @@ struct DeviceTarget::Impl {
     const void* a8_source[2] = {nullptr, nullptr};
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, candidates, winners, attention_counters;
     Buffer tickets;
+    // g4-dattn-f1 (STRIX_G4_DECODE_ATTN, FAST): per (layer, row) FP16 mirror descriptors and split-K scratch.
+    bool fast_decode = false;
+    MirrorFormat fast_format = MirrorFormat::none;
+    Buffer fast_mirrors, fast_scratch;
+    PinnedBuffer host_fast_mirrors;
     PinnedBuffer host_tokens, host_positions, host_reads, host_writes, host_failure, host_logits, host_taps, host_winners,
         host_hidden;
     std::vector<Candidate> selected;
@@ -496,6 +503,21 @@ DeviceTarget::DeviceTarget(const HostWeights& host, RopeTables tables, DeviceOpt
     b.tickets.resize(sizeof(unsigned));
     b.tickets.zero();
     b.candidates.resize(8ULL * ((c.vocab + 255U) / 256U) * sizeof(Candidate));
+    b.fast_format = fast_decode_attention_format();
+    b.fast_decode = b.fast_format != MirrorFormat::none;
+    {
+        static const bool witnessed = [&] {
+            std::cerr << "gemma4 decode attention identity "
+                      << fast_decode_attention_name(b.fast_format) << std::endl;
+            return true;
+        }();
+        (void)witnessed;
+    }
+    if (b.fast_decode) {
+        b.fast_mirrors.resize(8ULL * c.layers * sizeof(Fp16MirrorRead));
+        b.fast_mirrors.zero();
+        b.fast_scratch.resize(fast_decode_attention_scratch_bytes(8, c.max_positions));
+    }
     b.winners.resize(8 * sizeof(Candidate));
     if (b.stats.pinned_io) {
         b.host_tokens.allocate(b.tokens.size());
@@ -507,6 +529,8 @@ DeviceTarget::DeviceTarget(const HostWeights& host, RopeTables tables, DeviceOpt
         b.host_taps.allocate(b.taps.size());
         b.host_winners.allocate(b.winners.size());
         b.host_hidden.allocate(b.x.size());
+        if (b.fast_decode)
+            b.host_fast_mirrors.allocate(b.fast_mirrors.size());
     }
     if (options.profile || options.graph_timing) {
         hip_checked(hipEventCreate(&b.start));
@@ -655,6 +679,21 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             }
         b.input(b.reads, b.host_reads, descriptors.data(), descriptors.size() * sizeof(KvRead));
         b.input(b.writes, b.host_writes, destinations.data(), destinations.size() * sizeof(KvWrite));
+        if (b.fast_decode) {
+            // g4-dattn-f1: bring each stream's FP16 mirror to its committed frontier (64-row steps; the kernel
+            // rounds every later row itself, so the bytes do not depend on this schedule), then one descriptor
+            // per (global layer, row).
+            for (auto& entry : transactions)
+                fp16_mirror_sync(*entry.first->stream, b.fast_format, b.failure.as<unsigned>(), b.queue);
+            std::vector<Fp16MirrorRead> mirrors(8ULL * c.layers);
+            for (unsigned l = 0; l < c.layers; ++l)
+                if (c.layer[l].attention == AttentionKind::global)
+                    for (unsigned r = 0; r < n; ++r) {
+                        const auto* tx = static_cast<DeviceStream::Impl::Txn*>(rows[r]->transaction);
+                        mirrors[8ULL * l + r] = fp16_mirror_read(*tx->stream, c.layer[l].producer);
+                    }
+            b.input(b.fast_mirrors, b.host_fast_mirrors, mirrors.data(), mirrors.size() * sizeof(Fp16MirrorRead));
+        }
         // K/V epilogue folded into attention only when every row is its
         // transaction's only new position; the schedule is part of the graph key.
         const bool single_rows = std::all_of(transactions.begin(), transactions.end(),
@@ -735,7 +774,8 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                 }
                 bool attended = false;
                 const bool attention_a8 = b.stats.a8 && a8::quantized(y.o.format) && (c.heads * dim) % 256U == 0;
-                if (a.producer == l && single_rows)
+                const bool fast_global = b.fast_decode && global;
+                if (a.producer == l && single_rows && !fast_global)
                     b.run("attention_kv_store", [&] {
                         attended = fused_attention_store(
                             b.q.as<float>(), y.q_norm, b.k.as<float>(), b.v.as<float>(), y.k_norm,
@@ -770,6 +810,15 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                         });
                     }
                 }
+                if (!attended && fast_global)
+                    b.run("fast_decode_attention", [&] {
+                        attended = fast_decode_attention(
+                            b.q.as<float>(), y.q_norm, b.positions.as<std::uint64_t>(), table,
+                            b.reads.as<KvRead>() + 8ULL * l, b.fast_mirrors.as<Fp16MirrorRead>() + 8ULL * l, n, c.heads,
+                            dim, stride, b.att.as<float>(), b.fast_scratch.as<float>(), b.fast_scratch.size(),
+                            b.failure.as<unsigned>(), b.queue, b.stats.norm_search, b.stats.norm_bounds,
+                            b.stats.norm_intervals, b.fast_format, attention_a8 ? b.a8_output(c.heads * dim) : A8Rows{});
+                    });
                 if (!attended)
                     b.run("fused_attention", [&] {
                         attended = fused_attention(b.q.as<float>(), y.q_norm, b.positions.as<std::uint64_t>(), table,
@@ -966,6 +1015,9 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             b.failure.download(&failure, sizeof(failure));
         if (failure)
             throw std::runtime_error("nonfinite execution or missing device KV tag");
+        if (b.fast_decode)
+            for (auto& entry : transactions)
+                fp16_mirror_confirm(*entry.first->stream);
         if (want_hidden) {
             std::vector<float> normalized;
             const float* hidden_data = b.host_hidden.as<float>();

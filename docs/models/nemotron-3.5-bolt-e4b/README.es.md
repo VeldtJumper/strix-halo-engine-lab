@@ -24,7 +24,7 @@ declarado y una línea de stderr lo indica. Un perfil solo rechaza por un asset 
 | Perfil | Decode | Prefill | Garantía |
 |---|---|---|---|
 | `default` | `g4-v1` (activaciones FP32, pesos Q4_K_M) + drafter MTP en C1 | `prefill-exact` | Exacto: los bytes de salida son iguales a la ruta serial declarada para cualquier tamaño de batch (C4 == C1) y con el drafter activado o desactivado |
-| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP | `prefill-exact` (prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente) | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
+| `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP; atención de decode en profundidad `g4-dattn-f2` (copias int8 de la KV de las capas globales): cualificación pendiente, hasta entonces se ejecuta la atención exacta | `prefill-exact` (prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente) | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
 | `quality` | Paquete EXL3 (`--exl3-arm DIR`), identidad elegida una vez por paquete y sesión (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exacto dentro de su identidad EXL3; mayor fidelidad que Q4_K_M con un tamaño similar |
 
 La identidad de la ruta EXL3 se fija al arrancar a partir del paquete y de `--streams`, nunca por paso, así que la

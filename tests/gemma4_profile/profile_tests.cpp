@@ -227,6 +227,23 @@ void product_table() {
         for (const auto& e : r.entries) pending += e.status == pr::Status::pending;
         check(lines.size() == pending, "one stderr line per pending row, no more");
     }
+    // FAST decode attention at depth: pending until its receipt (exact runs), runnable with --allow-pending,
+    // never in DEFAULT/QUALITY, STRIX_G4_DECODE_ATTN=exact switches it off.
+    for (const auto app : {pr::App::engine, pr::App::decode_bench}) {
+        r = pr::resolve(pr::Name::fast, app, in());
+        check(status(r, "decode_attention") == pr::Status::pending && value(r, "decode_attention") == "exact" &&
+              r.find("decode_attention")->target == "g4-dattn-f2" && !r.active("decode_attention"),
+              "fast decode attention pending, exact runs");
+        pr::Inputs pending_ok = in(); pending_ok.allow_pending = true;
+        r = pr::resolve(pr::Name::fast, app, pending_ok);
+        check(status(r, "decode_attention") == pr::Status::unqualified && value(r, "decode_attention") == "g4-dattn-f2",
+              "allow-pending runs g4-dattn-f2 unqualified");
+        r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
+        check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
+        r = pr::resolve(pr::Name::standard, app, in());
+        check(status(r, "decode_attention") == pr::Status::builtin && value(r, "decode_attention") == "exact",
+              "default keeps the exact decode attention");
+    }
     // The prefill bench cannot run exact prefill: it refuses every profile without --allow-pending.
     refuses([] { (void)pr::resolve(pr::Name::fast, pr::App::prefill_bench, in()); }, "--allow-pending",
             "fast prefill bench refuses and names --allow-pending");

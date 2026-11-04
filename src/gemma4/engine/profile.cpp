@@ -20,6 +20,14 @@ constexpr Lever table[] = {
      .kind = Kind::bit_changing, .apps = engine | decode_bench,
      .source = "g4-a8-v1 (A8G32 activations, integer dots; byte gates exact); "
                "qualified: held-out fidelity bands met"},
+    // FAST decode attention at depth (global layers): int8 KV groups (one FP16 scale per 16 features) from the
+    // per-stream mirror, split-K over 128-key tiles, FP32 softmax and sums, ordered merge (g4-dattn-f2; g4-dattn-f1 =
+    // FP16 operands, selectable). Pending its fast-parity receipt (decode after 8K/32K/64K prompts); until
+    // then FAST runs the exact attention. STRIX_G4_DECODE_ATTN=exact is the OFF switch.
+    {.name = "decode_attention", .env = "STRIX_G4_DECODE_ATTN", .value = {"exact", "g4-dattn-f2", "exact"},
+     .builtin = "exact", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
+     .kind = Kind::bit_changing, .apps = engine | decode_bench, .target = "g4-dattn-f2",
+     .source = "pending: g4-dattn-f2 qualification receipt (fast-parity, decode after 8K/32K/64K prompts)"},
     // Drafter: <model dir>/drafter-mtp when present, --draft-mtp DIR overrides, --draft off or
     // STRIX_G4_DRAFT=0 switches it off. Missing weights never fail: decode runs exact without it.
     {.name = "draft", .env = "STRIX_G4_DRAFT", .option = "--draft-mtp", .value = {"mtp-auto", "mtp-auto", "mtp-auto"},
