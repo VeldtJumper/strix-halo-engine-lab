@@ -603,6 +603,7 @@ struct Engine::Impl {
         moe::opt::set_prefill_mtfit(-1);
         moe::opt::set_prefill_core8(-1);
         moe::opt::set_prefill_pipe(-1);
+        moe::opt::set_prefill_pipe_pair(-1);
         moe::opt::set_prefill_tail_stream(-1);
         moe::opt::set_prefill_table_ring(-1);
         moe::opt::set_prefill_gufuse(-1);

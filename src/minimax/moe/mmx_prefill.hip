@@ -651,6 +651,7 @@ int g_core_override = -1;
 int g_mtfit_override = -1;
 int g_core8_override = -1;
 int g_pipe_override = -1;
+int g_pipe_pair_override = -1;
 int g_tail_stream_override = -1;
 int g_gufuse_override = -1;
 int g_gather_tok_override = -1;
@@ -711,6 +712,25 @@ int prefill_pipe_default() {
     return value;
 }
 int prefill_pipe() { return g_pipe_override < 0 ? prefill_pipe_default() : g_pipe_override; }
+
+// STRIX_MMX_PREFILL_PIPE_PAIR (under PIPE): auto (default) = paired MT8 bands for calls of at least kPairMinRows rows
+// (whole-call ABBA: 4096 rows -0.9..-1.5 %, 2048 rows -0.6..-1.0 %; 1024 rows mixed, -1.1..+0.7 %, and the two-node 1K
+// prompt not faster, so it stays unpaired), 0 = never, 1 = every call. Same bits.
+constexpr unsigned kPairMinRows = 2048;
+int prefill_pipe_pair_default() {  // 2 = auto
+    static const int value = [] {
+        const char* e = std::getenv("STRIX_MMX_PREFILL_PIPE_PAIR");
+        if (e == nullptr || std::string(e) == "auto") return 2;
+        if (std::string(e) == "0") return 0;
+        if (std::string(e) == "1") return 1;
+        throw std::invalid_argument("STRIX_MMX_PREFILL_PIPE_PAIR must be auto, 0 or 1");
+    }();
+    return value;
+}
+bool prefill_pipe_pair(unsigned rows) {
+    const int mode = g_pipe_pair_override < 0 ? prefill_pipe_pair_default() : g_pipe_pair_override;
+    return mode == 1 || (mode == 2 && rows >= kPairMinRows);
+}
 
 // STRIX_MMX_PREFILL_TAIL_STREAM (v4 + mtfit): 1 (default) = the tail-class launches (MT 1..7) of each stage run on a side
 // stream beside the MT8 launch, joined before the stage's consumer; 0 = every class launch on the caller's stream.
@@ -854,13 +874,18 @@ constexpr const char* kGuLabel[8] = {"gate_up.mt1", "gate_up.mt2", "gate_up.mt3"
 constexpr const char* kDnLabel[8] = {"down.mt1", "down.mt2", "down.mt3", "down.mt4",
                                    "down.mt5", "down.mt6", "down.mt7", "down.mt8"};
 template <int V>
-void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream) {
+void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false) {
     if constexpr (V == 4) {
         if (cls == 7 && prefill_pipe() != 0) {
-            if (prefill_pipe() == 1)
-                hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
-            else
+            const bool simplify = prefill_pipe() == 2;
+            if (pair && simplify)
+                hipLaunchKernelGGL(pfk::grouped_pipe_pair_kernel<true>, dim3(ctas), dim3(128), 0, stream, items_d, n);
+            else if (pair)
+                hipLaunchKernelGGL(pfk::grouped_pipe_pair_kernel<false>, dim3(ctas), dim3(128), 0, stream, items_d, n);
+            else if (simplify)
                 hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+            else
+                hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
             return;
         }
         if (cls == 7 && prefill_core8() != 0) {
@@ -889,14 +914,15 @@ void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned 
         default: hipLaunchKernelGGL((pfk::grouped_kernel<8, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
     }
 }
-// core: 1 = v2, 2 = v3, 3 = v4, 8 / 9 = v3 diagnostics (no A loads / no decode)
-void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, unsigned core, hipStream_t stream) {
+// core: 1 = v2, 2 = v3, 3 = v4, 8 / 9 = v3 diagnostics (no A loads / no decode); pair = this MoE call's paired MT8 PIPE bands
+void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, unsigned core, hipStream_t stream,
+               bool pair) {
     if (list.empty()) return;
     const auto n = static_cast<unsigned>(list.size());
     switch (core) {
         case 1: launch_class<2>(items_d, n, ctas, cls, stream); break;
         case 2: launch_class<3>(items_d, n, ctas, cls, stream); break;
-        case 3: launch_class<4>(items_d, n, ctas, cls, stream); break;
+        case 3: launch_class<4>(items_d, n, ctas, cls, stream, pair); break;
         case 8: launch_class<31>(items_d, n, ctas, cls, stream); break;
         case 9: launch_class<32>(items_d, n, ctas, cls, stream); break;
         default: throw std::invalid_argument("minimax prefill moe: unknown core " + std::to_string(core));
@@ -1005,6 +1031,11 @@ void set_prefill_mtfit(int on) {
     g_mtfit_override = on;
 }
 int prefill_pipe_override() { return g_pipe_override; }
+void set_prefill_pipe_pair(int value) {
+    if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe_pair: value must be -1, 0, 1 or 2 (auto)");
+    (void)prefill_pipe_pair_default();  // capture once, including at Engine startup
+    g_pipe_pair_override = value;
+}
 void set_prefill_pipe(int value) {
     if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe: value must be -1, 0, 1 or 2");
     (void)prefill_pipe_default();
@@ -1088,6 +1119,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     if (workspace == nullptr || workspace_bytes < p.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
     auto* ws = static_cast<unsigned char*>(workspace);
     const unsigned core = prefill_core();
+    const bool pair = core == 3 && prefill_pipe_pair(v.rows);
     const bool gufuse = core == 3 && v.rows > 8 && prefill_gufuse();
     const bool v2 = core != 0;  // the grouped v2 item layout (v2, v3 and the v3 diagnostics)
     V2Items v2i;
@@ -1171,11 +1203,11 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             std::size_t c_at = at;
             try {
                 for (unsigned c = 0; c < 7 && side; ++c) {
-                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, g_tail_side);
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, g_tail_side, pair);
                     c_at += lists[c].size();
                 }
                 for (unsigned c = side ? 7U : 0U; c < 8; ++c) {
-                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, stream);
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, stream, pair);
                     c_at += lists[c].size();
                     if (!lists[c].empty()) mark(labels[core == 3 ? c : pfk::mt_of_class(c) - 1], stream);
                 }

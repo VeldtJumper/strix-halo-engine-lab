@@ -2631,6 +2631,22 @@ Run the small row-tile classes (MT 1-7, each with its own launch and register bu
 - **Measured gain:** MoE call, real weights and routes of one layer, 5 interleaved runs: 4096 rows 49.31 -> 47.81 ms (-3.0 %), 2048 rows -1.9 %, 1024 rows -1.9 %. Two Strix Halo nodes over 2x USB4, in-process A B A B A B A: 1K TTFT -0.1 to -1.1 % (every B faster, two runs), 8K mean -1.6 % (5 of 6 arms faster, one +2.3 % within the 8K noise); 32K fresh process per arm (A B A, B A B): TTFT -0.8 % / -0.3 % against the bracketing arms, MoE GPU time 24.46 -> 24.21 s (mean of 3). Merging the tail classes into one launch instead is slower (+1.5 % at 4096 rows): the merged kernel takes the largest class's registers.
 - **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
 
+<a id="mm-pf-pipe-pair"></a>
+
+### Prefill MoE paired MT8 PIPE bands
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_PIPE_PAIR`. **Default:** auto.
+
+Two neighbouring CTAs of the 128-row MT8 PIPE launch split the 128 output columns into two 64-column halves: each wave decodes one weight tile instead of two, and the two halves share the decoded tiles through a double-buffered LDS stage (one LDS fence and barrier per k tile).
+
+- **Preconditions:** v4 prefill MoE core with the PIPE MT8 kernel (the defaults); routed MoE calls only, dense prefill keeps the unpaired kernel.
+- **Automatic selection:** auto pairs a MoE call when it has at least 2048 rows; 0 = never, 1 = every call. The resolver supplies auto only when unset; explicit values win.
+- **Fallback notice:** None needed: smaller calls and =0 run the production PIPE kernel.
+- **Exactness evidence:** Same operands, k order and split partials per output. Bench: split partials, tile-major gate/up and down inputs and outputs byte-identical to the unpaired kernel (PIPE 1 and 2, MT-fit off and on, synthetic and real weights, 36 cells); prefill state, final rows and tokens identical on both ranks in every PAIR arm at 1K, 8K and 32K.
+- **Off switch:** STRIX_MMX_PREFILL_PIPE_PAIR=0
+- **Measured gain:** MoE call, real weights and routes of one layer, 10 A B B A blocks, five runs: 4096 rows -0.9 to -1.5 % (e.g. 50.19 -> 49.43 ms; one noisy run -0.1 %), 2048 rows -0.6 to -1.0 %; 1024 rows mixed (-1.1 to +0.7 %), so it stays unpaired. Two Strix Halo nodes over 2x USB4, in-process A B A B A B A: 8K TTFT mean 14.14 -> 14.04 s (-0.7 %); 32K fresh process per arm (A B A, B A B): TTFT 63.70 -> 63.48 s (-0.3 %, within noise), MoE GPU time 22.86 -> 22.90 s (neutral).
+- **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill_core.hpp), [dispatch](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
 <a id="mm-pf-gather-tok"></a>
 
 ### Prefill MoE token-major gather
