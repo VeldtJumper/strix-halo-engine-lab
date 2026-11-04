@@ -28,7 +28,7 @@ sections below; GLM on one RTX PRO 6000 is on the [GLM page](models/glm-5.3/READ
 | Engine | Hardware and workload | Latest measured result | Build | Exactness / conditions |
 |---|---|---|---|---|
 | Qwen3.8-Flash-Next, exact prefill | One node, plain command, prefill without model load, automatic T16384 from 32K | 1K **1,337 tok/s** (0.77 s); 4K **1,695** (2.42 s); 16K **1,730** (9.47 s); 17,700 **1,665** (10.63 s); 32K **1,713** (19.13 s); 128K **1,617** (81.08 s); 262,143 **1,509** (173.74 s); **54–56 %** of the contract ceilings (3,139 / 3,089 / 3,078 / 2,907 / 2,687 tok/s at 4K / 17,700 / 32K / 128K / 262,143) | main `85353311b` | default route; one binary; 64K not re-measured |
-| Qwen3.8-Flash-Next, YaRN factor 2 | One node, 262,144-token prompt, serial route | prefill **176.60 s = 1,484 tok/s**; serial decode **21.82 tok/s** | main `17b9c57b8` | one run |
+| Qwen3.8-Flash-Next, YaRN factor 2 | One node, 262,144-token prompt, serial route | prefill **175.18 s = 1,496 tok/s**; serial decode **21.74 tok/s** | GDN plain-launch fix | one run, Linux 7.4; 176.60 s on `17b9c57b8`, within run-to-run noise |
 | Qwen MTP decode | One node, 256 generated tokens, auto windows | 1K code **62.44 tok/s** (72 % of the 86.8 tok/s byte ceiling); 1K prose 51.56; 16K code / prose **50.69 / 50.31** | main `85353311b` | exact; this prose prompt differs from the 55.7 tok/s prose row |
 | Qwen 1M context (YaRN factor 4) | One node | serial 925 s TTFT / 1,198 tok/s prefill / 19.6 tok/s decode (Linux 7.3); MTP 1,133 s / 936 tok/s / **60.2 tok/s** (Linux 7.4, 102/120 accepted) | #288 `3b8b9ac0f` | MTP == serial gate; different kernels, so no serial-to-MTP ratio |
 | DeepSeek pair standalone prefill | Pair, 16K prompt, alternating runs | **14.27–14.59 s** | #201 | logits identical in every run |
@@ -249,14 +249,15 @@ These are historical rows; the current snapshot gives the newer prefill and deco
 Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
 real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
 overrides). TTFT runs from process launch to the first token and includes model load.
-The 262K prefill cell and the 262K serial decode cell are from public main `17b9c57b8` (262,144-token prompt, prefill
-time without model load, `--profile default`, one run: 176.60 s); the 262K MTP decode cell is from build `7b2453fe`; the
+The 262K prefill cell and the 262K serial decode cell are from the build with the GDN plain-launch fix (262,144-token
+prompt, prefill time without model load, `--profile default`, one run on Linux 7.4: 175.18 s; 176.60 s on `17b9c57b8`,
+within run-to-run noise); the 262K MTP decode cell is from build `7b2453fe`; the
 row's other cells are from the build above. The 1M row's serial cells are from public main `fdc39faba` on Linux 7.3; its
 MTP cells and exact gate are from #288 on Linux 7.4, so the row gives no serial-to-MTP ratio.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
-| 262,400 (2) | Full scope | 219 s / 224 s | **1,484 tok/s** `--profile default` (`17b9c57b8`) | 21.82 (`17b9c57b8`) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
+| 262,400 (2) | Full scope | 219 s / 224 s | **1,496 tok/s** `--profile default` (GDN plain-launch fix) | 21.74 (GDN plain-launch fix) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Full scope (MTP against serial with the HC output and index projection WMMA paths off) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); MTP route 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
 

@@ -120,8 +120,9 @@ YaRN, not native rotary, and do not qualify general 1M model fidelity or complet
 Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
 real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
 overrides). TTFT runs from process launch to the first token and includes model load.
-The 262K prefill cell and the 262K serial decode cell are from public main `17b9c57b8` (262,144-token prompt,
-prefill time without model load, `--profile default`, one run: 176.60 s); the 262K MTP decode cell is from build
+The 262K prefill cell and the 262K serial decode cell are from the build with the GDN plain-launch fix (262,144-token
+prompt, prefill time without model load, `--profile default`, one run on Linux 7.4: 175.18 s; 176.60 s on `17b9c57b8`,
+within run-to-run noise); the 262K MTP decode cell is from build
 `7b2453fe`; the row's other cells are from the build above.
 The 1M row's serial cells are from public main `fdc39faba` on Linux 7.3; its MTP cells and exact gate are from the
 MTP admission change (#288) on Linux 7.4. The two sets were measured on different kernels, so each cell states its
@@ -129,7 +130,7 @@ kernel and the row gives no serial-to-MTP ratio.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
-| 262,400 (2) | Full scope | 219 s / 224 s | **1,484 tok/s** `--profile default` (`17b9c57b8`) | 21.82 (`17b9c57b8`) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
+| 262,400 (2) | Full scope | 219 s / 224 s | **1,496 tok/s** `--profile default` (GDN plain-launch fix) | 21.74 (GDN plain-launch fix) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Full scope (MTP against serial with the two prefill paths below off) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); MTP route 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
 

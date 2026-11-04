@@ -379,6 +379,17 @@
   },
   {
     "engine": "qwen",
+    "name": "QPF2K GDN plain core launches",
+    "flag_or_env": "STRIX_QPF2K_GDN_COOP_LAUNCH",
+    "default": "0",
+    "exact": "For a fixed specialization, arrival tickets preserve logical head/half arithmetic, operand order and stores. Linux 7.4: terminal-logits fnv64 and tokens equal to the previous build at 16K and 32K in both arms; STRIX_QPF2K_GDN_CHECK=1 differ 0 in both arms. STRIX_QPF2K_GDN_CHECK=1 compares q/k, gates, FP32 core rows, conv history and recurrent state against production; CORE16 needs separate same-profile output/logit/state checks. These checks do not establish arbitrary preemption/restore safety.",
+    "gain": "Linux 7.4, 16K YaRN prompt: 0 hangs in 8 runs (3 in 4 with the cooperative launch); 32K prefill unchanged (ABBA, +-0.0 %)",
+    "preconditions": "Eligible fused GDN core. Plain launches run on the caller's stream instead of the cooperative queue, whose eviction/restore on Linux 7.4 could leave a running core waiting forever and hang prefill. Arrival tickets form pairs independently of physical block order. Each launch has its own zeroed arrival word, including pinned+paired dispatch and witness+fallback with continued norm counters. The two halves still exchange norm sums through a pair-local wait; tickets do not establish deadlock freedom under arbitrary preemption/restore. Follow-up: both halves in one workgroup, no inter-block wait. Both modes retain historical cooperative-support, per-block occupancy and whole-grid capacity admission; only the launch call changes. 0/unset = plain default, 1 = cooperative OFF arm, read once per process; restart to change it. Effective config reports requested value and effective plain/cooperative policy under gdn_core_launch.",
+    "off_switch": "STRIX_QPF2K_GDN_COOP_LAUNCH=1",
+    "doc_anchor": "docs/optimizations.md#qwen-gdn"
+  },
+  {
+    "engine": "qwen",
     "name": "QPF2K_GDN_GATES_BATCH",
     "flag_or_env": "STRIX_QPF2K_GDN_GATES_BATCH",
     "default": "1",
@@ -405,8 +416,8 @@
     "flag_or_env": "STRIX_QPF2K_GDN_CHUNK16",
     "default": "auto",
     "exact": "Bit-identical by construction (same per-row arithmetic, norm order, conv values and FP32/CORE16 stores; only the chunk length, stage count and barrier placement change). STRIX_QPF2K_GDN_CHECK byte compare of every layer: auto T 2048, forced T 4096 and T 8192, all differ 0 (FP32 outputs); CORE16 (FP16) route at T 4096: terminal-logits fnv64 digest and 32 generated tokens equal to STRIX_QPF2K_GDN_CHUNK16=0 (T 1024 digest equal on the FP32 route)",
-    "gain": "gdn_core per call (rocprofv3, fresh process per run, ABBA, one node): T 1024 37.46 -> 35.75 ms (-4.6 %), T 2048 -1.1 %, T 4096 -0.8 %, T 8192 +0.4 %; 8192- and 16384-row calls of 17.7K / 32K prompts +2 / +5 %. Hence the default takes calls of at most 4,096 rows (kQpf2kChunk16MaxRows), the last measured winning point. About 1-2 ms of core time per short prompt; no resolved TTFT change",
-    "preconditions": "STRIX_QPF2K_GDN fused lean core on the decay-NaN dispatch route (PARTS bits 4|16|32, not the 4-column core, not the witness core), call rows a multiple of 16 and at most kQpf2kChunk16MaxRows (4,096; STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS overrides it for crossover measurements), and both padded Chunk-16 kernels (Nan 2 pinned, Nan 1 paired; Opt 6, 25,600 B LDS) co-resident, else the 8-row kernels. The unpadded rows (Opt 2054, 24,064 B) measured slower than the 8-row kernels and run only when forced (=1). The norm ring grows to 16 rows only once such a call runs.",
+    "gain": "Historical, before the launch change: gdn_core per call (rocprofv3, fresh process per run, ABBA, one node): T 1024 37.46 -> 35.75 ms (-4.6 %), T 2048 -1.1 %, T 4096 -0.8 %, T 8192 +0.4 %; 8192- and 16384-row calls of 17.7K / 32K prompts +2 / +5 %. Hence the default takes calls of at most 4,096 rows (kQpf2kChunk16MaxRows), the last measured winning point. About 1-2 ms of core time per short prompt; no resolved TTFT change. These results do not measure the changed launch binary.",
+    "preconditions": "STRIX_QPF2K_GDN fused lean core on the decay-NaN dispatch route (PARTS bits 4|16|32, not the 4-column core, not the witness core), call rows a multiple of 16 and at most kQpf2kChunk16MaxRows (4,096; STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS overrides it for crossover measurements). Both launch modes require both padded Chunk-16 kernels (Nan 2 pinned, Nan 1 paired; Opt 6, 25,600 B LDS) to pass the same per-block and whole-grid capacity admission, else the 8-row kernels. The unpadded rows (Opt 2054, 24,064 B) measured slower than the 8-row kernels and run only when forced (=1). The norm ring grows to 16 rows only once such a call runs.",
     "off_switch": "STRIX_QPF2K_GDN_CHUNK16=0",
     "doc_anchor": "docs/optimizations.md#qwen-gdn-chunk16"
   },
@@ -615,7 +626,7 @@
     "default": "opt-in (bit 128 off; normal mask 55)",
     "exact": "Requires GDN byte/state checks and same-profile engine digests, including NaN cases; no defaults-on performance claim.",
     "gain": "No isolated measurement",
-    "preconditions": "Eligible lean GDN core, bit 128 set, bit 64 excluded, supported cooperative residency and scratch capacity.",
+    "preconditions": "Eligible lean GDN core, bit 128 set, bit 64 excluded and scratch capacity; both launch modes retain the same per-block and whole-grid capacity admission.",
     "off_switch": "Clear bit 128; STRIX_QPF2K_GDN_PARTS=55 restores the normal parts mask",
     "doc_anchor": "docs/optimizations.md#qwen-gdn-witness"
   },

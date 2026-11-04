@@ -1748,6 +1748,16 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         }
         for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC"})
             expect(yarn_environment_refusal({{name, "1"}}, 2).empty(), "YaRN admits the explicit default arm of code-default items");
+        for (const char* value : {"0", "1"}) {
+            auto launch = request; launch.environment["STRIX_QPF2K_GDN_COOP_LAUNCH"] = value;
+            const auto admitted = resolve(launch, memory);
+            expect(yarn_environment_refusal({{"STRIX_QPF2K_GDN_COOP_LAUNCH", value}}, 2).empty() && admitted.admitted &&
+                admitted.environment.at("STRIX_QPF2K_GDN_COOP_LAUNCH") == value,
+                "YaRN admits 0 = plain default and 1 = cooperative OFF arm");
+        }
+        expect(yarn_environment_refusal({{"STRIX_QPF2K_GDN_COOP_LAUNCH", "2"}}, 2) ==
+            "YaRN execution environment not supported: STRIX_QPF2K_GDN_COOP_LAUNCH (accepts 0|1)",
+            "YaRN launch policy values stay bounded");
         // Chunked GDN prefill keeps main's admission: no rotary site, any value (its option identity governs arithmetic).
         expect(yarn_environment_rule("STRIX_QPF2K_GDN_FP16_CHUNK") &&
             yarn_environment_rule("STRIX_QPF2K_GDN_FP16_CHUNK")->kind == YarnEnvironmentClass::nonrotary &&
@@ -3300,6 +3310,22 @@ int main(int argc, char** arguments) {
         };
         const auto saved_out=saved("STRIX_BITCALC_LOGITS_OUT");
         const auto saved_force=saved("STRIX_BITCALC_FORCE_TOKENS");
+        const auto saved_coop=saved("STRIX_QPF2K_GDN_COOP_LAUNCH");
+        for (const char* value : {static_cast<const char*>(nullptr), "", "0", "1", "10", "2"}) {
+            set_measurement("STRIX_QPF2K_GDN_COOP_LAUNCH",value);
+            auto launch=request;
+            launch.environment=requested_prefill_environment();
+            const auto report=serve::parse_json(effective_config_json(resolve(launch,memory)));
+            const auto* policy=report.find("gdn_core_launch");
+            const bool present=std::getenv("STRIX_QPF2K_GDN_COOP_LAUNCH")!=nullptr;
+            expect(policy && (present ? policy->find("requested")->as_string()==value : policy->find("requested")->is_null()) &&
+                policy->find("effective")->as_string()==(value && value[0]=='1'?"cooperative":"plain") &&
+                policy->find("read_once_per_process")->as_bool(),
+                "real environment collector reports requested GDN launch and the cached reader's plain/cooperative policy");
+            expect(present ? launch.environment.at("STRIX_QPF2K_GDN_COOP_LAUNCH")==value :
+                !launch.environment.contains("STRIX_QPF2K_GDN_COOP_LAUNCH"), "GDN launch override is captured without normalization");
+        }
+        set_measurement("STRIX_QPF2K_GDN_COOP_LAUNCH",saved_coop?saved_coop->c_str():nullptr);
         set_measurement("STRIX_BITCALC_LOGITS_OUT",nullptr);
         set_measurement("STRIX_BITCALC_FORCE_TOKENS",nullptr);
         auto measured=request;

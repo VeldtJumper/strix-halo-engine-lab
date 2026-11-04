@@ -46,6 +46,17 @@ sin cambiar instrucciones ni valores. Cada compilación puede comprobarse con
 
 ## Valores predeterminados incorporados por motor
 
+Los núcleos de recurrencia GDN fusionados de Qwen se lanzan de forma normal en el stream del llamador, no en la cola
+cooperativa. En Linux 7.4, una expulsión y restauración de las colas del proceso mientras corría un núcleo cooperativo
+podía dejarlo esperando para siempre y bloquear el prefill. Los bloques se emparejan por orden de llegada, así que el
+emparejamiento no depende del orden físico de despacho. Las dos mitades de cada cabeza de valores aún intercambian sumas
+de normalización mediante una espera local al par; el siguiente paso es un núcleo con ambas mitades en un solo grupo de
+trabajo, sin esperas entre bloques. `STRIX_QPF2K_GDN_COOP_LAUNCH=1` restaura el lanzamiento cooperativo (se lee una vez
+por proceso); ambos brazos eligen las mismas variantes, solo cambia la llamada de lanzamiento. Linux 7.4, prompt YaRN de
+16K: 0 bloqueos en 8 ejecuciones (3 de 4 con el lanzamiento cooperativo); logits terminales y tokens idénticos byte a
+byte al binario anterior con 16K y 32K en ambos brazos; prefill de 32K sin cambios (ABBA, +-0,0 %). Véase el [contrato de lanzamiento y comprobación de bytes](optimizations.md#qwen-gdn);
+las ganancias históricas de Chunk-16 de la tabla son anteriores a este cambio de lanzamiento.
+
 | Motor / optimización | Qué | Predeterminado | Ganancia | ¿Exacto? | Interruptor de desactivación |
 |---|---|---|---|---|---|
 | Qwen: aceptación del staged-gather de PLE | Acepta la cola ordenada tras el consumo correcto de la fila 0 | Corrección incondicional | Prefill 4K -1.1 %, 32K -1.9 %, 262K (YaRN) 198.19 -> 185.49 s (-6.4 %, dos pares), con preparación frente a la regla anterior, mismo binario | Logits completos iguales con 4K/32K; tokens iguales con 4K/32K/262K | Sin interruptor |

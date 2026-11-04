@@ -123,8 +123,9 @@ serial, no a la rotatoria nativa, y no cualifican la fidelidad general del model
 Medido en un nodo Strix Halo, ruta por defecto (código `a199c8e0` más la selección de bundle de #137), prosa real
 diversa (50 libros de dominio público en seis idiomas), decodificación greedy y escalera de almacenamiento automática (sin
 ajustes manuales de almacenamiento). El TTFT va desde el arranque del proceso hasta el primer token e incluye la carga del modelo.
-La celda de prefill a 262K y la de decode serial a 262K proceden de la rama main pública `17b9c57b8` (prompt de 262,144
-tokens, tiempo de prefill sin la carga del modelo, `--profile default`, una ejecución: 176.60 s); la celda de decode MTP a
+La celda de prefill a 262K y la de decode serial a 262K proceden del build con la corrección del lanzamiento simple de GDN
+(prompt de 262,144 tokens, tiempo de prefill sin la carga del modelo, `--profile default`, una ejecución con Linux 7.4: 175.18 s;
+176.60 s en `17b9c57b8`, dentro del ruido entre ejecuciones); la celda de decode MTP a
 262K procede del build `7b2453fe`; las demás celdas de la fila proceden del build indicado arriba.
 Las celdas serial de la fila de 1M proceden de la rama main pública `fdc39faba` con Linux 7.3; sus celdas MTP y su gate
 exacto proceden del cambio de admisión MTP (#288) con Linux 7.4. Ambos conjuntos se midieron con kernels distintos, por lo
@@ -132,7 +133,7 @@ que cada celda indica su kernel y la fila no da una relación entre serial y MTP
 
 | Contexto (factor YaRN) | Gate exacto (MTP == serial == pool desactivado) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | Aceptación MTP |
 |---|---|---|---|---|---|
-| 262,400 (2) | Alcance completo | 219 s / 224 s | **1,484 tok/s** `--profile default` (`17b9c57b8`) | 21.82 (`17b9c57b8`) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
+| 262,400 (2) | Alcance completo | 219 s / 224 s | **1,496 tok/s** `--profile default` (corrección del lanzamiento simple de GDN) | 21.74 (corrección del lanzamiento simple de GDN) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
 | 524,288 (2) | Alcance objetivo | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Alcance completo (MTP frente a serial con las dos rutas de prefill indicadas abajo desactivadas) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); ruta MTP 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
 
