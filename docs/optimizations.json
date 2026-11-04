@@ -1182,6 +1182,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Prefill o_b K-halves in one launch",
+    "flag_or_env": "STRIX_DS41_PREFILL_O_B_ONE",
+    "default": "on",
+    "exact": "Every non-NaN output bitwise equal to the two launches (h0, then h1 accumulated) and NaN where they give NaN; when both K-halves are NaN, which NaN payload survives follows the compiler's operand order inside the kernel. Device tests at 900 / 1030 rows with row and output tails; special activation deltas (+0, subnormal, overflowing, infinite) in either K-half or both, without and with NaNs of different payloads; two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens.",
+    "gain": "One launch with the first K-half's sums kept in registers instead of a store and an accumulated second launch. Kernel bench (2 x 2 tall form, 5120 outputs): -2 % at 896 rows, -5..-7 % at 1024 rows (fewer rows keep the two launches). Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order): 8.069 / 27.41 s with STRIX_DS41_PREFILL_O_B_ONE=0 vs 7.935 / 27.18 s default (-1.7 / -0.8 %).",
+    "preconditions": "Device prefill path without TP attention (row split); o_b not on FP16; chunks of at least 896 rows.",
+    "off_switch": "STRIX_DS41_PREFILL_O_B_ONE=0",
+    "doc_anchor": "docs/optimizations.md#ds-prefill-o-b-one"
+  },
+  {
+    "engine": "deepseek",
     "name": "Prefill hyper-connection fusion",
     "flag_or_env": "STRIX_DS41_PREFILL_HC_FUSE",
     "default": "on",

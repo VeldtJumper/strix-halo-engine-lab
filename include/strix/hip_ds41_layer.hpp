@@ -249,6 +249,10 @@ struct Q8A8DensePrefillView {
     float* a8_deltas = nullptr;
     std::int32_t* a8_sums = nullptr;
     std::uint32_t a8_stride = 0;
+    // 2: this K part and the next (k_offset + width, codes + width, deltas + width / 32; row_width set), every output the
+    // first part's sum + the second's, the bits of two launches with the second accumulated (one launch in the 2 x 2
+    // Lean 4 form, auto, row_width 8192 / width 4096, from 896 rows; else the two launches). No A8 output.
+    std::uint32_t k_parts = 1;
 };
 // Returns true when the outputs' A8 (a8_codes) was written.
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);

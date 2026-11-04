@@ -1721,6 +1721,22 @@ o_b reads the A8 operands of o_low, the output of o_a. They came from a separate
 - **Measured gain:** Kernel bench at the prefill chunk shape (1024 rows, o_a as one dense call per o-group, three interleaved runs): -3.6 % with 4 o-groups, -4.2 % with 8 o-groups (o_a + quantize). Below the run-to-run spread of a whole two-node prefill.
 - **Public evidence:** [Dense prefill kernels](../src/hip_ds41_layer.hip)
 
+<a id="ds-prefill-o-b-one"></a>
+
+### Prefill o_b K-halves in one launch
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREFILL_O_B_ONE`. **Default:** on.
+
+Without TP attention, o_b runs as two K-halves: h0 into the output, then h1 accumulated by a second launch. From 896-row chunks one launch now does both: each block keeps its h0 sums in registers and adds its h1 sums to them, the order of the second launch's accumulation.
+
+- **Preconditions:** Device prefill path without TP attention (row split); o_b not on FP16; chunks of at least 896 rows.
+- **Automatic selection:** On for chunks of at least 896 rows; smaller chunks keep the two launches (faster there).
+- **Fallback notice:** None.
+- **Exactness evidence:** Every non-NaN output bitwise equal to the two launches (h0, then h1 accumulated) and NaN where they give NaN; when both K-halves are NaN, which NaN payload survives follows the compiler's operand order inside the kernel. Device tests at 900 / 1030 rows with row and output tails; special activation deltas (+0, subnormal, overflowing, infinite) in either K-half or both, without and with NaNs of different payloads; two-node serve logits and generated ids identical at 1,999 / 8,399 / 32,499 tokens.
+- **Off switch:** STRIX_DS41_PREFILL_O_B_ONE=0
+- **Measured gain:** Kernel bench (2 x 2 tall form, 5120 outputs): -2 % at 896 rows, -5..-7 % at 1024 rows. Two-node serve TTFT at 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order): 8.069 / 27.41 s with STRIX_DS41_PREFILL_O_B_ONE=0 vs 7.935 / 27.18 s default (-1.7 / -0.8 %).
+- **Public evidence:** [Dense prefill kernels](../src/hip_ds41_layer.hip)
+
 <a id="ds-fast-moe-down-rows"></a>
 
 ### FAST MoE down row groups
