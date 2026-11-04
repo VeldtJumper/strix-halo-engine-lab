@@ -2293,6 +2293,17 @@
   },
   {
     "engine": "glm",
+    "name": "Decode step flag checked with the head",
+    "flag_or_env": "STRIX_GLM_STEP_FLAG",
+    "default": "1 (engine default)",
+    "exact": "No arithmetic change; pair decode tokens and R8 rows equal the reference on both ranks.",
+    "gain": "Pair, fresh process per arm, --mtp 0: C1 -0.2 % (39.07 / 39.12 -> 39.00 / 39.03 ms/token); R8 within noise",
+    "preconditions": "Plain decode steps (verify, MTP and prefill keep their checks).",
+    "off_switch": "STRIX_GLM_STEP_FLAG=0, or --baseline",
+    "doc_anchor": "docs/optimizations.md#glm-step-flag"
+  },
+  {
+    "engine": "glm",
     "name": "Server batched MTP verify",
     "flag_or_env": "STRIX_GLM_SERVE_G2",
     "default": "on (with MTP)",

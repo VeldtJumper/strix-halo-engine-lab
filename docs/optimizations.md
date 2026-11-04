@@ -3589,6 +3589,24 @@ last workgroup to arrive runs the unchanged finish. 2 = also two launches at 2..
 - **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -1.45 % (39.72 / 39.71 -> 39.12 / 39.16 ms/token); R8 unchanged
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
 
+<a id="glm-step-flag"></a>
+
+### Decode step flag checked with the head
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_STEP_FLAG`. **Default:** 1 (engine default).
+
+A plain decode step no longer syncs the host on the layers' non-finite flag before the head; the sticky flag is checked
+once with the head's, still before the argmax exchange and before any token is returned. Verify, MTP and prefill keep
+their checks.
+
+- **Preconditions:** plain decode steps (no speculative verify).
+- **Automatic selection:** none.
+- **Fallback notice:** None.
+- **Exactness evidence:** No arithmetic change; pair decode tokens and R8 rows equal the reference on both ranks.
+- **Off switch:** STRIX_GLM_STEP_FLAG=0, or --baseline
+- **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -0.2 % (39.07 / 39.12 -> 39.00 / 39.03 ms/token); R8 within noise
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [engine](../src/glm/engine/engine.hip)
+
 <a id="glm-serve-g2"></a>
 
 ### Server batched MTP verify

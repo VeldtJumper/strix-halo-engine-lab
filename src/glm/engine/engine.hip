@@ -552,6 +552,8 @@ struct Engine::Impl {
         seg_n = 0;
     }
     bool smoke_head = false;
+    // STRIX_GLM_STEP_FLAG=0: a plain step syncs for the layers' checkpoints before the head (old path).
+    const bool defer_layer_flag = !(std::getenv("STRIX_GLM_STEP_FLAG") != nullptr && std::string(std::getenv("STRIX_GLM_STEP_FLAG")) == "0");
     const bool boundary_fused = !(std::getenv("STRIX_GLM_BOUNDARY") != nullptr && std::string(std::getenv("STRIX_GLM_BOUNDARY")) == "0");
     // MoE kernels (TP2 rank slices, I = 1024): default for world 2; STRIX_GLM_MOE=ref = DefaultMoe.
     const bool moe_fast = opt.world == 2 && !(std::getenv("STRIX_GLM_MOE") != nullptr && std::string(std::getenv("STRIX_GLM_MOE")) == "ref");
@@ -1485,7 +1487,10 @@ struct Engine::Impl {
                         hip_ok(hipStreamSynchronize(stream), "null flip sync");
                     }
         }
-        if (sp == nullptr) check_flag("layers");
+        // Plain steps check the layers' checkpoints together with the head's (step), without a host round trip mid-step:
+        // the flag is sticky, so a layer checkpoint still throws before the argmax exchange and before any token is
+        // returned. Cross-rank symmetry is as before (each rank throws on its own flag).
+        if (sp == nullptr && !(kind == ForwardKind::Plain && defer_layer_flag)) check_flag("layers");
     }
 
     std::vector<std::uint32_t> step(std::span<const Row> rows) {
@@ -1501,7 +1506,7 @@ struct Engine::Impl {
         D::rmsnorm(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
         lib.run(head, hidden, logits, R, stream);
         D::argmax(logits, vocab_n, vocab0, amv, ami, flag, R, stream);
-        check_flag("head");
+        check_flag(defer_layer_flag ? "layers / head" : "head");
         xch->argmax(amv, ami, R, stream);
         mark(segHead);
         std::vector<std::uint32_t> out(R);
