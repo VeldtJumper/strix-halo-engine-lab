@@ -1183,11 +1183,18 @@ struct Engine::Impl {
         mark();
         const std::size_t bytes = n * kHidden * sizeof(float);
         if (pf_active) {  // prefill module: the copy kernel (or a publish kernel after an in-place producer), then the RX wait
+            // STRIX_MM_PF_TIMELINE: the send span (copy / publish), then the post span; the stream gap before the post
+            // span is this message's exposed exchange wait (producer done -> RX flag), reported per message.
+            if (tl) tl->mark("exchange-send", true);
             if (local == pf->tx()) pf->send(bytes, strix::minimax::pfx::Tag{which + 1, layer, calls});
             else pf->send_copy(local, bytes, strix::minimax::pfx::Tag{which + 1, layer, calls});
+            if (tl) tl->mark("exchange-send", false);
             const auto x = pf->recv();
             lap(prof.exchange);
+            if (tl) tl->exchange_received(bytes);
+            if (tl) tl->mark(which == 0 ? "attn-post" : "ffn-post", true);
             post_view(n, x, norm_w, router_w, bias);
+            if (tl) tl->mark(which == 0 ? "attn-post" : "ffn-post", false);
             lap(prof.post);
             return;
         }

@@ -21,6 +21,7 @@ struct PrefillTimeline {
         std::size_t chunk = 0;
         unsigned layer = 0;
         bool exposed = false;
+        std::size_t bytes = 0;  // exposed spans after exchange_received: the message size
     };
     struct HostSpan {
         Clock::time_point before{}, after{};
@@ -34,6 +35,7 @@ struct PrefillTimeline {
     std::size_t used = 0, host_used = 0, chunk = 0;
     unsigned layer = 0;
     bool full = false, received = false;
+    std::size_t received_bytes = 0;
     Clock::time_point start{};
     double pipeline_reuse_wait = 0, host_reuse_wait = 0;
 
@@ -72,8 +74,9 @@ struct PrefillTimeline {
         if (full) return;
         if (used == spans.size()) { full = true; return; }
         if (before) {
-            spans[used] = {category, chunk, layer, received};
+            spans[used] = {category, chunk, layer, received, received ? received_bytes : 0};
             received = false;
+            received_bytes = 0;
         }
         check(hipEventRecord(events[2 * used + (before ? 0U : 1U)], stream));
         if (!before) ++used;
@@ -91,6 +94,11 @@ struct PrefillTimeline {
         if (i < host.size()) host[i].after = Clock::now();
         if (recv) received = true;
     }
+    // The next span's stream gap is the exposed wait of a module exchange of `bytes` (single-member prefill path).
+    void exchange_received(std::size_t bytes) {
+        received = true;
+        received_bytes = bytes;
+    }
     static void msa_mark(void* user, const char* label, bool before) {
         static_cast<PrefillTimeline*>(user)->mark(label, before);
     }
@@ -106,6 +114,8 @@ struct PrefillTimeline {
         struct Total { const char* category = nullptr; double seconds = 0; std::size_t count = 0; };
         std::array<Total, 64> totals{};
         double busy = 0, idle = 0, exposed = 0, recv_host = 0, send_host = 0;
+        std::vector<double> msg_gap;  // per module exchange (bytes known): exposed wait in seconds
+        std::size_t msg_bytes = 0;
         const auto elapsed = [&](std::size_t a, std::size_t b) {
             float ms = 0;
             check(hipEventElapsedTime(&ms, events[a], events[b]));
@@ -126,6 +136,10 @@ struct PrefillTimeline {
                 const double gap = std::max(0.0, elapsed(2 * i - 1, 2 * i));
                 idle += gap;
                 if (spans[i].exposed) exposed += gap;
+                if (spans[i].exposed && spans[i].bytes != 0) {
+                    msg_gap.push_back(gap);
+                    msg_bytes += spans[i].bytes;
+                }
             }
         }
         for (std::size_t i = 0; i < host_used; ++i) {
@@ -138,6 +152,17 @@ struct PrefillTimeline {
             std::printf("pftimeline rank %u: %s %.6f s count %zu\n", rank, t.category, t.seconds, t.count);
         std::printf("pftimeline rank %u: exposed-exchange-wait %.6f s | host recv-wait %.6f s | host send %.6f s%s\n",
                     rank, exposed, recv_host, send_host, full ? " | POOL EXHAUSTED: recording stopped (partial totals)" : "");
+        if (!msg_gap.empty()) {
+            std::vector<double> g = msg_gap;
+            std::sort(g.begin(), g.end());
+            double sum = 0;
+            for (const double x : g) sum += x;
+            const double mb = static_cast<double>(msg_bytes) / static_cast<double>(g.size()) / 1e6;
+            std::printf("pftimeline rank %u: exchanges %zu, %.1f MB each: exposed wait sum %.6f s, median %.3f ms, p90 %.3f ms, "
+                        "max %.3f ms; bytes / median wait = %.2f GB/s per direction\n",
+                        rank, g.size(), mb, sum, g[g.size() / 2] * 1e3, g[g.size() * 9 / 10] * 1e3, g.back() * 1e3,
+                        mb / 1e3 / std::max(g[g.size() / 2], 1e-9));
+        }
         std::printf("pftimeline rank %u: pipeline reuse-wait %.6f s | ordinary host reuse-wait %.6f s (grouped units only; worker time may overlap compute)\n",
                     rank, pipeline_reuse_wait, host_reuse_wait);
         std::fflush(stdout);
