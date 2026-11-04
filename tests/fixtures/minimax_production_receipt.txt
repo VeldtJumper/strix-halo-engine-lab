@@ -15,8 +15,10 @@
 # STRIX_MM_PF_DENSE_O, STRIX_MMX_PREFILL_TAIL_STREAM, STRIX_MMX_PREFILL_PIPE_PAIR.
 # Decode items added with their own PAIR ABA receipts (in-process matched replay, logits bitwise across rows/verify):
 # STRIX_MM_XB_WARM_O, STRIX_MMX_MOE_TIGHT_GRID, STRIX_MMX_MOE_PIPE, STRIX_MM_SELECT_ONCE (fresh process per arm at 32K).
+# Draft pack: dspark-exl3-K4fc-sh (scaled-Hessian requant of dspark-exl3-K4fc, same layout and keys); paired A B B A
+# against the previous pack: spec ids == plain greedy in 32/32 sessions, acceptance equal, tok/s within +-2 %.
 receipt rank
-argv $M 0 usb4-auto $OUT --slots 8 --capacity 8256 --max-rows 4096 --gate oracle-A --gate-layers 6 --decode-check prompts/p1k.u32:24 --decode-check prompts/chat-prose.u32:16 --session 1k:prompts/p1k.u32:64 --session 8k:prompts/p8k.u32:16 --batch prompts/p1k.u32:24:1,2,4,8 --session jtb:chat/json-table.u32:256 --session cpy:chat/code-py.u32:256 --session pen:chat/prose-en.u32:256 --dspark-exl3 minimax-drafts/dspark-exl3-K4fc --spec jtb:chat/json-table.u32:256:auto --spec cpy:chat/code-py.u32:256:auto --spec pen:chat/prose-en.u32:256:auto
+argv $M 0 usb4-auto $OUT --slots 8 --capacity 8256 --max-rows 4096 --gate oracle-A --gate-layers 6 --decode-check prompts/p1k.u32:24 --decode-check prompts/chat-prose.u32:16 --session 1k:prompts/p1k.u32:64 --session 8k:prompts/p8k.u32:16 --batch prompts/p1k.u32:24:1,2,4,8 --session jtb:chat/json-table.u32:256 --session cpy:chat/code-py.u32:256 --session pen:chat/prose-en.u32:256 --dspark-exl3 minimax-drafts/dspark-exl3-K4fc-sh --spec jtb:chat/json-table.u32:256:auto --spec cpy:chat/code-py.u32:256:auto --spec pen:chat/prose-en.u32:256:auto
 plain $M 0 usb4-auto $OUT
 env STRIX_MM_SERVE_DSPARK=auto
 env STRIX_MM_LOOKUP=1
