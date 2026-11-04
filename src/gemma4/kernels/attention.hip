@@ -704,6 +704,12 @@ __global__ void __launch_bounds__(256) fused_attention_fast_kernel(const float* 
             a8_quantize_lane(value, store.quant, row, head * Dim + i);
     }
 }
+// Chunk of a long-span block: the full grid launches one slot per absolute chunk (slots == chunks); a compact
+// grid (STRIX_G4_ATTN_COMPACT, sliding layers: fused_chunks slots) maps slot i to the row's first visible chunk + i.
+// Per-chunk layouts keep the absolute chunk index and the full pitch, so every value is the full grid's.
+__device__ inline unsigned compact_chunk(unsigned slot, unsigned slots, unsigned chunks, Visibility range) {
+    return slots < chunks ? unsigned(range.first / attention_chunk) + slot : slot;
+}
 // Long spans, launch one of two: the chunk-parallel scores with the query
 // norm/rotation recomputed per chunk block (same values as the separate head
 // kernel), and per-chunk maxima.
@@ -721,14 +727,15 @@ __global__ void __launch_bounds__(128) chunk_scores_kernel(const float* q, Linea
                                                            float* scores, float* maxima, bool parallel, bool bounded,
                                                            bool intervals, unsigned* failure, bool shared) {
     const unsigned rh = shared ? blockIdx.x : blockIdx.y, row = rh / heads_count, head = rh % heads_count;
-    const unsigned chunk = shared ? blockIdx.y : blockIdx.x, chunks = shared ? gridDim.y : gridDim.x;
     const auto r = reads[row];
     const auto range = visible(r.position, r.global, r.window);
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    const unsigned chunk = compact_chunk(shared ? blockIdx.y : blockIdx.x, shared ? gridDim.y : gridDim.x, chunks, range);
     const std::uint64_t begin = std::uint64_t(chunk) * attention_chunk;
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     auto* out = scores + std::size_t(rh) * stride;
     if (begin > range.last || begin + attention_chunk <= range.first) {
-        if (threadIdx.x == 0)
+        if (threadIdx.x == 0 && chunk < chunks)
             maxima[std::size_t(rh) * chunks + chunk] = bit_cast<float>(0xff800000U);
         return;
     }
@@ -814,16 +821,20 @@ __device__ inline float ordered_sum(const float* base, std::uint64_t first, std:
 // the batch's ordered accumulation, and the last block requests 16 chunk partials at a time before adding them
 // in chunk order (Batch 8: one at a time, as before). Only the load batching changes; each numerator still adds
 // its positions in position order, skipping the same absent rows, and each merge its chunks in chunk order.
-template <bool Quant = false, unsigned Batch = 8>
+// Ticket = false (STRIX_G4_ATTN_FINAL, default on): the block ends after its partial; chunk_final_kernel, the next
+// launch, does the chunk-order merge for every feature in parallel instead of the last block.
+template <bool Quant = false, unsigned Batch = 8, bool Ticket = true>
 __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* reads, unsigned heads_count,
                                                                   unsigned dim, unsigned stride, const float* scores,
                                                                   const float* maxima, float* partials, float* out,
                                                                   unsigned* counters, unsigned* failure,
                                                                   A8Rows quant = {}, bool shared = false) {
     const unsigned rh = shared ? blockIdx.x : blockIdx.y, head = rh % heads_count;
-    const unsigned chunk = shared ? blockIdx.y : blockIdx.x, chunks = shared ? gridDim.y : gridDim.x;
+    const unsigned slots = shared ? gridDim.y : gridDim.x;
     const auto r = reads[rh / heads_count];
     const auto range = visible(r.position, r.global, r.window);
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    const unsigned chunk = compact_chunk(shared ? blockIdx.y : blockIdx.x, slots, chunks, range);
     const auto first = std::uint64_t(chunk) * attention_chunk;
     __shared__ float e[attention_chunk];
     __shared__ const float* values[attention_chunk];
@@ -895,12 +906,13 @@ __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* 
             partial[i] = numerator;
         }
     }
+    if constexpr (!Ticket) return;
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __syncthreads();
     if (threadIdx.x == 0)
         ticket = atomicAdd(counters + rh, 1U);
     __syncthreads();
-    if (ticket != chunks - 1U)
+    if (ticket != slots - 1U)
         return;
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     const float* merged = partials + std::size_t(rh) * chunks * (dim + 1U);
@@ -917,6 +929,27 @@ __global__ void __launch_bounds__(256) chunk_partial_merge_kernel(const KvRead* 
     if (threadIdx.x == 0)
         atomicExch(counters + rh, 0U);
 }
+// The chunk-order merge of chunk_partial_merge_kernel's last block, one thread per (row x head, feature): the
+// denominator and each numerator add the chunk partials from +0 in increasing chunk order (ordered_sum batches
+// only the loads), so every value is the ticketed merge's. Grid (row x head, dim / 64), 64 threads.
+template <bool Quant = false>
+__global__ void __launch_bounds__(64) chunk_final_kernel(const KvRead* reads, unsigned heads_count, unsigned dim,
+                                                         unsigned stride, const float* partials, float* out,
+                                                         unsigned* failure, A8Rows quant = {}) {
+    const unsigned rh = blockIdx.x, head = rh % heads_count, i = blockIdx.y * 64U + threadIdx.x;
+    const auto r = reads[rh / heads_count];
+    const auto range = visible(r.position, r.global, r.window);
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    const auto first_chunk = range.first / attention_chunk, last_chunk = range.last / attention_chunk;
+    const float* merged = partials + std::size_t(rh) * chunks * (dim + 1U);
+    const float denominator = ordered_sum<16>(merged + dim, first_chunk, last_chunk, dim + 1U);
+    const float numerator = ordered_sum<16>(merged + i, first_chunk, last_chunk, dim + 1U);
+    const float value = numerator / denominator;
+    out[std::size_t(rh) * dim + i] = value;
+    finite_flag(value, failure);
+    if constexpr (Quant)
+        a8_quantize_lane(value, quant, rh / heads_count, head * dim + i);
+}
 // Grouped long-span launches (STRIX_G4_ATTN_KV_SHARED=2): one block per
 // (row, key/value head, chunk) serves the group's query heads, so each key and
 // value is loaded once for all of them. Grid (row x kv head, chunk) as in the
@@ -931,13 +964,15 @@ __global__ void __launch_bounds__(128) group_scores_kernel(const float* q, Linea
                                                            bool intervals, unsigned* failure) {
     static_assert(group == 4U);
     const unsigned kv_count = heads_count / group, row = blockIdx.x / kv_count, kv_head = blockIdx.x % kv_count;
-    const unsigned chunk = blockIdx.y, chunks = gridDim.y, rh0 = row * heads_count + kv_head * group;
+    const unsigned rh0 = row * heads_count + kv_head * group;
     const auto r = reads[row];
     const auto range = visible(r.position, r.global, r.window);
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    const unsigned chunk = compact_chunk(blockIdx.y, gridDim.y, chunks, range);
     const std::uint64_t begin = std::uint64_t(chunk) * attention_chunk;
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     if (begin > range.last || begin + attention_chunk <= range.first) {
-        if (threadIdx.x < group)
+        if (threadIdx.x < group && chunk < chunks)
             maxima[std::size_t(rh0 + threadIdx.x) * chunks + chunk] = bit_cast<float>(0xff800000U);
         return;
     }
@@ -1002,9 +1037,11 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
                                                                   unsigned* counters, unsigned* failure,
                                                                   A8Rows quant = {}) {
     const unsigned kv_count = heads_count / group, row = blockIdx.x / kv_count, kv_head = blockIdx.x % kv_count;
-    const unsigned chunk = blockIdx.y, chunks = gridDim.y, rh0 = row * heads_count + kv_head * group;
+    const unsigned rh0 = row * heads_count + kv_head * group, slots = gridDim.y;
     const auto r = reads[row];
     const auto range = visible(r.position, r.global, r.window);
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    const unsigned chunk = compact_chunk(blockIdx.y, slots, chunks, range);
     const auto first = std::uint64_t(chunk) * attention_chunk;
     __shared__ float e[group][attention_chunk];
     __shared__ const float* values[attention_chunk];
@@ -1085,7 +1122,7 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
     if (threadIdx.x == 0)
         ticket = atomicAdd(counters + rh0, 1U);
     __syncthreads();
-    if (ticket != chunks - 1U)
+    if (ticket != slots - 1U)
         return;
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     for (unsigned h = 0; h < group; ++h) {
@@ -1194,6 +1231,24 @@ int attention_kv_shared_mode() {
     return mode;
 }
 bool attention_kv_shared_enabled() { return attention_kv_shared_mode() != 0; }
+// STRIX_G4_ATTN_COMPACT (default on, read once per process): sliding long-span launches cover only the window's
+// chunks; =0 launches one slot per chunk of the stride (same values either way).
+// STRIX_G4_ATTN_FINAL (default on, read once per process): the one-row long-span merge ends each chunk block at
+// its partial and merges the chunks in a separate per-feature launch; =0 keeps the ticketed last-block merge.
+static bool attention_final() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_ATTN_FINAL");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled;
+}
+static bool attention_compact() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_ATTN_COMPACT");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled;
+}
 bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* positions, const float* table,
                      const KvRead* reads, unsigned rows, unsigned heads_count, unsigned dim, unsigned stride,
                      bool global, float* out, unsigned* failure, Queue queue, bool parallel, bool bounded,
@@ -1220,8 +1275,11 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
         // Default (3): one row keeps a block per query head (more blocks); more rows share the group.
         int mode = kv_shared < 0 ? attention_kv_shared_mode() : kv_shared;
         if (mode == 3) mode = rows > 1U ? 2 : 1;
+        // Sliding layers see at most fused_chunks chunks: a compact grid launches only those (the stride's chunk
+        // count only sizes the layouts), instead of one mostly empty block per chunk of the longest context.
+        const unsigned slots = !global && attention_compact() ? span : chunks;
         if (mode == 2) {
-            const dim3 groups(rows * (heads_count / group), chunks);
+            const dim3 groups(rows * (heads_count / group), slots);
             if (global)
                 hipLaunchKernelGGL((group_scores_kernel<512>), groups, dim3(128), 0, stream, q, q_norm, positions, table, reads,
                                    heads_count, stride, scores, maxima, parallel, bounded, intervals, failure);
@@ -1244,7 +1302,7 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
             return true;
         }
         const bool shared = mode != 0;
-        const dim3 grid = shared ? dim3(rows * heads_count, chunks) : dim3(chunks, rows * heads_count);
+        const dim3 grid = shared ? dim3(rows * heads_count, slots) : dim3(slots, rows * heads_count);
         const auto chunk_scores = [&](auto dim, auto local) {
             hipLaunchKernelGGL((chunk_scores_kernel<decltype(dim)::value, decltype(local)::value>), grid, dim3(128), 0,
                                stream, q, q_norm, positions, table, reads, heads_count, stride, scores, maxima, parallel,
@@ -1257,10 +1315,20 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
         if (global) scores_local(std::integral_constant<unsigned, 512>{});
         else scores_local(std::integral_constant<unsigned, 256>{});
         launch_checked();
+        const bool final_launch = attention_final();
         const auto chunk_merge = [&](auto quantized, auto batch) {
-            hipLaunchKernelGGL((chunk_partial_merge_kernel<decltype(quantized)::value, decltype(batch)::value>), grid,
-                               dim3(256), 0, stream, reads, heads_count, dim, stride, scores, maxima, partials, out,
-                               counters, failure, quant, shared);
+            constexpr bool q8 = decltype(quantized)::value;
+            if (final_launch) {
+                hipLaunchKernelGGL((chunk_partial_merge_kernel<q8, decltype(batch)::value, false>), grid, dim3(256), 0,
+                                   stream, reads, heads_count, dim, stride, scores, maxima, partials, out, counters,
+                                   failure, quant, shared);
+                launch_checked();
+                hipLaunchKernelGGL((chunk_final_kernel<q8>), dim3(rows * heads_count, dim / 64U), dim3(64), 0, stream,
+                                   reads, heads_count, dim, stride, partials, out, failure, quant);
+            } else
+                hipLaunchKernelGGL((chunk_partial_merge_kernel<q8, decltype(batch)::value>), grid, dim3(256), 0, stream,
+                                   reads, heads_count, dim, stride, scores, maxima, partials, out, counters, failure,
+                                   quant, shared);
         };
         const auto chunk_batch = [&](auto quantized) {
             if (merge_batch_wide()) chunk_merge(quantized, std::integral_constant<unsigned, 32>{});

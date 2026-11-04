@@ -133,6 +133,8 @@ double run(const Case& t, bool bench) {
         throw std::runtime_error("shared key/value attention byte mismatch");
     }
     absorb(out[0]);
+    // Failure words too: a switch that set an extra bit in every mode of one process would otherwise pass.
+    for (const auto c : std::string_view(reinterpret_cast<const char*>(flags), 4)) digest = (digest ^ std::uint8_t(c)) * 1099511628211ULL;
     if (t.quant) { absorb(codes[0]); absorb(meta[0]); }
     ++cases;
     if (bench)
@@ -147,7 +149,8 @@ int main(int argc, char** argv) {
         require_device();
         if (argc == 2 && std::string_view(argv[1]) == "bench") {
             for (const std::uint64_t context : {8192ULL, 32768ULL, 65528ULL})
-                for (const unsigned rows : {1U, 4U, 8U}) run({context, true, rows, rows == 4U, false}, true);
+                for (const bool global : {true, false})
+                    for (const unsigned rows : {1U, 4U, 8U}) run({context, global, rows, rows == 4U, false}, true);
             return 0;
         }
         // Spans that admit the long-span launches (more than two chunks), chunk
