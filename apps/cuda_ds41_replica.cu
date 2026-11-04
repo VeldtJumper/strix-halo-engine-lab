@@ -21,7 +21,8 @@
 // --warmup-graphs none / --residency-seed none / --residency-save none disable each.
 // --baseline restores old defaults at that argument; later flags override each item.
 // STRIX_DS41_RTX_BASELINE=1 applies baseline before all arguments. --print-config emits
-// resolved JSON and exits before CUDA, fixtures or model reads (dummy model paths allowed).
+// resolved JSON and exits before CUDA, fixtures or model reads (dummy model paths allowed; --draft under caps
+// reads the model's GGUF header when it can).
 // --profile default|fast|quality (STRIX_DS41_PROFILE; strix/ds41_rtx_profile.hpp): one switch for every lever. default (= no
 // --profile) is today's configuration; quality = default (no higher-precision expert pack on the RTX); fast = default +
 // the qualified fast-only levers (none yet: they are listed as pending and not used). Per-lever options stay as expert
@@ -93,6 +94,7 @@
 #include "strix/ds41_dspark_vocab.hpp"
 #include "strix/ds41_rtx_schedule.hpp"
 #include "strix/ds41_rtx_budget.hpp"
+#include "strix/ds41_rtx_drafter_select.hpp"
 #include "strix/ds41_rtx_profile.hpp"
 
 #include "cuda_ds41_replica_serve.hpp"
@@ -421,6 +423,11 @@ int main(int argc, char** argv) {
     const char* wbs_env = std::getenv("STRIX_DS41_WB_STREAM");
     bool wb_stream = !(wbs_env && std::string(wbs_env) == "0");
     std::string draft_file, draft_vocab = "auto", window_arg = "controller", controller_scope = "chat";
+    // --drafter auto|on|off (strix/ds41_rtx_drafter_select.hpp; STRIX_DS41_DRAFTER): whether --draft loads; auto = off
+    // when a file tier is certain on one read location (plain decode measured faster there), else on; --baseline = on
+    strix::ds41::rtx::DrafterMode drafter_mode = strix::ds41::rtx::DrafterMode::automatic;
+    if (const char* v = std::getenv("STRIX_DS41_DRAFTER"); v && *v && !strix::ds41::rtx::parse_drafter_mode(v, drafter_mode))
+        usage("STRIX_DS41_DRAFTER must be auto, on or off");
     std::string draft_keep_from;  // --draft-keep-from FILE: route_stats lines of an earlier run (summed)
     std::uint32_t draft_keep = 64;  // --draft-keep N: the N most routed experts per drafter stage stay (0: all); adopted default 64
     bool route_stats = false;  // --route-stats: the drafter's routed-expert usage per speculative phase (pruning study)
@@ -467,6 +474,7 @@ int main(int argc, char** argv) {
         q8_r1 = false;
         q8_r1_pad = false;
         draft_keep = 0;
+        drafter_mode = strix::ds41::rtx::DrafterMode::on;
         controller_prior = controller_costs = "none";
         controller_costs_given = false;
         wb_defer = false;
@@ -630,6 +638,9 @@ int main(int argc, char** argv) {
         else known = false;
         if (known) continue;
         if (a == "--draft") draft_file = next();
+        else if (a == "--drafter") {
+            if (!strix::ds41::rtx::parse_drafter_mode(next(), drafter_mode)) usage("--drafter must be auto, on or off");
+        }
         else if (a == "--draft-device") draft_device = static_cast<int>(std::stol(next()));
         else if (a == "--draft-vocab") draft_vocab = next();
         else if (a == "--window") window_arg = next();
@@ -774,6 +785,48 @@ int main(int argc, char** argv) {
     }
     parse_args(launch_args);
     namespace fs = std::filesystem;
+    // --drafter: decided before the load (the arena default and the planner then see no drafter when it is off). The
+    // expert room is a pre-load estimate (strix/ds41_rtx_drafter_select.hpp): caps minus margins minus the trunk's
+    // declared GGUF bytes on the device; an explicit --vram-expert-gib / --ram-expert-gib bounds its side too.
+    const strix::ds41::rtx::DrafterSelect drafter_sel = [&]() {
+        namespace dsel = strix::ds41::rtx;
+        dsel::DrafterSelectIn in;
+        in.mode = drafter_mode;
+        in.draft_given = !draft_file.empty();
+        bool phase_drafts = false;
+        for (const auto& ph : split(phases_arg, ',')) phase_drafts = phase_drafts || !dsel::plain_phase(ph).empty();
+        in.wanted = in.draft_given && (!serve_dir.empty() || phase_drafts);
+        in.file_tier = file_tier;
+        in.read_locations = dsel::read_locations(model, o.weight_read.weight_dirs);
+        const std::uint64_t vtier = arena_auto || arena_gib < 0.0 ? 0U : dsel::budget_bytes(arena_gib);
+        const std::uint64_t rtier = ram_expert_gib < 0.0 ? 0U : dsel::budget_bytes(ram_expert_gib);
+        std::uint64_t trunk = 0;
+        if (in.draft_given && file_tier && (caps.device_capped() || vtier) &&
+            (caps.host_capped() || rtier)) {
+            try {  // the GGUF header only: every routed expert (the planner's layers x experts x expert bytes), the trunk
+                const auto manifest = strix::build_model_manifest(strix::gguf::read_file(model));
+                for (const auto& t : manifest.tensors) {
+                    if (t.layer && *t.layer >= layers_arg) continue;
+                    const bool routed = t.name.size() > 12 && t.name.compare(t.name.size() - 12, 12, "_exps.weight") == 0;
+                    if (routed) in.expert_bytes += t.byte_size;
+                    else if (t.role != strix::TensorRole::moe_expert && t.role != strix::TensorRole::ngram_table &&
+                             t.role != strix::TensorRole::mtp && t.role != strix::TensorRole::embedding)
+                        trunk += t.byte_size;
+                }
+            } catch (const std::exception&) {
+                in.expert_bytes = 0;  // unknown: the drafter stays
+            }
+        }
+        in.vram_room = dsel::drafter_room(caps.device_capped() ? dsel::budget_bytes(caps.vram_total_gib) : 0U,
+                                          caps.device_capped() ? dsel::budget_bytes(caps.vram_margin_gib) : 0U, trunk, vtier);
+        in.ram_room = dsel::drafter_room(caps.host_capped() ? dsel::budget_bytes(caps.ram_total_gib) : 0U,
+                                         caps.host_capped() ? dsel::budget_bytes(caps.ram_margin_gib) : 0U, 0U, rtier);
+        return dsel::drafter_select(in);
+    }();
+    // not loaded by the selection: no drafter from here on (arena default, census, session records); spec phases run plain
+    const bool drafter_off = !draft_file.empty() && !drafter_sel.on;
+    std::string drafter_plain;  // the request's speculative phases run plain ("schats0->chats0,..."); "" = none
+    if (drafter_off) draft_file.clear();
     if (arena_gib < 0) arena_gib = draft_file.empty() ? 80.0 : baseline_arena ? 71.5 : draft_keep == 64 ? 74.8 : draft_keep == 32 ? 76.5 : 71.5;
     if (draft_vocab == "auto") {
         const char* dir = std::getenv("STRIX_DS41_DRAFT_VOCAB");
@@ -867,8 +920,9 @@ int main(int argc, char** argv) {
     };
     if (max_rows == 0 && serve_dir.empty()) {
         bool windows = false;
-        for (const auto& ph : split(phases_arg, ','))
-            windows = windows || ph.rfind("wforce", 0) == 0 || ph.rfind("spec", 0) == 0 || ph.rfind("schats", 0) == 0 || ph.rfind("wsmoke", 0) == 0;
+        for (const auto& ph : split(phases_arg, ','))  // (no drafter: speculative phases run plain, one row)
+            windows = windows || ph.rfind("wforce", 0) == 0 || ph.rfind("wsmoke", 0) == 0 ||
+                      (!drafter_off && (ph.rfind("spec", 0) == 0 || ph.rfind("schats", 0) == 0));
         max_rows = windows ? 6U : 1U;
     }
     // the profile receipt: the resolution plus every lever's effective form after the options ("on" = today's default)
@@ -921,6 +975,7 @@ int main(int argc, char** argv) {
         field("router_form", router_form0 ? 0 : (dsrtxk_on || router_pf_explicit) ? 2 : 0);
         field("qakv_s1", !qakv_auto && (dsrtxk_on || o.decode_qakv_s1));
         field("q8_r1", q8_r1); field("q8_r1_pad", q8_r1_pad);
+        str("drafter", strix::ds41::rtx::drafter_mode_name(drafter_mode)); field("drafter_select", "{" + drafter_sel.json() + "}");
         field("draft_keep", draft_keep); field("arena_gib", arena_gib); field("arena_auto", arena_auto); field("lean_state", o.lean_state);
         str("draft_vocab", draft_vocab);
         str("controller_scope", controller_scope);
@@ -1104,6 +1159,16 @@ int main(int argc, char** argv) {
     };
     const auto prepare_request = [&]() {
     phases = split(phases_arg, ',');
+    drafter_plain.clear();
+    if (drafter_off)  // the drafter is not loaded: speculative phases run their plain equivalent (the same tokens)
+        for (auto& ph : phases) {
+            const auto plain = strix::ds41::rtx::plain_phase(ph);
+            if (plain.empty()) continue;
+            if (serve_dir.empty() && drafter_mode == strix::ds41::rtx::DrafterMode::off)
+                usage(("phase " + ph + " needs the drafter (--drafter off)").c_str());
+            drafter_plain += (drafter_plain.empty() ? "" : ",") + ph + "->" + plain;
+            ph = plain;
+        }
     any_exact = any_chats = any_window = any_draft = false;
     for (const auto& ph : phases) {
         if (ph.rfind("exact", 0) == 0 || ph.rfind("pressure", 0) == 0) any_exact = true;
@@ -1182,6 +1247,8 @@ int main(int argc, char** argv) {
     }
     };
     prepare_request();
+    if (!drafter_plain.empty())
+        std::fprintf(stderr, "drafter: not loaded (%s); running the plain phases %s\n", drafter_sel.reason.c_str(), drafter_plain.c_str());
     if (layers_arg == 40U) {
         if (receipt.empty()) usage("the full model needs --receipt (admitted SHA-256 of this file)");
         check_receipt(model, receipt);
@@ -1218,6 +1285,14 @@ int main(int argc, char** argv) {
     };
     int failures = 0;
     emit("{\"event\":\"profile\"," + profile_json().substr(1));
+    emit("{\"event\":\"drafter_select\"," + drafter_sel.json() + "}");
+    // once per request whose speculative phases run plain (the drafter is not loaded)
+    const auto note_plain = [&](const std::string& request) {
+        if (drafter_plain.empty()) return;
+        emit("{\"event\":\"drafter_off_plain\"" + (request.empty() ? std::string() : ",\"request\":" + rs::json_str(request)) +
+             ",\"reason\":" + rs::json_str(drafter_sel.reason) + ",\"phases\":" + rs::json_str(drafter_plain) + "}");
+    };
+    if (serve_dir.empty()) note_plain("");
     try {
         const auto t_load = std::chrono::steady_clock::now();
         const auto& imported = imported0;
@@ -1258,7 +1333,7 @@ int main(int argc, char** argv) {
         double draft_load_s = 0.0;
         const int ddev = draft_device < 0 ? target_device : draft_device;
         // the drafter: with --serve whenever --draft is given (requests choose their phases), else when a phase drafts
-        const bool load_drafter = serving ? !draft_file.empty() : any_draft;
+        const bool load_drafter = serving ? !draft_file.empty() : any_draft;  // (--drafter off / auto-off: draft_file cleared)
         if (load_drafter) {
             const auto t_d = std::chrono::steady_clock::now();
             auto lw = strix::ds41::dspark::load_weights(model, draft_file);
@@ -2444,8 +2519,13 @@ int main(int argc, char** argv) {
                  << "\",\"allocations\":{\"target_arena_bytes\":" << tier->device_bytes() << ",\"target_driver_bytes\":" << p.device_bytes()
                  << ",\"draft_resident_bytes\":" << (drafter ? drafter->device_bytes() : 0) << ",\"target_driver\":" << p.describe() << "}}";
             emit(meta.str());
+            // the chats this request runs (prompt capped at --chat-prompt), not every sequence of --seqs-file: sized by the
+            // whole file the records reached ~1 GB of host memory and tripped --ram-total-gib at the request
             std::size_t capacity = 1;
-            for (const auto& seq : seqs) capacity += seq.second.size() + chat_steps + 32;
+            for (const auto& c : split(chats_arg, ',')) {
+                const auto i = std::stoul(c);
+                if (i < seqs.size()) capacity += std::min<std::size_t>(chat_prompt, seqs[i].second.size()) + chat_steps + 32;
+            }
             capacity = (capacity + steps + 32) * std::max<std::size_t>(1, phases.size());
             census_records.resize(capacity);
             census_phases.resize(capacity);
@@ -3612,7 +3692,7 @@ int main(int argc, char** argv) {
                         if(!sc::explicit_request(args)) {
                             auto& r=*session_request;r.automatic=true;
                             r.session_command.id=sc::automatic_name(args);
-                            rs::check_request_args(args);parse_args(args);prepare_request();
+                            rs::check_request_args(args);parse_args(args);prepare_request();note_plain(*name);
                             sc::require(phases.size()==1&&chats_arg.find(',')==std::string::npos,"named prompt requires one phase and chat");
                             auto& c=r.session_command;c.used=true;c.op="turn";c.steps=chat_steps;c.dump=qual_dump;
                             if(phases[0]=="chats0")c.dspark=false;
@@ -3645,6 +3725,7 @@ int main(int argc, char** argv) {
                         if (!TierSite::can_set_sched() && (wb_defer != launch_wb_defer || flush_ready != launch_flush_ready))
                             usage("--wb-defer / --flush-ready: this build's tierstream has no ts_dg_set_sched (a new worker is needed)");
                         prepare_request();
+                        note_plain(*name);
                         if (std::uint64_t{imported.position} + needed_extra64() > o.max_positions)
                             usage("the request needs more positions than the worker's --max-positions capacity");
                         for (const auto& ph : phases) {

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ env = os.environ.copy()
 env["CUDA_VISIBLE_DEVICES"] = "-1"
 for key in ('STRIX_DS41_RTX_BASELINE', 'DG_LOAD_SERIAL', 'STRIX_SESSION_CACHE', 'STRIX_SESSION_DISK', 'STRIX_DS41_FILE_TIER',
             'STRIX_DS41_CE_PACING', 'STRIX_DS41_VRAM_TOTAL_GIB', 'STRIX_DS41_RAM_TOTAL_GIB', 'STRIX_DS41_WB_STREAM',
-            'STRIX_DS41_PROFILE', 'STRIX_DS41_PROFILE_ALLOW_PENDING'):
+            'STRIX_DS41_PROFILE', 'STRIX_DS41_PROFILE_ALLOW_PENDING', 'STRIX_DS41_DRAFTER', 'STRIX_WEIGHT_DIRS'):
     env.pop(key, None)
 
 
@@ -139,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
     assert default['vram_margin_gib'] == 1.5 and default['ram_margin_gib'] == 1 and default['budget_sample_ms'] == 100
     assert default['budget_plan'].startswith('none')
     capped = call(['--vram-total-gib', '24', '--ram-total-gib', '32'])
-    assert diff(default, capped) == {'vram_total_gib', 'ram_total_gib', 'budget_receipt', 'budget_plan'}
+    assert diff(default, capped) == {'vram_total_gib', 'ram_total_gib', 'budget_receipt', 'budget_plan', 'drafter_select'}
     assert capped['vram_total_gib'] == '24' and capped['ram_total_gib'] == '32' and capped['budget_receipt'] is True
     assert capped['budget_plan'].startswith('at load: arena slots = min(--vram-expert-gib, (24 GiB')
     assert call(extra={'STRIX_DS41_VRAM_TOTAL_GIB': '24', 'STRIX_DS41_RAM_TOTAL_GIB': '32'}) == capped
@@ -174,7 +175,8 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                     controller_costs='none', wb_defer=False, controller_scope='run', host_spares=96,
                     arena_gib=71.5, draft_vocab='full', warmup_graphs='none', residency_seed='none',
                     residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru', ce_pacing=False, wb_stream=False,
-                    file_tier=False, disk_queue=1)
+                    file_tier=False, disk_queue=1, drafter='on',
+                    drafter_select=dict(default['drafter_select'], mode='on', reason='--drafter on; not loaded: no speculative phase'))
     for key, value in expected.items():
         assert old[key] == value, (key, old[key], value)
     for key in ('decode_fuse_hc', 'decode_fuse_shared', 'decode_router_v2', 'decode_ob_one',
@@ -326,10 +328,61 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
         assert 'profile' in call(bad, ok=False).stderr
     call(extra={'STRIX_DS41_PROFILE': 'Fast'}, ok=False)
     assert call([*worker, '--profile', 'fast'], profile=True)['profile']['levers']['warmup_graphs']['effective'] == 'on'
+    # --drafter auto|on|off: default auto, env, CLI over env, --baseline = on (in order), bad values refused
+    assert default['drafter'] == 'auto'
+    ds = default['drafter_select']
+    assert ds['mode'] == 'auto' and ds['loaded'] is False and ds['file_tier_expected'] is False and ds['room_bytes'] is None, ds
+    assert ds['read_locations'] == 1 and ds['reason'].startswith('auto: no file tier certain'), ds
+    assert call(['--drafter', 'auto']) == call()
+    assert call(['--drafter', 'off'])['drafter'] == 'off' and call(['--drafter', 'off'])['drafter_select']['reason'].startswith('--drafter off')
+    assert call(extra={'STRIX_DS41_DRAFTER': 'off'})['drafter'] == 'off'
+    assert call(['--drafter', 'on'], extra={'STRIX_DS41_DRAFTER': 'off'})['drafter'] == 'on'
+    assert call(['--drafter', 'auto', '--baseline'])['drafter'] == 'on'
+    assert call(['--baseline', '--drafter', 'auto'])['drafter'] == 'auto'
+    assert call(extra={'STRIX_DS41_RTX_BASELINE': '1', 'STRIX_DS41_DRAFTER': 'off'})['drafter'] == 'on'
+    call(['--drafter', 'maybe'], ok=False)
+    call(extra={'STRIX_DS41_DRAFTER': 'yes'}, ok=False)
+    # the rule on a synthetic GGUF: 4 MiB of routed experts; caps of ~3 MiB on one read location = a certain file tier
+    def gguf(path, tensors):
+        def s_(t):
+            b = t.encode()
+            return struct.pack('<Q', len(b)) + b
+        head = b'GGUF' + struct.pack('<IQQ', 3, len(tensors), 0)
+        off = 0
+        for name, dims in tensors:
+            head += s_(name) + struct.pack('<I', len(dims)) + b''.join(struct.pack('<Q', d) for d in dims) + struct.pack('<IQ', 0, off)
+            n = 4
+            for d in dims:
+                n *= d
+            off += (n + 31) // 32 * 32
+        head += b'\0' * (-len(head) % 32)
+        path.write_bytes(head + b'\0' * off)
+    model = root / 'tiny.gguf'
+    gguf(model, [('blk.0.ffn_gate_exps.weight', [1024, 1024]), ('blk.0.attn_norm.weight', [256])])
+    tiny = [str(model), '--import-state', 'S', '--ref', 'R', '--draft', str(root / 'D.gguf'), '--serve', str(root / 'w'),
+            '--max-positions', '4096', '--vram-total-gib', '0.002', '--ram-total-gib', '0.001', '--vram-margin-gib', '0',
+            '--ram-margin-gib', '0']
+    off = call(base=tiny)
+    sel = off['drafter_select']
+    assert sel['loaded'] is False and sel['file_tier_expected'] is True and sel['expert_bytes'] == 4 << 20, sel
+    assert sel['room_bytes'] == round(0.002 * 2**30) - 1024 + round(0.001 * 2**30) and sel['read_locations'] == 1, sel
+    assert '1 read location' in sel['reason'] and off['arena_gib'] == 80, (sel, off['arena_gib'])  # no drafter: its arena default
+    on = call(['--drafter', 'on'], base=tiny)
+    assert on['drafter_select']['loaded'] is True and on['drafter_select']['file_tier_expected'] is True and on['arena_gib'] == 74.8
+    assert call(['--no-file-tier'], base=tiny)['drafter_select']['loaded'] is True
+    assert call(['--ram-total-gib', '1'], base=tiny)['drafter_select']['loaded'] is True  # every expert fits
+    stripes = root / 'stripes'
+    stripes.mkdir()
+    assert call(['--weight-dirs', str(stripes)], base=tiny)['drafter_select']['read_locations'] == 1  # no manifest there
+    (stripes / 'tiny.gguf.stripe.json').write_text('{}')
+    two = call(['--weight-dirs', str(stripes)], base=tiny)['drafter_select']
+    assert two['read_locations'] == 2 and two['loaded'] is True and 'read locations' in two['reason'], two
+    assert call(extra={'STRIX_WEIGHT_DIRS': str(stripes)}, base=tiny)['drafter_select']['read_locations'] == 2
     for label, config in [('i', default), ('ii', production), ('iii', old)]:
         print(label + ': ' + json.dumps(config, sort_keys=True))
     print('PASS: default == production (all keys); baseline; per-feature switches; ordering; arena; serve; auto fallbacks; '
-          '--profile default == quality == no profile (byte for byte), fast = default + pending listed, precedence, --allow-pending')
+          '--profile default == quality == no profile (byte for byte), fast = default + pending listed, precedence, --allow-pending; '
+          '--drafter auto|on|off (env, order, the auto rule on a synthetic GGUF: caps x read locations)')
 
 if baseline_exe:
     print(f"PASS: {baseline_comparisons} ordinary config outputs/stderr match the public baseline")
