@@ -88,6 +88,14 @@ Las lecturas de fichero van varias a la vez por defecto (`--disk-queue auto`: 4 
 más; `--disk-queue 1` o `--baseline` leen de una en una). Medido con 4 a la vez en una RTX PRO 6000 con límites de dispositivo completo `--vram-total-gib 24 --ram-total-gib 32`, los expertos que no caben en ningún nivel se leen de una unidad NVMe, 2 chats x 64 tokens tras un prompt de 96 tokens, en caliente, mismo binario, 6.55 / 6.75 tok/s normal / DSpark frente a 5.45 / 5.37 de una en una (+20 % / +26 %),
 16 a la vez igual que 4, tokens idénticos. Opciones y niveles: [RTX independiente](rtx-standalone.md).
 
+Con esos presupuestos el drafter DSpark suele costar más de lo que aporta: sus ventanas leen del fichero más expertos que
+la decodificación normal. `--drafter auto` (por defecto) no lo carga cuando los expertos se leerán seguro de una sola
+unidad, y sus 4.47 GB guardan más expertos; las peticiones DSpark se ejecutan entonces como decodificación normal con los
+mismos tokens. En una RTX PRO 6000 con una unidad NVMe: 24+32 GiB 8.2 tok/s sin drafter frente a 6-7.8 con DSpark, 48+32
+32.2 frente a 21.8, 64+32 52.2 frente a 51.8; con los expertos repartidos en dos unidades DSpark vuelve a ganar (9.3 frente
+a 7.8 en 24+32) y `auto` lo mantiene, igual que sin nivel de fichero (tarjeta completa: DSpark 105-108 tok/s). `--drafter on`
+/ `off` lo fuerzan.
+
 <a id="how-fast"></a>
 
 ## Resultados medidos: el par

@@ -5,11 +5,13 @@
 //   device: cudaMemGetInfo (total - free, the whole device) at stages; NVML (nvml.dll / libnvidia-ml.so.1, loaded at
 //           run time, optional) for the device's use BEFORE this process made its context (other processes: never
 //           charged) and for a background sampler that catches peaks between the stages. charged = used - before.
-//   host:   the process's resident memory (Windows working set, peak = PeakWorkingSetSize; Linux VmRSS / VmHWM). Not
-//           Windows PrivateUsage: under WDDM it also counts the system commit backing device allocations (measured
-//           at 24+32: private 38.5 GiB vs working set 16.8 GiB = pinned tier 15.3 GiB + the process; the excess
-//           was trunk + drafter + arena on the PRO), which charged VRAM to the RAM cap a second time. Pinned tiers are
-//           locked, so they always count.
+//   host:   the process's resident memory (Windows private working set, Linux VmRSS / VmHWM). Not Windows
+//           PrivateUsage: under WDDM it also counts the system commit backing device allocations (measured at 24+32:
+//           private 38.5 GiB vs working set 16.8 GiB = pinned tier 15.3 GiB + the process; the excess was trunk +
+//           drafter + arena on the PRO), which charged VRAM to the RAM cap a second time. Not WorkingSetSize: it also
+//           counts shareable / file-backed pages (mapped files) that are not this process's RAM. Windows keeps no peak
+//           of the private working set: the Meter keeps its own sampled maximum. Pinned tiers are locked, so they
+//           always count.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -46,18 +48,16 @@ constexpr std::uint64_t kNone = UINT64_MAX;
 
 struct HostMem {
     std::uint64_t commit = kNone;  // now
-    std::uint64_t peak = kNone;    // the process's peak so far (the OS keeps it)
+    std::uint64_t peak = kNone;    // the process's peak so far when the OS keeps it (Linux); kNone on Windows
 };
 
 inline HostMem host_mem() {
     HostMem h;
 #ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS_EX pc{};
+    PROCESS_MEMORY_COUNTERS_EX2 pc{};  // Windows 10 1709+
     pc.cb = sizeof pc;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pc), sizeof pc)) {
-        h.commit = pc.WorkingSetSize;
-        h.peak = pc.PeakWorkingSetSize;
-    }
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pc), sizeof pc))
+        h.commit = pc.PrivateWorkingSetSize;
 #else
     std::ifstream in("/proc/self/status");
     std::string k;
@@ -208,7 +208,7 @@ public:
         p.charged = p.device_used > before_ ? p.device_used - before_ : 0U;
         const auto h = host_mem();
         p.host_commit = h.commit;
-        p.host_peak = h.peak;
+        p.host_peak = h.peak == kNone ? note_host(h.commit) : h.peak;
         if (nvml_.ok()) {
             p.nvml_used = nvml_.used();
             p.nvml_process = nvml_.process_used(pid_);
@@ -239,6 +239,17 @@ public:
     [[nodiscard]] std::uint64_t sampler_samples() const { return samples_.load(); }
 
 private:
+    // the sampled maximum of the host figure (kNone: no sample yet)
+    std::uint64_t note_host(std::uint64_t v) const {
+        if (v == kNone) {
+            const auto cur = peak_host_.load();
+            return cur ? cur : kNone;
+        }
+        auto cur = peak_host_.load();
+        while (v > cur && !peak_host_.compare_exchange_weak(cur, v)) {
+        }
+        return std::max(v, cur);
+    }
     void run_sampler() {
         std::unique_lock<std::mutex> lk(mu_);
         while (!stop_) {
@@ -256,6 +267,8 @@ private:
                 while (pu > cur && !peak_process_.compare_exchange_weak(cur, pu)) {
                 }
             }
+            const auto hm = host_mem();
+            if (hm.peak == kNone) note_host(hm.commit);  // no OS peak (Windows): the sampler catches it between samples
             samples_.fetch_add(1);
             lk.lock();
             cv_.wait_for(lk, std::chrono::milliseconds(sample_ms_), [this] { return stop_; });
@@ -273,6 +286,7 @@ private:
     std::condition_variable cv_;
     bool stop_ = false;
     std::atomic<std::uint64_t> peak_charged_{0}, peak_process_{0}, samples_{0};
+    mutable std::atomic<std::uint64_t> peak_host_{0};
 };
 
 }  // namespace replica_budget

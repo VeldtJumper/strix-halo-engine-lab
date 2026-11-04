@@ -87,6 +87,13 @@ time). Measured with 4 at a time on one RTX PRO 6000 with whole-device caps `--v
 6.55 / 6.75 tok/s plain / DSpark vs 5.45 / 5.37 one at a time (+20 % / +26 %), 16 at a time the same as 4, identical
 tokens. Flags and tiers: [standalone RTX](rtx-standalone.md).
 
+At such budgets the DSpark drafter usually costs more than it gives: its windows read more experts from the file than
+plain decode. `--drafter auto` (the default) leaves it unloaded when experts will certainly be read from a single drive and
+lets its 4.47 GB hold more experts; DSpark requests then run plain decode with the same tokens. On one RTX PRO 6000 with one
+NVMe drive: 24+32 GiB 8.2 tok/s without the drafter vs 6-7.8 with DSpark, 48+32 32.2 vs 21.8, 64+32 52.2 vs 51.8; with
+expert stripes on two drives DSpark wins again (9.3 vs 7.8 at 24+32) and `auto` keeps it, as with no file tier (full card:
+DSpark 105-108 tok/s). `--drafter on` / `off` force it.
+
 <a id="how-fast"></a>
 
 ## Measured results: the pair

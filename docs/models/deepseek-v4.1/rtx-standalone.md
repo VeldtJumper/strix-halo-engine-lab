@@ -187,6 +187,7 @@ total cap means the whole device, "as if the user had a 24 GiB GPU":
 | `--vram-margin-gib G` / `--ram-margin-gib G` | Kept for allocations after the plan (graph capture, warmup, per-request buffers) | 1.5 / 1 |
 | `--budget-receipt` | Measure and print the budget events without caps (implied by a cap) | off |
 | `--budget-sample-ms N` | Period of the NVML peak sampler (0: stage samples only) | 100 |
+| `--drafter auto\|on\|off` (`STRIX_DS41_DRAFTER`) | Whether `--draft` loads the DSpark drafter. `auto` = off when a file tier is certain and the expert reads have one read location, else on (below). Without the drafter its bytes go to the expert tiers and speculative requests run plain decode (event `drafter_off_plain`; the same tokens) | `auto`; `--baseline` = `on` |
 
 At load the replica creates the context, allocates the trunk, the drafter, the
 decode workspaces, and measures each part (`cudaMemGetInfo`, minus the device's
@@ -204,8 +205,9 @@ The `budget` events: `stage:"plan"` (caps, measured components, the plan),
 `stage:"load"` (measured per component, declared bytes, tiers, peaks),
 `stage:"warmup"`, and `stage:"request"` at every request end (`stage:"run"`
 without `--serve`). Each carries the device peak (stage samples + the NVML
-sampler), the host peak (process commit peak, plus pinned bytes if the commit
-does not show them) and `peak_le_cap` (tierstream's `ss_budget_ledger_observe` /
+sampler), the host peak (the process's resident memory: on Windows the private
+working set, its maximum sampled by the replica; on Linux VmHWM; plus pinned
+bytes if it does not show them) and `peak_le_cap` (tierstream's `ss_budget_ledger_observe` /
 `ss_budget_ledger_within_caps`). The `plan` object is `ss_budget_plan_json`'s
 (`resident`, `arena_slots`, `pinned`, `disk`, `host_cap_units`, `device_capped`,
 `host_capped`, `min_vram_total_gib`, ...). Above a cap at load or after warmup the
@@ -216,6 +218,42 @@ PRO load at 2304 positions): trunk on the device 9.41 GiB (8.79 GiB of Q2/Q8
 file tensors), context + untracked ~2.8 GiB, attention state 17 MiB, drafter
 keep-64 4.12 GiB: ~16.5 GiB fixed, so the minimum is ~20.2 GiB and a 24 GiB
 card keeps ~5 GiB of arena (~440 resident experts besides the 96 spares).
+
+### Drafter by budget: `--drafter auto|on|off`
+
+DSpark pays when the experts it verifies are in VRAM or RAM; with a file tier
+on one drive its windows read more experts than plain decode and lose.
+Measured on the PRO (one NVMe drive, the same chat tokens in every arm):
+
+| Budget | Plain, no drafter | DSpark | Plain, drafter loaded |
+|---|---|---|---|
+| 24 GiB + 32 GiB, one drive | 8.18-8.20 tok/s | 5.94-7.78 | 6.24-6.44 |
+| 32 GiB + 32 GiB, one drive | 10.91 | 10.20 | |
+| full budget (no file tier) | 26.7 | 105-108 | |
+| 24 GiB + 32 GiB, expert stripes on 2 drives | 7.75-7.78 | 9.22-9.27 | |
+| 48 GiB + 32 GiB, one drive | 32.2 | 20.6-21.8 | |
+| 64 GiB + 32 GiB, one drive | 52.2 | 47.4-51.8 | |
+
+With `auto` at 24 GiB + 32 GiB the replica measured 8.05-8.13 tok/s (the drafter-free number), and in every row above
+`auto` picks the faster or an equal arm: off on one drive with a file tier, on with stripes on two drives or without a
+file tier.
+
+`auto` turns the drafter off exactly when a file tier is certain and the
+expert reads have fewer than 2 read locations. A file tier is certain when both
+sides are bounded (VRAM: `--vram-total-gib` or an explicit `--vram-expert-gib`;
+RAM: `--ram-total-gib` or an explicit `--ram-expert-gib`) and the room for
+experts is below every routed expert's bytes (layers x experts x one expert,
+from the GGUF header). The room is decided before the load, so it is an
+estimate that never undercounts: each cap minus its margin, minus the trunk's
+GGUF bytes on the device (nothing on the host), each side at most its explicit
+tier. Read locations = the model file plus each `--weight-dirs` /
+`STRIX_WEIGHT_DIRS` directory holding `<model file>.stripe.json` (tierstream's
+count). Doubtful cases keep the drafter. The startup event `drafter_select`
+(`mode`, `loaded`, `reason`, `file_tier_expected`, `read_locations`,
+`expert_bytes`, `room_bytes`) and `--print-config` (`drafter`,
+`drafter_select`) report the decision. Without `--serve`, speculative phases
+under `--drafter off` are refused; under `auto` they run their plain equivalent
+(`schats<K>` -> `chats<K>`, `spec<K>` -> `exact<K>`) with the reason printed.
 
 ## Profiles: `--profile default|fast|quality`
 
