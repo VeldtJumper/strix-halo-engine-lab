@@ -1441,10 +1441,22 @@ constexpr unsigned tall_waves = 8;
 // Lean 8 (forms 21xx / 22xx with ColFirst) are Lean 5 / 6 with the scale made opaque at its use instead, after the
 // tile's WMMA pair (the asm also takes the WMMA result, so it cannot be scheduled before it; it is not volatile, so the
 // deltas are not re-read from LDS for every tile).
-template <unsigned RT, unsigned OT, bool ColFirst = false, unsigned Lean = 0>
-__global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8DensePrefillView v) {
+// Parts = 2 (view k_parts 2): the K part at k_offset, then the next one (k_offset + width, codes + width) in the same
+// block, each output the first part's sum + the second's (the bits of a second launch with accumulate).
+template <unsigned RT, unsigned OT, bool ColFirst = false, unsigned Lean = 0, unsigned Parts = 1>
+__global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8DensePrefillView v0) {
     __shared__ float part[tall_waves][RT * OT][8][32];
     __shared__ float4 dsh[RT][32][2][2];
+    [[maybe_unused]] float first[RT * OT];
+#pragma unroll 1
+    for (unsigned kp = 0; kp < Parts; ++kp) {
+    Q8A8DensePrefillView v = v0;
+    if constexpr (Parts > 1) {
+        v.k_offset = v0.k_offset + kp * v0.width;
+        v.codes = v0.codes + kp * v0.width;
+        v.deltas = v0.deltas + kp * v0.width / 32U;
+        if (kp) __syncthreads();  // the first part's reads of part are done
+    }
     const unsigned w = threadIdx.x / wave, l = threadIdx.x % wave, h = l >> 4U, lo = l & 15U;
     const unsigned r0 = (ColFirst ? blockIdx.y : blockIdx.x) * 16U * RT, o0 = (ColFirst ? blockIdx.x : blockIdx.y) * 16U * OT;
     const unsigned groups = v.width / 32U, row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
@@ -1621,7 +1633,14 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
         const unsigned o = o0 + t * 16U + (ln & 15U), r = r0 + rt * 16U + 2U * e + (ln >> 4U);
         const float s0 = part[0][tile][e][ln] + part[4][tile][e][ln], s1 = part[1][tile][e][ln] + part[5][tile][e][ln];
         const float s2 = part[2][tile][e][ln] + part[6][tile][e][ln], s3 = part[3][tile][e][ln] + part[7][tile][e][ln];
-        const float y = (s0 + s2) + (s1 + s3);
+        float y = (s0 + s2) + (s1 + s3);
+        if constexpr (Parts > 1) {
+            if (kp == 0U) {
+                first[q] = y;
+                continue;
+            }
+            y = first[q] + y;
+        }
         ys[q] = y;
         if (o < v.count && r < v.rows) {
             float* dst = v.out + static_cast<std::size_t>(r) * v.out_stride + o;
@@ -1633,7 +1652,7 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     // row and group in one lane: each half wave quantizes its row's group with quantize_a8_kernel's operations, its first
     // maximum step (lanes L and L ^ 16) being the lane's own fmaxf(|x0|, |x1|), then the 8 / 4 / 2 / 1 steps in the half.
     if constexpr (OT % 2U == 0U) {
-        if (v.a8_codes) {
+        if (v.a8_codes && kp + 1U == Parts) {
 #pragma unroll
             for (unsigned rt = 0; rt < RT; ++rt)
 #pragma unroll
@@ -1661,6 +1680,7 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
                     }
                 }
         }
+    }
     }
 }
 
@@ -2846,8 +2866,38 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                 v.x_stride % 16U == 0 && v.out_stride >= v.count && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
                 (!v.row_width || (v.row_width % 32U == 0 && v.k_offset % 32U == 0 && v.k_offset + v.width <= v.row_width)) &&
                 (!v.a8_codes || (v.a8_deltas && v.a8_sums && !v.accumulate && v.count % 32U == 0 && v.a8_stride >= v.count &&
-                                 v.a8_stride % 32U == 0)),
+                                 v.a8_stride % 32U == 0)) &&
+                (v.k_parts == 1U || (v.k_parts == 2U && !v.accumulate && !v.a8_codes && v.row_width &&
+                                     std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
+                                     std::uint64_t{v.x_stride} >= 2ULL * v.width)),
             "Q8_0 x A8 dense prefill view");
+    if (v.k_parts == 2U) {
+        // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows
+        // lose to the two launches); else the two launches (the second accumulated)
+        // (the auto rule's 822 pick: o_a's count 1024 takes 914 first; the rotation gate and the statistics see two calls)
+        const auto env_on = [](const char* name) { const char* e = std::getenv(name); return e != nullptr && e[0] == '1'; };
+        const bool one = v.tall == 1U && v.rows >= 896U && v.row_width == 8192U && v.width == 4096U && v.count != 1024U &&
+                         !env_on("STRIX_DS41_DENSE_TALL_ROTATE") && !env_on("STRIX_DS41_DENSE_STATS") &&
+                         static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
+                         static_cast<std::size_t>(v.count) * (v.row_width / 32U * 34U) < 0x7fffffffULL &&
+                         [] { const char* e = std::getenv("STRIX_DS41_DENSE_FORM"); return !(e && e[0] == '0'); }();
+        if (one) {
+            const dim3 g((v.rows + 31U) / 32U, (v.count + 31U) / 32U);
+            hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 4U, 2U>), g, dim3(32 * tall_waves), 0, as_stream(stream), v);
+            check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
+            return false;
+        }
+        auto p0 = v;
+        p0.k_parts = 1U;
+        enqueue_q8_0_a8_dense_prefill(p0, stream);
+        auto p1 = p0;
+        p1.k_offset = v.k_offset + v.width;
+        p1.codes = v.codes + v.width;
+        p1.deltas = v.deltas + v.width / 32U;
+        p1.accumulate = true;
+        enqueue_q8_0_a8_dense_prefill(p1, stream);
+        return false;
+    }
     unsigned outputs = 32U;
     if (prefill_tuning::tiles())
         outputs = prefill_tuning::tile_override("STRIX_DS41_PREFILL_DENSE_TILE", prefill_tuning::dense_outputs(v.width, v.count, v.rows));

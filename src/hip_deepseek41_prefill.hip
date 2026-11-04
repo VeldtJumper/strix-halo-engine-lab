@@ -364,6 +364,12 @@ bool prefill_o_a8_fused() {
 }
 // STRIX_DS41_PREFILL_O_LOW_A8_FUSED (read per call; default on, =0 off): o_a's dense calls write o_low's A8 operands for
 // o_b (quantize_a8's bits) when their form owns whole 32-output groups; else the separate quantize_a8 as before
+// STRIX_DS41_PREFILL_O_B_ONE (read per call; default on, =0 off): o_b's two K-halves (h0, then + h1) in one dense call
+// (k_parts 2: one launch, h0 kept in registers), the bits of the two calls
+bool prefill_o_b_one() {
+    const char* v = std::getenv("STRIX_DS41_PREFILL_O_B_ONE");
+    return !(v && v[0] == '0');
+}
 bool prefill_o_low_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
     return !(v && v[0] == '0');
@@ -2600,6 +2606,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         } else if (fast_o_b) {
                             v.width = OL;  // the whole K in one GEMM
                             m.fast(&v, 1U, n, nullptr, 0U, m.o_low.p, st);
+                        } else if (!fp16_o_b && prefill_o_b_one()) {
+                            v.k_parts = 2U;  // h0 + h1, one call
+                            v.codes = m.olcodes.p;
+                            v.deltas = m.oldeltas.p;
+                            m.dense(v, m.o_low.p, st, false);
                         } else {
                             for (std::uint32_t part = 0; part < 2U; ++part) {
                                 v.k_offset = part * (OL / 2U);

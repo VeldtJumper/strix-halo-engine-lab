@@ -17,8 +17,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -746,6 +748,124 @@ void synthetic(std::mt19937& rng) {
                                                                 (written ? " (A8 written)" : " (A8 not written)"));
                 }
             }
+    }
+
+    // o_b's two K-halves in one call (k_parts 2): the bits of the two calls (h0, then h1 accumulated), for the one-launch
+    // form (auto, from 896 rows) and the two-launch fallback, with row and output tails.
+    {
+        const std::uint32_t width = 4096, row_width = 8192;
+        for (const std::uint32_t count : {320U, 304U})
+            for (const std::uint32_t many : {64U, 900U, 1030U}) {
+                const auto w = random_q8(rng, count, row_width);
+                const auto xa = host_a8(random_vector(rng, std::size_t{many} * row_width, 1.0F), many, row_width);
+                Device<std::uint8_t> dw(w);
+                DevA8 dx(xa);
+                Device<float> ref(std::vector<float>(std::size_t{many} * count, -1.0F)), got(std::vector<float>(std::size_t{many} * count, -1.0F));
+                Q8A8DensePrefillView v;
+                v.weight = dw.p; v.width = width; v.row_width = row_width; v.count = count; v.rows = many; v.x_stride = row_width;
+                v.out_stride = count; v.tall = 1U;
+                for (std::uint32_t part = 0; part < 2U; ++part) {
+                    auto q = v;
+                    q.k_offset = part * width; q.codes = dx.codes.p + part * width; q.deltas = dx.deltas.p + part * width / 32U;
+                    q.accumulate = part == 1U; q.out = ref.p;
+                    enqueue_q8_0_a8_dense_prefill(q, nullptr);
+                }
+                auto q = v;
+                q.k_parts = 2U; q.codes = dx.codes.p; q.deltas = dx.deltas.p; q.out = got.p;
+                enqueue_q8_0_a8_dense_prefill(q, nullptr);
+                expect(same_bits(got.down(), ref.down()), "o_b K-halves in one call = two calls bitwise, count=" + std::to_string(count) +
+                                                              " rows=" + std::to_string(many));
+            }
+    }
+    // The same with special activation deltas in either half or both (signed zero, subnormal, overflowing, infinite and
+    // NaNs of different payloads and signs): output bytes against the two calls; and k_parts 2 views past the row rejected.
+    {
+        const std::uint32_t width = 4096, row_width = 8192, count = 320, many = 1030;
+        const auto w = random_q8(rng, count, row_width);
+        auto xa = host_a8(random_vector(rng, std::size_t{many} * row_width, 1.0F), many, row_width);
+        const float specials[] = {-0.0F, 0.0F, 1e-40F, -1e-40F, 3e38F, INFINITY, -INFINITY,
+                                  __builtin_bit_cast(float, 0x7fc00001U), __builtin_bit_cast(float, 0xffc12345U),
+                                  __builtin_bit_cast(float, 0x7f800123U)};
+        for (std::uint32_t r = 0; r < many; ++r) {
+            auto& d = xa.rows[r].deltas;  // 256 groups: 0..127 in h0, 128..255 in h1
+            const std::uint32_t kind = r % 4U;  // 0: none, 1: h0, 2: h1, 3: both
+            for (std::uint32_t g = 0; g < 256U; g += 7U)
+                if ((kind == 1U && g < 128U) || (kind == 2U && g >= 128U) || kind == 3U) d[g] = specials[(r + g) % 10U];
+        }
+        Device<std::uint8_t> dw(w);
+        DevA8 dx(xa);
+        Device<float> ref(std::size_t{many} * count), got(std::size_t{many} * count);
+        Q8A8DensePrefillView v;
+        v.weight = dw.p; v.width = width; v.row_width = row_width; v.count = count; v.rows = many; v.x_stride = row_width;
+        v.out_stride = count; v.tall = 1U;
+        for (std::uint32_t part = 0; part < 2U; ++part) {
+            auto q = v;
+            q.k_offset = part * width; q.codes = dx.codes.p + part * width; q.deltas = dx.deltas.p + part * width / 32U;
+            q.accumulate = part == 1U; q.out = ref.p;
+            enqueue_q8_0_a8_dense_prefill(q, nullptr);
+        }
+        auto q = v;
+        q.k_parts = 2U; q.codes = dx.codes.p; q.deltas = dx.deltas.p; q.out = got.p;
+        enqueue_q8_0_a8_dense_prefill(q, nullptr);
+        const auto r0 = ref.down();
+        bool special = false;
+        for (const float x : r0) special = special || x != x || x == INFINITY || x == -INFINITY;
+        expect(special, "special-delta fixture reaches NaN / Inf outputs");
+        {
+            const auto g0 = got.down();
+            std::size_t diff = 0, nan_payload = 0, first = g0.size();
+            for (std::size_t i = 0; i < g0.size(); ++i)
+                if (std::memcmp(&g0[i], &r0[i], 4) != 0) {
+                    ++diff;
+                    if (g0[i] != g0[i] && r0[i] != r0[i]) ++nan_payload;
+                    if (first == g0.size()) first = i;
+                }
+            if (diff)
+                std::printf("special deltas: %zu differ (%zu both NaN, other payload); first %zu: one %08x two %08x\n", diff, nan_payload, first,
+                            __builtin_bit_cast(std::uint32_t, g0[first]), __builtin_bit_cast(std::uint32_t, r0[first]));
+            // every non-NaN output bitwise and NaN where the two calls give NaN; which NaN payload survives a two-NaN sum
+            // follows the compiler's operand order inside the kernel (not controllable from source)
+            expect(diff == nan_payload, "o_b K-halves in one call = two calls (finite bitwise, same NaN positions), special deltas");
+        }
+        {
+            // NaN-free special deltas: one group per row (group 5 in h0, 133 in h1, or both) set to +0, a subnormal, 3e38
+            // (overflowing products) or +Inf by row; every output bitwise (NaN only where the two calls give NaN), and the
+            // fixture reaches infinite outputs and finite outputs of the zero / subnormal rows.
+            auto xs = host_a8(random_vector(rng, std::size_t{many} * row_width, 1.0F), many, row_width);
+            const float cat[] = {0.0F, 1e-40F, 3e38F, INFINITY};
+            for (std::uint32_t r = 0; r < many; ++r) {
+                const std::uint32_t c = r % 4U, place = (r / 4U) % 3U;
+                if (place != 1U) xs.rows[r].deltas[5] = cat[c];
+                if (place != 0U) xs.rows[r].deltas[133] = cat[c];
+            }
+            DevA8 dsx(xs);
+            Device<float> ref2(std::size_t{many} * count), got2(std::size_t{many} * count);
+            for (std::uint32_t part = 0; part < 2U; ++part) {
+                auto q2 = v;
+                q2.k_offset = part * width; q2.codes = dsx.codes.p + part * width; q2.deltas = dsx.deltas.p + part * width / 32U;
+                q2.accumulate = part == 1U; q2.out = ref2.p;
+                enqueue_q8_0_a8_dense_prefill(q2, nullptr);
+            }
+            auto q2 = v;
+            q2.k_parts = 2U; q2.codes = dsx.codes.p; q2.deltas = dsx.deltas.p; q2.out = got2.p;
+            enqueue_q8_0_a8_dense_prefill(q2, nullptr);
+            const auto a = got2.down(), b = ref2.down();
+            std::size_t diff = 0, both_nan = 0, inf = 0, finite_low = 0;
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                if (std::memcmp(&a[i], &b[i], 4) != 0) { ++diff; if (a[i] != a[i] && b[i] != b[i]) ++both_nan; }
+                if (b[i] == INFINITY || b[i] == -INFINITY) ++inf;
+                if ((i / count) % 4U < 2U && std::isfinite(b[i])) ++finite_low;
+            }
+            expect(inf > 0 && finite_low > 0, "NaN-free special deltas reach infinite and finite (zero / subnormal) outputs");
+            expect(diff == both_nan, "o_b K-halves in one call = two calls, NaN-free special deltas (+0, subnormal, 3e38, +Inf)");
+        }
+        for (const std::uint32_t big : {0x80000000U, 0xC0000000U}) {
+            auto b = q;
+            b.width = big; b.row_width = big; b.x_stride = big;
+            bool rejected = false;
+            try { enqueue_q8_0_a8_dense_prefill(b, nullptr); } catch (const std::exception&) { rejected = true; }
+            expect(rejected, "k_parts 2 view past the row rejected (width " + std::to_string(big) + ")");
+        }
     }
 
     // K-split site (attn_output_b over two ranks): part 0 then part 1 accumulated, = q8_0_a8_split_rows.

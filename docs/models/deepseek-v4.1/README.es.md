@@ -182,6 +182,10 @@ Dentro de `--profile fast`, la proyección down del MoE relajado trabaja ahora p
 (`STRIX_DS41_FAST_MOE_DOWN_ROWS=64` restablece los grupos anteriores; mismos bits de salida FAST). La forma de 64 filas
 desbordaba registros. Prefill del par dentro de la aplicación, cuatro ejecuciones alternas: 8.4K 7.863 → 7.533 s
 (−4.2 %), 32.5K 27.509 → 27.077 s (−1.6 %); el kernel down por sí solo es un 13-25 % más rápido.
+En `default`, los bloques de prefill denso de 896 filas o más ejecutan ahora las dos mitades K de o_b en un solo
+lanzamiento (`STRIX_DS41_PREFILL_O_B_ONE=0` restablece los dos lanzamientos; toda salida que no sea NaN es idéntica bit a bit).
+TTFT del servidor en el par, ambos órdenes de ejecución, mismos logits e ids generados: 8.4K 8.069 → 7.935 s (−1.7 %),
+32.5K 27.41 → 27.18 s (−0.8 %). La tabla anterior es previa a este cambio y no se volvió a medir con él.
 
 <a id="deepseek-rtx-pipeline"></a>
 

@@ -348,6 +348,48 @@ void olow(std::mt19937& rng, std::uint32_t T, std::uint32_t groups, int iteratio
     for (int i = 0; i < 2; ++i) { (void)hipFree(lc[i]); (void)hipFree(ld[i]); (void)hipFree(ls[i]); }
 }
 
+// STRIX_BENCH_OB=1: o_b as the prefill runs it (two dense calls over the K-halves, the second accumulated) against the
+// one call with k_parts 2; outputs compared.
+void ob(std::mt19937& rng, std::uint32_t T, int iterations) {
+    const std::uint32_t width = 4096, row_width = 8192, count = 5120;
+    const auto w = random_q8(rng, count, row_width);
+    auto* dw = dev(w);
+    auto* dx = dev(random_vector(rng, std::size_t{T} * row_width, 1.0F));
+    auto* codes = dev<std::int8_t>(std::size_t{T} * row_width);
+    auto* deltas = dev<float>(std::size_t{T} * row_width / 32);
+    auto* sums = dev<std::int32_t>(std::size_t{T} * row_width / 32);
+    enqueue_quantize_a8(dx, row_width, T, codes, deltas, sums, nullptr);
+    float* out[2] = {dev<float>(std::size_t{T} * count), dev<float>(std::size_t{T} * count)};
+    Q8A8DensePrefillView v;
+    v.weight = dw; v.width = width; v.row_width = row_width; v.count = count; v.rows = T; v.x_stride = row_width; v.out_stride = count;
+    v.tall = 1U;
+    auto two = [&] {
+        for (std::uint32_t part = 0; part < 2U; ++part) {
+            auto q = v;
+            q.k_offset = part * width; q.codes = codes + part * width; q.deltas = deltas + part * width / 32U; q.accumulate = part == 1U;
+            q.out = out[0];
+            enqueue_q8_0_a8_dense_prefill(q, nullptr);
+        }
+    };
+    auto one = [&] {
+        auto q = v;
+        q.k_parts = 2U; q.codes = codes; q.deltas = deltas; q.out = out[1];
+        enqueue_q8_0_a8_dense_prefill(q, nullptr);
+    };
+    two();
+    one();
+    check(hipDeviceSynchronize(), "sync");
+    const bool same = std::memcmp(down(out[0], std::size_t{T} * count).data(), down(out[1], std::size_t{T} * count).data(), std::size_t{T} * count * 4) == 0;
+    double a = 0, b = 0;
+    for (int round = 0; round < 3; ++round) {
+        a += time_ms(iterations, two);
+        b += time_ms(iterations, one);
+    }
+    std::printf("{\"kernel\":\"o_b K-halves\",\"rows\":%u,\"two_ms\":%.4f,\"one_ms\":%.4f,\"bitwise\":%d}\n", T, a / 3, b / 3, same ? 1 : 0);
+    (void)hipFree(dw); (void)hipFree(dx); (void)hipFree(codes); (void)hipFree(deltas); (void)hipFree(sums);
+    (void)hipFree(out[0]); (void)hipFree(out[1]);
+}
+
 int main(int argc, char** argv) {
     const int iterations = argc > 1 ? std::atoi(argv[1]) : 10;
     std::mt19937 rng(7);
@@ -361,6 +403,10 @@ int main(int argc, char** argv) {
     // STRIX_BENCH_SITES=1: the attention sites only, at the production rows of a rank (row split: q_a / kv up to 4096
     // rows of an 8K prompt; q_b / o_a / o_b per chunk of at most chunk_rows = 1024; batch routes of 16 rows as the
     // prefill builds them)
+    if (const char* e = std::getenv("STRIX_BENCH_OB"); e && e[0] == '1') {
+        for (const std::uint32_t T : {512U, 768U, 896U, 1024U}) ob(rng, T, iterations);
+        return 0;
+    }
     if (const char* e = std::getenv("STRIX_BENCH_OLOW"); e && e[0] == '1') {
         for (const std::uint32_t groups : {4U, 8U})
             for (const std::uint32_t T : {256U, 512U, 1024U}) olow(rng, T, groups, iterations);

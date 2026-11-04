@@ -179,6 +179,10 @@ Within `--profile fast`, the relaxed MoE down projection now works on 32-row gro
 (`STRIX_DS41_FAST_MOE_DOWN_ROWS=64` restores the previous groups; same FAST output bits). The 64-row form spilled
 registers. In-app pair prefill, four alternating runs: 8.4K 7.863 → 7.533 s (−4.2 %), 32.5K 27.509 → 27.077 s
 (−1.6 %); the down kernel alone is 13-25 % faster.
+In `default`, dense prefill chunks of 896 rows or more now run o_b's two K-halves in one launch
+(`STRIX_DS41_PREFILL_O_B_ONE=0` restores two launches; every non-NaN output bitwise equal). Server TTFT on the pair,
+both run orders, same logits and generated ids: 8.4K 8.069 → 7.935 s (−1.7 %), 32.5K 27.41 → 27.18 s (−0.8 %).
+The table above predates this change and was not re-measured with it.
 
 <a id="deepseek-rtx-pipeline"></a>
 
