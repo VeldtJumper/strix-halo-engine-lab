@@ -1,5 +1,7 @@
 // CPU-only decode contract tests: no CUDA runtime, device or model data.
 #include "glm/rtxpf/producer/runtime.hpp"
+#include "glm/rtxpf/dsa_semantics.hpp"
+#include "glm/rtxpf/producer/decode_command.hpp"
 #include "glm/rtxpf/producer/session.hpp"
 #include "glm/rtxpf/producer/head_select.hpp"
 #include "glm/rtxpf/producer/expert_tier.hpp"
@@ -31,6 +33,35 @@ void check(bool b,const char* what){++checks;if(!b)throw std::runtime_error(std:
 template<class F> void rejects(F f,const char* what){bool threw=false;try{f();}catch(const std::exception&){threw=true;}check(threw,what);}
 template<class F> int rejects_code(F f){try{f();}catch(const RequestError& e){return e.code;}catch(const std::exception&){return -1;}return 0;}
 
+void dsa_short_skip_tests(){
+    using namespace strix::glm::rtxpf;
+    DecodeOptions d;check(d.dsa_short_skip,"DSA short skip defaults to 1");
+    set_dsa_short_skip_value(d,"0");check(!d.dsa_short_skip,"DSA short skip CLI off");
+    set_dsa_short_skip_value(d,"1");check(d.dsa_short_skip,"DSA short skip CLI on");
+    for(const char* bad:{"", "2", "-1", "true", "01", "1x"})rejects([&]{set_dsa_short_skip_value(d,bad);},"DSA short skip strictly 0|1");
+    check(d.dsa_short_skip,"invalid short skip leaves options unchanged");
+    for(unsigned pos:{0u,1023u,2047u,2048u,2050u,2051u,8191u,0xffffffffu}){
+        const bool expected=(std::uint64_t(pos)+1)/4<=dsa_selection_budget;
+        // Shared trunk/MTP guard; their call-site wiring is checked by test_decode.py.
+        check(dsa_short_skip_eligible(d.dsa_short_skip,1,pos)==expected,"decode short skip boundary");
+        check(!dsa_short_skip_eligible(false,1,pos),"OFF always restores work");
+        for(unsigned rows:{0u,2u,3u,4u,64u})check(!dsa_short_skip_eligible(true,rows,pos),"prefill/verify rows excluded");
+    }
+    check(dsa_short_skip_eligible(true,1,2050)&&!dsa_short_skip_eligible(true,1,2051),"2050 skip / 2051 no skip");
+    for(unsigned pos=0;pos<=2050;++pos){
+        std::vector<unsigned> full(pos+1);std::iota(full.begin(),full.end(),0);
+        check(dsa_host::select_causal(pos)==full,"short selection needs no scores and emits every causal token");
+        check(dsa_host::select(std::vector<float>((pos+1)/4,1.f),pos)==full,"score-free selection equals ranked selection");
+    }
+    rejects([]{dsa_host::select_causal(2051);},"score-free selection only within the budget");
+    rejects([]{dsa_host::select_causal(0xffffffffu);},"score-free selection widens before the budget check");
+    std::vector<float> scores(513,1);const auto selected=dsa_host::select(scores,2051);
+    check(selected.size()==4*dsa_selection_budget&&selected.back()==2047,"2051 resumes ranked pool selection");
+    auto parse=[](const std::string& extra){return parse_decode_command(strix::serve::parse_json("{\"op\":\"bench\",\"prompt\":\"p\",\"steps\":64,\"order\":[\"cold\",\"warm\"]"+extra+"}"));};
+    check(parse("").dsa_short_skip==-1,"command short skip omitted leaves setting unchanged");
+    for(int value:{0,1}){auto c=parse(",\"dsa_short_skip\":"+std::to_string(value));set_dsa_short_skip_value(d,std::to_string(c.dsa_short_skip));check(d.dsa_short_skip==(value==1),"command short skip options plumbing");}
+    for(const char* bad:{"true","false","2","-1","0.5","\"1\"","null"})rejects([&]{parse(",\"dsa_short_skip\":"+std::string(bad));},"command short skip type/range");
+}
 void session_tests(){
     SessionFrontier s(16);std::vector<std::uint32_t> q{5,6,7};
     rejects([&]{(void)s.position();},"closed session has no position");
@@ -184,6 +215,12 @@ void decode_timeline_tests(){
           &&std::abs(agg.find("phases")->find("routed_moe")->find("gpu_ms_per_token")->as_double()-6.5)<1e-9
           &&std::abs(agg.find("phases")->find("routed_moe")->find("gpu_ms_total")->as_double()-13.0)<1e-9,"timeline: per-arm totals over the steps that carry one");
     check(!aggregate_decode_timelines(Json::array()).find("tokens"),"timeline: no timeline, no totals");
+    {auto sub=Json::object();auto detail=Json::object();detail.set("gpu_ms",1.25);detail.set("calls",11);detail.set("skipped_calls",0);sub.set("dsa_index_query",detail);
+     detail=Json::object();detail.set("gpu_ms",0.0);detail.set("calls",1);detail.set("skipped_calls",1);sub.set("mtp_dsa_index_query",detail);
+     auto prof=t;prof.set("subcounters",sub);auto st=Json::object();st.set("timeline",prof);auto list=Json::array();list.push(st);list.push(st);
+     const auto sum=aggregate_decode_timelines(list);auto* sc=sum.find("subcounters");
+     check(sc->find("dsa_index_query")->find("gpu_ms_total")->as_double()==2.5&&sc->find("dsa_index_query")->find("calls")->as_int()==22,"index query subcounter aggregates");
+     check(sc->find("mtp_dsa_index_query")->find("skipped_calls")->as_int()==2&&sum.find("phases")->dump()==agg.find("phases")->dump(),"MTP skip counter separate, existing phase totals unchanged");}
     // Prefill phases (--prefill-profile) carry their names; the routed-MoE detail sums groups per call and layer and
     // gives the GEMM rates from rows x topk pairs (gate+up 4 h i, down 2 h i FLOP per pair).
     check(std::string(decode_phase_names[std::size_t(DecodePhase::stage)])=="stage"&&std::string(decode_phase_names[std::size_t(DecodePhase::state_export)])=="state_export"&&decode_phase_names.back()!=nullptr,"timeline: prefill phase names");
@@ -960,12 +997,16 @@ void profile_tests(){
     auto run=[&](std::vector<std::string> args,std::vector<std::pair<std::string,std::string>> env={}){rp::Inputs in;in.args=std::move(args);in.env=lookup(std::move(env));return rp::resolve(rp::App::decode_service,in);};
     const auto def=run({});
     check(def.name==rp::Name::standard&&def.qualification()=="qualified","no --profile = default, qualified");
-    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","prefill_tile_crossover","cuda_graphs","restore_decode_residency","flush_ready","prefill_overlap","decode_row_kernels"}){
+    for(const char* l:{"expert_tier","placement","eviction_policy","spare_share","row_tile","prefill_tile_crossover","cuda_graphs","restore_decode_residency","flush_ready","prefill_overlap","decode_row_kernels","dsa_short_skip"}){
         auto* e=def.find(l);check(e&&e->status==rp::Status::profile&&e->lever->kind==rp::Kind::exact,(std::string("default: exact lever on: ")+l).c_str());}
     check(def.find("expert_tier")->value=="tierstream"&&def.find("eviction_policy")->value=="auto"&&def.find("spare_share")->value=="5"&&def.find("row_tile")->value=="auto",
           "default values = today's service defaults");
     check(def.find("prefill_tile_crossover")->value=="0"&&run({"--profile","fast"}).find("prefill_tile_crossover")->value=="0","crossover 0 (allocated tile) in every profile");
     {const auto c=run({"--prefill-tile-crossover","8192"});check(c.find("prefill_tile_crossover")->status==rp::Status::explicit_cli&&c.find("prefill_tile_crossover")->value=="8192","--prefill-tile-crossover explicit");}
+    check(def.find("dsa_short_skip")->value=="1"&&run({"--profile","fast"}).find("dsa_short_skip")->value=="1","DSA short skip on in every profile");
+    {const auto off=run({"--dsa-short-skip","0"});auto* e=off.find("dsa_short_skip");check(e->status==rp::Status::explicit_cli&&e->value=="0","DSA short skip profile override");
+     auto j=strix::serve::parse_json(off.json([](std::string_view l){return l=="dsa_short_skip"?std::string("0"):std::string();}));auto* row=j.find("levers")->find("dsa_short_skip");
+     check(row->find("kind")->as_string()=="exact"&&row->find("effective")->as_string()=="0","DSA short skip receipt exact/effective");}
     auto* pp=def.find("predicted_prefetch");
     check(pp&&pp->status==rp::Status::pending&&pp->value=="0"&&pp->wanted=="1","predicted prefetch pending in default: its builtin (off) runs");
     check(!def.find("prefill_tile_large")&&!def.find("dsa_index_mma"),"default leaves the fast-only rows alone");
@@ -1320,7 +1361,7 @@ void request_tests(){
 }
 int main(int argc,char** argv){try{
     if(argc<2||argc>3)throw std::runtime_error("usage: decode_host BUILD_DIR [RECEIPT_ARTIFACT]");
-    session_tests();kda_schedule_tests();head_tests();catalog_tests();extent_tests(argv[1]);slot_tests();
+    dsa_short_skip_tests();session_tests();kda_schedule_tests();head_tests();catalog_tests();extent_tests(argv[1]);slot_tests();
 #ifdef GLM_TIERSTREAM_LIBRARY
     tier_budget_tests();
 #endif

@@ -177,7 +177,7 @@ __device__ float fold_index(const float* dots,const float* wh,unsigned l){
 template<int Kind>
 __global__ void index_scores(const float* pooled,const float* qi,const float* wh,float* scores,U32* keys,unsigned cap,unsigned first,unsigned* flag) {
     unsigned r=blockIdx.y,p0=blockIdx.x*16,P=(first+r+1)/4,l=threadIdx.x;
-    if(p0>=P||P<=512)return; // Entirely future tiles execute no loads or MMA.
+    if(p0>=P||P<=dsa_selection_budget)return; // Entirely future tiles execute no loads or MMA.
     __shared__ __align__(32) float dots[512];
     __shared__ __align__(32) BF operands[1024];
     index_dots<Kind>(pooled,qi+std::size_t(r)*4096,p0,P,dots,operands);
@@ -189,7 +189,7 @@ __global__ void index_scores(const float* pooled,const float* qi,const float* wh
 __global__ __launch_bounds__(128) void index_fp32_tiled(const float* pooled,const float* qi,const float* wh,float* scores,U32* keys,
                                                        unsigned cap,unsigned first,unsigned rows,unsigned* flag) {
     unsigned r0=blockIdx.y*2,p0=blockIdx.x*16,tid=threadIdx.x,h0=tid/16,p=tid%16;
-    unsigned Pmax=(first+min(r0+1,rows-1)+1)/4;if(p0>=Pmax||Pmax<=512)return;
+    unsigned Pmax=(first+min(r0+1,rows-1)+1)/4;if(p0>=Pmax||Pmax<=dsa_selection_budget)return;
     __shared__ float query[2][32][32],pool_tile[16][33],dots[2][32][16];
     float acc[2][4]{};
     for(unsigned k0=0;k0<128;k0+=32){
@@ -210,7 +210,7 @@ __global__ __launch_bounds__(128) void index_fp32_tiled(const float* pooled,cons
     for(unsigned r=0;r<2;++r)for(unsigned hh=0;hh<4;++hh)dots[r][h0+hh*8][p]=acc[r][hh];
     __syncthreads();
     if(tid<32){unsigned rr=tid/16,r=r0+rr,pp=p0+tid%16,P=(first+r+1)/4;
-        if(r<rows&&P>512&&pp<P){float v=fold_index(&dots[rr][0][0],wh+std::size_t(r)*32,tid%16);finite(v,flag);
+        if(r<rows&&P>dsa_selection_budget&&pp<P){float v=fold_index(&dots[rr][0][0],wh+std::size_t(r)*32,tid%16);finite(v,flag);
             scores[std::size_t(r)*cap+pp]=v;keys[std::size_t(r)*cap+pp]=ordered(v);}}
 }
 // Two queries x 32 pools. Each staged operand is reused across head/pool
@@ -224,7 +224,7 @@ __global__ __launch_bounds__(128) void tiled_index(const float* pooled,const flo
                                                 unsigned cap,unsigned first,unsigned rows,unsigned* flag) {
     unsigned r0=blockIdx.y*2,p0=blockIdx.x*32,l=threadIdx.x,warp=l/32;
     unsigned last=min(r0+1,rows-1),Pmax=(first+last+1)/4;
-    if(p0>=Pmax||Pmax<=512)return;
+    if(p0>=Pmax||Pmax<=dsa_selection_budget)return;
     extern __shared__ __align__(32) unsigned char tiled_storage[];
     auto& sh=*reinterpret_cast<TiledIndexShared*>(tiled_storage);
     for(unsigned j=l;j<64*128;j+=128){unsigned r=r0+j/(32*128);float v=r<rows?qi[std::size_t(r)*4096+j%4096]:0;
@@ -245,7 +245,7 @@ __global__ __launch_bounds__(128) void tiled_index(const float* pooled,const flo
     }
     __syncthreads();
     if(l<64){unsigned r=r0+l/32,p=p0+l%32,P=(first+r+1)/4;
-        if(r<rows&&P>512&&p<P){float v=0;for(unsigned h=0;h<32;++h)
+        if(r<rows&&P>dsa_selection_budget&&p<P){float v=0;for(unsigned h=0;h<32;++h)
             v=__fmaf_rn(wh[std::size_t(r)*32+h]*0.17677669529663687f,fmaxf(0.f,sh.dots[(l/32*32+h)*32+l%32]*0.088388347648318f),v);
             finite(v,flag);scores[std::size_t(r)*cap+p]=v;keys[std::size_t(r)*cap+p]=ordered(v);}
     }
@@ -262,7 +262,7 @@ __global__ __launch_bounds__(256) void streaming_index(const U32* staged,unsigne
     __shared__ IndexShared sh;
     unsigned r=blockIdx.x,t=first+r,P=(t+1)/4,l=threadIdx.x,lane=l%32,warp=l/32;
     U32* tok=tokens+std::size_t(r)*dsa_max_tokens;
-    if(P<=512){for(unsigned j=l;j<=t;j+=256)tok[j]=j;if(l==0)counts[r]=t+1;return;}
+    if(P<=dsa_selection_budget){for(unsigned j=l;j<=t;j+=256)tok[j]=j;if(l==0)counts[r]=t+1;return;}
     unsigned kept=0;
     for(unsigned base=0;base<P;base+=512){unsigned added=min(512u,P-base),n=kept+added;
         for(unsigned j=l;j<added;j+=256){sh.keys[kept+j]=staged[std::size_t(r)*stride+base+j];sh.ids[kept+j]=base+j;}
@@ -303,13 +303,13 @@ __global__ __launch_bounds__(1024) void select_rows(const U32* keys_all, unsigne
     const unsigned l = threadIdx.x, row = blockIdx.x, t = t0 + row;
     const unsigned P = (t + 1) / 4;
     U32* tokens = tokens_all + static_cast<std::size_t>(row) * dsa_max_tokens;
-    if (P <= 512) {
+    if (P <= dsa_selection_budget) {
         for (unsigned pos = l; pos <= t; pos += 1024) tokens[pos] = pos;
         if (l == 0) n_all[row] = t + 1;
         return;
     }
     const U32* keys = keys_all + static_cast<std::size_t>(row) * cap;
-    const unsigned k = 512;
+    const unsigned k = dsa_selection_budget;
     if (l == 0) {
         sh_prefix = 0;
         sh_mask = 0;
@@ -525,10 +525,10 @@ __global__ void compare_sets(const float* scores,unsigned cap,unsigned first,con
     unsigned r=blockIdx.x,l=threadIdx.x,P=(first+r+1)/4;
     const U32* ref=tokens+std::size_t(r)*dsa_max_tokens;const U32* act=native+std::size_t(r)*dsa_max_tokens;
     __shared__ float cutoff;__shared__ unsigned differs;
-    if(l==0){cutoff=CUDART_INF_F;differs=counts[r]!=native_counts[r];if(P>512)for(unsigned j=0;j<512;++j)cutoff=fminf(cutoff,scores[std::size_t(r)*cap+ref[j*4]/4]);}__syncthreads();
+    if(l==0){cutoff=CUDART_INF_F;differs=counts[r]!=native_counts[r];if(P>dsa_selection_budget)for(unsigned j=0;j<512;++j)cutoff=fminf(cutoff,scores[std::size_t(r)*cap+ref[j*4]/4]);}__syncthreads();
     for(unsigned p=l;p<P;p+=256)if(has_pool(ref,counts[r],p)!=has_pool(act,native_counts[r],p)){
         atomicExch(&differs,1);atomicAdd(&diag->differing_pools,1ull);float score=scores[std::size_t(r)*cap+p];
-        if(P>512&&fabsf(score-cutoff)<=abs+rel*fmaxf(fabsf(score),fabsf(cutoff)))atomicAdd(&diag->near_tie_pools,1ull);else atomicAdd(&diag->outside_tolerance_pools,1ull);}
+        if(P>dsa_selection_budget&&fabsf(score-cutoff)<=abs+rel*fmaxf(fabsf(score),fabsf(cutoff)))atomicAdd(&diag->near_tie_pools,1ull);else atomicAdd(&diag->outside_tolerance_pools,1ull);}
     // Trailing token membership and exact cardinality are never near-tie exempt.
     if(l==0){unsigned nr=counts[r],na=native_counts[r];if(nr!=na)atomicAdd(&diag->outside_tolerance_pools,1ull);
         for(unsigned j=(nr/4)*4;j<nr;++j)if(j>=na||ref[j]!=act[j]){atomicExch(&differs,1);atomicAdd(&diag->outside_tolerance_pools,1ull);}}
@@ -569,8 +569,18 @@ cudaError_t enqueue_dsa(const DsaCall& v,void* workspace,std::size_t bytes,cudaS
     const bool score_fp32=ref||mode==DsaIndex::fp32||mode==DsaIndex::mma_proj_fp32_score;
     auto mark=[&](unsigned phase,unsigned window,bool end){return prof?cudaEventRecord((end?prof->end:prof->begin)[phase*dsa_max_windows+window],s):cudaSuccess;};
     #define DSA_TRY(expr) do {auto status=(expr);if(status!=cudaSuccess)return status;} while(0)
+    // Only production one-row FP32 decode opts in. Diagnostic compare_sets can
+    // read scores on mismatched membership, so diagnostics retain the old work.
+    const bool skip_index=dsa_short_skip_eligible(v.short_skip,v.rows,v.first)&&!ref&&mode==DsaIndex::fp32
+        &&!v.node_mimic&&!v.index_only&&!v.compare_tokens&&!v.compare2_tokens&&!v.diagnostics&&!v.diagnostics2;
+    auto iqmark=[&](unsigned part,bool end){return v.index_query_profile?cudaEventRecord(
+        (end?v.index_query_profile->end:v.index_query_profile->begin)[part],s):cudaSuccess;};
     const bool rowk=v.row_kernels&&!ref&&!accurate&&!v.node_mimic&&v.rows<=32;
-    DSA_TRY(mark(0,0,false));for(unsigned j=0;j<5;++j)if(!rowk||j==0||j==4)layer_decode<<<ins[j]/16*(outs[j]/16),256,0,s>>>(matrices[j],a.weights[j]);DSA_TRY(cudaGetLastError());if(accurate){
+    DSA_TRY(mark(0,0,false));for(unsigned j=0;j<5;++j){
+        if(j==4)DSA_TRY(iqmark(0,false));
+        if((!rowk||j==0||j==4)&&!(skip_index&&j==4))layer_decode<<<ins[j]/16*(outs[j]/16),256,0,s>>>(matrices[j],a.weights[j]);
+        if(j==4)DSA_TRY(iqmark(0,true));
+    }DSA_TRY(cudaGetLastError());if(accurate){
         const U16* src[5]={a.weights[0],a.weights[4],w.key,w.gate,w.head_weight};
         const unsigned sizes[5]={4096*1536,1536*4096,128*4096,128*4096,32*4096};
         for(unsigned j=0;j<5;++j)widen<<<(sizes[j]+255)/256,256,0,s>>>(src[j],a.accurate_weights[j],sizes[j]);
@@ -608,15 +618,15 @@ cudaError_t enqueue_dsa(const DsaCall& v,void* workspace,std::size_t bytes,cudaS
         if(v.node_mimic){DSA_TRY(index_project(0,x,a.qa,n));}else {DSA_TRY(proj(0,x,a.qa,n,mode==DsaIndex::fp32&&index_fp32));}rms<<<n,256,0,s>>>(a.qa,w.qa_norm,a.qr,1536,v.node_mimic);
         if(!v.index_only){DSA_TRY(proj(1,a.qr,a.q,n));}
         if(!ref&&((index_fp32&&mode!=DsaIndex::fp32)||accurate)){DSA_TRY(index_project(0,x,a.qa,n));rms<<<n,256,0,s>>>(a.qa,w.qa_norm,a.qr,1536,v.node_mimic);}
-        DSA_TRY(index_project(4,a.qr,a.iq,n));DSA_TRY(index_ordinary(x,w.head_weight,a.wh,n,32,4));DSA_TRY(mark(3,window,true));
+        DSA_TRY(iqmark(1,false));if(!skip_index){DSA_TRY(index_project(4,a.qr,a.iq,n));DSA_TRY(index_ordinary(x,w.head_weight,a.wh,n,32,4));}DSA_TRY(iqmark(1,true));DSA_TRY(mark(3,window,true));
         DSA_TRY(mark(4,window,false));if(v.index_only){}else if(ref)absorb<false,true><<<dim3((n+15)/16,32,64),32,0,s>>>(a.q,w.kvb,a.qt,n);else absorb<false,false><<<dim3((n+15)/16,32,64),32,0,s>>>(a.q,w.kvb,a.qt,n);DSA_TRY(cudaGetLastError());DSA_TRY(mark(4,window,true));
-        DSA_TRY(mark(5,window,false));if(accurate){
+        DSA_TRY(mark(5,window,false));DSA_TRY(iqmark(2,false));if(skip_index){}else if(accurate){
             tiled_index<<<dim3(std::max(1u,((v.first+base+n)/4+31)/32),(n+1)/2),128,sizeof(TiledIndexShared),s>>>(v.state.pooled,a.iq,a.wh,a.scores,a.keys,cap/4,v.first+base,n,v.nonfinite);
             streaming_index<<<n,256,0,s>>>(a.keys,cap/4,v.first+base,a.tokens,a.counts);
         }
         else if(score_fp32&&!ref&&!v.legacy_fp32_index)index_fp32_tiled<<<dim3(std::max(1u,((v.first+base+n)/4+15)/16),(n+1)/2),128,0,s>>>(v.state.pooled,a.iq,a.wh,a.scores,a.keys,cap/4,v.first+base,n,v.nonfinite);
         else if(score_fp32)index_scores<1><<<dim3(std::max(1u,((v.first+base+n)/4+15)/16),n),32,0,s>>>(v.state.pooled,a.iq,a.wh,a.scores,a.keys,cap/4,v.first+base,v.nonfinite);
-        else index_scores<0><<<dim3(std::max(1u,((v.first+base+n)/4+15)/16),n),32,0,s>>>(v.state.pooled,a.iq,a.wh,a.scores,a.keys,cap/4,v.first+base,v.nonfinite);DSA_TRY(cudaGetLastError());DSA_TRY(mark(5,window,true));
+        else index_scores<0><<<dim3(std::max(1u,((v.first+base+n)/4+15)/16),n),32,0,s>>>(v.state.pooled,a.iq,a.wh,a.scores,a.keys,cap/4,v.first+base,v.nonfinite);DSA_TRY(cudaGetLastError());DSA_TRY(iqmark(2,true));DSA_TRY(mark(5,window,true));
         DSA_TRY(mark(6,window,false));if(!accurate)select_rows<<<n,1024,0,s>>>(a.keys,cap/4,v.first+base,a.tokens,a.counts);
         if(v.tokens){DSA_TRY(cudaMemcpyAsync(v.tokens+std::size_t(base)*dsa_max_tokens,a.tokens,std::size_t(n)*dsa_max_tokens*4,cudaMemcpyDeviceToDevice,s));DSA_TRY(cudaMemcpyAsync(v.counts+base,a.counts,n*4,cudaMemcpyDeviceToDevice,s));}
         if(v.compare_tokens)compare_sets<<<n,256,0,s>>>(a.scores,cap/4,v.first+base,a.tokens,a.counts,v.compare_tokens+std::size_t(base)*dsa_max_tokens,v.compare_counts+base,v.diagnostics,v.near_tie_abs,v.near_tie_rel);
@@ -731,7 +741,7 @@ cudaError_t enqueue_mtp(const MtpCall& v,void* workspace,std::size_t bytes,cudaS
     const bool rowk=v.row_proj&&!ref&&row_project_fits(w.eh,rows);
     if(!rowk)layer_decode<<<8192/16*(4096/16),256,0,s>>>(w.eh,a.decoded);MTP_TRY(project(w.eh,a.cat,a.z,rows,a,s,ref,false,rowk,v.row_r2));
     rms<<<rows,256,0,s>>>(a.z,w.input_norm,a.xn,4096);
-    DsaCall d{};d.rows=rows;d.first=v.first;d.w=w.attention;d.state=v.state;d.x=a.xn;d.y=a.part;d.nonfinite=v.nonfinite;d.index=v.index;d.legacy_fp32_index=v.legacy_fp32_index;d.row_kernels=v.row_proj;d.row_r2=v.row_r2;
+    DsaCall d{};d.rows=rows;d.first=v.first;d.w=w.attention;d.state=v.state;d.x=a.xn;d.y=a.part;d.nonfinite=v.nonfinite;d.index=v.index;d.legacy_fp32_index=v.legacy_fp32_index;d.row_kernels=v.row_proj;d.row_r2=v.row_r2;d.short_skip=v.dsa_short_skip;d.index_query_profile=v.index_query_profile;
     MTP_TRY(enqueue_dsa(d,a.dsa,a.dsa_bytes,s,ref));
     mtp_add<<<blocks,256,0,s>>>(a.z,a.part,a.residual,rows,v.nonfinite);rms<<<rows,256,0,s>>>(a.residual,w.post_norm,a.xn,4096);
     router_logits<<<rows,320,0,s>>>(a.xn,w.router,a.logits,v.nonfinite);router_select<<<rows,320,0,s>>>(a.logits,w.router_bias,a.ids,a.rates);

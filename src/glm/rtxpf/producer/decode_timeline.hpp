@@ -100,12 +100,16 @@ inline Json aggregate_decode_timelines(const Json& steps) {
     constexpr std::size_t P = std::size_t(DecodePhase::count);
     std::array<double, P> gpu{}, host{};
     double span = 0;
+    std::map<std::string,double> sub_ms;
+    std::map<std::string,std::uint64_t> sub_calls,sub_skipped;
     std::uint64_t tokens = 0;
     for (const auto& s : steps.as_array()) {
         const Json* t = s.find("timeline");
         if (!t) continue;
         ++tokens;
         span += t->find("span_ms")->as_double();
+        if(const auto* sub=t->find("subcounters"))for(const auto& [name,v]:sub->as_object()){
+            sub_ms[name]+=v.find("gpu_ms")->as_double();sub_calls[name]+=std::uint64_t(v.find("calls")->as_int());sub_skipped[name]+=std::uint64_t(v.find("skipped_calls")->as_int());}
         const Json* ph = t->find("phases");
         for (std::size_t p = 0; p < P; ++p)
             if (const Json* o = ph->find(decode_phase_names[p])) {
@@ -117,6 +121,7 @@ inline Json aggregate_decode_timelines(const Json& steps) {
     if (!tokens) return j;
     j.set("tokens", tokens);
     j.set("span_ms_per_token", span / double(tokens));
+    if(!sub_ms.empty()){auto sub=Json::object();for(const auto& [name,ms]:sub_ms){auto v=Json::object();v.set("gpu_ms_total",ms);v.set("gpu_ms_per_token",ms/double(tokens));v.set("calls",sub_calls[name]);v.set("skipped_calls",sub_skipped[name]);sub.set(name,v);}j.set("subcounters",sub);}
     auto phases = Json::object();
     for (std::size_t p = 0; p < P; ++p) {
         if (gpu[p] == 0 && host[p] == 0) continue;

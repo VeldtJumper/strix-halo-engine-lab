@@ -68,6 +68,12 @@ constexpr Lever kTable[] = {
                "prefill lowers the spare target and restores it before decode; off when the arena cannot keep two layers. "
                "Prefill state digests, tokens and logits equal with it off. TTFT full card 8K 44.7 -> 25.1 s, 32K 71.1 -> "
                "46.7 s; 24 GiB VRAM + 32 GiB RAM 1K 63.4 -> 60.3 s, 8K 73.7 -> 62.4 s. OFF: --prefill-overlap 0"},
+    {.name = "dsa_short_skip", .options = {{{"--dsa-short-skip", "*"}}}, .value = {"1", "1", "1"},
+     .builtin = "1", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
+     .source = "one-row decode and MTP: omit dead iq decode/projection, index head weights and scores when complete pools "
+               "fit the selection budget (through absolute position 2050). Full card: tokens, every logits digest, the "
+               "final state and replay digests equal with it off across the 2050 -> 2051 boundary; 1K decode 14.30 -> "
+               "15.00 tok/s warm, 6.77 -> 6.91 cold. OFF: --dsa-short-skip 0"},
     {.name = "decode_row_kernels", .env = "STRIX_GLM_RTX_ROW_KERNELS", .options = {{{"--decode-row-kernels", "*"}}},
      .value = {"1", "1", "1"}, .builtin = "1", .ready = all, .runnable = all, .kind = Kind::exact, .apps = service,
      .source = "few-row decode kernels, each output's arithmetic unchanged: MoE / KDA / DSA / MTP trellis GEMMs as "

@@ -1042,6 +1042,28 @@ class WindowTests(unittest.TestCase):
         slow = [dict(tokens=32000, verdict='BITWISE-EQUAL', timing=[dict(row_tile=4096, prefill_s=9.0), dict(row_tile=8192, prefill_s=9.5)])]
         self.assertIsNone(dw.crossover_estimate(slow, 8192)['crossover_at_most_rows'])
 
+    def test_dsa_short_skip_passthrough_and_decode_wiring(self):
+        for value in ('0', '1'):
+            a = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--dsa-short-skip', value])
+            a.expert_tier = 'tierstream'
+            a.unit_file, a.unit_manifest_sha256 = Path('U'), 'a'*64
+            for argv in (dw.service_command(a, Path('S')), dw.worker_options(a)):
+                self.assertEqual(argv[argv.index('--dsa-short-skip')+1], value)
+        self.assertIsNone(dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P']).dsa_short_skip)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--dsa-short-skip', '2'])
+        # Host-only wiring check: no CUDA compilation. Both decode MTP sites carry the
+        # option; ordinary prefill constructs calls without opting in.
+        runtime = (ROOT/'src/glm/rtxpf/producer/runtime.cu').read_text()
+        self.assertIn('v.short_skip=dopt.dsa_short_skip;', runtime)
+        self.assertEqual(runtime.count('m1.dsa_short_skip=dopt.dsa_short_skip;'), 2)
+        dsa = (ROOT/'src/glm/rtxpf/dsa.cu').read_text()
+        self.assertIn('d.short_skip=v.dsa_short_skip;', dsa)
+        self.assertIn('dsa_short_skip_eligible(v.short_skip,v.rows,v.first)', dsa)
+        self.assertIn('!v.compare_tokens&&!v.compare2_tokens&&!v.diagnostics&&!v.diagnostics2', dsa)
+        prefill = runtime[runtime.index('const bool prof=dopt.prefill_profile;'):runtime.index('} timeline,pf_timeline;')]
+        self.assertNotIn('short_skip=', prefill)
+
     def test_service_parses_every_planned_command(self):
         """Every request shape the harness can send (each run mode's plan, built by decode_command
         exactly as execute does, with the per-request tile at several allocations, plus quit) goes through
@@ -1072,13 +1094,15 @@ class WindowTests(unittest.TestCase):
         for op in ('qualify', 'bench', 'compare', 'ttft'):
             base = next(c for c in expected if c['op'] == op)
             for extra in (dict(row_kernels='0'), dict(row_kernels='1'), dict(row_kernels='moe+router'), dict(row_kernels='hc+kda+dsa'),
-                          dict(decode_profile=True), dict(decode_profile=False), dict(row_kernels='moe', decode_profile=True)):
+                          dict(dsa_short_skip=0), dict(dsa_short_skip=1), dict(decode_profile=True), dict(decode_profile=False), dict(row_kernels='moe', decode_profile=True)):
                 command = dict(base, **extra)
                 lines.append(json.dumps(command))
                 expected.append(command)
         lines.append(json.dumps(dict(op='quit')))
         expected.append(dict(op='quit'))
-        bad = [(dict(op='ttft', prompt='p', steps=1, tile=4096), 'unsupported request field: tile'),
+        bad = [(dict(op='ttft', prompt='p', steps=1, dsa_short_skip=True), 'dsa_short_skip must be 0 or 1'),
+               (dict(op='ttft', prompt='p', steps=1, dsa_short_skip=2), 'dsa_short_skip must be 0 or 1'),
+               (dict(op='ttft', prompt='p', steps=1, tile=4096), 'unsupported request field: tile'),
                (dict(op='qualify', prompt='p', steps=4, row_tile=4096), 'row_tile is not a field of op qualify'),
                (dict(op='ttft', prompt='p', steps=1, row_tile=100), 'row_tile must be a multiple of 32'),
                (dict(op='bench', prompt='p', steps=4), 'bench needs order'),
@@ -1106,6 +1130,8 @@ class WindowTests(unittest.TestCase):
                 self.assertEqual(got['export_dir'], 'export_dir' in command)
                 if 'row_kernels' in command:
                     self.assertEqual(got['row_kernels'], command['row_kernels'])
+                if 'dsa_short_skip' in command:
+                    self.assertEqual(got['dsa_short_skip'], command['dsa_short_skip'])
                 if 'decode_profile' in command:
                     self.assertEqual(got['decode_profile'], command['decode_profile'])
         for (b, why), got in zip(bad, out[len(expected):]):

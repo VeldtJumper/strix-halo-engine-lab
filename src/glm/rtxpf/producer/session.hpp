@@ -1,4 +1,5 @@
 #pragma once
+#include "../dsa_selection.hpp"
 // Host-only single-session decode contract (draft identity glm-dec-rtx-native-v1).
 // One pending token: for logical sequence S of length N, trunk state holds rows
 // S[0..N-2], MTP holds pairs (hidden[j],S[j+1]) for j<N-1, S[N-1] is pending and
@@ -45,7 +46,7 @@ inline bool kda_promotes(unsigned P){return P%kda_block==kda_block-1;}
 inline bool dsa_completes_pool(unsigned first){return (first+1)%4==0;}
 inline unsigned dsa_scored_pools(unsigned first){return (first+1)/4;}
 inline constexpr unsigned dsa_attended_bound=2051;
-inline unsigned dsa_attended_tokens(unsigned first){auto pools=dsa_scored_pools(first);return pools<=512?first+1:2048+(first+1)%4;}
+inline unsigned dsa_attended_tokens(unsigned first){auto pools=dsa_scored_pools(first);return pools<=dsa_selection_budget?first+1:4*dsa_selection_budget+(first+1)%4;}
 // Prompt-lookup drafts (local stand-in for the shared n-gram component): the longest suffix of `tokens`
 // (max_match down to min_match tokens) that occurred earlier, most recent occurrence first; returns up to k
 // tokens that followed it (empty: no match). Drafts only propose; the greedy verify decides every token.

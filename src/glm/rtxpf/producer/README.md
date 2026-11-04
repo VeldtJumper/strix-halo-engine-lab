@@ -804,6 +804,19 @@ faster (+8 % warm decode at 1K, same bits) and is part of the default `1`; the o
 were not faster and stay opt-in (dense strips were slower). `moe+hc+router+kda+dsa`
 is round one exactly.
 
+| Decode option | Contract |
+| --- | --- |
+| `--dsa-short-skip 0\|1` | Exact, default on (`1`): one-row decode and MTP omit dead index-query weight decode/projection, index head-weight projection and scoring when complete pools fit the selection budget (through absolute position 2050). `0` restores the work; prefill and persistent state are unchanged. Tokens, every logits digest, the final state and replay digests equal with it off across the 2050 -> 2051 boundary; full card 1K decode 14.30 -> 15.00 tok/s warm, 6.77 -> 6.91 cold. |
+
+Decode commands also accept `"dsa_short_skip": 0|1` for in-process A/B; it stays set
+for later commands and each receipt records the effective value. With
+`--decode-profile`, `timeline.subcounters.dsa_index_query` and
+`mtp_dsa_index_query` report the three disjoint index-work intervals in GPU ms,
+plus call and skipped-call counts. They overlap the existing `dsa` / `mtp` phases;
+do not add sub-counters to phase totals. Skipped work reports zero. Keep profiling
+off for timing A/B. Diagnostic set comparisons retain score work because their
+mismatch path reads scores; production selection reads no scores in this regime.
+
 **Self-speculation (`mtp_self_spec`, pending: `--mtp-self-spec 1`, tierstream cache only).**
 Each decode step verifies `[pending, draft 1..3]` in one trunk pass of two to four rows
 with the plain step's per-row kernels, so every row's arithmetic is the plain step's

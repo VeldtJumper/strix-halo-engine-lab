@@ -781,6 +781,20 @@ struct Runtime::Impl {
                 if(longest>=0){auto p=Json::object();p.set("layer",done[at].layer);p.set("phase",decode_phase_names[std::size_t(done[at].phase)]);p.set("gpu_ms",longest);j.set("longest_interval",p);}
                 return j;}catch(...){return Json::object();}}
     } timeline,pf_timeline; // pf_timeline: --prefill-profile (stage / state_export phases per layer)
+    // Sub-counters overlap the existing dsa / mtp phases; never add them to timeline totals.
+    // Reuse a fixed event pool. No event allocation in the measured token loop.
+    struct DsaIndexQueryPool {
+        struct Entry {DsaIndexQueryProfile events{};bool mtp=false,skipped=false;};
+        std::array<Entry,12> entries{};unsigned used=0;bool enabled=false;
+        ~DsaIndexQueryPool(){for(auto& e:entries)for(unsigned i=0;i<3;++i){if(e.events.begin[i])cudaEventDestroy(e.events.begin[i]);if(e.events.end[i])cudaEventDestroy(e.events.end[i]);}}
+        void enable(){for(auto& e:entries)for(unsigned i=0;i<3;++i){if(!e.events.begin[i])ck(cudaEventCreate(&e.events.begin[i]));if(!e.events.end[i])ck(cudaEventCreate(&e.events.end[i]));}enabled=true;}
+        void reset(){used=0;}
+        DsaIndexQueryProfile* next(bool mtp,bool skipped){if(!enabled)return nullptr;need(used<entries.size(),"DSA index-query event pool exhausted");auto& e=entries[used++];e.mtp=mtp;e.skipped=skipped;return &e.events;}
+        Json collect(){double ms[2]{};unsigned calls[2]{},skipped[2]{};
+            for(unsigned j=0;j<used;++j){auto& e=entries[j];unsigned k=e.mtp?1:0;++calls[k];if(e.skipped){++skipped[k];continue;}
+                for(unsigned i=0;i<3;++i){float t=0;ck(cudaEventElapsedTime(&t,e.events.begin[i],e.events.end[i]));ms[k]+=t;}}
+            auto out=Json::object();for(unsigned k=0;k<2;++k){auto v=Json::object();v.set("gpu_ms",ms[k]);v.set("calls",int(calls[k]));v.set("skipped_calls",int(skipped[k]));out.set(k?"mtp_dsa_index_query":"dsa_index_query",v);}return out;}
+    } index_query_pool;
     // --prefill-profile: one launch_cutlass Profile per routed-MoE call (layer x row tile). Fresh events each prefill, so a
     // group the call did not run has unrecorded events and ends that call's sums (cudaEventElapsedTime refuses them).
     struct MoeProfilePool {
@@ -1068,7 +1082,7 @@ struct Runtime::Impl {
         if(dopt.tier_predict)ts_tier->enable_predict();
         if(!dopt.routes_out.empty()){ts_tier->enable_routes();routes_file.open(dopt.routes_out,std::ios::binary|std::ios::app);need(routes_file.is_open(),("open --routes-out "+dopt.routes_out).c_str());}
         need(!dopt.routes_prefill||routes_file.is_open(),"--routes-prefill needs --routes-out on the tierstream expert tier");
-        tier_plan=Json::object();tier_plan.set("placement",placement);tier_plan.set("skip_empty_expert_groups",dopt.skip_empty_expert_groups?"on: routed MoE launches only the expert groups holding routed rows (device compaction)":"off");tier_plan.set("persistent_dense_fp16",dopt.persistent_dense_fp16?"on: shared experts and dense FFNs decoded once at startup":persist_note.empty()?std::string("off"):persist_note);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
+        tier_plan=Json::object();tier_plan.set("dsa_short_skip",dopt.dsa_short_skip?1:0);tier_plan.set("placement",placement);tier_plan.set("skip_empty_expert_groups",dopt.skip_empty_expert_groups?"on: routed MoE launches only the expert groups holding routed rows (device compaction)":"off");tier_plan.set("persistent_dense_fp16",dopt.persistent_dense_fp16?"on: shared experts and dense FFNs decoded once at startup":persist_note.empty()?std::string("off"):persist_note);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
         tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);
         tier_plan.set("weight_dirs",dopt.weight_dirs.empty()?std::string("none: the primary only"):dopt.weight_dirs);if(dopt.weight_dirs.empty())tier_plan.set("drive_readers",std::string("n/a: no --weight-dirs"));else tier_plan.set("drive_readers",std::uint64_t(dopt.drive_readers?dopt.drive_readers:4));
         tier_plan.set("disk_queue_source",b.disk_queue_source);tier_plan.set("disk_bounce_units",std::uint64_t(b.disk_readers));tier_plan.set("landing_blocks_requested",std::uint64_t(dopt.tier_landing_blocks));tier_plan.set("landing_blocks",b.landing_blocks);tier_plan.set("landing_max_queued",std::uint64_t(b.landing_blocks?dopt.tier_landing_max_queued:0));tier_plan.set("landing_ttl",std::uint64_t(b.landing_blocks?dopt.tier_landing_ttl:0));tier_plan.set("landing_chunk",std::uint64_t(b.landing_blocks?dopt.tier_landing_chunk:0));tier_plan.set("clean_evict",b.three_tier&&dopt.tier_clean_evict?"on: device victims with no free pinned block go to their file (no D2H)":"off");tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
@@ -1427,7 +1441,7 @@ struct Runtime::Impl {
                 KdaCall v{n,w.k,tl(l),part.as<float>(),kst2(l),kcv2(l)};v.row_kernels=dopt.row_kda;v.row_r2=dopt.row_r2;ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s));yrow=part.as<float>()+std::size_t(n-rows)*4096;
                 if(rows==1&&kda_promotes(P))promote_kda(l);
                 timeline.mark(int(l),DecodePhase::kda,compute.s);
-            }else{DsaCall v{};v.rows=rows;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;v.row_kernels=dopt.row_dsa;v.row_r2=dopt.row_r2;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));timeline.mark(int(l),DecodePhase::dsa,compute.s);}
+            }else{DsaCall v{};v.rows=rows;v.first=P;v.w=w.d;v.state=sdstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=DsaIndex::fp32;v.row_kernels=dopt.row_dsa;v.row_r2=dopt.row_r2;v.short_skip=dopt.dsa_short_skip;if(timeline.on)v.index_query_profile=index_query_pool.next(false,dsa_short_skip_eligible(v.short_skip,v.rows,v.first));ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));timeline.mark(int(l),DecodePhase::dsa,compute.s);}
             post(rx.as<float>(),yrow,rx2.as<float>(),rows);timeline.mark(int(l),DecodePhase::hc_post_attn,compute.s);
             pre(w.ffn,w.post,rx2.as<float>(),normalized.as<float>(),rows);timeline.mark(int(l),DecodePhase::hc_pre_ffn,compute.s);
             if(l<3){Call v{rows,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);v.row_gemv=dopt.row_moe;v.row_r2=dopt.row_r2;ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));timeline.mark(int(l),DecodePhase::dense_ffn,compute.s);}
@@ -1449,7 +1463,7 @@ struct Runtime::Impl {
     Json decode_step(bool qualification,bool draft){
         need(decode_mode,"decode not enabled");const unsigned P=sess.position();const U32 pending=sess.pending();
         try{
-            auto begin=std::chrono::steady_clock::now();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
+            auto begin=std::chrono::steady_clock::now();index_query_pool.reset();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
             auto* hs=host_small.as<U32>();hs[0]=pending;ck(cudaMemcpyAsync(tokens.as<U32>()+P,hs,4,cudaMemcpyHostToDevice,compute.s));
             trunk(P,1);
             ck(cudaMemcpyAsync(hs,argres.p,12,cudaMemcpyDeviceToHost,compute.s));ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::head,compute.s);ck(cudaStreamSynchronize(compute.s));
@@ -1466,7 +1480,7 @@ struct Runtime::Impl {
             hs[8]=y;ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,hs+8,4,cudaMemcpyHostToDevice,compute.s));
             embed<<<16,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P+1,emb.as<float>(),1,1);
             auto& w=*layers[45];
-            MtpCall m1{1,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;m1.row_r2=dopt.row_r2;ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
+            MtpCall m1{1,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;m1.row_r2=dopt.row_r2;m1.dsa_short_skip=dopt.dsa_short_skip;if(timeline.on)m1.index_query_profile=index_query_pool.next(true,dsa_short_skip_eligible(m1.dsa_short_skip,m1.rows,m1.first));ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
             tier->acquire(45,route.as<U32>(),8,compute.s);auto m2=m1;m2.phase=2;m2.route_ids=nullptr;m2.w.experts=static_cast<const Expert*>(tier->bind_selected_descriptors(45,compute.s));ck(enqueue_mtp(m2,workspace.p,ws_bytes,compute.s,exec));
             tier->release(45,compute.s);if(draft)enqueue_draft(0,hs+12);ck(cudaMemcpyAsync(hs+4,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::mtp,compute.s);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[4],"nonfinite MTP activation; session invalidated");
             if(draft)take_draft(hs+12);else have_draft=false;
@@ -1474,8 +1488,8 @@ struct Runtime::Impl {
             std::string routes;
             if(ts_tier&&tier.get()==ts_tier&&ts_tier->route_log.p){std::vector<U32> h(std::size_t(routed_gated)*routed_topk);ck(cudaMemcpy(h.data(),ts_tier->route_log.p,h.size()*4,cudaMemcpyDeviceToHost));routes=routes_line(h.data());
                 if(routes_file.is_open()){routes_file<<routes<<'\n';routes_file.flush();}}
-            record.set("position",int(P));record.set("token",std::uint64_t(y));record.set("trunk_ms",trunk_ms);record.set("step_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());record.set("experts",tier->collect_stats());if(!routes.empty())record.set("routes",routes);
-            if(timeline.on){record.set("timeline",timeline.collect());if(ts_tier&&tier.get()==ts_tier)record.set("slot_census",ts_tier->census(compute.s));}
+            record.set("dsa_short_skip",dopt.dsa_short_skip?1:0);record.set("position",int(P));record.set("token",std::uint64_t(y));record.set("trunk_ms",trunk_ms);record.set("step_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());record.set("experts",tier->collect_stats());if(!routes.empty())record.set("routes",routes);
+            if(timeline.on){auto t=timeline.collect();t.set("subcounters",index_query_pool.collect());record.set("timeline",t);if(ts_tier&&tier.get()==ts_tier)record.set("slot_census",ts_tier->census(compute.s));}
             return record;
         }catch(const std::exception& e){tier->fail_token(e.what());session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
         catch(...){tier->fail_token("non-standard exception");session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
@@ -1519,7 +1533,7 @@ struct Runtime::Impl {
             if(qualification){auto g=Json::array();g.push(r.find("logits_sha256")->as_string());r.set("logits",g);}r.set("drafted",0);r.set("accepted",0);return r;}
         drafts.resize(R-1);
         try{
-            auto begin=std::chrono::steady_clock::now();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
+            auto begin=std::chrono::steady_clock::now();index_query_pool.reset();timeline.start(compute.s);ck(cudaMemsetAsync(flag.p,0,4,compute.s));
             // host_small: argres rows 0..15, flag 24, verify tokens 32.., MTP tokens 40.., draft 48..50
             auto* hs=host_small.as<U32>();hs[32]=sess.pending();for(unsigned j=1;j<R;++j)hs[32+j]=drafts[j-1];
             if(from_mtp){ck(cudaMemcpyAsync(tokens.as<U32>()+P,hs+32,4,cudaMemcpyHostToDevice,compute.s));ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,argres.as<U32>()+16,4,cudaMemcpyDeviceToDevice,compute.s));}
@@ -1544,13 +1558,13 @@ struct Runtime::Impl {
             for(unsigned j=0;j<c;++j)hs[40+j]=out[j];ck(cudaMemcpyAsync(tokens.as<U32>()+P+1,hs+40,4*c,cudaMemcpyHostToDevice,compute.s));
             embed<<<16*c,256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+P+1,emb.as<float>(),c,1);
             auto& w=*layers[45];
-            MtpCall m1{c,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;m1.row_r2=dopt.row_r2;ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
+            MtpCall m1{c,P,w.m,sdstate(45),emb.as<float>(),hrow.as<float>(),mtp_out.as<float>(),flag.as<unsigned>(),DsaIndex::fp32};m1.phase=1;m1.route_ids=route.as<U32>();m1.row_proj=dopt.row_dsa;m1.row_moe=dopt.row_moe;m1.row_r2=dopt.row_r2;m1.dsa_short_skip=dopt.dsa_short_skip;if(timeline.on)m1.index_query_profile=index_query_pool.next(true,dsa_short_skip_eligible(m1.dsa_short_skip,m1.rows,m1.first));ck(enqueue_mtp(m1,workspace.p,ws_bytes,compute.s,exec));
             tier->acquire(45,route.as<U32>(),8*c,compute.s);auto m2=m1;m2.phase=2;m2.route_ids=nullptr;m2.w.experts=static_cast<const Expert*>(tier->bind_selected_descriptors(45,compute.s));ck(enqueue_mtp(m2,workspace.p,ws_bytes,compute.s,exec));
             tier->release(45,compute.s);enqueue_draft(c-1,hs+48);ck(cudaMemcpyAsync(hs+24,flag.p,4,cudaMemcpyDeviceToHost,compute.s));timeline.mark(-1,DecodePhase::mtp,compute.s);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());need(!hs[24],"nonfinite MTP activation; session invalidated");
             take_draft(hs+48);tier->end_token();for(auto y:out)sess.commit(y);
-            record.set("position",int(P));record.set("tokens",tok);record.set("token",std::uint64_t(out[0]));record.set("drafted",int(R-1));record.set("accepted",int(m));record.set("draft_source",from_mtp?"mtp":"lookup");
+            record.set("dsa_short_skip",dopt.dsa_short_skip?1:0);record.set("position",int(P));record.set("tokens",tok);record.set("token",std::uint64_t(out[0]));record.set("drafted",int(R-1));record.set("accepted",int(m));record.set("draft_source",from_mtp?"mtp":"lookup");
             record.set("trunk_ms",trunk_ms);record.set("step_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());record.set("experts",tier->collect_stats());
-            if(timeline.on){record.set("timeline",timeline.collect());if(ts_tier&&tier.get()==ts_tier)record.set("slot_census",ts_tier->census(compute.s));}
+            if(timeline.on){auto t=timeline.collect();t.set("subcounters",index_query_pool.collect());record.set("timeline",t);if(ts_tier&&tier.get()==ts_tier)record.set("slot_census",ts_tier->census(compute.s));}
             return record;
         }catch(const std::exception& e){have_draft=false;tier->fail_token(e.what());session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
         catch(...){have_draft=false;tier->fail_token("non-standard exception");session_failed();if(timeline.on)failed_timeline=timeline.collect_failed();failed_census();throw;}
@@ -1602,8 +1616,10 @@ std::string Runtime::plan_budget(const std::string& model,unsigned cap,unsigned 
     j.set("cuda_driver_loaded",GetModuleHandleW(L"nvcuda.dll")!=nullptr);return j.dump();
 }
 std::string Runtime::memory_report(const std::string& stage){return p_->memory_json(stage).dump();}
-void Runtime::set_decode_profile(bool on){if(on)p_->timeline.enable();else p_->timeline.on=false;if(p_->ts_tier){if(on)p_->ts_tier->enable_census();else p_->ts_tier->census_on=false;}}
+void Runtime::set_decode_profile(bool on){if(on){p_->timeline.enable();p_->index_query_pool.enable();}else p_->timeline.on=false;if(p_->ts_tier){if(on)p_->ts_tier->enable_census();else p_->ts_tier->census_on=false;}}
 void Runtime::set_row_kernels(const std::string& v){ck(cudaStreamSynchronize(p_->compute.s));set_row_kernels_value(p_->dopt,v);}
+void Runtime::set_dsa_short_skip(bool on){ck(cudaStreamSynchronize(p_->compute.s));p_->dopt.dsa_short_skip=on;p_->tier_plan.set("dsa_short_skip",on?1:0);}
+bool Runtime::dsa_short_skip()const{return p_->dopt.dsa_short_skip;}
 std::string Runtime::row_kernels()const{return row_kernels_name(p_->dopt);}
 std::string Runtime::expert_diagnostics(){auto j=Json::object();if(!p_->ts_tier)return j.dump();j=p_->ts_tier->api->diagnostics();
     if(p_->failed_timeline.find("timeline"))j.set("decode_timeline_at_failure",p_->failed_timeline);
