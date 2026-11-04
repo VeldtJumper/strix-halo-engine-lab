@@ -137,20 +137,27 @@ struct Begin {
     }
 };
 // Component IDs: KDA S=0, conv=1; DSA latent=2, ikey=3, igate=4, pooled=5.
+// Begin.version 1: each rank receives every component. Version 2 ('DSA once'): the same encoding; rank 0
+// receives every component, rank 1 only the KDA components (its DSA components reach it from rank 0 over
+// the pair link, outside this wire), so the DSA bytes cross the producer's link once.
 struct Component {
     unsigned layer, id;
     std::uint64_t rows, stride;
 };
+// Version 2: the components a rank does not receive (rank 1's DSA ids 2..5). The producer drops exactly these from
+// its export stream, and layout() omits them, so both ends agree by construction.
+inline bool omitted(unsigned version, unsigned rank, unsigned id) { return version == 2 && rank == 1 && id >= 2; }
 inline std::vector<Component> layout(const Begin& b) {
-    require(b.version == 1 && b.world == 2 && b.rank < 2 && (b.layers == 45 || b.layers == 46),
+    require((b.version == 1 || b.version == 2) && b.world == 2 && b.rank < 2 && (b.layers == 45 || b.layers == 46),
             "unsupported import layout/rank");
+    const bool dsa = !omitted(b.version, b.rank, 2);
     require(b.frontier > 0 && b.frontier < b.total && b.total <= 131072, "invalid import frontier");
     std::vector<Component> out;
     for (unsigned l = 0; l < b.layers; ++l) {
         if (l < 45 && l % 4 != 3) {
             out.push_back({l, 0, 32, 128 * 128 * 4});
             out.push_back({l, 1, 32, state_layout::kConvFloatsPerHead * sizeof(float)});
-        } else {
+        } else if (dsa) {
             out.push_back({l, 2, b.frontier, 1024});
             out.push_back({l, 3, b.frontier, 256});
             out.push_back({l, 4, b.frontier, 256});
