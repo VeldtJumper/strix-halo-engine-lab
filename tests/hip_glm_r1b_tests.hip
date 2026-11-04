@@ -646,18 +646,47 @@ void gate_hc_norm(const LayerCase& c, const std::vector<float>& Xall) {
             r1b::hc_pre(dX, fn, base, scale, F, mix, xc, R, nullptr, 4);
             dev::rmsnorm(xc, norm, dev::WType::BF16, kHidden, kEps, xn, R, nullptr);
             const auto refF = down(F, pf.size()), refM = down(mix, pm.size()), refC = down(xc, px.size()), refN = down(xn, px.size());
-            for (unsigned rep = 0; rep < 3; ++rep) {
+            // Launch modes 0 (three launches), 1 and 2 (one-launch site), three repetitions each.
+            for (unsigned rep = 0; rep < 9; ++rep) {
                 hok(hipMemcpy(F, pf.data(), pf.size() * 4, hipMemcpyHostToDevice), "poison F");
                 hok(hipMemcpy(mix, pm.data(), pm.size() * 4, hipMemcpyHostToDevice), "poison mix");
                 hok(hipMemcpy(xc, px.data(), px.size() * 4, hipMemcpyHostToDevice), "poison xc");
                 hok(hipMemcpy(xn, px.data(), px.size() * 4, hipMemcpyHostToDevice), "poison xn");
-                r1b::hc_pre_norm(dX, fn, base, scale, F, mix, xc, norm, xn, R, nullptr);
+                r1b::hc_pre_norm(dX, fn, base, scale, F, mix, xc, norm, xn, R, nullptr, static_cast<int>(rep % 3));
                 exact = same_bits(refF, down(F, pf.size())) && same_bits(refM, down(mix, pm.size())) &&
                         same_bits(refC, down(xc, px.size())) && same_bits(refN, down(xn, px.size())) && exact;
             }
-            // Each permuted row alone must match all four batched results.
-            for (unsigned r = 0; r < R; ++r) {
-                r1b::hc_pre_norm(dX + r * N, fn, base, scale, F, mix, xc, norm, xn, 1, nullptr);
+            // Arrival counter / fence check, queued: fused-site launches back-to-back on one stream (no host sync in between),
+            // alternating this input with a rotated one (perm 2's rows), each result snapshotted on the device; one final
+            // sync, then every snapshot == its input's mode-0 reference. R1 mode 1 (one launch), R8 mode 2 (two launches).
+            if (perm == 0 && (R == 1 || R == 8)) {
+                std::vector<float> X2(9 * N, std::nanf(""));
+                for (unsigned r = 0; r < R; ++r) std::memcpy(X2.data() + r * N, Xall.data() + ((r + 1) % 9) * N, N * sizeof(float));
+                auto* dX2 = up(X2);
+                r1b::hc_pre_norm(dX2, fn, base, scale, F, mix, xc, norm, xn, R, nullptr, 0);
+                const auto ref2M = down(mix, pm.size()), ref2N = down(xn, px.size());
+                const unsigned reps = R == 1 ? 1000 : 250;
+                const std::size_t sm = static_cast<std::size_t>(R) * kHcMix, sn = static_cast<std::size_t>(R) * kHidden;
+                float* snaps = up(std::vector<float>(reps * (sm + sn), std::nanf("")));
+                for (unsigned rep = 0; rep < reps; ++rep) {
+                    r1b::hc_pre_norm(rep % 2 ? dX2 : dX, fn, base, scale, F, mix, xc, norm, xn, R, nullptr, R == 1 ? 1 : 2);
+                    hok(hipMemcpyAsync(snaps + rep * (sm + sn), mix, sm * 4, hipMemcpyDeviceToDevice, nullptr), "snap mix");
+                    hok(hipMemcpyAsync(snaps + rep * (sm + sn) + sm, xn, sn * 4, hipMemcpyDeviceToDevice, nullptr), "snap xn");
+                }
+                const auto all = down(snaps, reps * (sm + sn));
+                for (unsigned rep = 0; rep < reps; ++rep) {
+                    const float* m = all.data() + rep * (sm + sn);
+                    const auto& rm = rep % 2 ? ref2M : refM;
+                    const auto& rn = rep % 2 ? ref2N : refN;
+                    exact = std::memcmp(m, rm.data(), sm * 4) == 0 && std::memcmp(m + sm, rn.data(), sn * 4) == 0 && exact;
+                }
+                hok(hipFree(snaps), "free snaps");
+                hok(hipFree(dX2), "free X2");
+            }
+            // Each permuted row alone must match all four batched results (every launch mode).
+            for (unsigned q = 0; q < 3 * R; ++q) {
+                const unsigned r = q % R;
+                r1b::hc_pre_norm(dX + r * N, fn, base, scale, F, mix, xc, norm, xn, 1, nullptr, static_cast<int>(q / R));
                 const auto f = down(F, N), m = down(mix, kHcMix), x = down(xc, kHidden), n = down(xn, kHidden);
                 independent = std::memcmp(f.data(), refF.data() + r * N, N * 4) == 0 &&
                               std::memcmp(m.data(), refM.data() + r * kHcMix, kHcMix * 4) == 0 &&
@@ -668,7 +697,7 @@ void gate_hc_norm(const LayerCase& c, const std::vector<float>& Xall) {
                 hok(hipFree(ptr), "free hc norm");
         }
         check(exact && independent, "hc_pre_norm L" + std::to_string(c.l) + " site " + std::to_string(site) +
-              ": F/mix/xc/xn == hc v4 + rmsnorm, R1..8, permutations, padding, x3, row independence");
+              ": F/mix/xc/xn == hc v4 + rmsnorm, launch modes 0/1/2, queued fused repeats (R1 x1000, R8 x250, alternating inputs), R1..8, permutations, padding, x3, row independence");
         for (void* ptr : {static_cast<void*>(fn), static_cast<void*>(base), static_cast<void*>(scale), static_cast<void*>(norm)})
             hok(hipFree(ptr), "free hc norm weights");
     }

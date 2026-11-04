@@ -69,6 +69,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: verify + MTP drafter on XferExchange, token vectors match --mtp 0, SP1a PASS"},
         {"hc-norm-fused", "STRIX_GLM_HC_NORM", "1", "0", true, true,
          "Measurement: R1b decode hc_fin + RMSNorm fused, tokens and R8 match reference; pair ABA x2 -2.3 % C1 MTP, -3.1 % R8"},
+        {"hc-site-launch", "STRIX_GLM_HC_SITE", "1", "0", false, true,
+         "Measurement: one launch per one-row decode mHC site, same bits; pair ABBA C1 -1.45 %, R8 unchanged (G-02)"},
         {"spec-kda-tree-2", "STRIX_GLM_SPEC_KDA_TREE", "2", "1", true, true,
          "Measurement: two-barrier KDA verify tree, bitwise == 9-barrier tree, token vectors match --mtp 0, +2.8 %"},
         {"xfer-boundary-fused", "STRIX_GLM_BOUNDARY", "1", "0", false, true,

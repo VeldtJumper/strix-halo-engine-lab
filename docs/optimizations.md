@@ -3570,6 +3570,25 @@ R1b decode fuses the hyper-connection finish (hc_fin) with the following RMSNorm
 - **Measured gain:** Pair ABA x2: C1 MTP decode -2.3 %, R8 -3.1 %
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
 
+<a id="glm-hc-site"></a>
+
+### Decode one-launch mHC site
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_HC_SITE`. **Default:** 1 (engine default).
+
+At one decode row the fused HC norm site (row norm, 64 block partials, finish + RMSNorm) runs as one kernel instead of
+three. Every workgroup recomputes the row norm with the same 256 lane chains and tree, computes its block partials, and the
+last workgroup to arrive runs the unchanged finish. 2 = also two launches at 2..8 rows (opt-in: measured slower at R8).
+
+- **Preconditions:** the fused HC norm (`STRIX_GLM_HC_NORM=1`, the default); one stream at a time (module scratch).
+- **Automatic selection:** one row only; 2..8 rows keep the three launches.
+- **Fallback notice:** None.
+- **Exactness evidence:** Device gate: F / mix / xc / xn bitwise equal to the three-launch site at 1..8 rows, real rows,
+  queued repeats; pair decode tokens and R8 rows equal the reference on both ranks.
+- **Off switch:** STRIX_GLM_HC_SITE=0, or --baseline
+- **Measured gain:** Pair, fresh process per arm, --mtp 0: C1 -1.45 % (39.72 / 39.71 -> 39.12 / 39.16 ms/token); R8 unchanged
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [R1b kernels](../src/glm/engine/glm_r1b.hip)
+
 <a id="glm-serve-g2"></a>
 
 ### Server batched MTP verify
