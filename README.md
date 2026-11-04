@@ -78,9 +78,9 @@ conditions, repetition counts, exactness evidence and off switches.
 | **GLM-5.3 Flash** | 2 nodes | MTP self-speculation decode, chat / code / JSON | **37.1 / 44.5 / 40.0 tok/s** | 1.50× / 1.79× / 1.62× plain R1b decode (40.3–40.6 ms/token); R1b identity −11.5 % vs R1 | default identity |
 | GLM-5.3 Flash | 2 nodes | Exact chunked prefill TTFT, 1K / 8K / 32K, 8192-row chunks | **2.83 / 15.27 / 63.1 s** (536 / 519 tok/s at 8K / 32K), all defaults | 3.18 / 17.77 / 76.59 s → 2.83 / 15.27 / 63.1 s (−11.0 / −14.1 / −17.6 %), logits bitwise | pair levers (fused mHC expand + norm, staged prefill exchange, fused decode HC norm) + current main |
 | GLM-5.3 Flash | 2 nodes | Served (`strix-glm5-serve`), concurrent streams C1 / C2 / C4 / C6 / C8, steady-state decode; 8 built-in short chat prompts in the GLM chat template, 22–59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, cache off, the server has no prompt cache | **C1 40.0 / C2 53.0 (G2 off 37.8) / C4 59.9 (53.6) / C6 62.5 (62.4) / C8 69.5 (69.4) tok/s aggregate** | every stream == the same request alone (exact); C1 through MTP (25.30 tok/s plain); batched MTP verify (G2) +40 / +12 % at C2 / C4, hands over to batched plain steps from C6 | current |
-| GLM-5.3 Flash on one RTX PRO 6000 | RTX PRO (Windows) | Exact prefill TTFT, 8K / 32K, full card, tile 8192 | **19.7 / 41.7 s** | decode-residency restore moved after the prefill, outside TTFT | current |
-| GLM-5.3 Flash on one RTX PRO 6000 | RTX PRO (Windows) | Decode, 1K / 8K, warm (cold) | **6.00 / 6.15 tok/s** (3.75 / 3.70) | 2.43 / 2.36 tok/s with the few-row decode kernels off, same load | current |
-| GLM-5.3 Flash on one RTX PRO 6000 | 24 GiB VRAM + 32 GiB host RAM | TTFT 1K / 8K; decode warm (cold) | **64.8 / 76.7 s**; **0.67 tok/s** (0.63) | first published row for this budget | current |
+| GLM-5.3 Flash on one RTX PRO 6000 | RTX PRO (Windows) | Exact prefill TTFT, 8K / 32K, full card, tile 8192 | **11.4 / 30.5 s** | first request, mean of two loads; prefill clean eviction and the tile rule's 8192 at full card; GPU-compute bound at 32K | current |
+| GLM-5.3 Flash on one RTX PRO 6000 | RTX PRO (Windows) | Decode, 1K / 8K, warm (cold) | **13.25 / 13.52 tok/s** (3.63 / 4.09) | full card, 24-token bench, ABBA means of one load; every compare bitwise equal | current |
+| GLM-5.3 Flash on one RTX PRO 6000 | 24 GiB VRAM + 32 GiB host RAM | TTFT 1K / 8K; decode 1K warm (cold) | **65.6 / 57.5 s**; **0.77 tok/s** (0.75) | file reads in flight auto by default at this budget (76 % of experts on the unit file); TTFT one load, decode mean of two loads, 24-token bench; single loads vary up to 2x | current |
 | **Nemotron 3.5 Bolt E4B** | 1 node | `default`, English chat, 256 tokens: C1 shipped (MTP drafter + prompt lookup) / C1 plain / C4 / C8 | **91.9** / 55.8 / 169.8 / 237.9 tok/s | prompt lookup on an agent code-edit prompt: 48.0 → 115.6 tok/s without a drafter, **149.1** shipped; chat decode unchanged within noise | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 node | `fast` (int8 activations, qualified), same columns | **99.5** / 54.0 / 206.5 / **340.6** tok/s | exact prefill 2K 458 → 538 tok/s; decode unchanged within noise | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 node | `quality` (EXL3 M4 pack), same columns; top-1 agreement with BF16 | **96.4** / 50.2 / 184.8 / 303.0 tok/s; **92.94 %** (Q4_K_M 87.0 %) | C1 shipped 83.8 → 96.4; plain C1 / C4 / C8 44.4 / 153.1 / 258.3 → 50.2 / 184.8 / 303.0 | `f32aab24` |
@@ -194,7 +194,7 @@ Requirements, one build or launch per route, what runs where, when a route does 
   [Results](docs/models/qwen3.8/README.md#qwen-prefill-offload).
 - **GLM-5.3 Flash on one RTX PRO 6000 (draft, opt-in, Windows).** Trunk, dense layers and shared experts on the card;
   the 43 × 288 routed experts streamed through the [tierstream](https://github.com/hyukudan/tierstream) device-gated
-  cache across VRAM, pinned RAM and disk. Exact prefill and decode; TTFT 19.7 / 41.7 s at 8K / 32K on the full card,
+  cache across VRAM, pinned RAM and disk. Exact prefill and decode; TTFT 11.4 / 30.5 s at 8K / 32K on the full card,
   and it also runs exact with 24 GiB VRAM + 32 GiB host RAM.
   [Results](docs/models/glm-5.3/README.md#glm-rtx-results) · [guide](src/glm/rtxpf/README.md).
 

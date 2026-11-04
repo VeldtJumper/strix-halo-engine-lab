@@ -22,14 +22,13 @@ struct DecodeOptions {
     // Three-tier file reads in flight (ss_options.dg_disk_queue: 1 = one at a time, as before; 2..64,
     // at most tier_staging since each read holds a staging buffer) and clean eviction (dg_clean_evict:
     // a device victim with no free pinned block goes to its file with no D2H copy and displaces no
-    // pinned unit). Placement / IO only: same bytes. Default 1 (one read at a time). 0 = auto (--tier-disk-queue
-    // auto, opt-in until its per-step policy is measured): the plan is made at queue 1 and, when it homes units on
-    // the file (three-tier), again with the readers tierstream's auto queue can start for these read locations
-    // billed (auto_disk_queue_bound); if that fits, the open passes TS_DG_DISK_QUEUE_AUTO, else queue 1.
-    unsigned tier_disk_queue=1;bool tier_clean_evict=false;
+    // pinned unit). Placement / IO only: same bytes. Unset = regime: queue-1 plan, then auto only when
+    // three-tier with at least 70 % of routed units on file. 0 = explicit auto at any file share.
+    // Auto bills auto_disk_queue_bound readers; if they fit, the open passes TS_DG_DISK_QUEUE_AUTO, else 1.
+    unsigned tier_disk_queue=disk_queue_regime;bool tier_clean_evict=false;
     // Two-stage file prefetch (tierstream dg_landing_*): predictions of file-homed units are read into
     // landing_blocks pinned blocks (never a GPU slot); a demand copies from there. Needs a file tier and
-    // tier_disk_queue > 1; billed as pinned host units. Placement only (same bytes); 0 = off until measured.
+    // explicit auto or tier_disk_queue > 1; billed as pinned host units. Placement only (same bytes); 0 = off until measured.
     unsigned tier_landing_blocks=0,tier_landing_max_queued=0,tier_landing_ttl=0;
     // tierstream dg_landing_chunk (SS_DG_LANDING_YIELD): landing reads run in chunks that yield their reader to a
     // demand read (0 = 4 MiB chunks; 0xFFFFFFFF = whole, unchunked landing reads). Used only with landing blocks.
@@ -124,12 +123,11 @@ inline std::string row_kernels_name(const DecodeOptions& d){
     return s.empty()?"0":s;
 }
 // The library's disk readers that each hold a bounce buffer beyond its own one (none at queue 1).
-inline unsigned disk_bounce_readers(const DecodeOptions& d){return d.tier_disk_queue>1?d.tier_disk_queue:0;}
-// --tier-disk-queue auto: the readers billed only when the plan is three-tier (0 = none: an explicit queue,
+inline unsigned disk_bounce_readers(const DecodeOptions& d){return d.tier_disk_queue!=disk_queue_regime&&d.tier_disk_queue>1?d.tier_disk_queue:0;}
+// Explicit or regime auto: readers billed only when the plan is three-tier (0 = none: a numeric queue,
 // or fewer than two staging buffers), and the queue an open passes from the readers its plan billed
 // (0 = the library's auto, which never exceeds them: auto_disk_queue_bound for these read locations).
-inline unsigned disk_auto_readers(const DecodeOptions& d){const unsigned q=auto_disk_queue_bound(d.weight_dirs,d.tier_staging);return d.tier_disk_queue||q<2?0:q;}
-inline unsigned resolved_disk_queue(unsigned asked,std::uint64_t billed_readers){return asked?asked:billed_readers>1?0u:1u;}
+inline unsigned disk_auto_readers(const DecodeOptions& d){const unsigned q=auto_disk_queue_bound(d.weight_dirs,d.tier_staging);return (d.tier_disk_queue&&d.tier_disk_queue!=disk_queue_regime)||q<2?0:q;}
 using StateSink=std::function<void(unsigned rank,unsigned layer,unsigned component,std::span<const std::byte>)>;
 // Constructor is the first device work. The service validates the UUID and all
 // host arguments before constructing it. No CPU emulation hides a CUDA failure.

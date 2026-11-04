@@ -881,7 +881,7 @@ struct Runtime::Impl {
         if(d.reference_compare)in.pinned.push_back({compare_part,8*hstride+288*sizeof(Expert)});
         in.pageable={{process_part,process_private}};if(d.reference_compare)in.pageable.push_back({compare_part,hstride});
         add_host_growth_parts(in.pageable,kv); // the bench snapshot (= session state + replay) and driver growth
-        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.max_ids=d.mtp_spec?4*routed_topk:routed_topk;in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;in.tier.disk_readers=disk_bounce_readers(d);in.tier.disk_readers_auto=disk_auto_readers(d);in.tier.landing_blocks=d.tier_landing_blocks;
+        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.max_ids=d.mtp_spec?4*routed_topk:routed_topk;in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;in.tier.disk_readers=disk_bounce_readers(d);in.tier.disk_readers_auto=disk_auto_readers(d);in.tier.disk_queue_request=d.tier_disk_queue;in.tier.landing_blocks=d.tier_landing_blocks;
         if(d.tier_ram_gib>=0)in.ram_expert_bytes=gib_bytes(d.tier_ram_gib);
         if(d.tier_vram_gib>=0){TierBudgetIn t=in.tier;const auto req=gib_bytes(d.tier_vram_gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;
             in.arena_units=tier_budget(t).resident;} // the explicit arena, planned (and checked) before any load
@@ -928,7 +928,7 @@ struct Runtime::Impl {
             for(unsigned t:{baseline_row_tile,default_max_row_tile})if(t<=cap&&t!=chosen.tile){auto p=one(t);a.push(trade(p,t==baseline_row_tile?"baseline 2048":"8192 (whole 8K prompt in one piece)"));}
             a.push(trade(chosen,"chosen"));chosen.json.set("row_tile_trade",a);};
         if(requested){need(valid_schedule(cap,requested),"capacity 4-aligned <=131072; tile 32-aligned <=min(capacity,32768)");auto p=one(requested);
-            p.json.set("row_tile",int(requested));p.json.set("row_tile_choice","--row-tile (explicit)");p.json.set("row_tile_components",tile_components(cap));trades(p);return p;}
+            p.json.set("row_tile",int(requested));p.json.set("row_tile_choice","--row-tile (explicit; bypasses automatic growth and file-home bounds)");p.json.set("row_tile_components",tile_components(cap));trades(p);return p;}
         // The rule (schedule.hpp): largest tile <= 8192 the plan admits whose activation +
         // workspace growth over tile 2048 costs <= 5% of the expert arena planned at 2048.
         const unsigned base_tile=std::min(baseline_row_tile,first_tile_candidate(cap));const auto base=one(base_tile);
@@ -936,16 +936,19 @@ struct Runtime::Impl {
         auto tried=Json::array();TilePlan last;
         for(unsigned t=first_tile_candidate(cap,default_max_row_tile);t;t=next_tile_candidate(t)){need(valid_schedule(cap,t),"tile candidate");auto p=one(t);
             const std::uint64_t cost=tile_cost(cap,t),growth=cost>base_cost?cost-base_cost:0;
-            // A larger tile must also keep the file tier no larger than tile 2048 does.
-            const bool off_file=!base.refused.empty()||!p.refused.empty()||p.plan.tier.disk<=base.plan.tier.disk;
-            const bool within=t<=base_tile||(base_arena&&tile_growth_within(growth,base_arena)&&off_file);
+            const bool within=t<=base_tile||(base_arena&&tile_growth_within(growth,base_arena));
+            const auto file=tile_file_admission(base.plan.tier.disk,p.plan.tier.disk,base.in.tier.keys);
+            const bool file_ok=t<=base_tile||file.admitted;
             auto x=Json::object();x.set("row_tile",int(t));x.set("activation_plus_workspace_bytes",cost);x.set("growth_over_2048_bytes",growth);
             x.set("growth_share_of_arena_2048",base_arena?double(growth)/double(base_arena):-1.0);
             x.set("expert_arena_bytes",p.refused.empty()?p.plan.tier.slots*p.in.tier.unit_bytes:0);x.set("resident_units",p.plan.tier.resident);
             x.set("file_units",p.plan.tier.disk);
-            x.set("verdict",!p.refused.empty()?"REFUSED (plan)":!off_file?"REFUSED (more expert units on the file tier than tile 2048)":!within?"REFUSED (growth over 5% of the expert arena)":"CHOSEN");tried.push(x);
-            if(p.refused.empty()&&within){p.json.set("row_tile",int(t));
-                p.json.set("row_tile_choice","default: the largest tile <= 8192 the whole-device plan admits whose activation + workspace growth over tile 2048 is <= 5% of the expert arena planned at 2048");
+            x.set("file_units_over_2048",int(std::int64_t(p.plan.tier.disk)-std::int64_t(base.plan.tier.disk)));
+            x.set("file_admission_reason",t<=base_tile?"baseline or smaller tile":file.reason);
+            x.set("reason",!p.refused.empty()?p.refused:!within?std::string("growth over 5% of the expert arena"):!file_ok?std::string(file.reason):"plan and growth admitted; "+std::string(t<=base_tile?"baseline or smaller tile":file.reason));
+            x.set("verdict",!p.refused.empty()?"REFUSED (plan)":!within?"REFUSED (growth over 5% of the expert arena)":!file_ok?"REFUSED (additional file units)":"CHOSEN");tried.push(x);
+            if(p.refused.empty()&&within&&file_ok){p.json.set("row_tile",int(t));
+                p.json.set("row_tile_choice","default: largest tile <= 8192 admitted by the plan, growth <= 5% of the 2048 expert arena; extra file units only when 2048 file share <= 15% and the increase <= 5% of routed units");
                 p.json.set("expert_arena_at_2048_bytes",base_arena);p.json.set("row_tiles_tried",tried);p.json.set("row_tile_components",tile_components(cap));trades(p);return p;}
             last=std::move(p);}
         last.json.set("row_tiles_tried",tried);last.json.set("row_tile_components",tile_components(cap));return last;
@@ -1017,7 +1020,7 @@ struct Runtime::Impl {
         auto [physical,commit]=host_free();const std::uint64_t host_avail=host_budget(physical,commit,floor_gib);
         std::uint64_t avail=0,dev=0,host=host_avail;TierBudget b;Json open_plan;
         // Arena-only requests (--tier-vram-gib / --tier-ram-gib) are granted exactly or refused with the numbers.
-        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.max_ids=tier_ids();t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;t.disk_readers=disk_bounce_readers(dopt);t.disk_readers_auto=disk_auto_readers(dopt);t.landing_blocks=dopt.tier_landing_blocks;
+        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.max_ids=tier_ids();t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;t.disk_readers=disk_bounce_readers(dopt);t.disk_readers_auto=disk_auto_readers(dopt);t.disk_queue_request=dopt.tier_disk_queue;t.landing_blocks=dopt.tier_landing_blocks;
             const auto req=gib_bytes(gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;return tier_budget(t).resident;};
         if(whole_device){
             // Re-plan from what is allocated now (measured device use; process
@@ -1039,7 +1042,7 @@ struct Runtime::Impl {
             if(dopt.tier_ram_gib>=0){host=gib_bytes(dopt.tier_ram_gib);
                 need(host<=host_avail,("requested tierstream RAM tier "+gib_text(host)+" exceeds the "+gib_text(host_avail)+" host memory available above the floor at cache open").c_str());}
             TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=dev>(256ULL<<20)?dev-(256ULL<<20):0;in.host_bytes=host>(256ULL<<20)?host-(256ULL<<20):0;
-            in.max_ids=tier_ids();in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;in.disk_readers=disk_bounce_readers(dopt);in.disk_readers_auto=disk_auto_readers(dopt);in.landing_blocks=dopt.tier_landing_blocks;b=tier_budget(in);
+            in.max_ids=tier_ids();in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;in.disk_readers=disk_bounce_readers(dopt);in.disk_readers_auto=disk_auto_readers(dopt);in.disk_queue_request=dopt.tier_disk_queue;in.landing_blocks=dopt.tier_landing_blocks;b=tier_budget(in);
         }
         need(b.refuse.empty(),b.refuse.empty()?"":b.refuse.c_str());
         TierOpenConfig cfg;cfg.max_ids=tier_ids();// The cache opens the canonical held path, never the operator's (possibly aliased) name.
@@ -1068,7 +1071,7 @@ struct Runtime::Impl {
         tier_plan=Json::object();tier_plan.set("placement",placement);tier_plan.set("skip_empty_expert_groups",dopt.skip_empty_expert_groups?"on: routed MoE launches only the expert groups holding routed rows (device compaction)":"off");tier_plan.set("persistent_dense_fp16",dopt.persistent_dense_fp16?"on: shared experts and dense FFNs decoded once at startup":persist_note.empty()?std::string("off"):persist_note);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
         tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);
         tier_plan.set("weight_dirs",dopt.weight_dirs.empty()?std::string("none: the primary only"):dopt.weight_dirs);if(dopt.weight_dirs.empty())tier_plan.set("drive_readers",std::string("n/a: no --weight-dirs"));else tier_plan.set("drive_readers",std::uint64_t(dopt.drive_readers?dopt.drive_readers:4));
-        tier_plan.set("disk_queue_source",std::string(dopt.tier_disk_queue?"explicit":"auto"));tier_plan.set("disk_bounce_units",std::uint64_t(b.disk_readers));tier_plan.set("landing_blocks_requested",std::uint64_t(dopt.tier_landing_blocks));tier_plan.set("landing_blocks",b.landing_blocks);tier_plan.set("landing_max_queued",std::uint64_t(b.landing_blocks?dopt.tier_landing_max_queued:0));tier_plan.set("landing_ttl",std::uint64_t(b.landing_blocks?dopt.tier_landing_ttl:0));tier_plan.set("landing_chunk",std::uint64_t(b.landing_blocks?dopt.tier_landing_chunk:0));tier_plan.set("clean_evict",b.three_tier&&dopt.tier_clean_evict?"on: device victims with no free pinned block go to their file (no D2H)":"off");tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
+        tier_plan.set("disk_queue_source",b.disk_queue_source);tier_plan.set("disk_bounce_units",std::uint64_t(b.disk_readers));tier_plan.set("landing_blocks_requested",std::uint64_t(dopt.tier_landing_blocks));tier_plan.set("landing_blocks",b.landing_blocks);tier_plan.set("landing_max_queued",std::uint64_t(b.landing_blocks?dopt.tier_landing_max_queued:0));tier_plan.set("landing_ttl",std::uint64_t(b.landing_blocks?dopt.tier_landing_ttl:0));tier_plan.set("landing_chunk",std::uint64_t(b.landing_blocks?dopt.tier_landing_chunk:0));tier_plan.set("clean_evict",b.three_tier&&dopt.tier_clean_evict?"on: device victims with no free pinned block go to their file (no D2H)":"off");tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
         {auto c=ts_tier->census(compute.s);for(const auto& l:c.find("layers")->as_array())ts_tier->open_persistent.push_back(std::uint32_t(l.find("persistent")->as_int()));
          tier_plan.set("slot_census_at_open",c);} // homes per gated layer as the cache opened
         {auto diag=ts_tier->api->diagnostics();if(diag.find("cuda_module_loading"))tier_plan.set("tierstream_cuda_module_loading",diag.find("cuda_module_loading")->as_string());

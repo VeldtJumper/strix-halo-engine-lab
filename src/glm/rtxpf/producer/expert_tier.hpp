@@ -10,6 +10,7 @@
 // per-expert reads from the existing device/pinned/file layer tiers.
 #include "expert_source.hpp"
 #include "head_select.hpp"
+#include "disk_queue.hpp"
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -157,6 +158,7 @@ struct TierBudgetIn {
     std::uint32_t disk_readers=0;
     // --tier-disk-queue auto: readers billed as above only when the plan is three-tier (0 = none).
     std::uint32_t disk_readers_auto=0;
+    unsigned disk_queue_request=1; // unset sentinel gates auto on the queue-1 plan's file share
     // The library's landing blocks (dg_landing_blocks): pinned, one host stride each, outside the
     // pinned tier; billed whenever requested (the library allocates them only with a file tier).
     std::uint32_t landing_blocks=0;
@@ -164,7 +166,7 @@ struct TierBudgetIn {
 };
 struct TierBudget {
     std::uint64_t slots=0,resident=0,pinned=0,disk=0,spare_slots=0,host_spares=0,staging=0,ring=0,disk_readers=0,landing_blocks=0;
-    bool three_tier=false;std::string refuse;
+    bool three_tier=false;std::string refuse,disk_queue_source;
     std::uint64_t device_bytes(std::uint64_t unit)const{return slots*unit;}
     std::uint64_t host_bytes(std::uint64_t unit)const{return (pinned+host_spares+staging+disk_readers+landing_blocks)*unit;}
 };
@@ -215,6 +217,9 @@ inline Json whole_device_json(const WholeDeviceIn& in,const WholeDevicePlan& p){
     j.set("min_vram_total_bytes",p.min_vram_total);j.set("min_ram_total_bytes",p.min_ram_total);j.set("unit_stride",in.tier.unit_bytes);
     j.set("arena_slots",p.tier.slots+p.tier.ring);j.set("arena_bytes",(p.tier.slots+p.tier.ring)*in.tier.unit_bytes);j.set("resident_units",p.tier.resident);j.set("spare_slots",p.tier.spare_slots);
     j.set("pinned_units",p.tier.pinned);j.set("file_units",p.tier.disk);j.set("three_tier",p.tier.three_tier);
+    j.set("disk_queue_requested",disk_queue_requested(in.tier.disk_queue_request));
+    j.set("disk_queue_resolved",int(resolved_disk_queue(in.tier.disk_queue_request,p.tier.disk_readers))); // 0 = library auto
+    j.set("disk_queue_billed_readers",p.tier.disk_readers);j.set("disk_queue_source",p.tier.disk_queue_source);
     j.set("summary","VRAM: fixed "+gib_text(p.device_fixed)+" (context "+gib_text(in.context)+") + margin "+gib_text(in.vram_margin)+" + expert arena "+gib_text(p.device_planned>p.device_fixed?p.device_planned-p.device_fixed:0)+
         " = "+gib_text(p.device_planned)+(in.vram_total?" of "+gib_text(in.vram_total):std::string())+"; RAM: fixed "+gib_text(p.host_fixed)+" + pinned experts "+gib_text(p.host_planned>p.host_fixed?p.host_planned-p.host_fixed:0)+
         " = "+gib_text(p.host_planned)+(in.ram_total?" of "+gib_text(in.ram_total):std::string())+"; units resident/pinned/file "+std::to_string(p.tier.resident)+"/"+std::to_string(p.tier.pinned)+"/"+std::to_string(p.tier.disk)+

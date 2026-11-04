@@ -2427,10 +2427,10 @@
     "engine": "glm-rtx",
     "name": "RTX file reads in flight",
     "flag_or_env": "--tier-disk-queue",
-    "default": "1 (auto opt-in)",
+    "default": "regime auto",
     "exact": "Same output bytes (tokens, logits, state) at any queue.",
-    "gain": "Preliminary: auto vs 1, 24 GiB VRAM + 32 GiB RAM, one drive: decode +11.9 % / +9.6 % 1K cold / warm, +18.8 % 8K cold, -3.4 % 8K warm (not settled)",
-    "preconditions": "Three-tier open that reads units from the unit file; reader buffers billed to pinned host memory.",
+    "gain": "Auto vs 1 at about 76 % file share (24 GiB VRAM + 32 GiB RAM) was never slower in the latest measured decode cell means: 1K cold / warm +42 / +35 %, 8K cold / warm +33 / +16 %. Earlier one-drive cells were +9..+42 % in seven of eight (remaining -3.4 % traced to drive read phases); two-drive stripes +26..+38 %. Single loads vary up to 2x, so the gain size is uncertain. At about 61 % (48 GiB + 32 GiB), one earlier night observed cold-1K decode -32 % against the queue-1 mean; warm 1K +3 %, cold 8K +7 %, warm 8K +1 %. A later set at the same budget reversed the cold-1K result: auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff: 61 % stays at 1. Full card (about 1-4 % at tile 2048) tied in TTFT (8K +0.6..+2 %, 32K equal), so it stays at 1.",
+    "preconditions": "Default: queue-1 three-tier plan with file_units * 100 >= total routed units * 70 (planner disk and keys). Measured about 76 % admits auto; 61 % and full card about 1-4 % at tile 2048 stay at 1. Auto reader buffers billed via auto_disk_queue_bound to pinned host memory; fallback to 1 if staging < 2 or they do not fit. Explicit auto and numeric queues unchanged. Landing blocks require an explicit queue.",
     "off_switch": "--tier-disk-queue 1",
     "doc_anchor": "docs/optimizations.md#glm-rtx-disk-queue"
   },

@@ -1273,6 +1273,24 @@ class WindowTests(unittest.TestCase):
                                   '--row-tile', '8192', '--check-inputs'])
             self.assertEqual(dw.worker_options(c)[dw.worker_options(c).index('--row-tile') + 1], '8192')
 
+    def test_service_disk_queue_policy_inspection(self):
+        """Requested policy and deferred resolution are visible without model/device work."""
+        exe = BUILD / 'glm_native_service.exe'
+        if not exe.is_file():
+            self.skipTest('service not built')
+        env = {k: v for k, v in os.environ.items() if k != 'CUDA_VISIBLE_DEVICES'}
+        for args, requested, source in (([], 'unset: regime', 'default: regime'),
+                                        (['--tier-disk-queue', 'auto'], 'auto', 'explicit-cli'),
+                                        (['--tier-disk-queue', '1'], '1', 'explicit-cli'),
+                                        (['--tier-disk-queue', '8'], '8', 'explicit-cli')):
+            with self.subTest(requested=requested):
+                out = subprocess.run([str(exe), '--print-effective-config'] + args,
+                                     capture_output=True, text=True, env=env, timeout=60)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                policy = json.loads(out.stdout.strip().splitlines()[-1])['disk_queue_policy']
+                self.assertEqual(policy, dict(requested=requested, source=source,
+                                             resolution='pending plan-time resolution'))
+
     def test_service_sets_eager_module_loading(self):
         """The service sets CUDA_MODULE_LOADING=EAGER at the top of main, before any CUDA call
         (--print-effective-config exits before the first one and reports it); an explicit value is kept."""

@@ -267,7 +267,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
     w::require(!dopts.spec_lookup||dopts.mtp_spec,"--spec-lookup drafts for the self-speculation verify (--mtp-self-spec 1)");
     // Landing (tierstream dg_landing_*): the sub-options need the blocks, and the landing reads run on the read pool.
     w::require(dopts.tier_landing_blocks||(!dopts.tier_landing_max_queued&&!dopts.tier_landing_ttl&&!dopts.tier_landing_chunk),"--tier-landing-max-queued / -ttl / -chunk need --tier-landing-blocks N > 0");
-    w::require(!dopts.tier_landing_blocks||(dopts.expert_tier=="tierstream"&&(dopts.tier_disk_queue>1||disk_auto_readers(dopts)>1)),"--tier-landing-blocks needs the tierstream cache and --tier-disk-queue > 1 (or auto with --tier-staging >= 2)");
+    w::require(!dopts.tier_landing_blocks||(dopts.expert_tier=="tierstream"&&dopts.tier_disk_queue!=p::disk_queue_regime&&(dopts.tier_disk_queue>1||disk_auto_readers(dopts)>1)),"--tier-landing-blocks needs the tierstream cache and explicit --tier-disk-queue > 1 (or auto with --tier-staging >= 2)");
     w::require(!dopts.mtp_spec||(dopts.routes_out.empty()&&dopts.expert_tier=="tierstream"),
                "--mtp-self-spec: tierstream expert tier only, not with --routes-out (it records one row per layer)");
     if(auto* e=use("prefill_tile_large");e&&e->status==rp::Status::unqualified){auto* rt=prof.find("row_tile");if(!rt||rt->status!=rp::Status::explicit_cli)tile=std::min(8192u,capacity/32*32);}
@@ -301,7 +301,11 @@ int main(int argc,char** argv){p::install_crash_report();try{
             catch(const std::exception& e){r.set("ok",false);r.set("error",std::string(e.what()));}
             std::cout<<r.dump()<<"\n"<<std::flush;}
         return 0;}
-    if(print_effective){auto pj=strix::serve::parse_json(profile_json);pj.set("cuda_module_loading",module_loading);std::cout<<pj.dump()<<"\n"<<std::flush;return 0;}
+    if(print_effective){auto pj=strix::serve::parse_json(profile_json);pj.set("cuda_module_loading",module_loading);
+        auto dq=Json::object();dq.set("requested",p::disk_queue_requested(dopts.tier_disk_queue));
+        dq.set("source",dopts.tier_disk_queue==p::disk_queue_regime?"default: regime":"explicit-cli");
+        dq.set("resolution","pending plan-time resolution");pj.set("disk_queue_policy",dq);
+        std::cout<<pj.dump()<<"\n"<<std::flush;return 0;}
     for(const auto& line:prof.notices())std::cerr<<line<<"\n";
     if(plan_budget){
         // Dry plan (no --allow-gpu, no CUDA calls): sizes from shard headers, host
