@@ -126,6 +126,7 @@ and manifests. Unpinned sizes must be read from actual manifests/files; bpw is n
 | DeepSeek pair packs | [DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) | Project packs in same repository; immutable revision not recorded by fetcher | `ours-K4/*`, `ours-K5/*`, `mixB.txt`, `aux/vocab/*.bin`, `aux/draft-keep-stats.jsonl`; copy vocabulary to `vocab/` for pairs | Unpinned | DeepSeek MIT; preserve adopted pack/code notices separately. |
 | GLM | [GLM-5.3-Flash-exl3-mirror](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) | `turboderp/GLM-5.3-Flash-exl3@2a30229e`, 4.05 bpw | Under `glm/`: `*.safetensors`, `*.json`, optional `*.txt`, `*.jinja`, `*.model`, including tokenizer | Exact bytes unpinned (4.05 bpw) | MIT; retain model/conversion notices. |
 | MiniMax | [MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) | `Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw@c33e7a66` | Under `minimax/`: same EXL3 patterns plus `dspark/*` | Exact bytes unpinned (3.06 bpw) | MiniMax Community License, non-commercial by default; attribution **Built with MiniMax M3.1-Flash**. Review commercial/distribution permission. |
+| MiniMax EXL3 draft | same MiniMax mirror | Project packs: the `dspark/` draft re-quantized to EXL3 4-bit (fc included) with `src/minimax/dspark/ref/quant_draft.py --K 4 --fc` | Under `minimax-drafts/`: `dspark-exl3-K4fc-sh/` (production, scaled-Hessian metric) and `dspark-exl3-K4fc/` (previous pack); each `config.json`, `model-dspark-exl3.safetensors`, `model.safetensors.index.json` | 1,134,088,202 bytes per weight file; sha256 `341142bb9d2b9cbe35ccdd5c32f9b21ca374cdc268f988e5ac843becc03f941d` (K4fc-sh) and `29b86c0e9df79eefce92146f498ca720a7e0703301cb44a720a07ab1566872d2` (K4fc), all files in the mirror's `SHA256SUMS` | Same MiniMax Community License and attribution as the MiniMax row. |
 | MiniMax draft provenance | [MiniMax-M3.1-Flash-DFlash2-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) | `incoai/MiniMax-M3.1-Flash-DFlash2@ac07a7c1` | Draft source; fetcher selects `dspark/*` from main MiniMax mirror rather than this separate mirror | Unpinned | Retain MiniMax and draft conversion terms. |
 
 The DeepSeek pair layout under `--model-dir models` is:
@@ -171,6 +172,14 @@ bash scripts/bench/fetch-models.sh --engine glm --model-dir models
 bash scripts/bench/fetch-models.sh --engine minimax --model-dir models
 bash scripts/bench/fetch-models.sh --engine qwen --profile gsq --model-dir models
 bash scripts/bench/bench.sh hash-models --engine deepseek --model-dir models
+```
+
+The MiniMax EXL3 draft pack is not fetched by the script. Fetch it once and point rank or
+serve at it with `--dspark-exl3` (the bench kit reads `BENCH_MINIMAX_DRAFT_EXL3`):
+
+```bash
+hf download hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror \n  --include 'minimax-drafts/dspark-exl3-K4fc-sh/*' --local-dir models
+BENCH_MINIMAX_DRAFT_EXL3=models/minimax-drafts/dspark-exl3-K4fc-sh \n  bash scripts/bench/bench.sh run --engine minimax --peer user@node-b --suite quick
 ```
 
 Fetch options: required `--engine` (five names and pair aliases), required `--model-dir`,
