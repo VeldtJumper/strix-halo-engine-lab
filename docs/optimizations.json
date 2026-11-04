@@ -1820,6 +1820,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Served DSpark context rows staged",
+    "flag_or_env": "STRIX_MM_SERVE_DSPARK_STAGE",
+    "default": "1",
+    "exact": "Exact: emitted tokens target-greedy and identical to the request alone in every burst; only the drafter context's bits change.",
+    "gain": "plain cycles with a drafter context -4 % (one request) to -6 % (two requests)",
+    "preconditions": "A request with a DSpark drafter context.",
+    "off_switch": "STRIX_MM_SERVE_DSPARK_STAGE=0",
+    "doc_anchor": "docs/optimizations.md#mm-serve-dspark-stage"
+  },
+  {
+    "engine": "minimax",
     "name": "MSA prefill mode 6",
     "flag_or_env": "STRIX_MM_PF_MSA_REWORK",
     "default": "6",

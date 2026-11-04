@@ -281,6 +281,7 @@ Checkpoint Runtime::capture(const std::string &id) {
   c.sections = split_state(raw, frontier_.consumed);
   c.sections.push_back({"pending.logits", false, bytes(logits_)});
   if (dd_) {
+    dd_->flush(slot_, nullptr);  // rows staged by the serve step join the context before it is exported
     auto s = dd_->export_context(slot_);
     c.sections.push_back({"draft.K", true, bytes(s.k)});
     c.sections.push_back({"draft.V", true, bytes(s.v)});

@@ -2746,6 +2746,21 @@ Run the attention output projection of full 4096-row prefill pieces on the engin
 - **Measured gain:** o projection per 4096-row piece 7.89 -> 7.59 ms; part of the shipping set below.
 - **Implementation / evidence:** [engine site](../src/minimax/engine/engine.hip), [dense call](../src/minimax/moe/mmx_prefill.hip)
 
+<a id="mm-serve-dspark-stage"></a>
+### Served DSpark context rows staged
+
+**Engine:** `minimax` (`strix-minimax-serve`). **Control:** `STRIX_MM_SERVE_DSPARK_STAGE`. **Default:** 1.
+
+Each decode cycle's committed drafter-context rows are staged and appended in one batch by the slot's next draft pass (or after 32 rows) instead of one append per cycle.
+
+- **Preconditions:** A request with a DSpark drafter context (auto-promoted prompts at one request, or DSpark on).
+- **Automatic selection:** On unless the variable is 0; with the variable unset, `STRIX_MM_BASELINE=1` turns it off.
+- **Fallback notice:** None.
+- **Exactness evidence:** Exact: emitted tokens are target-greedy and identical to the request alone in every burst (prose, code and fenced-code prompts, one and two requests, alternating fresh servers); only the drafter context's own bits change; acceptance unchanged.
+- **Off switch:** STRIX_MM_SERVE_DSPARK_STAGE=0
+- **Measured gain:** Plain cycles with a drafter context 44.3-44.5 -> 42.5-43.0 ms at one request, 58.7-59.7 -> 55.1-56.5 ms at two (DSpark on); default auto with fenced-code prompts 44.3 -> 42.0 ms per cycle (one request). One cycle per 32 rows per slot carries the batched append (~30 ms).
+- **Implementation / evidence:** [serve step](../apps/minimax_serve_main.cpp), [drafter staging](../src/minimax/dspark/hip_minimax_dspark.hip)
+
 <a id="mm-pf-table-ring"></a>
 ### Prefill MoE table ring
 
