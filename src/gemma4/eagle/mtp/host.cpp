@@ -468,16 +468,21 @@ Draft HostDrafter::draft(const Inputs& in, std::uint32_t k) {
         for (std::uint32_t s = T / 2; s; s /= 2)
             for (std::uint32_t t = 0; t < s; ++t)
                 if (better(bv[t + s], bi[t + s], bv[t], bi[t])) { bv[t] = bv[t + s]; bi[t] = bi[t + s]; }
-        float second = -std::numeric_limits<float>::infinity();
-        for (std::uint32_t i = 0; i < n; ++i) if (ids[i] != bi[0]) second = std::max(second, z[i]);
-        for (std::uint32_t t = 0; t < T; ++t)
-            for (std::uint32_t i = t; i < n; i += T) sum[t] = sum[t] + declared_exp(z[i] - bv[0]);
-        for (std::uint32_t s = T / 2; s; s /= 2)
-            for (std::uint32_t t = 0; t < s; ++t) sum[t] = sum[t] + sum[t + s];
         token = bi[0];
         out.tokens[depth] = token;
-        out.prob[depth] = 1.0F / sum[0];
-        out.margin[depth] = bv[0] - second;
+        // Requested statistics only (Drafter::set_statistics); the device head skips them the same way.
+        if (statistics() & statistic_margin) {
+            float second = -std::numeric_limits<float>::infinity();
+            for (std::uint32_t i = 0; i < n; ++i) if (ids[i] != bi[0]) second = std::max(second, z[i]);
+            out.margin[depth] = bv[0] - second;
+        }
+        if (statistics() & statistic_probability) {
+            for (std::uint32_t t = 0; t < T; ++t)
+                for (std::uint32_t i = t; i < n; i += T) sum[t] = sum[t] + declared_exp(z[i] - bv[0]);
+            for (std::uint32_t s = T / 2; s; s /= 2)
+                for (std::uint32_t t = 0; t < s; ++t) sum[t] = sum[t] + sum[t + s];
+            out.prob[depth] = 1.0F / sum[0];
+        }
     }
     impl_->times.draft_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     remember(in, k);

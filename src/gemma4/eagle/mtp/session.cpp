@@ -42,6 +42,7 @@ std::array<std::uint32_t, 7> Session::propose_window(std::uint32_t anchor, std::
     // Exact verification makes any proposal safe; without the previous row's hidden or the KV views, propose zeros.
     Inputs in;
     if (!k || !inputs(anchor, position, in)) return out;
+    drafter_->set_statistics(0); // ids only: nothing consumes prob/margin here
     last_ = drafter_->draft(in, k);
     for (std::uint32_t i = 0; i < k; ++i) out[i] = last_.tokens[i];
     return out;
@@ -57,6 +58,7 @@ engine::DraftSession::Confident Session::propose_confident(std::uint32_t anchor,
     // Numerics are draft(in, d) for the final d whether reached at once or by extension (Drafter::extend contract);
     // the window only selects how many of these tokens the greedy verification sees.
     auto depth = config.next_depth({}, kmax);
+    drafter_->set_statistics(statistic_probability); // the window reads prob only
     last_ = drafter_->draft(in, depth);
     for (auto next = config.next_depth({last_.prob.data(), depth}, kmax); next > depth;
          next = config.next_depth({last_.prob.data(), depth}, kmax)) {

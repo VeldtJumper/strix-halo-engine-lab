@@ -122,11 +122,13 @@ struct Tables {                       // target RoPE tables (RopeTables layout)
     std::uint32_t positions = 0;
     void validate() const;
 };
+// Optional head statistics of a draft (Drafter::set_statistics). The draft ids never depend on them.
+inline constexpr std::uint32_t statistic_probability = 1, statistic_margin = 2, statistic_all = 3;
 struct Draft {
     std::uint32_t depth = 0;
     std::array<std::uint32_t, max_depth> tokens{};
-    std::array<float, max_depth> prob{};   // top-1 softmax probability over the 4096 candidates
-    std::array<float, max_depth> margin{}; // top-1 minus top-2 candidate logit (diagnostics/tolerance)
+    std::array<float, max_depth> prob{};   // top-1 softmax probability over the 4096 candidates (0 when not requested)
+    std::array<float, max_depth> margin{}; // top-1 minus top-2 candidate logit (diagnostics; 0 when not requested)
 };
 struct Timings {
     double draft_ms = 0;
@@ -144,6 +146,11 @@ public:
     // margin of every depth) is bit-identical to draft(inputs, k) from scratch: the chain is deterministic. The target
     // KV views passed to draft() must be unchanged. Default: re-runs draft() on the inputs saved by remember().
     virtual Draft extend(std::uint32_t k);
+    // Which head statistics draft()/extend() compute (statistic_* bits, default all). Without a consumer (plain
+    // propose_window) the session requests none, so the head skips the exp-sum and runner-up reductions; the
+    // confidence window requests the probability only. Tokens are identical for every setting.
+    void set_statistics(std::uint32_t bits) { statistics_ = bits & statistic_all; }
+    [[nodiscard]] std::uint32_t statistics() const { return statistics_; }
 protected:
     // Saves the inputs (hidden row copied; KV views by pointer) and depth of a draft() call for the default extend().
     void remember(const Inputs& inputs, std::uint32_t k);
@@ -151,6 +158,7 @@ private:
     Inputs saved_;
     std::vector<float> saved_hidden_;
     std::uint32_t saved_depth_ = 0;
+    std::uint32_t statistics_ = statistic_all;
 };
 
 class HostDrafter final : public Drafter {
@@ -173,5 +181,17 @@ void attend_head(const float* q, std::uint32_t dim, const KvLayer& kv, std::uint
                  std::uint64_t last, float* out);
 // Top-k cluster ids: repeated argmax (higher value, lower index on ties), in selection order.
 std::vector<std::uint32_t> top_clusters(std::span<const float> logits, std::uint32_t k);
+// One compare-exchange of the device top-k bitonic network (power-of-two n, stage `size`, `stride`, pair p < n/2):
+// sorts (value, id) best first under better(). Running every pair of every stage (size = 2..n, stride = size/2..1)
+// sorts the array; its first k ids equal top_clusters (distinct ids make better() a total order).
+STRIX_G4_HD inline void bitonic_pair(float* value, std::uint32_t* id, std::uint32_t size, std::uint32_t stride,
+                                     std::uint32_t p) {
+    const std::uint32_t lo = 2U * stride * (p / stride) + p % stride, hi = lo + stride;
+    const bool forward = (lo & size) == 0U; // forward runs put the better element first
+    if (forward ? better(value[hi], id[hi], value[lo], id[lo]) : better(value[lo], id[lo], value[hi], id[hi])) {
+        const float v = value[lo]; value[lo] = value[hi]; value[hi] = v;
+        const std::uint32_t x = id[lo]; id[lo] = id[hi]; id[hi] = x;
+    }
+}
 
 } // namespace strix::gemma4::eagle::mtp

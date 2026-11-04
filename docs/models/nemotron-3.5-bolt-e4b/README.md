@@ -114,6 +114,11 @@ Decode passes return the device's greedy token per row and copy logits and hidde
 request or drafter reads them: +1.9 / +4.6 / +5.9 % at C1 / C4 / C8 with the drafter off and +3.3 / +8.3 / +9.3 % with
 the MTP drafter on (`default`, short prompts, same bytes); `STRIX_G4_DECODE_EXPORT=0` restores the full copies.
 
+The MTP drafter's attention loads each target KV head once for both query heads that share it, and its cluster top-k
+is one bitonic sort: GPU ms per draft depth 0.423 / 0.746 / 2.617 → 0.346 / 0.578 / 1.750 at 512 / 4K / 32K context
+(q8_0 drafter, top-64, HIP graphs, one node), draft ids bit-identical; `STRIX_G4_MTP_KERNELS=legacy` restores the
+previous kernels.
+
 Single-request decode also drafts from the text itself (prompt lookup): it proposes the continuation of the longest
 earlier match of the last tokens in the prompt and output, and the main model verifies every token, so token ids equal
 drafting off. It pays off where the output copies from the context. Agent code-edit prompt (a 2.2K-token Python file

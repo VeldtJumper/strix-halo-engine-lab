@@ -120,6 +120,11 @@ estado oculto al host solo cuando una petición o el drafter los lee: +1.9 / +4.
 +3.3 / +8.3 / +9.3 % con el drafter MTP (`default`, prompts cortos, mismos bytes); `STRIX_G4_DECODE_EXPORT=0` restaura
 las copias completas.
 
+La atención del drafter MTP carga cada cabeza KV del objetivo una vez para las dos cabezas de consulta que la
+comparten, y su top-k de clústeres es una ordenación bitónica: ms de GPU por profundidad del borrador 0.423 / 0.746 /
+2.617 → 0.346 / 0.578 / 1.750 con contexto 512 / 4K / 32K (drafter q8_0, top-64, grafos HIP, un nodo), ids del
+borrador idénticos bit a bit; `STRIX_G4_MTP_KERNELS=legacy` restaura los kernels anteriores.
+
 El decode de una petición también propone tokens a partir del propio texto (prompt lookup): propone la continuación
 de la coincidencia anterior más larga de los últimos tokens del prompt y de la salida, y el modelo principal verifica
 cada token, así que los ids de los tokens son iguales a los obtenidos sin draft. Compensa cuando la salida copia del
