@@ -155,6 +155,8 @@ use `v3`.
 | Short chat prompts, 256 tokens: batching on / llama.cpp server | — | — | **160.4** / 244.1 |
 
 The table above was measured before the next two serving changes (prompt chunks while others decode and the prompt prefix cache).
+Later, on main `d7069831d` (short chat prompts, 128 tokens, prefix cache off, `default`): C1 / C4 / C8
+**92.1 / 143.8 / 187.4 tok/s** aggregate, time to first token p50 0.10 / 0.19 / 0.37 s.
 
 While other requests decode, a prompt is processed in chunks of at most 64 rows (`STRIX_G4_SERVE_PREFILL_ROWS`,
 `0` = whole 512-row chunks), so a long prompt pauses them for shorter stretches: with the mixed prompts above the
