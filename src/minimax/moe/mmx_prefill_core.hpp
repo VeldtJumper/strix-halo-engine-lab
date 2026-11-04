@@ -563,6 +563,154 @@ __global__ __launch_bounds__(128) void grouped_pipe_kernel(const Item* items, un
     }
 }
 
+// Paired PIPE bands (STRIX_MMX_PREFILL_PIPE_PAIR). CTAs by and by ^ 1 of a band of two full 128-row tiles take the two
+// 64-column halves of the item's 128 outputs; wave w covers rows band + 128 (w >> 1) of column pair w & 1 and decodes only
+// its own tile (8 states per lane; lanes 16-31 hold k 8..15, whose window starts 2 Bits later, so the word / shift
+// constants stay those of k 0..7). The CTA shares the four decoded tiles through LDS (two buffers, one barrier per k
+// tile) and keeps PIPE's schedule: a0 before the decode, a1 and the next weight words after it. Same WMMA chain and the
+// same partial stores per output as item_pipe.
+template <int Bits, bool Simplify>
+__device__ void item_pipe_pair(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
+    using NW = Norm<Bits>;
+    constexpr int MT = 8, G = 4;
+    constexpr int kNL = NW::g(7) + 2;  // words for k 0..7 of the shifted window
+    const int lane = static_cast<int>(threadIdx.x & 31U);
+    const int wave = static_cast<int>(threadIdx.x >> 5U);
+    const int c = lane & 15;
+    const bool upper = lane >= 16;
+    const unsigned first_row = it.row0 + (by & ~1U) * 128U + static_cast<unsigned>(wave >> 1) * 128U;
+    const unsigned tiles_k = it.input / 16U;
+    const int begin = static_cast<int>(static_cast<std::uint64_t>(tiles_k) * bz / it.splits);
+    const int end = static_cast<int>(static_cast<std::uint64_t>(tiles_k) * (bz + 1U) / it.splits);
+    const int tile_pair = static_cast<int>(bx) * 4 + static_cast<int>(by & 1U) * 2 + (wave & 1);
+    const int my_tile = 2 * tile_pair + (wave >> 1);
+    const int base = 32 * (c & 7) + 4 * (c >> 3);
+    const int S = (base + 1) * Bits - 16 + 256 * Bits - 32 + (upper ? 2 * Bits : 0);
+    const int d = S & 31, wb = (S >> 5) - (d == 0 ? 1 : 0);
+    const unsigned sh = static_cast<unsigned>((32 - d) & 31);
+    std::uint32_t loff[kNL];
+#pragma unroll
+    for (int i = 0; i < kNL; ++i)
+        loff[i] = static_cast<std::uint32_t>(my_tile * NW::kWords + (wb + i) % NW::kWords) * 4U;
+    const std::size_t k_stride = static_cast<std::size_t>(it.output / 16U) * NW::kWords;
+    const auto* weights = dev::uniform(it.trellis);
+    // Rebase per row tile using scalar 64-bit arithmetic, then use bounded lane offsets.
+    const auto* x = dev::uniform(it.x + static_cast<std::size_t>(first_row / 16U) * tiles_k * 256U);
+    Float8 acc0[MT] = {}, acc1[MT] = {};
+    std::uint32_t ln[kNL];
+    if (begin < end) {
+        const auto* kb = reinterpret_cast<const unsigned char*>(dev::uniform(weights + static_cast<std::size_t>(begin) * k_stride));
+#pragma unroll
+        for (int i = 0; i < kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
+    }
+    for (int tile_k = begin; tile_k < end; ++tile_k) {
+        Half16 a0[G];
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            const auto* ab = reinterpret_cast<const unsigned char*>(dev::uniform(
+                x + (static_cast<std::size_t>(m) * tiles_k + static_cast<unsigned>(tile_k)) * 256U));
+            a0[m] = pipe_load_a(ab, static_cast<std::uint32_t>(c) * 32U);
+        }
+        const int buffer = (tile_k - begin) & 1;
+        { // Decode temporaries die before the second A bank becomes live.
+            std::uint32_t nrm[kNL - 1], mine[4], full[8];
+#pragma unroll
+            for (int i = 0; i < kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(ln[i], ln[i + 1], sh);
+#pragma unroll
+            for (int r = 0; r < 8; r += 2) {
+                std::uint16_t v[2];
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const int rr = r + i;
+                    const auto state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
+                    if constexpr (Simplify)
+                        v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(pipe_codebook(state)));
+                    else
+                        v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(codebook_mul1(state)));
+                }
+                mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const auto peer = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                full[i] = upper ? peer : mine[i];
+                full[i + 4] = upper ? mine[i] : peer;
+            }
+            if (!upper) exchange[buffer * 64 + wave * 16 + c] = as_half16(full);
+        }
+        Half16 a1[G];
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            const auto* ab = reinterpret_cast<const unsigned char*>(dev::uniform(
+                x + (static_cast<std::size_t>(G + m) * tiles_k + static_cast<unsigned>(tile_k)) * 256U));
+            a1[m] = pipe_load_a(ab, static_cast<std::uint32_t>(c) * 32U);
+        }
+        if (tile_k + 1 < end) {
+            const auto* kb = reinterpret_cast<const unsigned char*>(dev::uniform(weights + static_cast<std::size_t>(tile_k + 1) * k_stride));
+#pragma unroll
+            for (int i = 0; i < kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
+        }
+        // LDS release only: A and the next weight words stay outstanding across the barrier. A buffer is rewritten only
+        // after the next barrier, which every wave reaches after these reads.
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+        const Half16 b0 = exchange[buffer * 64 + (wave & 1) * 16 + c];
+        const Half16 b1 = exchange[buffer * 64 + ((wave & 1) + 2) * 16 + c];
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            acc0[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b0, acc0[m]);
+            acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
+        }
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            acc0[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b0, acc0[G + m]);
+            acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
+        }
+    }
+    const unsigned col0 = static_cast<unsigned>(2 * tile_pair * 16 + c);
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned row = first_row + static_cast<unsigned>(16 * m + 2 * j + (lane >> 4));
+            auto* dst = it.part + (static_cast<std::size_t>(bz) * it.rows + row) * it.output;
+            dst[col0] = acc0[m][j];
+            dst[col0 + 16U] = acc1[m][j];
+        }
+    }
+}
+
+// A band of two full 128-row tiles runs paired, every other tile PIPE / the tail. The test reads only by & ~1 and
+// by | 1, so both CTAs of a band agree.
+template <int Bits, bool Simplify>
+__device__ __forceinline__ void pipe_pair_or_tail(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
+    if ((by | 1U) < it.gy && it.row0 + (by & ~1U) * 128U + 256U <= it.rows)
+        item_pipe_pair<Bits, Simplify>(it, bx, by, bz, exchange);
+    else pipe_or_tail<Bits, 8, 4, Simplify>(it, bx, by, bz);
+}
+
+template <bool Simplify = false>
+__global__ __launch_bounds__(128) void grouped_pipe_pair_kernel(const Item* items, unsigned count) {
+    __shared__ Half16 exchange[128];  // 2 buffers x 4 decoded tiles x 16 columns
+    unsigned lo = 0, hi = count;
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (items[mid].cta_begin <= blockIdx.x) lo = mid;
+        else hi = mid;
+    }
+    const Item it = items[lo];
+    const unsigned local = blockIdx.x - it.cta_begin;
+    const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: pipe_pair_or_tail<3, Simplify>(it, bx, by, bz, exchange); break;
+        case 4: pipe_pair_or_tail<4, Simplify>(it, bx, by, bz, exchange); break;
+        case 5: pipe_pair_or_tail<5, Simplify>(it, bx, by, bz, exchange); break;
+        case 6: pipe_pair_or_tail<6, Simplify>(it, bx, by, bz, exchange); break;
+        default: pipe_pair_or_tail<8, Simplify>(it, bx, by, bz, exchange); break;
+    }
+}
+
 // V: 2 = v2 core (item_core), 3 = v3 exact, 4 = v4 (v3 + tiled A), 31 / 32 = v3 diagnostics (no A loads / no decode;
 // bench only).
 template <int MT, int V>

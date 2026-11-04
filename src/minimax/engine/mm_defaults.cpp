@@ -101,6 +101,8 @@ constexpr Item kItems[] = {
     {"pf_idx_rows", "STRIX_MM_PF_IDX_ROWS", "64", "32",
      "Prefill index measurement: exact (state/final rows identical), Q64 vs Q32 index scoring 8K -35 %, 32K -28 %; TTFT 8K -1.5 %, 32K -1.8 %, 1K neutral"},
     {"pf_moe_pipe", "STRIX_MMX_PREFILL_PIPE", "1", "0", "Prefill measurement: exact, 8K B/A 0.973 / 0.935 / 0.924"},
+    {"pf_moe_pipe_pair", "STRIX_MMX_PREFILL_PIPE_PAIR", "auto", "0",
+     "Prefill MoE measurement: exact (partials/xt/at/output bitwise), paired MT8 bands for calls >= 2048 rows: MoE call -0.6..-1.0 % 2048 / -0.9..-1.5 % 4096 rows, 1024 mixed"},
     {"pf_moe_tail_stream", "STRIX_MMX_PREFILL_TAIL_STREAM", "1", "0",
      "Prefill MoE measurement: exact (partials/xt/at/output bitwise), tail classes beside MT8: MoE call -1.9 to -3.0 % real routes"},
     {"pf_gather_tok", "STRIX_MMX_PREFILL_GATHER_TOK", "1", "0",

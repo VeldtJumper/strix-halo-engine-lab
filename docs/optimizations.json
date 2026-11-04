@@ -1721,6 +1721,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill MoE paired MT8 PIPE bands",
+    "flag_or_env": "STRIX_MMX_PREFILL_PIPE_PAIR",
+    "default": "auto",
+    "exact": "Same operands, k order and split partials per output; two neighbouring CTAs split the 128 output columns and share the decoded weight tiles through LDS. Prefill MoE bench: split partials, tile-major gate/up and down inputs and outputs byte-identical to the unpaired PIPE kernel (PIPE 1 and 2, MT-fit off and on, synthetic and real weights, 36 cells); prefill state, final rows and tokens identical on both ranks in every PAIR arm at 1K, 8K and 32K.",
+    "gain": "MoE call, real weights and routes of one layer, 10 A B B A blocks, five runs: 4096 rows -0.9 to -1.5 % (one noisy run -0.1 %), 2048 rows -0.6 to -1.0 %; 1024 rows mixed (-1.1 to +0.7 %), left unpaired. Two Strix Halo nodes, in-process A B A B A B A: 8K TTFT 14.14 -> 14.04 s (-0.7 %); 32K fresh process per arm (A B A, B A B): TTFT 63.70 -> 63.48 s (-0.3 %, within noise), MoE GPU time neutral (22.86 vs 22.90 s)",
+    "preconditions": "v4 prefill MoE core with the PIPE MT8 kernel (the defaults); routed MoE calls of at least 2048 rows under auto; dense prefill stays unpaired.",
+    "off_switch": "STRIX_MMX_PREFILL_PIPE_PAIR=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-pipe-pair"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MoE token-major gather",
     "flag_or_env": "STRIX_MMX_PREFILL_GATHER_TOK",
     "default": "1",
