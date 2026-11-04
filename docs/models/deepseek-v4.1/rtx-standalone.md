@@ -231,12 +231,14 @@ Measured on the PRO (one NVMe drive, the same chat tokens in every arm):
 | 32 GiB + 32 GiB, one drive | 10.91 | 10.20 | |
 | full budget (no file tier) | 26.7 | 105-108 | |
 | 24 GiB + 32 GiB, expert stripes on 2 drives | 7.75-7.78 | 9.22-9.27 | |
+| 48 GiB + 32 GiB, expert stripes on 2 drives | 31.5 | 20.9-21.6 | |
 | 48 GiB + 32 GiB, one drive | 32.2 | 20.6-21.8 | |
 | 64 GiB + 32 GiB, one drive | 52.2 | 47.4-51.8 | |
 
 With `auto` at 24 GiB + 32 GiB the replica measured 8.05-8.13 tok/s (the drafter-free number), and in every row above
 `auto` picks the faster or an equal arm: off on one drive with a file tier, on with stripes on two drives or without a
-file tier.
+file tier. The exception is 48 GiB + 32 GiB with stripes on two drives, where `auto` keeps DSpark and it is about 32 %
+slower; use `--drafter off` there until the rule is updated.
 
 `auto` turns the drafter off exactly when a file tier is certain and the
 expert reads have fewer than 2 read locations. A file tier is certain when both
