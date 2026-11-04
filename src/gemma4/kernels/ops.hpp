@@ -66,6 +66,7 @@ bool linear_fused(LinearView w, const float* x, std::uint32_t rows, float* out, 
 bool store_fusion_enabled();
 bool row_prefetch_enabled(std::uint32_t rows);
 bool pair_tile_enabled(std::uint32_t rows);
+bool staged_input_enabled(std::uint32_t rows);
 void synchronize(Queue queue = nullptr);
 void require_device(); // gfx1151 / wave32 only; does not silently select another identity
 void linear(LinearView w, const float* x, std::uint32_t rows, float* out, bool shared = true, Queue queue = nullptr,
