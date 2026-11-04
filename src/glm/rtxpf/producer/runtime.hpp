@@ -71,6 +71,8 @@ struct DecodeOptions {
     // mix chains from shared memory (row_hc), the router over 9 CTAs + a parallel top 8 (row_router),
     // the KDA qkv/out and DSA kva/qb/out trellis projections as the same MMA chains (row_kda, row_dsa).
     bool row_moe=false,row_hc=false,row_router=false,row_kda=false,row_dsa=false;
+    // Exact removal of dead index-query work in one-row short-context DSA, including MTP.
+    bool dsa_short_skip=true;
     // Round 2 of those kernels (opt-in, same values), RowR2 bits: r2pre A loads before the weight decode, r2dense
     // dense FP16 ordinary strips, r2idx FP32 index row chains, r2hc 4-wide hc reads, r2par parallel prefix/compaction.
     unsigned row_r2=0;
@@ -100,6 +102,10 @@ struct DecodeOptions {
 // bits), r2pre, r2dense, r2idx, r2hc, r2par (round-2 tokens alone change nothing: they select round 2 of the listed
 // kernels), e.g. 1+r2dense. moe+hc+router+kda+dsa is round one exactly.
 inline constexpr const char* row_kernel_keys[]={"moe","hc","router","kda","dsa"};
+inline void set_dsa_short_skip_value(DecodeOptions& d,const std::string& v){
+    if(v!="0"&&v!="1")throw std::runtime_error("--dsa-short-skip 0|1");
+    d.dsa_short_skip=v=="1";
+}
 inline constexpr struct {const char* key;unsigned bit;} row_r2_keys[]={{"r2pre",r2_pre},{"r2dense",r2_dense},{"r2idx",r2_idx},{"r2hc",r2_hc},{"r2par",r2_par}};
 inline void set_row_kernels_value(DecodeOptions& d,const std::string& v){
     bool* f[]={&d.row_moe,&d.row_hc,&d.row_router,&d.row_kda,&d.row_dsa};
@@ -151,6 +157,8 @@ public:
     void set_decode_profile(bool on);
     void set_row_kernels(const std::string& value); // decode_row_kernels between requests (no session work in flight)
     std::string row_kernels()const;
+    void set_dsa_short_skip(bool on); // between commands, no session work in flight
+    bool dsa_short_skip()const;
     // Writes the cache residency (most recent first) to the residency file; "" when off. Between requests.
     std::string save_residency();
     std::string model_sha256()const;

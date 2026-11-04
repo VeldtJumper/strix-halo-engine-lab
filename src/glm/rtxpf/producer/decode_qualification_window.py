@@ -408,6 +408,7 @@ def service_command(a, binary):
                             ('--skip-empty-expert-groups', getattr(a, 'skip_empty_expert_groups', None)),
                             ('--persistent-dense-fp16', getattr(a, 'persistent_dense_fp16', None)),
                             ('--decode-row-kernels', getattr(a, 'decode_row_kernels', None)),
+                            ('--dsa-short-skip', getattr(a, 'dsa_short_skip', None)),
                             ('--mtp-self-spec', getattr(a, 'mtp_self_spec', None)),
                             ('--spec-lookup', getattr(a, 'spec_lookup', None)),
                             ('--expert-residency', getattr(a, 'expert_residency', None)),
@@ -1440,7 +1441,7 @@ def worker_options(a):
     the fitted tile sweep (and the note of an arm the parent dropped)."""
     argv = []
     for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency', 'prefill_overlap', 'prefill_profile', 'prefill_clean_evict',
-                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'mtp_self_spec', 'spec_lookup', 'expert_residency', 'expert_routes', 'routes_out', 'routes_prefill', 'row_tile', 'profile', 'prefill_tile_crossover',
+                 'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'dsa_short_skip', 'mtp_self_spec', 'spec_lookup', 'expert_residency', 'expert_routes', 'routes_out', 'routes_prefill', 'row_tile', 'profile', 'prefill_tile_crossover',
                  'weight_dirs', 'drive_readers', 'tier_staging', 'tier_disk_queue', 'tier_clean_evict', 'disk_prefetch',
                  'tier_landing_blocks', 'tier_landing_max_queued', 'tier_landing_ttl', 'tier_landing_chunk'):
         if getattr(a, name, None) is not None:
@@ -1619,6 +1620,7 @@ def arguments(argv=None):
     p.add_argument('--persistent-dense-fp16', choices=['0', '1'], help='shared experts / dense FFNs decoded once at startup (exact; pending row; ~2.8 GiB)')
     p.add_argument('--mtp-self-spec', choices=['0', '1', 'always'], help='MTP self-speculation: greedy verify of the MTP draft (exact; 1 = adaptive, always = every step)')
     p.add_argument('--spec-lookup', choices=['0', '1'], help='prompt-lookup drafts for the self-speculation verify (exact; pending row)')
+    p.add_argument('--dsa-short-skip', choices=('0', '1'), help='exact short-context DSA dead index-query skip (service default: 1; 0 restores the work)')
     p.add_argument('--decode-row-kernels', help='one-row decode kernels: 0, 1 or a subset of moe, hc, router, kda, dsa joined by + (exact; pending row)')
     p.add_argument('--decode-profile', action='store_true',
                    help='decode timeline: CUDA events per phase per layer in every decode step record and per-arm totals '

@@ -1,5 +1,6 @@
 #pragma once
 #include "native.cuh"
+#include "dsa_selection.hpp"
 namespace strix::glm::rtxpf {
 inline constexpr const char* dsa_identity="glm-pf-rtx-native-v1-dsa64-f32idx";
 inline constexpr const char* dsa_mma_index_identity="glm-pf-rtx-native-v1-dsa64-mmaidx";
@@ -28,6 +29,9 @@ struct DsaState {U16 *latent,*key,*gate;float* pooled;unsigned capacity;};
 struct DsaDiagnostics {
     unsigned long long differing_rows, differing_pools, near_tie_pools, outside_tolerance_pools;
 };
+// Three disjoint intervals: iq weight decode, iq/head projections, score launch.
+// Decode profiling only; preallocated by the caller, never part of model state.
+struct DsaIndexQueryProfile {cudaEvent_t begin[3],end[3];};
 struct DsaCall {
     unsigned rows,first;
     DsaWeights w; DsaState state;
@@ -48,6 +52,8 @@ struct DsaCall {
     bool row_kernels=false;
     unsigned row_r2=0; // RowR2 bits (opt-in): r2_pre A loads before the decode, r2_idx FP32 index row chains, r2_dense ordinary strips
     float near_tie_abs=1.e-3f,near_tie_rel=1.e-3f;
+    bool short_skip=false; // decode caller opts in; prefill and diagnostics retain their existing work
+    DsaIndexQueryProfile* index_query_profile=nullptr; // few-row FP32 decode only
 };
 // Caller creates timing events for phase*dsa_max_windows+window. decode/pool
 // use only window zero. Every other phase has ceil(rows/64) event pairs.

@@ -213,6 +213,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
         else if(a=="--tier-policy"){w::require(value=="lru"||value=="scored"||value=="auto","--tier-policy must be lru, scored or auto");dopts.tier_policy=value;}else if(a=="--tier-predict"){w::require(value=="0"||value=="1","--tier-predict 0|1");dopts.tier_predict=value=="1";}
         else if(a=="--skip-empty-expert-groups"){w::require(value=="0"||value=="1","--skip-empty-expert-groups 0|1");dopts.skip_empty_expert_groups=value=="1";}
         else if(a=="--persistent-dense-fp16"){w::require(value=="0"||value=="1","--persistent-dense-fp16 0|1");dopts.persistent_dense_fp16=value=="1";}
+        else if(a=="--dsa-short-skip")p::set_dsa_short_skip_value(dopts,value);
         else if(a=="--decode-row-kernels")p::set_row_kernels_value(dopts,value);
         else if(a=="--command-file")command_file=value;else if(a=="--command-out")command_out=value;
         else if(a=="--mtp-self-spec"){w::require(value=="0"||value=="1"||value=="always","--mtp-self-spec 0|1|always");dopts.mtp_spec=value!="0";dopts.spec_always=value=="always";}
@@ -255,6 +256,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
     // (STRIX_GLM_RTX_SKIP_EMPTY_GROUPS / _PERSISTENT_DENSE_FP16) sets them explicitly. prefill_overlap: on in every profile.
     for(auto [lever,flag]:{std::pair<const char*,bool*>{"skip_empty_expert_groups",&dopts.skip_empty_expert_groups},{"persistent_dense_fp16",&dopts.persistent_dense_fp16},{"prefill_overlap",&dopts.prefill_overlap}})
         if(auto* e=prof.find(lever);e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)*flag=e->value!="off"&&e->value!="0";
+    if(auto* e=use("dsa_short_skip"))p::set_dsa_short_skip_value(dopts,e->value);
     if(auto* e=prof.find("decode_row_kernels");e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)p::set_row_kernels_value(dopts,e->value);
     // mtp_self_spec from the profile applies where it can run (the tierstream cache, no --routes-out); --mtp-self-spec 1 elsewhere is an error.
     if(auto* e=prof.find("mtp_self_spec");e&&e->status!=rp::Status::explicit_cli&&e->status!=rp::Status::pending)
@@ -283,6 +285,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
         if(lever=="skip_empty_expert_groups")return dopts.skip_empty_expert_groups?"1":"0";
         if(lever=="persistent_dense_fp16")return dopts.persistent_dense_fp16?"1 (dropped at startup if the plan cannot afford it)":"0";
         if(lever=="prefill_overlap")return dopts.prefill_overlap?"1 (off when the arena cannot keep two layers)":"0";
+        if(lever=="dsa_short_skip")return dopts.dsa_short_skip?"1":"0";
         if(lever=="decode_row_kernels")return p::row_kernels_name(dopts);
         if(lever=="mtp_self_spec")return dopts.mtp_spec?"1":"0";
         if(lever=="lookup_drafts")return dopts.spec_lookup?"1":"0";
@@ -297,6 +300,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
     // feeds it every request shape the harness plans).
     if(check_commands){for(std::string line;std::getline(std::cin,line);){auto r=Json::object();
             try{auto c=p::parse_decode_command(strix::serve::parse_json(line));if(!c.row_kernels.empty()){p::DecodeOptions d;p::set_row_kernels_value(d,c.row_kernels);r.set("row_kernels",p::row_kernels_name(d));}
+                if(c.dsa_short_skip>=0)r.set("dsa_short_skip",c.dsa_short_skip);
                 if(c.decode_profile>=0)r.set("decode_profile",c.decode_profile==1);r.set("ok",true);r.set("op",c.op);r.set("steps",int(c.steps));r.set("row_tile",int(c.row_tile));r.set("export_dir",!c.export_dir.empty());r.set("order",c.order);}
             catch(const std::exception& e){r.set("ok",false);r.set("error",std::string(e.what()));}
             std::cout<<r.dump()<<"\n"<<std::flush;}
@@ -365,8 +369,9 @@ int main(int argc,char** argv){p::install_crash_report();try{
         auto ready=Json::object();ready.set("ready",true);identity_fields(ready);emit(ready);
         for(std::string line;std::getline(commands,line);){if(line.empty())continue;
             const auto cmd=p::parse_decode_command(strix::serve::parse_json(line));const auto& op=cmd.op;if(op=="quit")break;
-            // Optional per-command decode_row_kernels / decode timeline (in-process A/B over one load); they stay set.
+            // Optional per-command decode_row_kernels / dsa_short_skip / decode timeline (in-process A/B over one load); they stay set.
             if(!cmd.row_kernels.empty())runtime.set_row_kernels(cmd.row_kernels);
+            if(cmd.dsa_short_skip>=0)runtime.set_dsa_short_skip(cmd.dsa_short_skip==1);
             if(cmd.decode_profile>=0)runtime.set_decode_profile(cmd.decode_profile==1);
             if(cmd.lookup>=0)runtime.set_spec_lookup(cmd.lookup==1);
             auto tokens=read_prompt(cmd.prompt,capacity);const auto steps=cmd.steps;w::require(steps>=1&&steps<=64&&tokens.size()+steps+1<=capacity,"command steps/capacity");
@@ -383,7 +388,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
                 std::cerr<<"FAILED-RECEIPT "<<f.dump()<<"\n"<<std::flush;throw;}
             persist_residency(runtime,out);
             out.set("memory",strix::serve::parse_json(runtime.memory_report("request:"+op))); // measured peaks vs the whole-device caps
-            out.set("op",op);out.set("row_kernels",runtime.row_kernels());out.set("prompt",cmd.prompt);out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());emit(out);
+            out.set("op",op);out.set("row_kernels",runtime.row_kernels());out.set("dsa_short_skip",runtime.dsa_short_skip()?1:0);out.set("prompt",cmd.prompt);out.set("wall_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());emit(out);
         }
         return 0;
     }
