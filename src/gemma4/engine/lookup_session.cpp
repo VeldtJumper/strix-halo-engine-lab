@@ -129,6 +129,7 @@ public:
         if (kind_ != Kind::none) {
             emitted_ = std::uint32_t(staged_tokens_.size());
             emitted_tokens_ = staged_tokens_;
+            publish_time_ = Clock::now();
         }
         staged_tokens_.clear(); staged_positions_.clear();
         if (inner_) inner_->publish();
@@ -154,6 +155,11 @@ public:
         receipt.set("prompt_lookup", j);
         if (arbiter_) {
             auto stats = spec_stats_;
+            // The final cycle is published but never closed by a next proposal: count it, timed to its publish.
+            if (kind_ != Kind::none && emitted_ > 0) {
+                const double ms = std::chrono::duration<double, std::milli>(publish_time_ - cycle_start_).count();
+                if (ms > 0) stats.record(spec_outcome(ms), emitted_);
+            }
             stats.index_bytes = proposer_->bytes();
             receipt.set("spec_stats", strix::serve::parse_json(stats.json()));
         }
@@ -245,10 +251,11 @@ private:
     // STRIX_SPEC_ARBITER=1 (C1 confidence path): the shared proposer + arbiter choose lookup(k) / the inner drafter
     // (scored on its measured upper-bound rate, it picks its own window) / a plain step. Verify windows <= 8 rows.
     Confident propose_spec(std::uint32_t anchor, std::uint64_t position, std::uint32_t kmax, const ConfidenceConfig& config) {
-        strix::spec::Proposal proposal;
+        auto& proposal = spec_proposal_;
+        proposal.tokens.clear();
         if (synced(anchor, position)) {
             const auto t = Clock::now();
-            proposal = proposer_->propose({}, std::min(kmax, max_draft));
+            proposer_->propose(proposal, {}, std::min(kmax, max_draft));
             spec_stats_.lookup_time(std::chrono::duration<double, std::micro>(Clock::now() - t).count());
         }
         strix::spec::StepInput in;
@@ -284,12 +291,7 @@ private:
         if (kind_ == Kind::none) return;
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - cycle_start_).count();
         if (arbiter_ && emitted_ && ms > 0) {
-            namespace sp = strix::spec;
-            const auto source = kind_ == Kind::lookup ? sp::Source::lookup : kind_ == Kind::inner ? sp::Source::model
-                                                                                                    : sp::Source::serial;
-            const std::uint32_t accepted = std::min(window_, emitted_ - 1);
-            const sp::Outcome o{source, spec_bucket_, window_, accepted, window_ + 1, std::max(0.0, ms - draft_ms_),
-                                draft_ms_, spec_context_};
+            const auto o = spec_outcome(ms);
             arbiter_->observe(o, emitted_tokens_);
             spec_stats_.record(o, emitted_);
         }
@@ -305,6 +307,14 @@ private:
             }
         }
         kind_ = Kind::none; emitted_ = 0; draft_ms_ = 0;
+    }
+    // The open cycle's outcome after `ms` of wall time (emitted_ > 0).
+    [[nodiscard]] strix::spec::Outcome spec_outcome(double ms) const {
+        namespace sp = strix::spec;
+        const auto source = kind_ == Kind::lookup ? sp::Source::lookup : kind_ == Kind::inner ? sp::Source::model
+                                                                                                : sp::Source::serial;
+        const std::uint32_t accepted = std::min(window_, emitted_ - 1);
+        return {source, spec_bucket_, window_, accepted, window_ + 1, std::max(0.0, ms - draft_ms_), draft_ms_, spec_context_};
     }
     // Cycle time without draft rows and drafting: plain cycles, else inner cycles minus rows/drafting, else lookup.
     [[nodiscard]] double base_ms() const {
@@ -332,6 +342,7 @@ private:
     std::unique_ptr<strix::spec::ContextProposer> proposer_;  // STRIX_SPEC_ARBITER=1 only
     std::unique_ptr<strix::spec::Arbiter> arbiter_;
     strix::spec::SpecStats spec_stats_;
+    strix::spec::Proposal spec_proposal_;  // reused every step (no per-pass allocation)
     std::vector<std::uint32_t> emitted_tokens_;
     std::uint32_t spec_bucket_ = 0;
     std::uint64_t spec_context_ = 0;
@@ -342,7 +353,7 @@ private:
     std::array<double, buckets> evidence_{};
     Moments inner_stats_, plain_stats_;
     double inner_rows_ = 0, inner_draft_ = 0, inner_n_ = 0, base_lookup_ = 0, base_lookup_n_ = 0, draft_ms_ = 0;
-    Clock::time_point cycle_start_{};
+    Clock::time_point cycle_start_{}, publish_time_{};
     Kind kind_ = Kind::none;
     std::uint32_t window_ = 0, emitted_ = 0, last_token_ = 0;
     std::uint64_t last_position_ = 0;

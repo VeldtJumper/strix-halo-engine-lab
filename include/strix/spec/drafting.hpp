@@ -53,6 +53,8 @@ public:
     void commit(std::span<const std::uint32_t> tokens);
     // Continuation of stream + extra (extra = a hypothetical prefix, e.g. a model draft to extend), at most max_len.
     [[nodiscard]] Proposal propose(std::span<const std::uint32_t> extra, std::uint32_t max_len);
+    // The same into a caller-owned proposal (its token storage is reused across steps).
+    void propose(Proposal& out, std::span<const std::uint32_t> extra, std::uint32_t max_len);
     [[nodiscard]] std::uint64_t tokens() const { return index_->tokens(); }
     [[nodiscard]] std::size_t bytes() const { return index_->bytes(); }
 
