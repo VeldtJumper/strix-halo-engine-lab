@@ -49,11 +49,27 @@ public:
             while (len < max_match_ && e >= len + low && tok(e - len) == tok(cur - len)) ++len;
             m.length = len;
             m.distance = cur - e;
+            m.source_end = e;
             for (std::uint64_t i = e + 1; i <= cur && m.available < want; ++i) m.next[m.available++] = tok(i);
             return m;
         }
         return m;
     }
+    std::size_t continuation(std::uint64_t source_end, std::span<const std::uint32_t> extra,
+                             std::span<std::uint32_t> out) const override {
+        const std::uint64_t total = n_ + extra.size(), low = oldest();
+        std::size_t count = 0;
+        for (std::uint64_t i = source_end + 1; i < total && count < out.size(); ++i) {
+            if (i < low) return count;
+            out[count++] = i < n_ ? ring_[i % cap_] : extra[std::size_t(i - n_)];
+        }
+        return count;
+    }
+    std::uint32_t at(std::uint64_t position) const override {
+        if (position >= n_ || position < oldest()) throw std::out_of_range("lookup index position outside the ring");
+        return ring_[position % cap_];
+    }
+    std::uint64_t oldest() const override { return n_ > cap_ ? n_ - cap_ : 0; }
     std::uint64_t tokens() const override { return n_; }
     std::size_t bytes() const override { return ring_.size() * 4 + keys_.size() * 16; }
 

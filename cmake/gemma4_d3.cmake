@@ -1,6 +1,6 @@
 # Product device sessions and stream-local policy. Other package targets remain unchanged.
 target_sources(strix_gemma4_engine PRIVATE src/gemma4/engine/auto_policy.cpp src/gemma4/engine/lookup_session.cpp)
-target_link_libraries(strix_gemma4_engine PUBLIC strix_lookup)
+target_link_libraries(strix_gemma4_engine PUBLIC strix_lookup strix_spec)
 add_executable(strix-gemma4-gate apps/gemma4_gate_main.cpp)
 target_link_libraries(strix-gemma4-gate PRIVATE strix_gemma4_engine)
 strix_target_warnings(strix-gemma4-gate)

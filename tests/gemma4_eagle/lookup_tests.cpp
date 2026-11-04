@@ -273,6 +273,23 @@ void coordinator_tests() {
     const auto multi = decode(lookup_only, prompts, 3, en::DraftMode::automatic);
     for (std::size_t i = 0; i < prompts.size(); ++i) LK_CHECK(multi.ids[i] == off.ids[i], "3 streams ids == OFF (prompt %zu)", i);
     std::printf("lookup: 3 streams ids == OFF\n");
+
+    // STRIX_SPEC_ARBITER=1: the shared strix::spec proposer + arbiter decide the C1 cycles; ids == OFF everywhere.
+    set_env("STRIX_SPEC_ARBITER", "1");
+    const auto spec_cfg = lk::LookupConfig::from_environment();
+    set_env("STRIX_SPEC_ARBITER", nullptr);
+    LK_CHECK(spec_cfg.spec_arbiter && !cfg.spec_arbiter, "STRIX_SPEC_ARBITER parsed, default off");
+    const struct { const char* name; en::DraftFactory inner; std::size_t streams; bool strong; } arms[] = {
+        {"lookup only", {}, 1, false}, {"weak inner", weak, 1, false}, {"strong inner", good, 1, true},
+        {"lookup only, 3 streams", {}, 3, false}};
+    for (const auto& arm : arms) {
+        const auto s = decode(lk::hybrid_factory(arm.inner, spec_cfg), prompts, arm.streams, en::DraftMode::automatic);
+        for (std::size_t i = 0; i < prompts.size(); ++i)
+            LK_CHECK(s.ids[i] == off.ids[i], "spec arbiter (%s) ids == OFF (prompt %zu)", arm.name, i);
+        if (arm.streams == 1 && !arm.strong) LK_CHECK(s.cycles > 0 && s.accepted > 0, "spec arbiter (%s) used lookup", arm.name);
+        std::printf("lookup: spec arbiter, %s: ids == OFF, %llu lookup cycles, %llu/%llu accepted\n", arm.name,
+                    (unsigned long long)s.cycles, (unsigned long long)s.accepted, (unsigned long long)s.proposed);
+    }
 }
 } // namespace
 
