@@ -4,11 +4,11 @@ For current benchmark commands, model requirements, reference verdicts and machi
 
 Every speed number quoted in the [README](../README.md) is listed here with its date, configuration and
 exactness check. All numbers are measured in the lab; values are medians of 3 or more runs unless a row
-says otherwise. The overnight snapshot states counts where recorded; unspecified counts must not be assumed to be medians.
+says otherwise. The snapshots state counts where recorded; unspecified counts must not be assumed to be medians.
 Estimates and calculations are not listed as results.
 
 The README shows, per mode, the **best** measured result and a **typical** one. Additional measured builds
-are collected [below](#additional-measured-builds), with build IDs. The overnight snapshot and README
+are collected [below](#additional-measured-builds), with build IDs. The current snapshot and README
 supersede older rows only for the named build and workload.
 
 Hardware names used below:
@@ -19,7 +19,29 @@ Hardware names used below:
   [USB4 driver series](https://github.com/hyukudan/strix-halo-usb4-driver).
 - **Workstation:** a PC with an NVIDIA RTX PRO 6000 Blackwell (96 GB), reaching the pair over 1 GbE.
 
-## Overnight snapshot (2026-10-25/26)
+## Current snapshot
+
+The latest measured result per engine and workload, each on a build that is on public main (the build column names
+the merged commit or pull request). All rows are exact. Rows that were not re-measured keep their value in the
+sections below; GLM on one RTX PRO 6000 is on the [GLM page](models/glm-5.3/README.md#glm-rtx-results).
+
+| Engine | Hardware and workload | Latest measured result | Build | Exactness / conditions |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next, exact prefill | One node, plain command, prefill without model load, automatic T16384 from 32K | 1K **1,337 tok/s** (0.77 s); 4K **1,695** (2.42 s); 16K **1,730** (9.47 s); 17,700 **1,665** (10.63 s); 32K **1,713** (19.13 s); 128K **1,617** (81.08 s); 262,143 **1,509** (173.74 s); **54–56 %** of the contract ceilings (3,139 / 3,089 / 3,078 / 2,907 / 2,687 tok/s at 4K / 17,700 / 32K / 128K / 262,143) | main `85353311b` | default route; one binary; 64K not re-measured |
+| Qwen3.8-Flash-Next, YaRN factor 2 | One node, 262,144-token prompt, serial route | prefill **176.60 s = 1,484 tok/s**; serial decode **21.82 tok/s** | main `17b9c57b8` | one run |
+| Qwen MTP decode | One node, 256 generated tokens, auto windows | 1K code **62.44 tok/s** (72 % of the 86.8 tok/s byte ceiling); 1K prose 51.56; 16K code / prose **50.69 / 50.31** | main `85353311b` | exact; this prose prompt differs from the 55.7 tok/s prose row |
+| Qwen 1M context (YaRN factor 4) | One node | serial 925 s TTFT / 1,198 tok/s prefill / 19.6 tok/s decode (Linux 7.3); MTP 1,133 s / 936 tok/s / **60.2 tok/s** (Linux 7.4, 102/120 accepted) | #288 `3b8b9ac0f` | MTP == serial gate; different kernels, so no serial-to-MTP ratio |
+| DeepSeek pair standalone prefill | Pair, 16K prompt, alternating runs | **14.27–14.59 s** | #201 | logits identical in every run |
+| DeepSeek standalone RTX | RTX PRO 6000, full card, DSpark, 2 chats × 64 tokens after a 96-token prompt | **105–108 tok/s** (plain 26.7) | #325 | exact; a different workload from the 82.3 / 87.7 / 94.4 tok/s same-load rows |
+| MiniMax M3.1 Flash, decode | Pair TP2, greedy 1K / 8K, cold | **43.30 / 45.06 ms/token** (23.10 / 22.19 tok/s) | public tree of PR #59 | ranks agree, reference IDs equal |
+| MiniMax M3.1 Flash, DSpark | Pair TP2, JSON / Python / prose | **59.96 / 36.93 / 27.05 tok/s** | PR #70 `fbd43423` | IDs equal greedy |
+| MiniMax M3.1 Flash, prefill | Pair TP2; 1K / 8K alternating arms in one process, 32K fresh process both orders | TTFT **2.49–2.52 / 13.85–14.29 (mean 14.04) / 63.48 s** | #334 `c225cdaa2` | state and final rows equal the references on both ranks |
+| MiniMax M3.1 Flash, served | Pair TP2, 8 distinct ~190-token prompts, 256 tokens, C1 / C2 / C4 / C8 | **22.0 / 32.2 / 44.5 / 55.7 tok/s** aggregate (repeat run 22.1 / 32.5 / 45.1 / 56.1) | main `e6ce78571` | every request's IDs equal the request alone |
+| GLM-5.3 Flash, decode | Pair TP2, R1b, `--mtp 0`; R8 batch; two runs | **39.00–39.03 ms/token** (25.6 tok/s, 57 % of the 44.7 tok/s ceiling); R8 **112.14–112.31 ms/step** (71.3 tok/s aggregate, calculated) | #332 `ec76191f2` | tokens and R8 equal the reference on both ranks |
+| GLM-5.3 Flash, exact prefill | Pair TP2, 1K / 8K / 32K, 8192-row chunks | TTFT **2.83 / 15.15 / 61.96 s** | #300 `32ec66bd3` | logits bitwise; MoE remainder tiles 32K −1.2 % over both run orders |
+| Nemotron 3.5 Bolt E4B, served | One node, `default`, short chat prompts, 128 tokens, prefix cache off | C1 / C4 / C8 **92.1 / 143.8 / 187.4 tok/s** aggregate | main `d7069831d` | exact `default` |
+
+## Earlier snapshot
 
 All six engines are **Production**: Qwen, DeepSeek on the pair, standalone RTX, RTX + pair, MiniMax and GLM.
 New optimizations require separate qualification and publication. Measurements below supersede historical
@@ -32,8 +54,8 @@ rows only for the named build and workload. Raw receipts and review corresponden
 | Qwen3.8-Flash-Next, UD-Q4_K_XL, dense A8 | One node, exact prefill sweep, 2026-10-26 | **3.00–240.62 s** across 4K–262,143 tokens; **40.5–45.3 %** of route-matched contract ceilings | `8b99cf58` shipped in PR #49; HC v3 band 16 shipped in #50; later measurements below |
 | Qwen MTP decode, UD-Q4_K_XL, dense A8 | One node, code 1K / 8K, auto windows, 256 generated tokens; `702bc074`, 2026-10-25 | **59.59 / 54.00 tok/s**; 1K **69 %** of 86.8 tok/s byte ceiling | Recipe golden equal; prose 8K **49.58 tok/s** on `226bb691`, exact |
 | DeepSeek pipeline, expert-TP identity | RTX PRO + pair over 1 GbE, two groups; pair `6525d5e8`, CUDA `463c08ec` line | Batch N2/4/8 **60.1 / 97.5 / 137.2 tok/s**; DSpark N1/2/4 **52.4 / 91.3 / 156.8 tok/s** wall aggregate (2026-10-24); server C1/2/4/8 **43.2 / 65.8 / 77.9 / 91.7 tok/s** (2026-10-25) | Batch: 8 prompts × 48 tokens, bitwise gates; server: 8-category short set, 32/32 IDs equal pair-only |
-| MiniMax M3.1 Flash, EXL3 3.06 bpw | Two nodes TP2 over USB4, 1K / 8K greedy benchmark, 2026-10-26 | **44.57 / 46.10 ms/token**; fresh 8K prefill **17.731 s (462 tok/s)** | Exact archived-reference checks at 1K/8K; new defaults pending publication |
-| GLM-5.3 Flash, EXL3 4.05 bpw, R1 | Two nodes TP2 over USB4, chat decode / R8 batch / exact 8K prefill | **45.29 ms/token (22.1 tok/s)**, **51 %** of 23.2 ms floor; batch **122.0 ms/step = 65.5 tok/s** aggregate (calculated); exact 8K prefill **17.77 s** with the current defaults (20.32 s after PR #183, earlier 34.70 s on `875ca821`) | R1 reference equal; latest integration `41d8cfdc`, pending publication |
+| MiniMax M3.1 Flash, EXL3 3.06 bpw | Two nodes TP2 over USB4, 1K / 8K greedy benchmark | **44.57 / 46.10 ms/token**; fresh 8K prefill **17.731 s (462 tok/s)** | Exact archived-reference checks at 1K/8K; later defaults published, see the current snapshot |
+| GLM-5.3 Flash, EXL3 4.05 bpw, R1 | Two nodes TP2 over USB4, chat decode / R8 batch / exact 8K prefill | **45.29 ms/token (22.1 tok/s)**, **51 %** of 23.2 ms floor; batch **122.0 ms/step = 65.5 tok/s** aggregate (calculated); exact 8K prefill **17.77 s** with the current defaults (20.32 s after PR #183, earlier 34.70 s on `875ca821`) | R1 reference equal; later builds published, see the current snapshot |
 
 Standalone RTX best runs across loads (2026-10-25): code **94–95**, English **97**, Spanish **100–101 tok/s**,
 **58–63 %** of the 6.18 ms all-hit ceiling. Loads vary by up to **~10 %**; compare within one load.
@@ -146,7 +168,7 @@ question. This is not an end-to-end speedup.
 ### MiniMax latest measurements
 
 All rows: EXL3 trellis weights at 3.06 bpw, two Strix Halo nodes TP2 over USB4, greedy reference.
-The engine is Production; the newer optimization sets below are **in development, pending publication**.
+The engine is Production; these rows record earlier builds. The later sets are published; the current snapshot has their numbers.
 
 | Mode | Prompt / context | Measured result | Date | Build / exactness |
 |---|---|---|---|---|
@@ -176,8 +198,8 @@ are byte-identical. Qualification is conditional on those eight texts; the older
 
 ### GLM latest measurements
 
-EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine; newer builds below are
-**in development, pending publication**. R1b is the default decode identity; `--identity r1` restores R1.
+EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine; these rows record earlier builds, and
+the current snapshot has the later published numbers. R1b is the default decode identity; `--identity r1` restores R1.
 
 | Mode | Prompt / context | Measured | Date | Build / exactness |
 |---|---|---:|---|---|
@@ -220,22 +242,23 @@ uses MTP speculative decoding, greedy (temperature 0), thinking off, dense A8 nu
 | Prefill / time to first token, 16K | 1,089 tok/s / 15.05 s | 2026-10-22 | same | same |
 | Prefill / time to first token, 32K | 1,065 tok/s / 30.76 s | 2026-10-22 | same, `--unqualified-context` | same |
 
-These are historical 2026-10-22 rows; the overnight snapshot gives the newer exact-prefill measurements.
+These are historical rows; the current snapshot gives the newer prefill and decode measurements.
 
 ### Long context (YaRN, one node)
 
 Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
 real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
 overrides). TTFT runs from process launch to the first token and includes model load.
-The 262K prefill cell is from public main `669bcb83` (262,144-token prompt, prefill time without model load,
-`--profile default` and `--profile fast` interleaved, two pairs: 179.07 s and 174.18 s); the 262K decode cells are from
-build `7b2453fe`; the row's other cells are from the build above.
+The 262K prefill cell and the 262K serial decode cell are from public main `17b9c57b8` (262,144-token prompt, prefill
+time without model load, `--profile default`, one run: 176.60 s); the 262K MTP decode cell is from build `7b2453fe`; the
+row's other cells are from the build above. The 1M row's serial cells are from public main `fdc39faba` on Linux 7.3; its
+MTP cells and exact gate are from #288 on Linux 7.4, so the row gives no serial-to-MTP ratio.
 
 | Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
 |---|---|---|---|---|---|
-| 262,400 (2) | Full scope | 219 s / 224 s | **1,464 tok/s** `--profile default`; 1,505 tok/s `--profile fast` (`669bcb83`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
+| 262,400 (2) | Full scope | 219 s / 224 s | **1,484 tok/s** `--profile default` (`17b9c57b8`) | 21.82 (`17b9c57b8`) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
 | 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
-| 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
+| 1,048,576 (4) | Full scope (MTP against serial with the HC output and index projection WMMA paths off) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); MTP route 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
 
 These are exactness checks against serial YaRN, not native rotary; they do not establish general model
 fidelity at these lengths. See the [Qwen long-context section](models/qwen3.8/README.md#qwen-long-context).
@@ -344,7 +367,7 @@ token per node, 6.5-bit 0.0447 at 3.63 GB; paired ΔKL −0.0001.
 ## Additional measured builds
 
 Historical builds measured through 2026-10-25; each hash identifies the measured build.
-The overnight snapshot above records newer results without qualifying unmeasured combinations.
+The snapshots above record newer results without qualifying unmeasured combinations.
 Same hardware, greedy, every run exact against its reference before its time is counted.
 
 ### DeepSeek V4.1 Flash, pair
@@ -381,7 +404,7 @@ On `cab238d6` (2026-10-24), the short-set server wall aggregate at C1 / C2 / C4 
 ### MiniMax M3.1 Flash
 
 Production engine: EXL3 trellis weights at 3.06 bits per weight, two nodes, tensor parallel over USB4.
-The following rows retain their historical build; the overnight snapshot records newer measurements.
+The following rows retain their historical build; the current snapshot records newer measurements.
 
 | What | Value | Date | Build | Conditions and exactness |
 |---|---|---|---|---|
