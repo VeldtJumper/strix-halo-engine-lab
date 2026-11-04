@@ -284,6 +284,41 @@ void index_and_select(std::uint64_t last, unsigned rows, unsigned ratio, unsigne
 }
 
 // STRIX_DS41_IDX_CAND_FILTER and STRIX_DS41_IDX_DIRECT against today's path on the same inputs. Filter: the candidate
+// Selection over scores with few distinct values (levels; 1 = every score equal), so long runs of equal keys meet the
+// threshold and whole radix bins are taken: every pool mode, host == device.
+void select_ties(std::uint32_t count, unsigned rows, unsigned levels, unsigned topk, unsigned cand, unsigned bs) {
+    std::vector<std::uint64_t> pos(rows);
+    for (unsigned r = 0; r < rows; ++r) pos[r] = count - rows + r;
+    std::mt19937 gen(levels * 7919U + count);
+    std::vector<std::vector<float>> scores(rows);
+    std::vector<float> flat(std::size_t{rows} * count, 0.0F);
+    for (unsigned r = 0; r < rows; ++r) {
+        scores[r].resize(static_cast<std::size_t>(pos[r] + 1U));
+        for (std::size_t t = 0; t < scores[r].size(); ++t) {
+            scores[r][t] = static_cast<float>(gen() % levels) * 0.25F - 1.0F;
+            flat[std::size_t{r} * count + t] = scores[r][t];
+        }
+    }
+    Dev<float> dscores(flat);
+    Dev<std::uint64_t> dpos(pos);
+    const std::uint32_t nb = (count + bs - 1) / bs;
+    Dev<std::uint8_t> dcand(std::size_t{rows} * nb);
+    Dev<std::uint32_t> dkeys(std::size_t{rows} * count), didx(std::size_t{rows} * topk), dcnt(rows);
+    std::vector<std::vector<std::uint8_t>> cands(rows, std::vector<std::uint8_t>(nb, 0));
+    for (const auto pool : {a::Pool::candidate_source, a::Pool::candidate_user, a::Pool::plain}) {
+        g::enqueue_select(g::SelectView{rows, 1, count, topk, cand, bs, pool, dpos.p, dscores.p, dcand.p, dkeys.p, didx.p, dcnt.p}, nullptr);
+        check(hipDeviceSynchronize());
+        const auto di = didx.get(), dc = dcnt.get();
+        bool ok = true;
+        for (unsigned r = 0; r < rows; ++r) {
+            const auto mine = a::select_topk(scores[r], pool, cands[r], topk, cand, bs);
+            ok = ok && dc[r] == mine.size() && std::equal(mine.begin(), mine.end(), &di[std::size_t{r} * topk]);
+        }
+        expect(ok, "select ties pool " + std::to_string(static_cast<int>(pool)) + " levels " + std::to_string(levels) + " count " + std::to_string(count));
+    }
+    std::printf("select with ties: count %u rows %u levels %u topk %u: host == device\n", count, rows, levels, topk);
+}
+
 // user's scores over a poisoned buffer (NaN bytes) with the source's pool, then select == the unfiltered selection, and
 // every candidate position's score == the unfiltered one. Direct (count <= topk): idx, counts and pool bytes == select.
 void index_filter_direct(std::uint64_t last, unsigned rows, unsigned ratio, unsigned topk, unsigned cand, unsigned bs, bool bench) {
@@ -1250,6 +1285,11 @@ int main() {
         index_filter_direct(4000, 2, 1, 64, 8, 8, false);                                        // filter, small pool
         index_filter_direct(9000, 3, 1, 64, 8, 8, false);                                        // filter, small pool, two-level
         index_filter_direct(50, 5, 1, 64, 8, 8, false);                                          // direct, small pool
+        for (const unsigned levels : {1U, 2U, 7U, 300U}) {                                     // equal keys at the threshold
+            select_ties(3000, 2, levels, a::kTopK, a::kCandBlocks, a::kCandBlockSize);          // one block
+            select_ties(40000, 3, levels, a::kTopK, a::kCandBlocks, a::kCandBlockSize);         // two-level selection
+            select_ties(9000, 2, levels, 64, 8, 8);                                             // two-level, small pool
+        }
         attention(5, 1, 0, false);       // window only, partial window
         attention(1000, 3, 0, false);
         attention(1000, 1, 300, false);

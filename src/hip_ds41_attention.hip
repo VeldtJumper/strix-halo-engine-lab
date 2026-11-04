@@ -503,10 +503,91 @@ __device__ unsigned block_exclusive_scan(unsigned x, unsigned* warp_tot, unsigne
     return r;
 }
 // Threshold T (the k-th largest key) and how many keys equal to T are taken (need); requires n > k. Per-wave
-// histograms (integer counts, so the result does not depend on the order of the adds); wave 0 scans the 256 bins
-// from the top, 8 per lane, with a lane prefix scan.
+// histograms (integer counts, so the result does not depend on the order of the adds), merged into one total per bin by
+// 256 threads in parallel (each sums its bin over the waves); wave 0 scans the 256 totals from the top, 8 per lane,
+// with a lane prefix scan. A bin taken whole ends the search early: every key of the bin and above is taken and every
+// key below it is not, so T = (the bin's lowest key) - 1 with need 0 selects the same keys (the k-th largest key's
+// equals are all in the bin, so the rule "key > T, then the first need keys equal to T" picks them all either way).
 constexpr unsigned kSelWaves = kSelThreads / 32;
 __device__ void radix_threshold(const std::uint32_t* keys, std::uint32_t n, std::uint32_t k, unsigned (*hist)[256],
+    std::uint32_t& thr, std::uint32_t& need) {
+    __shared__ std::uint32_t prefix_s, rem_s, done_s, total[256];
+    const unsigned lane = threadIdx.x & 31U, w = threadIdx.x >> 5U;
+    std::uint32_t prefix = 0, mask = 0, rem = k;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (unsigned b = lane; b < 256U; b += 32U) hist[w][b] = 0;
+        __syncthreads();
+        for (std::uint32_t i = threadIdx.x; i < n; i += kSelThreads) {
+            const std::uint32_t key = keys[i];
+            if ((key & mask) == prefix) atomicAdd(&hist[w][(key >> shift) & 255U], 1U);
+        }
+        __syncthreads();
+        if (threadIdx.x < 256U) {
+            unsigned c = 0;
+            for (unsigned ww = 0; ww < kSelWaves; ++ww) c += hist[ww][threadIdx.x];
+            total[threadIdx.x] = c;
+        }
+        __syncthreads();
+        if (w == 0U) {
+            unsigned cnt[8], local = 0;   // lane owns bins 255 - 8 lane - i, i = 0..7 (descending)
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                cnt[i] = total[255U - 8U * lane - i];
+                local += cnt[i];
+            }
+            unsigned incl = local;
+#pragma unroll
+            for (int d = 1; d < 32; d *= 2) {
+                const unsigned y = __shfl_up(incl, static_cast<unsigned>(d), 32);
+                if (lane >= static_cast<unsigned>(d)) incl += y;
+            }
+            const unsigned before = incl - local;
+            if (before < rem && incl >= rem) {   // exactly one lane
+                unsigned cum = before, i = 0;
+                while (cum + cnt[i] < rem) { cum += cnt[i]; ++i; }
+                const std::uint32_t low = prefix | ((255U - 8U * lane - i) << shift);
+                const bool whole = cnt[i] == rem - cum && low != 0U;
+                prefix_s = whole ? low - 1U : low;
+                rem_s = whole ? 0U : rem - cum;
+                done_s = whole ? 1U : 0U;
+            }
+        }
+        __syncthreads();
+        prefix = prefix_s; rem = rem_s;
+        const bool done = done_s != 0U;
+        mask |= 255U << shift;
+        __syncthreads();
+        if (done) break;
+    }
+    thr = prefix; need = rem;
+}
+// Visits keys in index order; f(i, selected, out_index) for every i < n. One block scan per chunk counts the keys above
+// T (low 16 bits) and equal to T (high 16 bits; a chunk has at most kSelThreads of each): the selected keys before i are
+// those above T plus the equal ones whose rank among the equals is below need.
+template <class F>
+__device__ void ordered_select(const std::uint32_t* keys, std::uint32_t n, std::uint32_t thr, std::uint32_t need,
+    unsigned* warp_tot, F f) {
+    static_assert(kSelThreads < 65536U, "packed counts");
+    std::uint32_t eq_carry = 0, out_carry = 0;
+    for (std::uint32_t base = 0; base < n; base += kSelThreads) {
+        const std::uint32_t i = base + threadIdx.x;
+        const std::uint32_t key = i < n ? keys[i] : 0U;
+        const unsigned gt = i < n && key > thr ? 1U : 0U, eq = i < n && key == thr ? 1U : 0U;
+        unsigned total;
+        const unsigned ex = block_exclusive_scan(gt | eq << 16U, warp_tot, total);
+        const std::uint32_t eq_rank = eq_carry + (ex >> 16U), taken = min(eq_carry, need);
+        const unsigned sel = gt != 0U || (eq != 0U && eq_rank < need) ? 1U : 0U;
+        const unsigned out = out_carry + (ex & 0xFFFFU) + (min(eq_rank, need) - taken);
+        if (i < n) f(i, sel != 0U, out);
+        const std::uint32_t eq_next = eq_carry + (total >> 16U);
+        out_carry += (total & 0xFFFFU) + (min(eq_next, need) - taken);
+        eq_carry = eq_next;
+    }
+}
+
+// STRIX_DS41_SELECT_V1=1 (the <true> instantiations of the select kernels): the selection before the parallel histogram merge, the packed scan and
+// the whole-bin end (same thresholds, same selected positions in the same order).
+__device__ void radix_threshold_v1(const std::uint32_t* keys, std::uint32_t n, std::uint32_t k, unsigned (*hist)[256],
     std::uint32_t& thr, std::uint32_t& need) {
     __shared__ std::uint32_t prefix_s, rem_s;
     const unsigned lane = threadIdx.x & 31U, w = threadIdx.x >> 5U;
@@ -551,7 +632,7 @@ __device__ void radix_threshold(const std::uint32_t* keys, std::uint32_t n, std:
 }
 // Visits keys in index order; f(i, selected, out_index) for every i < n.
 template <class F>
-__device__ void ordered_select(const std::uint32_t* keys, std::uint32_t n, std::uint32_t thr, std::uint32_t need,
+__device__ void ordered_select_v1(const std::uint32_t* keys, std::uint32_t n, std::uint32_t thr, std::uint32_t need,
     unsigned* warp_tot, F f) {
     std::uint32_t eq_carry = 0, out_carry = 0;
     for (std::uint32_t base = 0; base < n; base += kSelThreads) {
@@ -568,6 +649,19 @@ __device__ void ordered_select(const std::uint32_t* keys, std::uint32_t n, std::
     }
 }
 
+template <bool Legacy>
+__device__ __forceinline__ void select_threshold(const std::uint32_t* keys, std::uint32_t n, std::uint32_t k, unsigned (*hist)[256],
+    std::uint32_t& thr, std::uint32_t& need) {
+    if constexpr (Legacy) radix_threshold_v1(keys, n, k, hist, thr, need);
+    else radix_threshold(keys, n, k, hist, thr, need);
+}
+template <bool Legacy, class F>
+__device__ __forceinline__ void select_ordered(const std::uint32_t* keys, std::uint32_t n, std::uint32_t thr, std::uint32_t need,
+    unsigned* warp_tot, F f) {
+    if constexpr (Legacy) ordered_select_v1(keys, n, thr, need, warp_tot, f);
+    else ordered_select(keys, n, thr, need, warp_tot, f);
+}
+template <bool Legacy>
 __device__ __forceinline__ void select_core(const SelectView& v, const uint3 bid, unsigned (*hist)[256], unsigned* warp_tot) {
     const unsigned r = bid.x;
     const std::uint32_t n = static_cast<std::uint32_t>((v.pos[r] + 1U) / v.ratio);
@@ -588,8 +682,8 @@ __device__ __forceinline__ void select_core(const SelectView& v, const uint3 bid
             for (std::uint32_t b = threadIdx.x; b < nb; b += kSelThreads) cand[b] = keys[b] > ninf_key ? 1U : 0U;
         } else {
             std::uint32_t thr, need;
-            radix_threshold(keys, nb, v.cand_blocks, hist, thr, need);
-            ordered_select(keys, nb, thr, need, warp_tot, [&](std::uint32_t b, bool s, unsigned) {
+            select_threshold<Legacy>(keys, nb, v.cand_blocks, hist, thr, need);
+            select_ordered<Legacy>(keys, nb, thr, need, warp_tot, [&](std::uint32_t b, bool s, unsigned) {
                 cand[b] = s && keys[b] > ninf_key ? 1U : 0U;
             });
         }
@@ -605,15 +699,16 @@ __device__ __forceinline__ void select_core(const SelectView& v, const uint3 bid
         return;
     }
     std::uint32_t thr, need;
-    radix_threshold(keys, n, v.topk, hist, thr, need);
-    ordered_select(keys, n, thr, need, warp_tot, [&](std::uint32_t t, bool s, unsigned out) { if (s) idx[out] = t; });
+    select_threshold<Legacy>(keys, n, v.topk, hist, thr, need);
+    select_ordered<Legacy>(keys, n, thr, need, warp_tot, [&](std::uint32_t t, bool s, unsigned out) { if (s) idx[out] = t; });
     if (threadIdx.x == 0U) v.idx_count[r] = v.topk;
 }
+template <bool Legacy>
 __device__ __forceinline__ void select_body(const SelectView& v, const uint3 bid) {
     DS41_TIMED(4U);
     __shared__ unsigned hist[kSelWaves][256];
     __shared__ unsigned warp_tot[33];
-    select_core(v, bid, hist, warp_tot);
+    select_core<Legacy>(v, bid, hist, warp_tot);
 }
 // Two-level selection for long rows (max_count > kSelSlice). Level one, one block per slice of 4096 positions: the
 // slice's keys in LDS, its own top-k (same rule: key, then the smaller position) written in position order and
@@ -635,6 +730,7 @@ __device__ __forceinline__ SelScratch sel_scratch(const SelectView& v, unsigned 
 // over the survivors (keys, then positions in order) gives today's result. The slice records its candidate count and
 // whether a candidate key is at or below -inf's (in the block-maximum scratch, unused by users); the merge checks both and
 // otherwise runs today's one-block selection over the whole row.
+template <bool Legacy>
 __device__ void select_slice_compact(const SelectView& v, unsigned s, std::uint32_t n, std::uint32_t t0, std::uint32_t m,
     const float* scores, const std::uint8_t* cand, const SelScratch& sc, std::uint32_t* skeys, unsigned (*hist)[256], unsigned* warp_tot) {
     __shared__ std::uint32_t boff[kSelSlice / 8U];
@@ -665,11 +761,12 @@ __device__ void select_slice_compact(const SelectView& v, unsigned s, std::uint3
         return;
     }
     std::uint32_t thr, need;
-    radix_threshold(skeys, ms, v.topk, hist, thr, need);
-    ordered_select(skeys, ms, thr, need, warp_tot, [&](std::uint32_t i, bool sel, unsigned out) {
+    select_threshold<Legacy>(skeys, ms, v.topk, hist, thr, need);
+    select_ordered<Legacy>(skeys, ms, thr, need, warp_tot, [&](std::uint32_t i, bool sel, unsigned out) {
         if (sel) { ok[out] = skeys[i]; op[out] = position(i); }
     });
 }
+template <bool Legacy>
 __device__ __forceinline__ void select_slice_body(const SelectView& v, const uint3 bid) {
     DS41_TIMED(4U);
     __shared__ unsigned hist[kSelWaves][256];
@@ -684,7 +781,7 @@ __device__ __forceinline__ void select_slice_body(const SelectView& v, const uin
     const SelScratch sc = sel_scratch(v, r);
     const float ninf = -__builtin_inff();
     if (v.compact && v.pool == Pool::candidate_user) {
-        select_slice_compact(v, s, n, t0, m, scores, cand, sc, skeys, hist, warp_tot);
+        select_slice_compact<Legacy>(v, s, n, t0, m, scores, cand, sc, skeys, hist, warp_tot);
         return;
     }
     for (std::uint32_t i = threadIdx.x; i < m; i += kSelThreads) {
@@ -708,13 +805,14 @@ __device__ __forceinline__ void select_slice_body(const SelectView& v, const uin
         return;
     }
     std::uint32_t thr, need;
-    radix_threshold(skeys, m, v.topk, hist, thr, need);
-    ordered_select(skeys, m, thr, need, warp_tot, [&](std::uint32_t i, bool sel, unsigned out) {
+    select_threshold<Legacy>(skeys, m, v.topk, hist, thr, need);
+    select_ordered<Legacy>(skeys, m, thr, need, warp_tot, [&](std::uint32_t i, bool sel, unsigned out) {
         if (sel) { ok[out] = skeys[i]; op[out] = t0 + i; }
     });
 }
 // Level two: block 0 of a row selects the top-k among the survivors; block 1 (candidate source only) the candidate
 // blocks among the block maxima.
+template <bool Legacy>
 __device__ __forceinline__ void select_merge_body(const SelectView& v, const uint3 bid) {
     DS41_TIMED(4U);
     __shared__ unsigned hist[kSelWaves][256];
@@ -731,8 +829,8 @@ __device__ __forceinline__ void select_merge_body(const SelectView& v, const uin
             return;
         }
         std::uint32_t thr, need;
-        radix_threshold(sc.bmax, nb, v.cand_blocks, hist, thr, need);
-        ordered_select(sc.bmax, nb, thr, need, warp_tot, [&](std::uint32_t b, bool s, unsigned) {
+        select_threshold<Legacy>(sc.bmax, nb, v.cand_blocks, hist, thr, need);
+        select_ordered<Legacy>(sc.bmax, nb, thr, need, warp_tot, [&](std::uint32_t b, bool s, unsigned) {
             cand[b] = s && sc.bmax[b] > ninf_key ? 1U : 0U;
         });
         return;
@@ -749,14 +847,14 @@ __device__ __forceinline__ void select_merge_body(const SelectView& v, const uin
         unsigned all_cnt;
         (void)block_exclusive_scan(cnt, warp_tot, all_cnt);
         if (__syncthreads_or(static_cast<int>(bad)) != 0 || all_cnt <= v.topk) {
-            select_core(v, make_uint3(r, 0U, 0U), hist, warp_tot);
+            select_core<Legacy>(v, make_uint3(r, 0U, 0U), hist, warp_tot);
             return;
         }
     }
     const std::uint32_t total = ((n + kSelSlice - 1) / kSelSlice) * v.topk;
     std::uint32_t thr, need;
-    radix_threshold(sc.keys, total, v.topk, hist, thr, need);
-    ordered_select(sc.keys, total, thr, need, warp_tot, [&](std::uint32_t i, bool s, unsigned out) { if (s) idx[out] = sc.pos[i]; });
+    select_threshold<Legacy>(sc.keys, total, v.topk, hist, thr, need);
+    select_ordered<Legacy>(sc.keys, total, thr, need, warp_tot, [&](std::uint32_t i, bool s, unsigned out) { if (s) idx[out] = sc.pos[i]; });
     if (threadIdx.x == 0U) v.idx_count[r] = v.topk;
 }
 
@@ -1612,23 +1710,29 @@ __global__ __launch_bounds__(256) void index_scores_seg_kernel(SegmentLaunch<Ind
     const uint3 b = segment_block(s, k);
     index_scores_body(s.v[k], b);
 }
-__global__ __launch_bounds__(kSelThreads) void select_kernel(SelectView v) { select_body(v, own_block()); }
+template <bool Legacy>
+__global__ __launch_bounds__(kSelThreads) void select_kernel(SelectView v) { select_body<Legacy>(v, own_block()); }
+template <bool Legacy>
 __global__ __launch_bounds__(kSelThreads) void select_seg_kernel(SegmentLaunch<SelectView> s) {
     unsigned k;
     const uint3 b = segment_block(s, k);
-    select_body(s.v[k], b);
+    select_body<Legacy>(s.v[k], b);
 }
-__global__ __launch_bounds__(kSelThreads) void select_slice_kernel(SelectView v) { select_slice_body(v, own_block()); }
+template <bool Legacy>
+__global__ __launch_bounds__(kSelThreads) void select_slice_kernel(SelectView v) { select_slice_body<Legacy>(v, own_block()); }
+template <bool Legacy>
 __global__ __launch_bounds__(kSelThreads) void select_slice_seg_kernel(SegmentLaunch<SelectView> s) {
     unsigned k;
     const uint3 b = segment_block(s, k);
-    select_slice_body(s.v[k], b);
+    select_slice_body<Legacy>(s.v[k], b);
 }
-__global__ __launch_bounds__(kSelThreads) void select_merge_kernel(SelectView v) { select_merge_body(v, own_block()); }
+template <bool Legacy>
+__global__ __launch_bounds__(kSelThreads) void select_merge_kernel(SelectView v) { select_merge_body<Legacy>(v, own_block()); }
+template <bool Legacy>
 __global__ __launch_bounds__(kSelThreads) void select_merge_seg_kernel(SegmentLaunch<SelectView> s) {
     unsigned k;
     const uint3 b = segment_block(s, k);
-    select_merge_body(s.v[k], b);
+    select_merge_body<Legacy>(s.v[k], b);
 }
 __global__ __launch_bounds__(256) void select_direct_kernel(SelectView v) { select_direct_body(v, own_block()); }
 __global__ __launch_bounds__(256) void select_direct_seg_kernel(SegmentLaunch<SelectView> s) {
@@ -1735,15 +1839,24 @@ static unsigned select_slices(const SelectView& v) {
     return static_cast<unsigned>(slices);
 }
 static dim3 select_merge_grid(const SelectView& v) { return dim3(v.pool == Pool::candidate_source ? 2U : 1U, v.rows); }
-void enqueue_select(const SelectView& v, hipStream_t stream) {
+bool select_v1() {
+    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_SELECT_V1"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+template <bool Legacy>
+void launch_select(const SelectView& v, hipStream_t stream) {
     const unsigned slices = select_slices(v);
     if (slices == 0U) {
-        hipLaunchKernelGGL(select_kernel, dim3(v.rows), dim3(kSelThreads), 0, stream, v);
+        hipLaunchKernelGGL(select_kernel<Legacy>, dim3(v.rows), dim3(kSelThreads), 0, stream, v);
     } else {
-        hipLaunchKernelGGL(select_slice_kernel, dim3(slices, v.rows), dim3(kSelThreads), 0, stream, v);
-        hipLaunchKernelGGL(select_merge_kernel, select_merge_grid(v), dim3(kSelThreads), 0, stream, v);
+        hipLaunchKernelGGL(select_slice_kernel<Legacy>, dim3(slices, v.rows), dim3(kSelThreads), 0, stream, v);
+        hipLaunchKernelGGL(select_merge_kernel<Legacy>, select_merge_grid(v), dim3(kSelThreads), 0, stream, v);
     }
     check(hipGetLastError(), "ds41 select");
+}
+void enqueue_select(const SelectView& v, hipStream_t stream) {
+    if (select_v1()) launch_select<true>(v, stream);
+    else launch_select<false>(v, stream);
 }
 namespace {
 int index_candidate_filter_mode = -1, index_direct_mode = -1, attention_segment_hpw_mode = -1;
@@ -1955,18 +2068,23 @@ void enqueue_select_direct_segments(std::span<const SelectView> views, hipStream
     }, [](const SelectView& v) { return dim3(v.rows); });
     check(hipGetLastError(), "ds41 select direct (segments)");
 }
-void enqueue_select_segments(std::span<const SelectView> views, hipStream_t stream) {
+template <bool Legacy>
+void launch_select_segments(std::span<const SelectView> views, hipStream_t stream) {
     for (const auto& v : views) (void)select_slices(v);
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
-        hipLaunchKernelGGL(select_seg_kernel, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+        hipLaunchKernelGGL(select_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
     }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(v.rows) : dim3(0); });
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
-        hipLaunchKernelGGL(select_slice_seg_kernel, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+        hipLaunchKernelGGL(select_slice_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
     }, [](const SelectView& v) { const unsigned s = select_slices(v); return s == 0U ? dim3(0) : dim3(s, v.rows); });
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
-        hipLaunchKernelGGL(select_merge_seg_kernel, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+        hipLaunchKernelGGL(select_merge_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
     }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(0) : select_merge_grid(v); });
     check(hipGetLastError(), "ds41 select (segments)");
+}
+void enqueue_select_segments(std::span<const SelectView> views, hipStream_t stream) {
+    if (select_v1()) launch_select_segments<true>(views, stream);
+    else launch_select_segments<false>(views, stream);
 }
 // STRIX_DS41_ATTN_SEG_HPW: one form for every segment, attention_hpw's rule over the blocks of all of them (0: off)
 static unsigned shared_segment_hpw(std::span<const AttentionView> views) {
