@@ -48,12 +48,13 @@ public:
                 "STRIX_G4_KV_POOL","STRIX_G4_OUTPUT_TILE","STRIX_G4_KV_PUBLISH",
                 "STRIX_G4_LINEAR_FINITE","STRIX_G4_NORM_PREFETCH","STRIX_G4_NORM_FINITE",
                 "STRIX_G4_EXL3_OUTPUT_TILE","STRIX_G4_EXL3_COLUMN_CACHE",
-                "STRIX_G4_PREFILL_EXACT_MANYROW","STRIX_G4_ATTN_KV_SHARED","STRIX_G4_EXL3_FFN_FUSE"}) switches.set(name,enabled(name));
+                "STRIX_G4_PREFILL_EXACT_MANYROW","STRIX_G4_ATTN_KV_SHARED","STRIX_G4_EXL3_FFN_FUSE",
+                "STRIX_G4_EXL3_COOP_SADDR","STRIX_G4_EXL3_INPUT_PRELOAD","STRIX_G4_EXL3_HASH16"}) switches.set(name,enabled(name));
         const auto* tiling = std::getenv("STRIX_G4_OUTPUT_TILE");
         switches.set("STRIX_G4_OUTPUT_TILE",enabled("STRIX_G4_CHUNK_DECODE") && tiling && std::string(tiling) == "1");
         switches.set("STRIX_G4_HOST_PARALLEL","not used by device target or device drafter");
         const auto* depth = std::getenv("STRIX_G4_EXL3_COOP_DEPTH");
-        switches.set("STRIX_G4_EXL3_COOP_DEPTH",std::string(depth && *depth ? depth : "4"));
+        switches.set("STRIX_G4_EXL3_COOP_DEPTH",std::string(depth && *depth ? depth : "auto"));
         metadata_.set("off_switches",switches);
         // Prompt prefill: exact or a8 many-row chunks match their decode linears;
         // EXL3 packs keep their identity's core order.

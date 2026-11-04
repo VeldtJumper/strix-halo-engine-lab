@@ -87,11 +87,22 @@ the bytes equal the pack's own 64x64 WMMA kernel (`STRIX_G4_EXL3_PREFILL_GEMM=0`
 restores it). The FFN keeps raw gate/up GEMM values and forms the middle stage
 above into down's input panels in one launch (`STRIX_G4_PREFILL_FUSE_FFN=0` runs
 the separate linears). `strix-gemma4-exl3-panels-tests` compares both by memcmp.
-Decode cores (rows <= 8) keep four chunks of raw trellis words in flight per
-wave and align each chunk's window only when it is consumed (the single-chunk
-core was latency-bound); chunks are consumed in the same order with the same
-arithmetic, so the bytes are unchanged (`STRIX_G4_EXL3_COOP_DEPTH=1` restores one
-chunk, `2` keeps two).
+Decode cores (rows <= 8) keep raw trellis words of several chunks in flight per
+wave (eight for 4-bit tiles at one or two rows, four elsewhere) and align each
+chunk's window only when it is consumed; chunks are consumed in the same order
+with the same arithmetic, so the bytes are unchanged
+(`STRIX_G4_EXL3_COOP_DEPTH=1|2|4|8` forces one depth; 8 falls back to the
+largest dividing 4, 2 or 1). Tile words and activation pairs are loaded from a
+wave-uniform scalar base plus a 32-bit lane offset (`STRIX_G4_EXL3_COOP_SADDR=0`
+restores per-lane 64-bit addresses; the opt-in fused core keeps them), and the
+codebook product `s * 0x83dcd12d` is formed (up to four rows) from two full-rate
+16-bit multiplies with the byte sum by `v_sad_u8` instead of the quarter-rate
+32-bit multiply and the byte dot product (`STRIX_G4_EXL3_HASH16=0`, also implied
+by `STRIX_G4_EXL3_COOP_SADDR=0`; same product and sum for all 16-bit states, and
+the operator bench compares all 65,536 codebook values). Input transforms and
+the FFN middle stage issue all their activation and scale loads before the first
+FP32 rounding boundary (`STRIX_G4_EXL3_INPUT_PRELOAD=0` restores the interleaved
+order; same values and boundaries).
 
 The engine selects this identity with `STRIX_G4_EXL3_PREFILL=wmma` (profile row
 `exl3_prefill`, pending in QUALITY until its qualification receipt; the panels
