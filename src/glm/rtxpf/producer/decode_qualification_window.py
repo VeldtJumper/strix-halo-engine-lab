@@ -400,6 +400,8 @@ def service_command(a, binary):
                             ('--tier-spare-slots', getattr(a, 'tier_spare_slots', None)),
                             ('--restore-decode-residency', getattr(a, 'restore_decode_residency', None)),
                             ('--prefill-overlap', getattr(a, 'prefill_overlap', None)),
+                            ('--prefill-profile', getattr(a, 'prefill_profile', None)),
+                            ('--prefill-clean-evict', getattr(a, 'prefill_clean_evict', None)),
                             ('--tier-policy', getattr(a, 'tier_policy', None)),
                             ('--tier-predict', getattr(a, 'tier_predict', None)),
                             ('--tier-flush-ready', getattr(a, 'tier_flush_ready', None)),
@@ -1437,7 +1439,7 @@ def worker_options(a):
     """Every run option the worker re-parses: caps, tiers, placement, the startup tile,
     the fitted tile sweep (and the note of an arm the parent dropped)."""
     argv = []
-    for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency', 'prefill_overlap',
+    for name in ('capacity', 'vram_total_gib', 'ram_total_gib', 'tier_vram_gib', 'tier_ram_gib', 'tier_spare_percent', 'tier_spare_slots', 'restore_decode_residency', 'prefill_overlap', 'prefill_profile', 'prefill_clean_evict',
                  'tier_policy', 'tier_predict', 'tier_flush_ready', 'skip_empty_expert_groups', 'persistent_dense_fp16', 'decode_row_kernels', 'mtp_self_spec', 'spec_lookup', 'expert_residency', 'expert_routes', 'routes_out', 'routes_prefill', 'row_tile', 'profile', 'prefill_tile_crossover',
                  'weight_dirs', 'drive_readers', 'tier_staging', 'tier_disk_queue', 'tier_clean_evict', 'disk_prefetch',
                  'tier_landing_blocks', 'tier_landing_max_queued', 'tier_landing_ttl', 'tier_landing_chunk'):
@@ -1553,6 +1555,11 @@ def arguments(argv=None):
     p.add_argument('--prefill-overlap', choices=['0', '1'], help='prefill through the cache: make the next routed layer resident while '
                    'the kernels of the current layer run (two layers held, no token; off when the arena cannot keep two layers; '
                    'exact; default 1 = profile row; 0 = off)')
+    p.add_argument('--prefill-clean-evict', choices=['0', '1'], help='service: clean eviction during a three-tier prefill '
+                   '(victims go to their file, no write-back; the open setting again for decode; same bytes; default 1)')
+    p.add_argument('--prefill-profile', choices=['0', '1'], help='service: per-layer/phase prefill timeline and routed-MoE '
+                   'group split in each prefill receipt (prefill_timings.prefill_timeline; CUDA graphs off for profiled '
+                   'prefills; events only, same bytes; default off)')
     p.add_argument('--tier-policy', choices=['lru', 'scored', 'auto'], help='boundary victims (default auto = SCORED_AUTO)')
     p.add_argument('--tier-predict', choices=['0', '1'], help='overlapped next-layer prefetch (default 0)')
     p.add_argument('--tier-flush-ready', choices=['0', '1'], help='flush the cache demand stream after each ready signal (WDDM submission; default 1 = profile row flush_ready)')
@@ -1590,8 +1597,9 @@ def arguments(argv=None):
                    '(glm_unit_file plan --stripe); file-tier misses and make_resident read every drive (default: the primary only)')
     p.add_argument('--tier-staging', type=int, choices=range(1, 65), metavar='1..64',
                    help='service: three-tier file staging buffers (pinned; one per read in flight)')
-    p.add_argument('--tier-disk-queue', type=int, choices=range(1, 65), metavar='1..64',
-                   help='service: three-tier file reads in flight (<= --tier-staging; default 1 = one at a time)')
+    p.add_argument('--tier-disk-queue', choices=['auto'] + [str(n) for n in range(1, 65)], metavar='auto|1..64',
+                   help='service: three-tier file reads in flight (<= --tier-staging; default 1 = one at a time; auto = '
+                        '4 / 6 / 8 for 1 / 2 / 3+ read locations when the plan has a file tier)')
     p.add_argument('--disk-prefetch', choices=['0', '1'],
                    help='service: three-tier predicted units homed on the file are read ahead (dg_disk_prefetch; with --tier-predict 1)')
     p.add_argument('--tier-clean-evict', choices=['0', '1'],

@@ -119,6 +119,8 @@ public:
     // the open-time target back. false = unsupported (the caller keeps today's behaviour).
     virtual bool lower_spare_target(unsigned){return false;}
     virtual void restore_spare_target(){}
+    // Between tokens: clean eviction on / off (ss_dg_set_clean_evict; placement only). false = unsupported.
+    virtual bool set_clean_evict(bool){return false;}
     // Overlapped next-layer prefetch (ss_dg_enqueue_predict): with n > 0, every
     // export of a gated layer g < through promises n predicted ids of g + 1, and
     // enqueue_predict(g) hands them over on a side stream joined before g+1's export.
@@ -153,6 +155,8 @@ struct TierBudgetIn {
     // The library's per-reader bounce buffers beyond its own one: with dg_disk_queue > 1 each
     // disk reader holds one (up to a unit's covering read), billed to pinned host memory.
     std::uint32_t disk_readers=0;
+    // --tier-disk-queue auto: readers billed as above only when the plan is three-tier (0 = none).
+    std::uint32_t disk_readers_auto=0;
     // The library's landing blocks (dg_landing_blocks): pinned, one host stride each, outside the
     // pinned tier; billed whenever requested (the library allocates them only with a file tier).
     std::uint32_t landing_blocks=0;
@@ -511,6 +515,39 @@ public:
         if(!lowered_)return;lowered_=0;std::string why;
         try{api.restore_spare_target();}catch(const std::exception& e){why=e.what();}catch(...){why="non-standard exception";}
         if(why.empty())return;const std::string m="spare target restore: "+why;site.retire(m);if(rethrow)throw std::runtime_error(m);}
+};
+// Prefill clean eviction (DecodeOptions::prefill_clean_evict), by phase: a three-tier prefill sweeps every expert
+// through the arena, so a decode resident it displaces would be copied back to a pinned block, pushing a pinned unit
+// to the file that the sweep then reads again. With clean eviction the victim goes to its file (it holds the bytes)
+// and no pinned unit moves. Turned on for the prefill only when the open did not turn it on, and the open's setting
+// is put back at the prefill's end or abort (decode keeps its own measured setting). Placement only: same bytes.
+class PrefillCleanEvict {
+    bool on_=false;
+public:
+    bool on()const{return on_;}
+    // true = turned on for this prefill. A cache without the call (or a throwing call: why = its error) keeps the
+    // open's setting; a failing reset after a failed call retires the worker and throws.
+    bool begin(TierCacheApi& api,CacheTokenSite& site,bool want,bool open_on,bool three_tier,std::string& why){
+        why.clear();
+        if(!want||open_on||!three_tier||on_)return false;
+        try{if(!api.set_clean_evict(true))return false;}
+        catch(const std::exception& e){why=e.what();}catch(...){why="non-standard exception";}
+        if(!why.empty()){try{api.set_clean_evict(false);}catch(...){const std::string m="clean evict reset after a failed set ("+why+")";site.retire(m);throw std::runtime_error(m);}
+            return false;}
+        on_=true;return true;}
+    // The open's setting (off) again. A failure retires the worker; with rethrow (a prefill's normal end) the
+    // request fails too, the abort path keeps its original error.
+    void restore(TierCacheApi& api,CacheTokenSite& site,bool rethrow){
+        if(!on_)return;on_=false;std::string why;
+        try{api.set_clean_evict(false);}catch(const std::exception& e){why=e.what();}catch(...){why="non-standard exception";}
+        if(why.empty())return;const std::string m="clean evict restore: "+why;site.retire(m);if(rethrow)throw std::runtime_error(m);}
+    // The receipt note: the setting the prefill actually ran with (a two-tier plan has no file tier, so none applies).
+    static std::string note(bool want,bool open_on,bool three_tier,bool turned_on,const std::string& why){
+        if(!three_tier)return "off: two-tier plan (no file tier)";
+        if(open_on)return "on: the open's own setting (--tier-clean-evict 1)";
+        if(turned_on)return "on: victims of this prefill with no free pinned block go to their file (no write-back); the open's setting again after it";
+        if(!want)return "off: option";
+        return why.empty()?"off: cache without the call":"off: set failed ("+why+")";}
 };
 // Opt-in prefill overlap (DecodeOptions::prefill_overlap), the library's held-layer contract: a layer
 // held by make_resident runs its kernels with NO token (slots from the device table only; held sets

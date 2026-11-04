@@ -2369,6 +2369,28 @@
     "doc_anchor": "docs/optimizations.md#glm-identity"
   },
   {
+    "engine": "glm-rtx",
+    "name": "RTX prefill clean eviction",
+    "flag_or_env": "--prefill-clean-evict",
+    "default": "ON",
+    "exact": "Prefill state, tokens and logits bitwise equal on and off; 16 TTFT repeats bitwise equal across four alternating loads.",
+    "gain": "Full card 8K TTFT 14.9 \u2192 12.7 s / 13.2 \u2192 11.6 s first / second request (off \u2192 on, \u221215 % / \u221212 %), 32K tie; unit-file reads \u221260 %",
+    "preconditions": "glm_native_service three-tier open with prefill through the tierstream cache.",
+    "off_switch": "--prefill-clean-evict 0",
+    "doc_anchor": "docs/optimizations.md#glm-rtx-prefill-clean-evict"
+  },
+  {
+    "engine": "glm-rtx",
+    "name": "RTX file reads in flight",
+    "flag_or_env": "--tier-disk-queue",
+    "default": "1 (auto opt-in)",
+    "exact": "Same output bytes (tokens, logits, state) at any queue.",
+    "gain": "Preliminary: auto vs 1, 24 GiB VRAM + 32 GiB RAM, one drive: decode +11.9 % / +9.6 % 1K cold / warm, +18.8 % 8K cold, -3.4 % 8K warm (not settled)",
+    "preconditions": "Three-tier open that reads units from the unit file; reader buffers billed to pinned host memory.",
+    "off_switch": "--tier-disk-queue 1",
+    "doc_anchor": "docs/optimizations.md#glm-rtx-disk-queue"
+  },
+  {
     "engine": "qwen",
     "name": "Router selection",
     "flag_or_env": "STRIX_PREFILL_ROUTER_SELECT",

@@ -136,6 +136,11 @@ weight tile straight into tensor-core fragments and keep the pinned GEMMs' accum
 Prefill overlap is on by default: while one layer's kernels run, the next layer's experts are made resident. Prefill
 state, tokens and logits are bitwise equal with it off. In same-window comparisons it cuts TTFT to 0.56× (8K) and 0.66×
 (32K) of the overlap-off time on the full card. Turn it off with `--prefill-overlap 0`.
+Prefill clean eviction is on by default: a decode resident the prefill displaces while no pinned block is free goes
+back to the unit file instead of pushing a pinned unit out. On the full card it cuts 8K TTFT by 15 % / 12 % (first /
+second request), ties at 32K and reads 60 % fewer unit-file bytes, bitwise equal. Turn it off with
+`--prefill-clean-evict 0`. More file reads in flight (`--tier-disk-queue auto`) stay opt-in until a per-step choice
+is measured.
 With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on disk) it also runs exact: TTFT
 **60.3 s** at 1K and **62.4 s** at 8K with the prefill overlap (63.4 / 73.7 s with it off in the same window); decode
 **0.67 tok/s** warm (0.63 cold). With the opt-in two-stage file prefetch (`--tier-landing-blocks 16`, three striped

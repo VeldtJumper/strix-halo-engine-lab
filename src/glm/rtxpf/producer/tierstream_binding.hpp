@@ -46,7 +46,7 @@ struct TierOpenConfig {
     // ss_options.weight_dirs / drive_readers: stripe copies of the unit file on other drives
     // (placement of reads only; every chunk is checked against the stripe manifest). Empty: primary only.
     std::string weight_dirs;std::uint32_t drive_readers=0;
-    // ss_options.dg_disk_queue (1..64, <= staging) / dg_clean_evict; three-tier opens only.
+    // ss_options.dg_disk_queue (1..64, <= staging; 0 = TS_DG_DISK_QUEUE_AUTO, its readers billed) / dg_clean_evict; three-tier opens only.
     std::uint32_t disk_queue=1;bool clean_evict=false;
     // ss_options.dg_landing_blocks / dg_landing_max_queued / dg_landing_ttl (three-tier with disk_queue > 1; 0 = off).
     std::uint32_t landing_blocks=0,landing_max_queued=0,landing_ttl=0;

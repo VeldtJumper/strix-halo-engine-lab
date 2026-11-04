@@ -1,6 +1,7 @@
 // Host-only tierstream binding (C ABI calls; the device-gated kernels are
 // enqueued by the library on the caller's stream). No device work at include.
 #include "tierstream_binding.hpp"
+#include "disk_queue.hpp"
 #include "tierstream/ts.h"
 #include <stdexcept>
 namespace strix::glm::rtxpf::producer {
@@ -22,11 +23,13 @@ void configure(const TierOpenConfig& c,Handles& h,ts_budget& b,ts_options& o){
     ts_ok(ts_plan_from_tiers(h.desc,&b,c.tiers.data(),c.tiers.size(),&h.plan),"plan");
     ts_options_defaults(&o);o.backend=c.cuda?TS_BACKEND_CUDA:TS_BACKEND_CPU;o.device=0;o.forward_mode=TS_FORWARD_DEVICE_GATED;o.pin_planned=0;o.verify_hash=0;
     expert_need(p.spare_slots>=1,"the global spare count must be positive");o.dg_max_ids=c.max_ids;o.dg_spare_slots=std::uint32_t(p.spare_slots);
-    expert_need(c.disk_queue>=1&&c.disk_queue<=64,"disk queue must be 1..64");
+    expert_need(c.disk_queue<=64,"disk queue must be auto (0) or 1..64");
     if(p.three_tier){o.dg_disk_tier=1;o.dg_disk_prefetch=c.disk_prefetch?1u:0u;o.dg_disk_staging=std::uint32_t(p.staging);
-        // Each read in flight holds one staging buffer.
+        // Each read in flight holds one staging buffer. Auto resolves at the open to clamp(3 x locations, 4, 8),
+        // at most this staging: the plan must have billed a bounce buffer for each of those readers.
         expert_need(c.disk_queue<=std::max<std::uint64_t>(p.staging,1),"disk queue exceeds the staging buffers (raise --tier-staging)");
-        o.dg_disk_queue=c.disk_queue;o.dg_clean_evict=c.clean_evict?1u:0u;
+        expert_need(c.disk_queue||p.disk_readers>=auto_disk_queue_bound(c.weight_dirs,unsigned(std::max<std::uint64_t>(p.staging,1))),"auto disk queue without its reader bounce buffers billed");
+        o.dg_disk_queue=c.disk_queue?c.disk_queue:TS_DG_DISK_QUEUE_AUTO;o.dg_clean_evict=c.clean_evict?1u:0u;
         if(c.landing_blocks){o.dg_landing_blocks=c.landing_blocks;o.dg_landing_max_queued=c.landing_max_queued;o.dg_landing_ttl=c.landing_ttl;
 #ifdef SS_DG_LANDING_YIELD
             o.dg_landing_chunk=c.landing_chunk;
@@ -92,6 +95,7 @@ public:
         for(std::size_t i=0;i<total&&i<u.size();++i)keys.push_back(std::uint32_t(u[i].gated)*view_.units+std::uint32_t(u[i].unit));return keys;}
     bool lower_spare_target(unsigned n)override{ts_ok(ts_dg_set_budgets(h_.ctx,n,per_layer_,per_token_),"lower spare target");return true;}
     void restore_spare_target()override{ts_ok(ts_dg_set_budgets(h_.ctx,spare_open_,per_layer_,per_token_),"restore spare target");}
+    bool set_clean_evict(bool on)override{ts_ok(ts_dg_set_clean_evict(h_.ctx,on?1u:0u),"set clean evict");return true;}
     void enqueue_wait(unsigned g,void* s)override{ts_ok(ts_dg_enqueue_wait(h_.ctx,int(g),s),"enqueue wait");}
     void enqueue_end(void* s)override{ts_ok(ts_dg_enqueue_end(h_.ctx,s),"enqueue end");}
     void end()override{const auto s=ts_dg_end_rows(h_.ctx,1);if(s!=TS_OK){const char* e=ts_last_error();last_error_=e?e:"";}ts_ok(s,"token not accepted");}
@@ -103,6 +107,8 @@ public:
         j.set("tokens",s.tokens);j.set("device_timeouts",s.device_timeouts);j.set("stalled",s.stalled);j.set("miss_layers",s.miss_layers);j.set("lookups",s.lookups);j.set("misses",s.misses);
         j.set("covered_waits",s.covered_waits);j.set("fetched",s.fetched);j.set("prefetched",s.prefetched);j.set("free_slots",s.free_slots);j.set("slots",s.slots);j.set("blocks",s.blocks);
         j.set("wb_forced",s.wb_forced);j.set("wb_outstanding_bytes",s.wb_outstanding_bytes);
+        // File reads in flight as the open resolved them (0 = no file tier) and the read locations auto counted.
+        j.set("disk_queue_resolved",std::uint64_t(s.disk_queue_resolved));j.set("disk_locations",std::uint64_t(s.disk_locations));
         // The library's view of the CUDA module loading mode at open (0 unknown, 1 eager, 2 lazy).
         j.set("cuda_module_loading",s.cuda_module_loading==1?"eager":s.cuda_module_loading==2?"lazy":"unknown");return j;}
     TierView view()const override{return view_;}

@@ -143,6 +143,11 @@ El solapamiento del prefill está activado por defecto: mientras corren los kern
 siguiente se hacen residentes. El estado del prefill, los tokens y los logits son idénticos bit a bit con él desactivado.
 En comparaciones dentro de una misma ventana deja el TTFT en 0.56× (8K) y 0.66× (32K) del tiempo sin solapamiento con la
 tarjeta completa. Se desactiva con `--prefill-overlap 0`.
+La expulsión limpia en el prefill está activada por defecto: un residente de decode que el prefill desplaza sin
+bloque fijado libre vuelve al fichero de unidades en lugar de sacar una unidad fijada. En la tarjeta completa reduce
+el TTFT de 8K un 15 % / 12 % (primera / segunda petición), empata a 32K y lee un 60 % menos del fichero de unidades,
+idéntico bit a bit. Se desactiva con `--prefill-clean-evict 0`. Más lecturas de fichero simultáneas
+(`--tier-disk-queue auto`) siguen siendo opcionales hasta medir una elección por paso.
 Con 24 GiB de VRAM + 32 GiB de
 RAM del host (la mayoría de los expertos leídos del archivo de unidades en disco) también funciona de forma exacta: TTFT
 **60.3 s** con 1K y **62.4 s** con 8K con el solapamiento del prefill (63.4 / 73.7 s sin él en la misma ventana); decode
