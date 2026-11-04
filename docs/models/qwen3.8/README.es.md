@@ -123,16 +123,16 @@ serial, no a la rotatoria nativa, y no cualifican la fidelidad general del model
 Medido en un nodo Strix Halo, ruta por defecto (código `a199c8e0` más la selección de bundle de #137), prosa real
 diversa (50 libros de dominio público en seis idiomas), decodificación greedy y escalera de almacenamiento automática (sin
 ajustes manuales de almacenamiento). El TTFT va desde el arranque del proceso hasta el primer token e incluye la carga del modelo.
-La celda de prefill a 262K procede de la rama main pública `669bcb83` (prompt de 262,144 tokens, tiempo de prefill sin la
-carga del modelo, `--profile default` y `--profile fast` intercalados, dos pares: 179.07 s y 174.18 s); las celdas de decode a
-262K proceden del build `7b2453fe`; las demás celdas de la fila proceden del build indicado arriba.
+La celda de prefill a 262K y la de decode serial a 262K proceden de la rama main pública `17b9c57b8` (prompt de 262,144
+tokens, tiempo de prefill sin la carga del modelo, `--profile default`, una ejecución: 176.60 s); la celda de decode MTP a
+262K procede del build `7b2453fe`; las demás celdas de la fila proceden del build indicado arriba.
 Las celdas serial de la fila de 1M proceden de la rama main pública `fdc39faba` con Linux 7.3; sus celdas MTP y su gate
 exacto proceden del cambio de admisión MTP (#288) con Linux 7.4. Ambos conjuntos se midieron con kernels distintos, por lo
 que cada celda indica su kernel y la fila no da una relación entre serial y MTP.
 
 | Contexto (factor YaRN) | Gate exacto (MTP == serial == pool desactivado) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | Aceptación MTP |
 |---|---|---|---|---|---|
-| 262,400 (2) | Alcance completo | 219 s / 224 s | **1,464 tok/s** `--profile default`; 1,505 tok/s `--profile fast` (`669bcb83`) | 20.55 / **59.5 tok/s** (2.9x, `7b2453fe`) | 75 % |
+| 262,400 (2) | Alcance completo | 219 s / 224 s | **1,484 tok/s** `--profile default` (`17b9c57b8`) | 21.82 (`17b9c57b8`) / **59.5 tok/s** (`7b2453fe`) | 79 % (98/124) |
 | 524,288 (2) | Alcance objetivo | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
 | 1,048,576 (4) | Alcance completo (MTP frente a serial con las dos rutas de prefill indicadas abajo desactivadas) | 925 s (Linux 7.3) / 1,133 s (Linux 7.4) | 1,198 tok/s (Linux 7.3); ruta MTP 936 tok/s (Linux 7.4) | 19.6 (Linux 7.3) / **60.2 tok/s** (Linux 7.4) | 85 % (102/120) |
 
@@ -171,8 +171,9 @@ especulativa MTP con ventanas 2/4/8, perfil A8 denso, thinking desactivado, 256 
 
 | Modo | Hardware | Prompt / contexto | Concurrencia | Mejor | Típico | Build |
 |---|---|---|---:|---:|---:|---|
-| Decode MTP | 1 nodo | 1K, código, ventanas automáticas | 1 | **59.59 tok/s** (69 % del techo de bytes de 86.8 tok/s) | prosa: 55.7 tok/s (`0117a140`) | `702bc074` |
+| Decode MTP | 1 nodo | 1K, código, ventanas automáticas | 1 | **62.44 tok/s** (72 % del techo de bytes de 86.8 tok/s) | prosa: 55.7 tok/s (`0117a140`) | main `85353311b` |
 | Decode MTP | 1 nodo | 8K | 1 | **54.00 tok/s** (código, ventanas automáticas) | prosa: 49.58 tok/s (`226bb691`, atención de draft exacta) | código `702bc074`; prosa `226bb691` |
+| Decode MTP | 1 nodo | 16K | 1 | **50.69 tok/s** (código, ventanas automáticas) | prosa: 50.31 tok/s | main `85353311b` |
 | Decode MTP | 1 nodo | 32K | 1 | **47.9 tok/s** (código; rango observado 44.5–52.6) | mediana de 4 | `0117a140` |
 | MTP + ventanas de copia (opt-in), edición larga con copia | 1 nodo | documento Markdown (~10 KB) a corregir, respuesta de 2,047 tokens | 1 | **183.5 tok/s** | | `e1b115a2` |
 | MTP + ventanas de copia (opt-in), edición larga con copia | 1 nodo | fichero Python + diff a aplicar, respuesta de 1,417 tokens | 1 | **163.9 tok/s** | | `e1b115a2` |
@@ -211,12 +212,12 @@ nodo hace el decode; 64 tokens generados idénticos a la ejecución solo en el n
 
 | Modo | Hardware | 1K | 4K | 8K | 16K | 32K | Build |
 |---|---|---:|---:|---:|---:|---:|---|
-| Prefill, TTFT | 1 nodo | **1.12 s** | **3.02 s** | | **14.64 s** | **22.95 s** | `0117a140` (1K/16K); perfil combinado más abajo (activado por defecto) |
+| Prefill, TTFT | 1 nodo | **0.77 s** | **2.42 s** | | **9.47 s** | **19.13 s** | main `85353311b`, comando simple |
 | Descarga de prefill, TTFT | RTX PRO + 1 nodo | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | `70b93af3` |
 | Mismo servidor sin la RTX, TTFT | 1 nodo | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | misma compilación del servidor |
 
 La descarga se compara con el mismo servidor de producción al que reenvía (tiles de prompt de 2,048 filas), que lee
-los prompts más despacio que la fila de prefill de un nodo anterior (tiles de 8,192 filas). A 32K la ruta RTX es 4.9× más rápida que
+los prompts más despacio que la fila de prefill de un nodo anterior (tiles de filas automáticos). A 32K la ruta RTX es 4.9× más rápida que
 ese servidor. Con la descarga activada, el router envía los prompts de 1K tokens o más a la RTX PRO; los más cortos
 se leen en el nodo.
 
@@ -245,6 +246,9 @@ El tipo de prompt no se especifica para el barrido de longitudes.
 Dos ejecuciones por brazo a 4K / 17,700; 32K tiene una ejecución de línea base y dos predeterminadas; las filas más largas son ejecuciones únicas.
 Tiles de prompt: 4,096 a 4K / 128K, 8,192 a 17,700 / 32K / 64K, 2,048 con colas de 256/16 filas a 262,143.
 La dispersión entre ejecuciones y entre nodos llega a ~5 %; las comparaciones únicas son orientativas.
+Nueva medición en la rama main pública `85353311b` (comando simple, un nodo): 4,096 **1,695 tok/s**, 17,700 **1,665**,
+32,768 **1,713** (19.13 s), 131,072 **1,617** (81.08 s), 262,143 **1,509** (173.74 s) = 54.0 / 53.9 / 55.7 / 55.6 / 56.2 %
+de los mismos techos; 65,536 no se volvió a medir.
 
 [PR #49](https://github.com/hyukudan/strix-halo-engine-lab/pull/49) incorpora como valores predeterminados el prefill combinado, el batching/core16 de los gates GDN
 y el staging de selección/activación del router. [PR #50](https://github.com/hyukudan/strix-halo-engine-lab/pull/50)
@@ -262,8 +266,8 @@ en la compilación publicada, 32K en cuatro pares ABBA **−0.17 s** de media (t
 Estos tiempos son comparaciones separadas, no un nuevo barrido de longitud completa.
 
 La CLI simple ahora se resuelve a la ruta de producción medida. En un nodo Strix Halo, la identidad de prefill FP16
-rápida midió **22.03 s / 1,487 tok/s a 32K**, **100.3 s a 131,072 tokens** y
-**202.8 s / 1,293 tok/s a 262,143 tokens** (T8192 en las longitudes largas, recuperación de páginas PLE admitida).
+rápida midió **19.13 s / 1,713 tok/s a 32K**, **81.08 s a 131,072 tokens** y
+**173.74 s / 1,509 tok/s a 262,143 tokens** (rama main pública `85353311b`, T16384 automático desde 32K).
 Los digests coinciden con la referencia de esa identidad a 32K/64K/128K/262K; esto no es igualdad de bits con el serial A8 denso
 ni una nueva cualificación de fidelidad del modelo en contexto largo. Véase el [catálogo](../../optimizations.md#qwen-tiled).
 

@@ -229,7 +229,7 @@
     "flag_or_env": "--known-prefix-window; --known-prefix-full-rows; --known-prefix-prefill-rows; --known-prefix-expert-union; --known-window-router-rows; --prefill-numerical-profile",
     "default": "auto",
     "exact": "Tokens and terminal FP32 logits digests match the reference for the selected profile pair, including 32K/64K/128K/262K. Fast FP16 prefill is exact relative to its own reference, not bit-identical to dense-A8 serial prefill; longer-context fidelity remains outside the 8192 qualification.",
-    "gain": "One Strix Halo node: 32K 22.03 s = 1,487 tok/s; 131,072 tokens 100.3 s; 262,143 tokens 202.8 s = 1,293 tok/s. Previous documented default externally reported about 119 tok/s versus about 822 with union + router rows; separate from local measurements.",
+    "gain": "One Strix Halo node, public main 85353311b: 32K 19.13 s = 1,713 tok/s; 131,072 tokens 81.08 s = 1,617 tok/s; 262,143 tokens 173.74 s = 1,509 tok/s. Previous documented default externally reported about 119 tok/s versus about 822 with union + router rows; separate from local measurements.",
     "preconditions": "Pinned verified checkpoint, qualified gfx1151 target, A8 runtime, >=16 prompt tokens, positive generation, eligible eager registered mapping, unambiguous UMA/GTT observations and sufficient backing capacity.",
     "off_switch": "--baseline / STRIX_BASELINE=1 restores historical resolution; STRIX_PREFILL_F16=0 or --known-prefix-window=0 declines automatic tiling. --prefill-numerical-profile dense-a8 retains tiling with dense-A8 arithmetic. Controlled feature =0 or STRIX_QPF2K_DEFAULTS=0 also declines auto selection; exact operator A/B needs an explicit route with the same profile pair.",
     "doc_anchor": "docs/optimizations.md#qwen-tiled"
