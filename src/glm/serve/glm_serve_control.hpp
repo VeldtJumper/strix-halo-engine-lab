@@ -19,14 +19,18 @@
 #include <string>
 #include <vector>
 
+#include "glm/serve/glm_serve_import.hpp"
+
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 4;
+inline constexpr std::uint32_t kControlVersion = 6;  // 3: chunked prefill (ppos); 4: batched spec (spec_verify / spec_draft); 5: import_expect / import_state / state_digest; 6: import settings in Hello (moves every later field by 16 bytes), import_drop
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
 inline constexpr std::uint32_t kEnterSeed = 4U;   // mtp_enter pflags: open the C1 decoder from the slot's batched-spec seed
+inline constexpr std::uint32_t kImportFailed = ~0U;  // import_state's token on a rank whose restore failed
+inline constexpr std::uint32_t kImportDsaOnce = 8U;  // import_state pflags: hand-off v2, rank 0 relays the DSA components to rank 1
 inline constexpr std::size_t kControlBytes = 512;
 inline constexpr unsigned kMaxRows = 8;                       // Engine::step takes 1..8 rows
 inline constexpr std::size_t kTokensPerMessage = 16384;       // 64 KiB per prompt message
@@ -40,12 +44,27 @@ inline constexpr std::uint64_t kNoRound = ~std::uint64_t{0};
 //   commit and the drafter catch-up (both ranks, from the merged results). Produces per window: count, tokens.
 // spec_draft: one more draft for slot pslot (an MTP extension step of its drafter chain).
 enum class Cmd : std::uint32_t { reply = 0, hello = 1, prefill = 2, step = 3, heartbeat = 4, shutdown = 5,
-                                 mtp_enter = 6, mtp_run = 7, mtp_leave = 8, spec_verify = 9, spec_draft = 10 };
+                                 mtp_enter = 6, mtp_run = 7, mtp_leave = 8, spec_verify = 9, spec_draft = 10,
+                                 import_state = 11, import_expect = 12, state_digest = 13, import_drop = 14 };
+// state_digest (import gate): both ranks digest slot pslot's state up to frontier ppos (Engine::state_bytes_upto, per
+// component: fnv64 + size, as u32 words); rank 1 sends its digests to rank 0. No engine state changes.
+// import_expect: every rank starts receiving the RTX hand-off for import_id (plen prompt tokens follow); its replies then
+// carry that id and its staging status (import_id / import_status: ImportStatus). import_state commits only once both
+// ranks report ready; a failure on either rank (import_abort: the slot reset, kImportFailed) is reported in the next
+// reply (import_status restored / failed, import_token: the first token) and both fall back to the prefill.
+// import_drop: every rank forgets what it staged (or is still receiving) under import_id (a fallback or a cancelled
+// request), so its receiver and memory are freed at once.
+// import_state: slot pslot restored from the payload each rank staged under import_id (the RTX producer's hand-off,
+// verified on that rank), then its last prompt token (plen tokens follow, as for prefill) through prefill / prefill_mtp.
 
 inline const char* cmd_name(Cmd c) {
     switch (c) {
         case Cmd::reply: return "reply";
         case Cmd::hello: return "hello";
+        case Cmd::import_state: return "import_state";
+        case Cmd::import_expect: return "import_expect";
+        case Cmd::import_drop: return "import_drop";
+        case Cmd::state_digest: return "state_digest";
         case Cmd::prefill: return "prefill";
         case Cmd::step: return "step";
         case Cmd::heartbeat: return "heartbeat";
@@ -78,7 +97,12 @@ struct Hello {
     std::uint32_t mtp = 0;            // served MTP self-speculation on (both ranks load and run it)
     std::uint32_t mtp_kmax = 0;       // drafts per cycle (adaptive below it)
     std::uint32_t g2 = 0;             // batched self-speculation (multi-slot verify) on
-    std::uint32_t pad = 0;
+    // RTX import settings every rank must share (0 = import off): bit 0 receiver on, bit 1 'DSA once'; the expected
+    // hand-off wire version; FNV-1a of the --import-model-sha attestation (operator-supplied, see the README).
+    std::uint32_t import_flags = 0;
+    std::uint32_t import_wire = 0;
+    std::uint32_t import_pad = 0;
+    std::uint64_t import_model_hash = 0;
     bool operator==(const Hello&) const = default;
 };
 
@@ -100,9 +124,27 @@ struct Control {
     std::uint32_t budget = 0, cycles = 0, pad1 = 0;  // mtp_run
     std::uint64_t ppos = 0;              // prefill: position of the chunk's first token (0: the slot is reset first)
     std::uint32_t sbudget[kMaxRows]{};   // spec_verify: per window
+    std::uint32_t import_id = 0, import_status = 0;  // import_state / import_expect; replies: this rank's staging status
+    std::uint32_t import_token = 0, pad2 = 0;          // replies: the first token of this rank's import_state
 };
 static_assert(sizeof(Control) <= kControlBytes);
 static_assert(sizeof(WireRow) == 16);
+// The block is a raw memcpy of Control: any change of these offsets is a wire-layout change and needs a new
+// kControlVersion (decode checks magic and version before reading any other field, so a peer with another layout is
+// refused there instead of misreading commands).
+static_assert(offsetof(Control, magic) == 0 && offsetof(Control, version) == 4, "GLMC: magic / version lead the block");
+static_assert(offsetof(Control, hello) == 200 && sizeof(Hello) == 72, "GLMC v6 layout: Hello");
+static_assert(offsetof(Control, pflags) == 272 && offsetof(Control, budget) == 276 && offsetof(Control, cycles) == 280 &&
+                  offsetof(Control, ppos) == 288 && offsetof(Control, sbudget) == 296 && offsetof(Control, import_id) == 328 &&
+                  offsetof(Control, import_status) == 332 && offsetof(Control, import_token) == 336 && sizeof(Control) == 344,
+              "GLMC v6 layout changed: bump kControlVersion and update these offsets");
+static_assert(offsetof(Control, pad1) == 284 && offsetof(Control, pad2) == 340, "GLMC v6 layout: reserved fields");
+static_assert(offsetof(Hello, model_hash) == 0 && offsetof(Hello, identity_hash) == 8 && offsetof(Hello, capacity) == 16 &&
+                  offsetof(Hello, slots) == 24 && offsetof(Hello, max_rows) == 28 && offsetof(Hello, step_rows) == 32 &&
+                  offsetof(Hello, world) == 36 && offsetof(Hello, mtp) == 40 && offsetof(Hello, mtp_kmax) == 44 &&
+                  offsetof(Hello, g2) == 48 && offsetof(Hello, import_flags) == 52 && offsetof(Hello, import_wire) == 56 &&
+                  offsetof(Hello, import_pad) == 60 && offsetof(Hello, import_model_hash) == 64,
+              "GLMC v6 Hello layout changed: bump kControlVersion and update these offsets");
 
 inline std::uint32_t fnv1a32(std::span<const std::uint32_t> tokens, std::uint32_t h = 2166136261U) {
     for (const std::uint32_t t : tokens)
@@ -137,7 +179,7 @@ inline Control decode(const Block& b) {
     if (c.version != kControlVersion)
         throw ProtocolError("control channel: protocol version " + std::to_string(c.version) + " from the peer, expected " +
                             std::to_string(kControlVersion));
-    if (c.cmd > static_cast<std::uint32_t>(Cmd::spec_draft)) throw ProtocolError("control channel: unknown command");
+    if (c.cmd > static_cast<std::uint32_t>(Cmd::import_drop)) throw ProtocolError("control channel: unknown command");
     if (c.cycles > kMaxMtpCycles) throw ProtocolError("control channel: too many MTP cycles");
     if (c.nrows > kMaxRows) throw ProtocolError("control channel: more than 8 rows");
     if (c.pslot >= 32) throw ProtocolError("control channel: prefill slot out of range");
@@ -164,6 +206,9 @@ inline std::string hello_mismatch(const Hello& mine, const Hello& peer) {
     f("mtp", mine.mtp, peer.mtp);
     f("mtp_kmax", mine.mtp_kmax, peer.mtp_kmax);
     f("g2", mine.g2, peer.g2);
+    f("import_flags", mine.import_flags, peer.import_flags);
+    f("import_wire", mine.import_wire, peer.import_wire);
+    f("import_model_hash", mine.import_model_hash, peer.import_model_hash);
     return s;
 }
 
@@ -328,6 +373,35 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
                                                         : eng.prefill(c.pslot, p, c.ppos));
             break;
         }
+        case Cmd::import_state: {
+            if (c.pslot >= slots || ((c.resets >> c.pslot) & 1U) == 0) throw ProtocolError("control channel: import without its slot reset");
+            if (c.plen < 2 || c.plen >= capacity) throw ProtocolError("control channel: import prompt length out of range");
+            ch.tokens(prompt, c.plen, sender);
+            // A failed restore / last-token call is local to this rank: the slot is reset (import_abort) and the lead
+            // learns both ranks' outcome from the next reply. No echo: the ranks may differ here by design.
+            std::uint32_t y = kImportFailed;
+            try {
+                y = eng.import_state(c.pslot, c.import_id, std::span<const std::uint32_t>(prompt), (c.pflags & kPrefillMtp) != 0,
+                                     (c.pflags & kImportDsaOnce) != 0);
+            } catch (const ImportFatal&) {
+                throw;  // inside the engine collectives after both ranks restored: the engine's fatal contract
+            } catch (const std::exception& e) {
+                eng.import_abort(c.pslot, c.import_id, e.what());
+                y = kImportFailed;
+            }
+            out.push_back(y);
+            return out;
+        }
+        case Cmd::import_drop: {
+            if constexpr (requires { eng.import_drop(c.import_id); }) eng.import_drop(c.import_id);
+            return out;
+        }
+        case Cmd::import_expect: {
+            if (c.plen < 2 || c.plen >= capacity) throw ProtocolError("control channel: import prompt length out of range");
+            ch.tokens(prompt, c.plen, sender);
+            eng.import_expect(c.import_id, std::span<const std::uint32_t>(prompt));
+            return out;
+        }
         case Cmd::step: {
             const std::span<const WireRow> rows(c.row, c.nrows);
             check_rows(rows, slots, capacity);
@@ -363,6 +437,20 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             if (c.pslot >= slots) throw ProtocolError("control channel: mtp_leave out of range");
             eng.mtp_leave(c.pslot);
             return out;
+        }
+        case Cmd::state_digest: {
+            if (c.pslot >= slots || c.ppos == 0 || c.ppos >= capacity) throw ProtocolError("control channel: state_digest out of range");
+            if constexpr (requires { eng.state_digest(c.pslot, c.ppos); }) {
+                std::vector<std::uint32_t> mine = eng.state_digest(c.pslot, c.ppos), peer;
+                // the same layout on both ranks (hello): rank 1 sends its words, rank 0 receives them
+                if (sender) ch.tokens(peer, mine.size(), false);
+                else ch.tokens(mine, mine.size(), true);
+                out = std::move(mine);  // rank 0: its digests, then rank 1's
+                out.insert(out.end(), peer.begin(), peer.end());
+                return out;
+            } else {
+                throw ProtocolError("control channel: state_digest not supported by this engine");
+            }
         }
         case Cmd::heartbeat:
         case Cmd::shutdown: return out;

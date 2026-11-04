@@ -48,8 +48,10 @@ struct RunResult {
     unsigned cycles = 0, offered = 0, accepted = 0;
     double loop_ms = 0, tail_ms = 0;
 };
+// pos0 > 0: positions [0, pos0) are already in the slot (an imported state, Engine::restore_state); only prompt[pos0..]
+// runs, with the same calls the full prompt makes for those rows.
 Seed bootstrap(engine::Engine&, std::uint32_t slot, std::span<const std::uint32_t> prompt,
-               BootstrapPolicy, ControlState&);
+               BootstrapPolicy, ControlState&, std::uint64_t pos0 = 0);
 // Budget includes seed.y0. Always flushes deferred committed rows before returning.
 RunResult decode_greedy(engine::Engine&, std::uint32_t slot, Seed, const DecodePolicy&, unsigned budget, ControlState&);
 // decode_greedy one verify cycle at a time (the server interleaves control rounds between cycles; decode_greedy is

@@ -158,6 +158,32 @@ de **0.67 tok/s** en caliente (0.63 en frío). Con el prefetch de archivo en dos
 ventanas, con salida idéntica (las repeticiones variaron entre un 15 y un 55 %). Compilación, archivo de unidades y
 opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
 
+**Prefill en RTX hacia el par (FAST, desactivado por defecto).** `strix-glm5-serve --rtx-prefill HOST:PUERTO
+--import-listen IP:PUERTO --import-peer IP:PUERTO --import-key FICHERO --import-model-sha SHA` (`--import-listen` en cada
+rango; solo motores con su capa MTP) deja que el productor RTX haga el prefill de los prompts largos y entregue a cada
+rango su estado. Ambos rangos preparan la entrega y votan (la vinculación autenticada y después ambos restaurados) antes
+de ejecutar el último token del prompt; cualquier fallo antes de ese voto vuelve al prefill propio del par en los dos
+rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). `--import-dsa-once`
+(con `dsa_once` del productor) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par
+(8K: de 480 a 316 MB en el enlace del productor, con tokens iguales a los de la entrega de la versión 1). Los prompts importados llevan la identidad FAST
+`glm-pf-rtx-native-v1` (no son bit a bit el prefill propio del par; el `prefill_route` de cada respuesta la nombra).
+`--import-gate` falla si algún brazo enrutado no importó de verdad (y una batería sin prompts también falla).
+`--import-model-sha` es una atestación del operador: el receptor la compara con la cabecera de la entrega del
+productor; no se calcula a partir de los tensores que cargó el par. Los ajustes de importación (receptor activo,
+`--import-dsa-once`, versión del protocolo y SHA del modelo atestado) deben coincidir en todos los rangos: el hello
+rechaza una discrepancia al arrancar. El bloque de control es la versión 6: un rango de esta compilación rechaza en el
+hello a un rango de una compilación anterior.
+
+Medido con la versión publicada (greedy, 128 tokens, caché desactivada, 1 GbE entre el PC con RTX y los nodos, productor
+arrancado en cada ejecución): el tiempo hasta el primer token con la importación fue de 39.4 s a 1K y 45.6 s a 8K, frente a
+2.83 s y 15.7 s con el prefill exacto propio del par (con MTP: 38.6 frente a 2.91 s y 44.5 frente a 16.3 s), por lo que la
+ruta no es más rápida en esta configuración. Casi todo el tiempo importado es el prefill en la RTX (38-44 s): esa
+ejecución arrancó el productor sin su caché de tierstream, de modo que cargaba capas de expertos desde los fragmentos
+del modelo en cada petición (el README del productor muestra el arranque con caché); el coste de una importación en el par es de unos 0.4 s (cola
+de la transferencia, restauración, prefill del último token y commit). Que compense depende del tiempo de prefill en la
+RTX para prompts largos. Con el productor arrancado con su caché (primera petición, una ejecución, misma versión publicada, 1 GbE): 8K importado en 21.0 s
+(prefill en la RTX 19.7 s) frente a 15.7 s con el prefill propio del par, todavía no más rápido.
+
 ## Todos los valores predeterminados incorporados de GLM
 
 El registro de cambios de cada palanca de GLM activada por defecto, con su ganancia medida, su evidencia de exactitud y

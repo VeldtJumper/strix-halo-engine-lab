@@ -32,8 +32,9 @@ void ControlState::observe(unsigned index, double elapsed) {
     if (rank == 0) observe_cost(publisher, index, elapsed);
 }
 Seed bootstrap(engine::Engine& e, std::uint32_t slot, std::span<const std::uint32_t> prompt,
-               BootstrapPolicy policy, ControlState& control) {
+               BootstrapPolicy policy, ControlState& control, std::uint64_t pos0) {
     if (prompt.empty()) throw std::invalid_argument("spec bootstrap: empty prompt");
+    if (pos0 >= prompt.size()) throw std::invalid_argument("spec bootstrap: pos0 past the prompt");
     IdentityScope scope(e);
     control.calibration = Calibration{};  // every new prompt starts with the same virtual observations
     control.cycle = control.step = 0;
@@ -41,7 +42,7 @@ Seed bootstrap(engine::Engine& e, std::uint32_t slot, std::span<const std::uint3
     seed.p = prompt.size();
     if (policy == BootstrapPolicy::Chunked) {
         auto c = control.next(2);
-        const auto b = e.prefill_mtp(slot, prompt, 0, c);
+        const auto b = e.prefill_mtp(slot, prompt.subspan(static_cast<std::size_t>(pos0)), pos0, c);
         control.consume(c);
         seed.y0 = b.y0;
         seed.draft = b.mtp.id.at(0);
@@ -49,7 +50,7 @@ Seed bootstrap(engine::Engine& e, std::uint32_t slot, std::span<const std::uint3
         seed.hp = b.hp;
         seed.flagged = b.mtp.flagged;
     } else {
-        for (std::size_t j = 0; j < prompt.size(); ++j) {
+        for (std::size_t j = static_cast<std::size_t>(pos0); j < prompt.size(); ++j) {
             const engine::Row row{slot, prompt[j], j};
             const auto nx = e.step({&row, 1}).at(0);
             const bool last = j + 1 == prompt.size();

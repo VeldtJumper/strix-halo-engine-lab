@@ -149,6 +149,29 @@ With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on 
 drives) decode was 20-40 % faster than without it in the same windows, identical output (repeats varied by 15-55 %).
 Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
 
+**RTX prefill into the pair (FAST, off by default).** `strix-glm5-serve --rtx-prefill HOST:PORT --import-listen IP:PORT
+--import-peer IP:PORT --import-key FILE --import-model-sha SHA` (every rank `--import-listen`; engines with their MTP
+layer only) lets the RTX producer prefill long prompts and hand each rank its state. Both ranks stage the hand-off,
+vote on it (the authenticated binding, then both restored) before the last prompt token runs, and any failure before
+that vote falls back to the pair's own prefill on both ranks; a failure inside the last-token collectives stops the
+server (fatal). `--import-dsa-once` (with the producer's `dsa_once`) sends the DSA state to rank 0 only and relays it
+to rank 1 over the pair link (8K: 480 -> 316 MB on the producer link, tokens equal to the version 1 hand-off). Imported prompts carry the FAST identity
+`glm-pf-rtx-native-v1` (not bitwise the pair's own prefill; each response's `prefill_route` names it).
+`--import-gate` fails unless every routed arm really imported (and a suite with no prompt fails). `--import-model-sha` is
+an operator attestation: the receiver compares it with the producer's hand-off header, it is not computed from the
+tensors the pair loaded. The import settings (receiver on, `--import-dsa-once`, wire version, the attested model SHA)
+must agree on every rank: the hello refuses a mismatch at startup. The control block is version 6: a rank of this build
+refuses a rank of an older build at hello.
+
+Measured on the release build (greedy, 128 tokens, cache off, 1 GbE between the RTX PC and the nodes, producer started
+per run): time to first token with the import 39.4 s at 1K and 45.6 s at 8K, against 2.83 s and 15.7 s for the pair's
+own exact prefill (with MTP: 38.6 vs 2.91 s and 44.5 vs 16.3 s), so the route is not faster on this setup. Almost all of
+the imported time is the RTX prefill (38-44 s): that run started the producer without its tierstream cache, so it staged
+expert layers from the model shards on every request (the producer README shows the cached launch); the pair-side
+cost of an import is about 0.4 s (transfer tail, restore, last-token prefill, commit). Whether it pays depends on the RTX
+prefill time for long prompts. With the producer launched with its cache (first request, one run, same release build, 1 GbE): 8K imported 21.0 s
+(RTX prefill 19.7 s) against 15.7 s for the pair's own prefill, still not faster.
+
 ## Every shipped GLM default
 
 The changelog of every default-on GLM lever with its measured gain, exactness evidence and off switch is in
