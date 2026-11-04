@@ -219,12 +219,14 @@ int main(int argc,char** argv){p::install_crash_report();try{
         else if(a=="--spec-lookup"){w::require(value=="0"||value=="1","--spec-lookup 0|1");dopts.spec_lookup=value=="1";}
         else if(a=="--restore-decode-residency"){w::require(value=="0"||value=="1","--restore-decode-residency 0|1");dopts.restore_decode_residency=value=="1";}
         else if(a=="--prefill-overlap"){w::require(value=="0"||value=="1","--prefill-overlap 0|1");dopts.prefill_overlap=value=="1";}
+        else if(a=="--prefill-clean-evict"){w::require(value=="0"||value=="1","--prefill-clean-evict 0|1");dopts.prefill_clean_evict=value=="1";}
+        else if(a=="--prefill-profile"){w::require(value=="0"||value=="1","--prefill-profile 0|1");dopts.prefill_profile=value=="1";}
         else if(a=="--tier-flush-ready"){w::require(value=="0"||value=="1","--tier-flush-ready 0|1");dopts.tier_flush_ready=value=="1";}
         else if(a=="--tier-host-spares")dopts.tier_host_spares=unsigned(std::stoul(value));else if(a=="--tier-staging"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)>=1&&std::stoul(value)<=64,"--tier-staging 1..64");dopts.tier_staging=unsigned(std::stoul(value));}
         else if(a=="--prefill-tile-crossover"){w::require(value=="off"||(!value.empty()&&value.find_first_not_of("0123456789")==std::string::npos&&value.size()<=6&&std::stoul(value)<=131072),"--prefill-tile-crossover: rows 0..131072 or off");}
         else if(a=="--weight-dirs"){w::require(value.find('\0')==std::string::npos,"--weight-dirs: embedded NUL");p::check_weight_dirs(value);dopts.weight_dirs=value;}
         else if(a=="--drive-readers"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)>=1&&std::stoul(value)<=32,"--drive-readers 1..32");dopts.drive_readers=unsigned(std::stoul(value));}
-        else if(a=="--tier-disk-queue"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)>=1&&std::stoul(value)<=64,"--tier-disk-queue 1..64");dopts.tier_disk_queue=unsigned(std::stoul(value));}
+        else if(a=="--tier-disk-queue"){if(value=="auto")dopts.tier_disk_queue=0;else{w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)>=1&&std::stoul(value)<=64,"--tier-disk-queue auto|1..64");dopts.tier_disk_queue=unsigned(std::stoul(value));}}
         else if(a=="--tier-clean-evict"){w::require(value=="0"||value=="1","--tier-clean-evict 0|1");dopts.tier_clean_evict=value=="1";}
         else if(a=="--tier-landing-blocks"){w::require(!value.empty()&&value.size()<=4&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)<=4096,"--tier-landing-blocks 0..4096");dopts.tier_landing_blocks=unsigned(std::stoul(value));}
         else if(a=="--tier-landing-max-queued"){w::require(!value.empty()&&value.size()<=2&&value.find_first_not_of("0123456789")==std::string::npos&&std::stoul(value)<=64,"--tier-landing-max-queued 0..64");dopts.tier_landing_max_queued=unsigned(std::stoul(value));}
@@ -265,7 +267,7 @@ int main(int argc,char** argv){p::install_crash_report();try{
     w::require(!dopts.spec_lookup||dopts.mtp_spec,"--spec-lookup drafts for the self-speculation verify (--mtp-self-spec 1)");
     // Landing (tierstream dg_landing_*): the sub-options need the blocks, and the landing reads run on the read pool.
     w::require(dopts.tier_landing_blocks||(!dopts.tier_landing_max_queued&&!dopts.tier_landing_ttl&&!dopts.tier_landing_chunk),"--tier-landing-max-queued / -ttl / -chunk need --tier-landing-blocks N > 0");
-    w::require(!dopts.tier_landing_blocks||(dopts.expert_tier=="tierstream"&&dopts.tier_disk_queue>1),"--tier-landing-blocks needs the tierstream cache and --tier-disk-queue > 1");
+    w::require(!dopts.tier_landing_blocks||(dopts.expert_tier=="tierstream"&&(dopts.tier_disk_queue>1||disk_auto_readers(dopts)>1)),"--tier-landing-blocks needs the tierstream cache and --tier-disk-queue > 1 (or auto with --tier-staging >= 2)");
     w::require(!dopts.mtp_spec||(dopts.routes_out.empty()&&dopts.expert_tier=="tierstream"),
                "--mtp-self-spec: tierstream expert tier only, not with --routes-out (it records one row per layer)");
     if(auto* e=use("prefill_tile_large");e&&e->status==rp::Status::unqualified){auto* rt=prof.find("row_tile");if(!rt||rt->status!=rp::Status::explicit_cli)tile=std::min(8192u,capacity/32*32);}

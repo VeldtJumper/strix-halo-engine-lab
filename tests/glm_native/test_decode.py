@@ -1004,7 +1004,13 @@ class WindowTests(unittest.TestCase):
         for argv in (dw.service_command(q, 'svc'), dw.worker_options(q)):
             for flag, value in (('--tier-staging', '16'), ('--tier-disk-queue', '16'), ('--tier-clean-evict', '1'), ('--disk-prefetch', '1')):
                 self.assertEqual(argv[argv.index(flag) + 1], value)
-        self.assertNotIn('--tier-disk-queue', dw.service_command(m, 'svc'))  # default: one read at a time
+        self.assertNotIn('--tier-disk-queue', dw.service_command(m, 'svc'))  # default: the service's queue 1
+        for v in ('auto', '1'):
+            with patch.object(dw, 'host_total_gib', return_value=191.6):
+                one = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--tier-disk-queue', v])
+            self.assertEqual(dw.service_command(one, 'svc')[dw.service_command(one, 'svc').index('--tier-disk-queue') + 1], v)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--tier-disk-queue', '0'])
         with patch.object(dw, 'host_total_gib', return_value=191.6):
             land = dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--full-card', '--tier-disk-queue', '8',
                                  '--tier-landing-blocks', '16', '--tier-landing-max-queued', '4', '--tier-landing-ttl', '0', '--tier-landing-chunk', 'whole'])

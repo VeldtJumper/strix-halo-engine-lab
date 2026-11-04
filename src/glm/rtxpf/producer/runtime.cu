@@ -411,7 +411,7 @@ struct Runtime::Impl {
         if(requested_tile){tile=requested_tile;tile_choice="request override (row_tile)";}else{tile=select_prefill_tile(P,allocated_tile,tile_crossover);tile_choice=prefill_tile_reason(P,tile_crossover);}}
     void record_prefill_cache(){if(!prefill_via_cache||!ts_tier)return;last_timings.set("prefill_cache",counter_delta(prefill_counters0,cache_counters()));
         auto a=Json::array();double total=0;for(double x:ts_tier->acquire_ms){a.push(x);total+=x;}last_timings.set("make_resident_ms_per_layer",a);last_timings.set("make_resident_ms_total",total);
-        last_timings.set("prefill_overlap",ts_tier->overlap_note);
+        last_timings.set("prefill_overlap",ts_tier->overlap_note);last_timings.set("prefill_clean_evict",ts_tier->clean_note);
         if(ts_tier->overlapping)for(auto [k,v]:{std::pair<const char*,const std::vector<double>*>{"prefill_overlap_gpu_idle_ms",&ts_tier->gpu_idle_ms},{"prefill_overlap_host_wait_ms",&ts_tier->host_wait_ms}}){
             auto w=Json::array();double wt=0;for(double x:*v){w.push(x);wt+=x;}last_timings.set(std::string(k)+"_per_layer",w);last_timings.set(std::string(k)+"_total",wt);}
         last_timings.set("decode_restore",restore_pending?"deferred to the next decode token":"off");}
@@ -674,6 +674,7 @@ struct Runtime::Impl {
     void run_prefill(std::span<const U32> input,const std::string& identity,const StateSink& sink){
         prefill_counters0=cache_counters();if(ts_tier)ts_tier->acquire_ms.clear();
         if(prefill_via_cache&&ts_tier)ts_tier->choose_overlap(dopt.prefill_overlap); // once per prefill: held layers, no token
+        if(prefill_via_cache&&ts_tier)ts_tier->choose_clean_evict(dopt.prefill_clean_evict,dopt.tier_clean_evict); // between tokens; restored with the spares
         request_start=std::chrono::steady_clock::now();releases=Json::array();staging_ms=0;file_read_ms=0;file_bytes=0;file_ring_bytes[0]=file_ring_bytes[1]=0;graph_binding_ms=0;
         // Request-scoped reads: do not silently reuse a previous request's last
         // two host rings, which would leave a forced-file repeat unexercised.
@@ -682,33 +683,36 @@ struct Runtime::Impl {
         need(input.size()>=2&&input.size()<=capacity,"prompt exceeds resident capacity");for(auto t:input)need(t<154880,"token outside vocabulary");unsigned P=unsigned(input.size()-1);auto mode=index(identity);
         census_rows.clear();if(dopt.routes_prefill&&routes_file.is_open())census_rows.assign(std::size_t(P)*routed_gated*routed_topk,~U32(0));
         ck(cudaMemsetAsync(flag.p,0,4,compute.s));ck(cudaMemcpyAsync(tokens.p,input.data(),input.size_bytes(),cudaMemcpyHostToDevice,h2d.s));ck(cudaStreamSynchronize(h2d.s));
-        embed<<<unsigned((std::size_t(P)*4*4096+255)/256),256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>(),X.as<float>(),P,4);
+        // --prefill-profile: one event per enqueued phase (graphs off: the same kernels launched directly), read after the final synchronization.
+        const bool prof=dopt.prefill_profile;auto pm=[&](int layer,DecodePhase ph){if(prof)pf_timeline.mark(layer,ph,compute.s);};
+        if(prof){const std::size_t tiles=(P+tile-1)/tile;pf_timeline.enable(46*(tiles*12+8)+2*(P/2048+2)+64);pf_timeline.start(compute.s);moe_pool.reset();}
+        embed<<<unsigned((std::size_t(P)*4*4096+255)/256),256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>(),X.as<float>(),P,4);pm(-1,DecodePhase::embed);
         // Entire prefix for each layer. No state from a later layer becomes
         // visible before the preceding layer's last prefix row is complete.
-        for(unsigned l=0;l<45;++l){auto& w=*layers[l];zero_layer(l);auto stage_start=std::chrono::steady_clock::now();stage(l);staging_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-stage_start).count();
+        for(unsigned l=0;l<45;++l){auto& w=*layers[l];zero_layer(l);auto stage_start=std::chrono::steady_clock::now();stage(l);staging_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-stage_start).count();pm(int(l),DecodePhase::stage);
             for(unsigned first=0;first<P;first+=tile){auto chunk=row_tile(first,P,tile);unsigned n=chunk.rows;auto off=std::size_t(first)*4096;
                 auto sequence=[&]{
-                    pre(w.attn,w.input,X.as<float>()+off*4,normalized.as<float>(),n);
+                    pre(w.attn,w.input,X.as<float>()+off*4,normalized.as<float>(),n);pm(int(l),DecodePhase::hc_pre_attn);
                     if(l%4!=3){KdaCall v{n,w.k,normalized.as<float>(),part.as<float>(),kst(l),kcv(l)};
                         // Session prefill only: capture the open B32 block's start
                         // state/convolution and retain its normalized input rows.
                         const auto b0=kda_block_start(P);KdaCheckpoint cp{};const KdaCheckpoint* checkpoint=nullptr;
                         if(in_session&&kda_open_rows(P)&&first<=b0&&b0<first+n){cp={b0-first,cks(l),ckc(l)};checkpoint=&cp;
                             ck(cudaMemcpyAsync(tl(l),normalized.as<float>()+std::size_t(cp.row)*4096,std::size_t(n-cp.row)*kda_row_bytes,cudaMemcpyDeviceToDevice,compute.s));}
-                        ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s,false,checkpoint));}
-                    else {DsaCall v{};v.rows=n;v.first=first;v.w=w.d;v.state=dstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=mode;v.legacy_fp32_index=legacy_index;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));}
-                    post(X.as<float>()+off*4,part.as<float>(),X2.as<float>(),n);
-                    pre(w.ffn,w.post,X2.as<float>(),normalized.as<float>(),n);
-                    if(l<3){Call v{n,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));}
-                    else {router<<<n,320,0,compute.s>>>(normalized.as<float>(),w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());
-                        Call v{n,288,4096,2048,normalized.as<float>(),ids.as<U32>(),rates.as<float>(),w.descriptors.as<Expert>(),routed.as<float>()};ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));
-                        Call sh{n,1,4096,2048,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));
-                        add<<<unsigned((std::size_t(n)*4096+255)/256),256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),part.as<float>(),std::size_t(n)*4096,flag.as<unsigned>());
+                        ck(enqueue_kda(v,workspace.p,ws_bytes,compute.s,false,checkpoint));pm(int(l),DecodePhase::kda);}
+                    else {DsaCall v{};v.rows=n;v.first=first;v.w=w.d;v.state=dstate(l);v.x=normalized.as<float>();v.y=part.as<float>();v.nonfinite=flag.as<unsigned>();v.index=mode;v.legacy_fp32_index=legacy_index;ck(enqueue_dsa(v,workspace.p,ws_bytes,compute.s));pm(int(l),DecodePhase::dsa);}
+                    post(X.as<float>()+off*4,part.as<float>(),X2.as<float>(),n);pm(int(l),DecodePhase::hc_post_attn);
+                    pre(w.ffn,w.post,X2.as<float>(),normalized.as<float>(),n);pm(int(l),DecodePhase::hc_pre_ffn);
+                    if(l<3){Call v{n,1,4096,12288,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),part.as<float>()};predecoded(v,w);ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec));pm(int(l),DecodePhase::dense_ffn);}
+                    else {router<<<n,320,0,compute.s>>>(normalized.as<float>(),w.router,w.bias,ids.as<U32>(),rates.as<float>(),flag.as<unsigned>());pm(int(l),DecodePhase::router);
+                        Call v{n,288,4096,2048,normalized.as<float>(),ids.as<U32>(),rates.as<float>(),w.descriptors.as<Expert>(),routed.as<float>()};ck(enqueue_cutlass(v,workspace.p,ws_bytes,compute.s,exec,prof?moe_pool.next(int(l),n):nullptr));pm(int(l),DecodePhase::routed_moe);
+                        Call sh{n,1,4096,2048,normalized.as<float>(),nullptr,nullptr,w.shared_descriptor.as<Expert>(),shared.as<float>()};predecoded(sh,w);ck(enqueue_cutlass(sh,workspace.p,ws_bytes,compute.s,exec));pm(int(l),DecodePhase::shared_expert);
+                        add<<<unsigned((std::size_t(n)*4096+255)/256),256,0,compute.s>>>(routed.as<float>(),shared.as<float>(),part.as<float>(),std::size_t(n)*4096,flag.as<unsigned>());pm(int(l),DecodePhase::combine);
                     }
-                    post(X2.as<float>(),part.as<float>(),X.as<float>()+off*4,n);
+                    post(X2.as<float>(),part.as<float>(),X.as<float>()+off*4,n);pm(int(l),DecodePhase::hc_post_ffn);
                 };
                 auto binding=prefill_binding(first,n,identity,legacy_index,session_key(P));
-                if(graphs){auto& g=graph[l][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
+                if(graphs&&!prof){auto& g=graph[l][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
                 // Census: this tile's router ids, in stream order before the next tile's router overwrites them.
                 if(!census_rows.empty()&&l>=3)ck(cudaMemcpy2DAsync(census_rows.data()+std::size_t(first)*routed_gated*routed_topk+std::size_t(l-3)*routed_topk,routed_gated*routed_topk*4,ids.p,routed_topk*4,routed_topk*4,n,cudaMemcpyDeviceToHost,compute.s));
             }
@@ -716,20 +720,23 @@ struct Runtime::Impl {
             // H2D for N+1 runs while N's queued kernels execute. Acquisition
             // occurs only at N+1; exporting N never waits for N+1's ready event.
             if(!serial_stage){auto begin=std::chrono::steady_clock::now();stage(l+1,false);staging_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();}
+            pm(int(l),DecodePhase::stage); // the layer's release and the next layer's staging
             if(in_session&&is_kda_layer(l)&&!kda_open_rows(P)){ck(cudaMemcpyAsync(cks(l),kst(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(ckc(l),kcv(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));}
-            if(!in_session){check_finite<<<unsigned((state.bytes/4+255)/256),256,0,compute.s>>>(state.as<float>(),state.bytes/4,flag.as<unsigned>());export_state(l,P,sink);}
+            if(!in_session){check_finite<<<unsigned((state.bytes/4+255)/256),256,0,compute.s>>>(state.as<float>(),state.bytes/4,flag.as<unsigned>());export_state(l,P,sink);pm(int(l),DecodePhase::state_export);}
             else if(is_kda_layer(l))check_finite<<<unsigned((kda_state_bytes/4+255)/256),256,0,compute.s>>>(kst(l),kda_state_bytes/4,flag.as<unsigned>());
             if(l>=3)ck(cudaEventRecord(ring[l%2].retired.e,compute.s));
         }
         for(unsigned first=0;first<P;first+=tile){auto chunk=row_tile(first,P,tile);unsigned n=chunk.rows;auto off=std::size_t(first)*4096;hc_final_kernel<<<dim3(16,n),256,0,compute.s>>>(X.as<float>()+off*4,part.as<float>());norm<<<n,256,0,compute.s>>>(part.as<float>(),u16("model.language_model.norm.weight"),hidden.as<float>()+off,n);}
-        zero_layer(45);auto stage_start=std::chrono::steady_clock::now();stage(45);staging_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-stage_start).count();auto& w=*layers[45];
+        pm(-1,DecodePhase::head);
+        zero_layer(45);auto stage_start=std::chrono::steady_clock::now();stage(45);staging_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-stage_start).count();auto& w=*layers[45];pm(45,DecodePhase::stage);
         // Each exact row tile pairs hidden[t] with input[t+1]. Absolute DSA
         // positions and complete pools survive between calls; no padded tokens.
         const unsigned mtp_tile=mtp_row_tile(tile); // MTP in its own (<= 2048-row) pieces
         for(unsigned first=0;first<P;first+=mtp_tile){auto chunk=row_tile(first,P,mtp_tile);unsigned n=chunk.rows;auto off=std::size_t(first)*4096;
             auto sequence=[&]{embed<<<unsigned((std::size_t(n)*4096+255)/256),256,0,compute.s>>>(u16("model.language_model.embed_tokens.weight"),tokens.as<U32>()+first+1,embedding.as<float>(),n,1);
                 MtpCall v{n,first,w.m,dstate(45),embedding.as<float>(),hidden.as<float>()+off,part.as<float>(),flag.as<unsigned>(),mode};v.legacy_fp32_index=legacy_index;ck(enqueue_mtp(v,workspace.p,ws_bytes,compute.s,exec));};
-            auto binding=prefill_binding(first,n,identity,legacy_index,session_key(P));if(graphs){auto& g=graph[45][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
+            auto binding=prefill_binding(first,n,identity,legacy_index,session_key(P));if(graphs&&!prof){auto& g=graph[45][chunk.bucket];g.launch(compute.s,binding,sequence);graph_binding_ms+=g.binding_ms;}else sequence();
+            pm(45,DecodePhase::mtp);
         }
         if(prefill_via_cache)prefill_end(45);
         if(prefill_via_cache&&ts_tier)ts_tier->restore_spares(true); // the decode spare target again, before the residency restore (a failure fails the request)
@@ -737,11 +744,14 @@ struct Runtime::Impl {
         // The decode residency restore is deferred (restore_pending): it runs before the next decode
         // token (or explicitly, untimed, after a TTFT prefill); a prefill-only request never pays it.
         if(prefill_via_cache&&ts_tier&&ts_tier->restore)restore_pending=true;
-        ck(cudaEventRecord(ring[1].retired.e,compute.s));if(!in_session)export_state(45,P,sink);ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());
+        pm(45,DecodePhase::stage); // the MTP layer's release and the decode spare target again
+        ck(cudaEventRecord(ring[1].retired.e,compute.s));if(!in_session){export_state(45,P,sink);pm(45,DecodePhase::state_export);}ck(cudaStreamSynchronize(compute.s));ck(cudaGetLastError());
         if(in_session){unsigned bad=0;ck(cudaMemcpy(&bad,flag.p,4,cudaMemcpyDeviceToHost));need(!bad,"nonfinite session prefill");}
         unsigned read_mask=(file_ring_bytes[0]?1u:0u)|(file_ring_bytes[1]?2u:0u);
         need(prefill_via_cache||!require_file_tier||file_tier_covered(file_count,file_bytes,read_mask,both_file_rings),"requested file tier performed no reads or missed a ring");
         last_timings=Json::object();last_timings.set("file_ring0_bytes",file_ring_bytes[0]);last_timings.set("file_ring1_bytes",file_ring_bytes[1]);last_timings.set("layer_state_releases",releases);last_timings.set("trunk_staging_host_ms",staging_ms);last_timings.set("graph_binding_host_ms",graph_binding_ms);last_timings.set("file_tier_host_read_ms",file_read_ms);last_timings.set("file_tier_bytes",file_bytes);last_timings.set("runtime_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-request_start).count());
+        if(prof){ck(cudaStreamSynchronize(decode.s));auto t=pf_timeline.collect();t.set("routed_moe_detail",moe_pool.collect(routed_topk,4096,2048));
+            t.set("note","--prefill-profile: CUDA graphs off for this prefill (same kernels launched directly); events only, same bytes; routed_moe_detail covers layers 3..44 (the MTP layer's experts are in its mtp phase)");last_timings.set("prefill_timeline",t);}
     }
     // ======================= decode session (draft) =======================
     // The authenticated unit binding is declared BEFORE `tier` (destroyed after it);
@@ -752,7 +762,7 @@ struct Runtime::Impl {
     struct DecodeTimelineRec {
         bool on=false;std::vector<cudaEvent_t> ev;std::vector<TimelineMark> marks;std::size_t n=0;std::chrono::steady_clock::time_point last;
         ~DecodeTimelineRec(){for(auto e:ev)if(e)cudaEventDestroy(e);}
-        void enable(){if(ev.empty()){ev.resize(640,nullptr);for(auto& e:ev)ck(cudaEventCreate(&e));}on=true;}
+        void enable(std::size_t want=640){for(auto i=ev.size();i<want;++i){ev.push_back(nullptr);ck(cudaEventCreate(&ev.back()));}on=true;}
         void start(cudaStream_t s){if(!on)return;marks.clear();n=0;ck(cudaEventRecord(ev[n++],s));last=std::chrono::steady_clock::now();}
         void mark(int layer,DecodePhase phase,cudaStream_t s){if(!on)return;need(n<ev.size(),"decode timeline: event pool exhausted");ck(cudaEventRecord(ev[n++],s));
             const auto t=std::chrono::steady_clock::now();marks.push_back({layer,phase,std::chrono::duration<double,std::milli>(t-last).count()});last=t;}
@@ -770,7 +780,28 @@ struct Runtime::Impl {
                 j.set("timeline",decode_timeline_json(done,gpu,0));
                 if(longest>=0){auto p=Json::object();p.set("layer",done[at].layer);p.set("phase",decode_phase_names[std::size_t(done[at].phase)]);p.set("gpu_ms",longest);j.set("longest_interval",p);}
                 return j;}catch(...){return Json::object();}}
-    } timeline;
+    } timeline,pf_timeline; // pf_timeline: --prefill-profile (stage / state_export phases per layer)
+    // --prefill-profile: one launch_cutlass Profile per routed-MoE call (layer x row tile). Fresh events each prefill, so a
+    // group the call did not run has unrecorded events and ends that call's sums (cudaEventElapsedTime refuses them).
+    struct MoeProfilePool {
+        std::vector<std::unique_ptr<Profile>> p;std::vector<std::pair<int,unsigned>> at;
+        static void each(Profile& x,const std::function<void(cudaEvent_t&)>& f){
+            for(auto* a:{x.begin,x.decoded,x.gate_up,x.down,x.decode_start,x.ready,x.input,x.gu_start,x.gu_gemm,x.swiglu,x.down_input,x.down_start,x.down_gemm})for(unsigned g=0;g<18;++g)f(a[g]);
+            f(x.merge_begin);f(x.merge_end);}
+        void reset(){for(auto& x:p)each(*x,[](cudaEvent_t& e){if(e)cudaEventDestroy(e);e=nullptr;});p.clear();at.clear();}
+        ~MoeProfilePool(){reset();}
+        Profile* next(int layer,unsigned rows){auto x=std::make_unique<Profile>();each(*x,[](cudaEvent_t& e){e=nullptr;});p.push_back(std::move(x));
+            each(*p.back(),[](cudaEvent_t& e){ck(cudaEventCreate(&e));});at.push_back({layer,rows});return p.back().get();}
+        // After the streams synchronized.
+        Json collect(unsigned topk,unsigned hidden,unsigned inter){std::vector<MoeCallTimes> calls;
+            auto el=[](cudaEvent_t a,cudaEvent_t b,double& acc){float ms=0;if(cudaEventElapsedTime(&ms,a,b)!=cudaSuccess){cudaGetLastError();return false;}acc+=ms;return true;};
+            for(std::size_t i=0;i<p.size();++i){const auto& x=*p[i];MoeCallTimes t;t.layer=at[i].first;t.rows=at[i].second;
+                for(unsigned g=0;g<18;++g){if(!el(x.begin[g],x.input[g],t.transform_ms))break;++t.groups;
+                    el(x.decode_start[g],x.decoded[g],t.decode_ms);el(x.input[g],x.ready[g],t.decode_wait_ms);el(x.ready[g],x.gu_start[g],t.setup_ms);el(x.gu_start[g],x.gu_gemm[g],t.gate_up_ms);
+                    el(x.gu_gemm[g],x.down_input[g],t.epilogue_ms);el(x.down_input[g],x.down_start[g],t.setup_ms);el(x.down_start[g],x.down_gemm[g],t.down_ms);el(x.down_gemm[g],x.down[g],t.epilogue_ms);}
+                el(x.merge_begin,x.merge_end,t.merge_ms);calls.push_back(t);}
+            return prefill_moe_json(calls,topk,hidden,inter);}
+    } moe_pool;
     Json failed_timeline; // the last failed decode token's partial timeline (--decode-profile)
     Json residency_restore; // the last restore of the decode placement (deferred: before the next decode token)
     bool restore_pending=false;Json prefill_counters0;
@@ -850,7 +881,7 @@ struct Runtime::Impl {
         if(d.reference_compare)in.pinned.push_back({compare_part,8*hstride+288*sizeof(Expert)});
         in.pageable={{process_part,process_private}};if(d.reference_compare)in.pageable.push_back({compare_part,hstride});
         add_host_growth_parts(in.pageable,kv); // the bench snapshot (= session state + replay) and driver growth
-        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.max_ids=d.mtp_spec?4*routed_topk:routed_topk;in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;in.tier.disk_readers=disk_bounce_readers(d);in.tier.landing_blocks=d.tier_landing_blocks;
+        in.tier.keys=c.size();in.tier.unit_bytes=c.unit_stride();in.tier.max_ids=d.mtp_spec?4*routed_topk:routed_topk;in.tier.spare_slots=d.tier_spare_slots;in.tier.spare_permille=d.tier_spare_permille;in.tier.host_spares=d.tier_host_spares;in.tier.staging=d.tier_staging;in.tier.disk_readers=disk_bounce_readers(d);in.tier.disk_readers_auto=disk_auto_readers(d);in.tier.landing_blocks=d.tier_landing_blocks;
         if(d.tier_ram_gib>=0)in.ram_expert_bytes=gib_bytes(d.tier_ram_gib);
         if(d.tier_vram_gib>=0){TierBudgetIn t=in.tier;const auto req=gib_bytes(d.tier_vram_gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;
             in.arena_units=tier_budget(t).resident;} // the explicit arena, planned (and checked) before any load
@@ -986,7 +1017,7 @@ struct Runtime::Impl {
         auto [physical,commit]=host_free();const std::uint64_t host_avail=host_budget(physical,commit,floor_gib);
         std::uint64_t avail=0,dev=0,host=host_avail;TierBudget b;Json open_plan;
         // Arena-only requests (--tier-vram-gib / --tier-ram-gib) are granted exactly or refused with the numbers.
-        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.max_ids=tier_ids();t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;t.disk_readers=disk_bounce_readers(dopt);t.landing_blocks=dopt.tier_landing_blocks;
+        auto arena_units=[&](double gib){TierBudgetIn t;t.keys=keys;t.max_ids=tier_ids();t.unit_bytes=stride;t.spare_slots=dopt.tier_spare_slots;t.spare_permille=dopt.tier_spare_permille;t.host_spares=dopt.tier_host_spares;t.staging=dopt.tier_staging;t.disk_readers=disk_bounce_readers(dopt);t.disk_readers_auto=disk_auto_readers(dopt);t.landing_blocks=dopt.tier_landing_blocks;
             const auto req=gib_bytes(gib);t.device_bytes=req>(256ULL<<20)?req-(256ULL<<20):0;t.host_bytes=~0ULL>>1;return tier_budget(t).resident;};
         if(whole_device){
             // Re-plan from what is allocated now (measured device use; process
@@ -1008,12 +1039,12 @@ struct Runtime::Impl {
             if(dopt.tier_ram_gib>=0){host=gib_bytes(dopt.tier_ram_gib);
                 need(host<=host_avail,("requested tierstream RAM tier "+gib_text(host)+" exceeds the "+gib_text(host_avail)+" host memory available above the floor at cache open").c_str());}
             TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=dev>(256ULL<<20)?dev-(256ULL<<20):0;in.host_bytes=host>(256ULL<<20)?host-(256ULL<<20):0;
-            in.max_ids=tier_ids();in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;in.disk_readers=disk_bounce_readers(dopt);in.landing_blocks=dopt.tier_landing_blocks;b=tier_budget(in);
+            in.max_ids=tier_ids();in.spare_slots=dopt.tier_spare_slots;in.spare_permille=dopt.tier_spare_permille;in.host_spares=dopt.tier_host_spares;in.staging=dopt.tier_staging;in.disk_readers=disk_bounce_readers(dopt);in.disk_readers_auto=disk_auto_readers(dopt);in.landing_blocks=dopt.tier_landing_blocks;b=tier_budget(in);
         }
         need(b.refuse.empty(),b.refuse.empty()?"":b.refuse.c_str());
         TierOpenConfig cfg;cfg.max_ids=tier_ids();// The cache opens the canonical held path, never the operator's (possibly aliased) name.
         const auto order=placement_order();cfg.tiers=tier_assignment(b,keys,order);cfg.seed=order;cfg.policy=policy_code(dopt.tier_policy);cfg.budget=b;cfg.unit_bytes=stride;cfg.disk_prefetch=dopt.disk_prefetch;cfg.flush_ready=dopt.tier_flush_ready;cfg.ledger=ledger.l.get();
-        cfg.weight_dirs=dopt.weight_dirs;cfg.drive_readers=dopt.drive_readers;cfg.disk_queue=dopt.tier_disk_queue;cfg.clean_evict=dopt.tier_clean_evict;
+        cfg.weight_dirs=dopt.weight_dirs;cfg.drive_readers=dopt.drive_readers;cfg.disk_queue=resolved_disk_queue(dopt.tier_disk_queue,b.disk_readers);cfg.clean_evict=dopt.tier_clean_evict;
         // Landing options as one group, only when the plan kept the blocks (a file tier): none on a two-tier plan.
         if(b.landing_blocks){cfg.landing_blocks=std::uint32_t(b.landing_blocks);cfg.landing_max_queued=dopt.tier_landing_max_queued;cfg.landing_ttl=dopt.tier_landing_ttl;cfg.landing_chunk=dopt.tier_landing_chunk;}
         // The source path is the bound native path as lossless UTF-8 (tierstream decodes UTF-8);
@@ -1037,10 +1068,13 @@ struct Runtime::Impl {
         tier_plan=Json::object();tier_plan.set("placement",placement);tier_plan.set("skip_empty_expert_groups",dopt.skip_empty_expert_groups?"on: routed MoE launches only the expert groups holding routed rows (device compaction)":"off");tier_plan.set("persistent_dense_fp16",dopt.persistent_dense_fp16?"on: shared experts and dense FFNs decoded once at startup":persist_note.empty()?std::string("off"):persist_note);tier_plan.set("flush_ready",dopt.tier_flush_ready?"on: dg_flush_ready, the demand stream is flushed after each ready signal (WDDM submission)":"off");tier_plan.set("predicted_prefetch",dopt.tier_predict?"on: next layer's router on this layer's MoE input, ss_dg_enqueue_predict on a side stream (8 ids, layers 3..43 predict 4..44)":"off");tier_plan.set("routes_recording",dopt.routes_out.empty()?"off":dopt.routes_out);
         tier_plan.set("unit_file",dopt.unit_file);tier_plan.set("unit_file_sha256",unit_file_sha);
         tier_plan.set("weight_dirs",dopt.weight_dirs.empty()?std::string("none: the primary only"):dopt.weight_dirs);if(dopt.weight_dirs.empty())tier_plan.set("drive_readers",std::string("n/a: no --weight-dirs"));else tier_plan.set("drive_readers",std::uint64_t(dopt.drive_readers?dopt.drive_readers:4));
-        tier_plan.set("disk_queue",std::uint64_t(b.three_tier?dopt.tier_disk_queue:0));tier_plan.set("disk_bounce_units",std::uint64_t(b.disk_readers));tier_plan.set("landing_blocks_requested",std::uint64_t(dopt.tier_landing_blocks));tier_plan.set("landing_blocks",b.landing_blocks);tier_plan.set("landing_max_queued",std::uint64_t(b.landing_blocks?dopt.tier_landing_max_queued:0));tier_plan.set("landing_ttl",std::uint64_t(b.landing_blocks?dopt.tier_landing_ttl:0));tier_plan.set("landing_chunk",std::uint64_t(b.landing_blocks?dopt.tier_landing_chunk:0));tier_plan.set("clean_evict",b.three_tier&&dopt.tier_clean_evict?"on: device victims with no free pinned block go to their file (no D2H)":"off");tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
+        tier_plan.set("disk_queue_source",std::string(dopt.tier_disk_queue?"explicit":"auto"));tier_plan.set("disk_bounce_units",std::uint64_t(b.disk_readers));tier_plan.set("landing_blocks_requested",std::uint64_t(dopt.tier_landing_blocks));tier_plan.set("landing_blocks",b.landing_blocks);tier_plan.set("landing_max_queued",std::uint64_t(b.landing_blocks?dopt.tier_landing_max_queued:0));tier_plan.set("landing_ttl",std::uint64_t(b.landing_blocks?dopt.tier_landing_ttl:0));tier_plan.set("landing_chunk",std::uint64_t(b.landing_blocks?dopt.tier_landing_chunk:0));tier_plan.set("clean_evict",b.three_tier&&dopt.tier_clean_evict?"on: device victims with no free pinned block go to their file (no D2H)":"off");tier_plan.set("unit_manifest_sha256",dopt.unit_manifest_sha256);
         {auto c=ts_tier->census(compute.s);for(const auto& l:c.find("layers")->as_array())ts_tier->open_persistent.push_back(std::uint32_t(l.find("persistent")->as_int()));
          tier_plan.set("slot_census_at_open",c);} // homes per gated layer as the cache opened
-        if(auto diag=ts_tier->api->diagnostics();diag.find("cuda_module_loading"))tier_plan.set("tierstream_cuda_module_loading",diag.find("cuda_module_loading")->as_string());
+        {auto diag=ts_tier->api->diagnostics();if(diag.find("cuda_module_loading"))tier_plan.set("tierstream_cuda_module_loading",diag.find("cuda_module_loading")->as_string());
+         // File reads in flight as the open resolved them (auto: the library's choice for the read locations; 0 = two-tier).
+         tier_plan.set("disk_queue",diag.find("disk_queue_resolved")?std::uint64_t(diag.find("disk_queue_resolved")->as_int()):std::uint64_t(b.three_tier?cfg.disk_queue:0));
+         if(diag.find("disk_locations"))tier_plan.set("disk_locations",std::uint64_t(diag.find("disk_locations")->as_int()));}
         tier_plan.set("restore_decode_residency",dopt.restore_decode_residency?"on: the open placement is made resident again after every prefill through the cache":"off");
         tier_plan.set("unit_file_authenticated",unit_auth_how);tier_plan.set("unit_file_binding",binding_text);tier_plan.set("unit_file_bound_path",bound_path);tier_plan.set("unit_file_hash_ms",unit_hash_ms);tier_plan.set("reference_compare",reference_tier!=nullptr);tier_plan.set("unit_stride",stride);tier_plan.set("resident_units",b.resident);tier_plan.set("pinned_units",b.pinned);tier_plan.set("file_units",b.disk);
         tier_plan.set("arena_slots",b.slots+b.ring);tier_plan.set("spare_slots",b.spare_slots);tier_plan.set("host_spares",b.host_spares);tier_plan.set("disk_staging",b.staging);tier_plan.set("three_tier",b.three_tier);
@@ -1264,7 +1298,10 @@ struct Runtime::Impl {
         // lowers the target (PrefillSpareTarget) and restore_spares() puts it back once the prefill ends or aborts
         // (placement only; a prefill evicts decode residents there anyway). rethrow: the normal end fails the request.
         PrefillSpareTarget spares;unsigned serial_steps=0;
-        void restore_spares(bool rethrow){spares.restore(*api,site,rethrow);}
+        PrefillCleanEvict clean;std::string clean_note="off: option";
+        void restore_spares(bool rethrow){spares.restore(*api,site,rethrow);clean.restore(*api,site,rethrow);}
+        void choose_clean_evict(bool want,bool open_on){std::string why;const bool on=clean.begin(*api,site,want,open_on,budget.three_tier,why);
+            clean_note=PrefillCleanEvict::note(want,open_on,budget.three_tier,on,why);}
         void choose_overlap(bool want){overlap.reset();host_wait_ms.clear();gpu_idle_ms.clear();serial_steps=0;restore_spares(true);overlapping=want&&PrefillResidency::two_layers(budget);
             std::string lower_failed;if(!overlapping&&spares.lower(*api,site,budget,want,lower_failed))overlapping=true;
             const unsigned spare_lowered=spares.lowered();

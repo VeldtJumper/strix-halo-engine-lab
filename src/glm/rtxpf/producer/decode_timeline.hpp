@@ -35,11 +35,13 @@ enum class DecodePhase : unsigned {
     head,          // final mix + norm + lm_head + argmax + result copies
     host_gap,      // device idle while the host synchronizes, checks and reads the result
     mtp,           // MTP maintenance (its own export/wait and experts) + its synchronization
+    stage,         // prefill: the layer's staging (trunk H2D, expert-cache make_resident / release); device idle while the host stages
+    state_export,  // prefill: the layer's state export (stream synchronization, D2H copies, the sink)
     count
 };
 inline constexpr std::array<const char*, std::size_t(DecodePhase::count)> decode_phase_names{
     "embed", "hc_pre_attn", "kda", "dsa", "hc_post_attn", "hc_pre_ffn", "dense_ffn", "router", "export_wait",
-    "predict", "routed_moe", "shared_expert", "combine", "hc_post_ffn", "head", "host_gap", "mtp"};
+    "predict", "routed_moe", "shared_expert", "combine", "hc_post_ffn", "head", "host_gap", "mtp", "stage", "state_export"};
 
 struct TimelineMark {
     int layer = -1;  // model layer, -1 = outside the layer loop
@@ -125,6 +127,43 @@ inline Json aggregate_decode_timelines(const Json& steps) {
         phases.set(decode_phase_names[p], o);
     }
     j.set("phases", phases);
+    return j;
+}
+// Prefill (--prefill-profile): one routed-MoE call (a layer's row tile), its 16-expert groups' device times summed
+// (launch_cutlass's Profile events). decode_ms runs on the decode stream beside the GEMMs; decode_wait_ms is the
+// compute stream waiting for a group's decoded FP16 weights, so decode_wait_ms > 0 means the call is decode-bound.
+struct MoeCallTimes {
+    int layer = -1;
+    unsigned rows = 0, groups = 0;
+    double transform_ms = 0, decode_ms = 0, decode_wait_ms = 0, setup_ms = 0, gate_up_ms = 0, epilogue_ms = 0, down_ms = 0, merge_ms = 0;
+};
+// Totals, per layer, and the GEMM rates: gate+up = 4 x hidden x inter and down = 2 x hidden x inter FLOP per
+// (row, routed expert) pair, rows x topk pairs per call.
+inline Json prefill_moe_json(const std::vector<MoeCallTimes>& calls, unsigned topk, unsigned hidden, unsigned inter) {
+    struct Sum { double transform = 0, decode = 0, wait = 0, setup = 0, gu = 0, epi = 0, down = 0, merge = 0, gu_flop = 0, down_flop = 0; std::uint64_t rows = 0, calls = 0; };
+    auto add = [&](Sum& t, const MoeCallTimes& c) {
+        t.transform += c.transform_ms; t.decode += c.decode_ms; t.wait += c.decode_wait_ms; t.setup += c.setup_ms;
+        t.gu += c.gate_up_ms; t.epi += c.epilogue_ms; t.down += c.down_ms; t.merge += c.merge_ms;
+        const double pairs = double(c.rows) * topk;
+        t.gu_flop += 4.0 * hidden * inter * pairs; t.down_flop += 2.0 * hidden * inter * pairs;
+        t.rows += c.rows; ++t.calls;
+    };
+    auto json = [](const Sum& t) {
+        auto o = Json::object();
+        o.set("calls", t.calls); o.set("rows", t.rows);
+        o.set("transform_ms", t.transform); o.set("weight_decode_ms", t.decode); o.set("decode_wait_ms", t.wait); o.set("setup_ms", t.setup);
+        o.set("gate_up_gemm_ms", t.gu); o.set("epilogue_ms", t.epi); o.set("down_gemm_ms", t.down); o.set("merge_ms", t.merge);
+        o.set("gate_up_tflop", t.gu_flop / 1e12); o.set("down_tflop", t.down_flop / 1e12);
+        o.set("gate_up_tflops", t.gu > 0 ? t.gu_flop / (t.gu * 1e9) : 0.0); o.set("down_tflops", t.down > 0 ? t.down_flop / (t.down * 1e9) : 0.0);
+        return o;
+    };
+    Sum total;
+    std::map<int, Sum> layers;
+    for (const auto& c : calls) { add(total, c); add(layers[c.layer], c); }
+    auto per_layer = Json::array();
+    for (const auto& [layer, t] : layers) { auto o = json(t); o.set("layer", layer); per_layer.push(o); }
+    auto j = json(total);
+    j.set("layers", per_layer);
     return j;
 }
 }  // namespace strix::glm::rtxpf::producer

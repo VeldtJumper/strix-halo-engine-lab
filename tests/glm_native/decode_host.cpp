@@ -184,6 +184,16 @@ void decode_timeline_tests(){
           &&std::abs(agg.find("phases")->find("routed_moe")->find("gpu_ms_per_token")->as_double()-6.5)<1e-9
           &&std::abs(agg.find("phases")->find("routed_moe")->find("gpu_ms_total")->as_double()-13.0)<1e-9,"timeline: per-arm totals over the steps that carry one");
     check(!aggregate_decode_timelines(Json::array()).find("tokens"),"timeline: no timeline, no totals");
+    // Prefill phases (--prefill-profile) carry their names; the routed-MoE detail sums groups per call and layer and
+    // gives the GEMM rates from rows x topk pairs (gate+up 4 h i, down 2 h i FLOP per pair).
+    check(std::string(decode_phase_names[std::size_t(DecodePhase::stage)])=="stage"&&std::string(decode_phase_names[std::size_t(DecodePhase::state_export)])=="state_export"&&decode_phase_names.back()!=nullptr,"timeline: prefill phase names");
+    std::vector<MoeCallTimes> calls(3);calls[0].layer=3;calls[0].rows=8192;calls[0].groups=18;calls[0].gate_up_ms=100;calls[0].down_ms=50;calls[0].decode_ms=40;calls[0].decode_wait_ms=5;
+    calls[1]=calls[0];calls[1].rows=4096;calls[2]=calls[0];calls[2].layer=4;
+    const auto m=prefill_moe_json(calls,8,4096,2048);const double pairs=(8192.0+4096+8192)*8,gu=4.0*4096*2048*pairs;
+    check(m.find("calls")->as_int()==3&&m.find("rows")->as_int()==20480&&std::abs(m.find("gate_up_gemm_ms")->as_double()-300)<1e-9&&std::abs(m.find("decode_wait_ms")->as_double()-15)<1e-9,"prefill MoE: per-call sums");
+    check(std::abs(m.find("gate_up_tflop")->as_double()-gu/1e12)<1e-9&&std::abs(m.find("gate_up_tflops")->as_double()-gu/(300*1e9))<1e-9&&std::abs(m.find("down_tflops")->as_double()-gu/2/(150*1e9))<1e-9,"prefill MoE: GEMM FLOP and rates");
+    const auto& ml=m.find("layers")->as_array();check(ml.size()==2&&ml[0].find("layer")->as_int()==3&&ml[0].find("calls")->as_int()==2&&ml[1].find("rows")->as_int()==8192,"prefill MoE: per-layer rows");
+    check(prefill_moe_json({},8,4096,2048).find("gate_up_tflops")->as_double()==0,"prefill MoE: no calls, no rate");
 }
 // skip_empty_expert_groups: the C1 group schedule (c1_schedule.hpp, the same functions the
 // kernels call). Group counts; the device's slot -> expert list is a permutation with the
@@ -397,6 +407,25 @@ void tier_budget_tests(){
      check((l3.pinned+l3.host_spares+l3.staging)*unit+16*stride<=in.host_bytes,"pinned tier + landing blocks fit the RAM budget");
      l.host_bytes=400ULL<<30;const auto l2=tier_budget(l);
      check(l2.refuse.empty()&&!l2.three_tier&&l2.landing_blocks==0&&l2.pinned==two.pinned&&l2.host_bytes(unit)==two.host_bytes(unit),"two-tier: landing requested but not billed (no file tier)");}
+    // Disk readers (auto or explicit): billed only on a three-tier plan and taken out of the host room, so the pinned
+    // tier shrinks and everything fits the RAM budget; none on a two-tier plan; when auto readers do not fit, the bare
+    // plan (queue 1) stands, while landing blocks keep the charged plan's refusal.
+    {auto a=in;a.disk_readers_auto=8;const auto a3=tier_budget(a);auto x=in;x.disk_readers=8;const auto x3=tier_budget(x);
+     check(a3.refuse.empty()&&a3.three_tier&&a3.disk_readers==8&&a3.pinned==x3.pinned&&a3.resident==x3.resident&&a3.host_bytes(unit)==x3.host_bytes(unit),"three-tier: auto readers billed as explicit queue 8");
+     check(a3.pinned+8<=three.pinned&&a3.host_bytes(unit)<=in.host_bytes,"three-tier: reader buffers come out of the RAM budget (pinned tier smaller, total within the budget)");
+     auto x2=in;x2.disk_readers=8;x2.host_bytes=400ULL<<30;const auto xt=tier_budget(x2);check(xt.refuse.empty()&&!xt.three_tier&&xt.disk_readers==0&&xt.pinned==two.pinned,"two-tier: explicit queue readers not billed (no file tier, the library allocates none)");
+     a.host_bytes=400ULL<<30;const auto a2=tier_budget(a);
+     check(a2.refuse.empty()&&!a2.three_tier&&a2.disk_readers==0&&a2.pinned==two.pinned&&a2.host_bytes(unit)==two.host_bytes(unit),"two-tier: auto readers not billed");
+     auto b=in;b.disk_readers_auto=8;b.landing_blocks=16;const auto b3=tier_budget(b);
+     check(b3.refuse.empty()&&b3.three_tier&&b3.disk_readers==8&&b3.landing_blocks==16,"three-tier: auto readers and landing blocks billed together");
+     // 20 units off the device; the host holds 8 spares + 8 staging + 4 pinned: three-tier at queue 1, no room for
+     // 8 readers -> auto falls back to queue 1, landing keeps the refusal; 27 units stay three-tier with the readers
+     // (3 pinned + 8 spares + 8 staging + 8 readers; from 28 the 20 units + 8 spares fit two-tier, which bills no staging).
+     TierBudgetIn e;e.keys=keys;e.unit_bytes=unit;e.device_bytes=(12364ULL+16+17)*unit;e.disk_readers_auto=8;e.host_bytes=20*unit;
+     {auto e0=e;e0.disk_readers_auto=0;const auto b0=tier_budget(e0);check(b0.refuse.empty()&&b0.three_tier,("fallback case: three-tier at queue 1 ("+b0.refuse+")").c_str());}
+     const auto f=tier_budget(e);check(f.refuse.empty()&&f.three_tier&&f.disk_readers==0&&resolved_disk_queue(0,f.disk_readers)==1,("auto readers that do not fit: queue 1 plan ("+f.refuse+")").c_str());
+     auto el=e;el.landing_blocks=4;check(!tier_budget(el).refuse.empty(),"auto readers + landing that do not fit: refused");
+     e.host_bytes=27*unit;const auto g=tier_budget(e);check(g.refuse.empty()&&g.three_tier&&g.disk_readers==8&&g.host_bytes(unit)<=e.host_bytes,("auto readers that fit: billed within the RAM budget (three_tier "+std::to_string(g.three_tier)+", readers "+std::to_string(g.disk_readers)+", pinned "+std::to_string(g.pinned)+", spares "+std::to_string(g.host_spares)+", staging "+std::to_string(g.staging)+", disk "+std::to_string(g.disk)+", refuse '"+g.refuse+"')").c_str());}
     // Landing with a spare share: the blocks are decided per spare count, so the chosen plan carries them exactly when
     // it is three-tier. Boundary case (host 80 units, staging 64, 5% spares): the charged share plan is refused,
     // the fallback is the two-tier minimum, which must carry no blocks.
@@ -406,9 +435,14 @@ void tier_budget_tests(){
          if(p.three_tier)check((p.pinned+p.host_spares+p.staging)*unit+16*unit<=s.host_bytes,"spare share + landing: blocks fit beside the pinned tier");}
      s.host_bytes=80*unit;const auto edge=tier_budget(s);check(!edge.three_tier&&edge.landing_blocks==0&&edge.host_bytes(unit)==(edge.pinned+edge.host_spares+edge.staging)*unit,"spare-share fallback: two-tier minimum, no blocks billed");}
     auto lib=library_budget(three,unit,keys,8);check(lib.ring_slots==17&&lib.device_bytes>=(three.slots+17)*unit&&lib.host_bytes>=three.host_bytes(unit),"library budget covers arena/ring and pinned blocks");
-    // Defaults: no new option changes today's behaviour (queue 1 = no extra bounce buffers, no stripes, no clean evict).
-    {const DecodeOptions d{};check(disk_bounce_readers(d)==0&&d.weight_dirs.empty()&&d.drive_readers==0&&d.tier_disk_queue==1&&!d.tier_clean_evict&&!d.routes_prefill&&TierBudgetIn{}.disk_readers==0,"new options default off");
-     auto q=d;q.tier_disk_queue=8;check(disk_bounce_readers(q)==8,"queue 8: eight reader bounce buffers");
+    // Defaults: one read at a time (auto is opt-in: readers billed only on a three-tier plan), no stripes, no clean evict.
+    {const DecodeOptions d{};check(disk_bounce_readers(d)==0&&disk_auto_readers(d)==0&&d.weight_dirs.empty()&&d.drive_readers==0&&d.tier_disk_queue==1&&!d.tier_clean_evict&&!d.routes_prefill&&TierBudgetIn{}.disk_readers==0&&TierBudgetIn{}.disk_readers_auto==0,"defaults: one read at a time (auto opt-in), other options off");
+     auto q=d;q.tier_disk_queue=8;check(disk_bounce_readers(q)==8&&disk_auto_readers(q)==0,"queue 8: eight reader bounce buffers, no auto");
+     auto a=d;a.tier_disk_queue=0;check(disk_bounce_readers(a)==0&&disk_auto_readers(a)==4,"auto, one read location: tierstream starts at most 4 readers, 4 billed");
+     auto a2=a;a2.weight_dirs="D:/s";auto a3=a;a3.weight_dirs="D:/s;C:/s";check(disk_auto_readers(a2)==6&&disk_auto_readers(a3)==8,"auto: 6 for two read locations, 8 for three");
+     auto s4=a3;s4.tier_staging=4;auto s1=a;s1.tier_staging=1;check(disk_auto_readers(s4)==4&&disk_auto_readers(s1)==0,"auto readers at most the staging buffers, none below two");
+     check(auto_disk_queue_bound("",8)==4&&auto_disk_queue_bound("a;b;c;d",8)==8&&auto_disk_queue_bound("a",3)==3,"auto bound = clamp(3 x locations, 4, 8), at most the staging");
+     check(resolved_disk_queue(0,8)==0&&resolved_disk_queue(0,0)==1&&resolved_disk_queue(1,0)==1&&resolved_disk_queue(16,16)==16,"open queue: library auto when its readers were billed, else 1; explicit as given");
      bool bad=false;for(const char* v:{"",";","D:/s;;C:/s","D:/s;d:\\S\\"," ;D:/s"}){try{check_weight_dirs(v);}catch(...){continue;}bad=true;}
      check(!bad,"--weight-dirs: empty entries and duplicates refused");try{check_weight_dirs("D:/a;C:/b");}catch(...){check(false,"--weight-dirs: two distinct directories accepted");}}
     // dg_disk_queue > 1: one bounce buffer per disk reader, billed in the plan, host bytes and library budget.
@@ -554,6 +588,36 @@ void prefill_cache_tests(){
       sp.restore(m,st,false);check(!st.unusable().empty(),"abort path: a failed restore retires without a second throw");}
      {SpareMock m;m.fail_lower=true;m.fail_restore=true;CacheTokenSite st(m);PrefillSpareTarget sp;
       rejects([&]{(void)sp.lower(m,st,tb,true,why);},"a failed lowering whose reset fails throws");check(!st.unusable().empty(),"and retires the worker");}}
+    // Prefill clean eviction by phase (PrefillCleanEvict): on only for a three-tier prefill when the open has it off,
+    // the open's setting (off) again exactly once at the end or abort; a failed set keeps it off; a failed reset retires.
+    {struct CleanMock final:TierCacheApi {bool on=false;int sets=0;bool fail_on=false,fail_off=false;
+        void begin()override{}void enqueue_begin(void*)override{}void enqueue_export(unsigned,const std::int32_t*,unsigned,void*)override{}void enqueue_wait(unsigned,void*)override{}
+        void enqueue_end(void*)override{}void end()override{}TierView view()const override{return TierView{};}void reset_open()override{}Json stats()override{return Json::object();}
+        bool set_clean_evict(bool v)override{++sets;if(v&&fail_on)throw std::runtime_error("injected set failure");if(!v&&fail_off)throw std::runtime_error("injected reset failure");on=v;return true;}};
+     std::string why;
+     {CleanMock m;CacheTokenSite st(m);PrefillCleanEvict ce;check(ce.begin(m,st,true,false,true,why)&&ce.on()&&m.on&&why.empty(),"clean evict on for a three-tier prefill");
+      ce.restore(m,st,true);ce.restore(m,st,true);check(!m.on&&m.sets==2&&!ce.on()&&st.unusable().empty(),"clean evict: the open's setting again, once");}
+     {CleanMock m;CacheTokenSite st(m);PrefillCleanEvict ce;
+      check(!ce.begin(m,st,false,false,true,why)&&!ce.begin(m,st,true,true,true,why)&&!ce.begin(m,st,true,false,false,why)&&m.sets==0,
+            "clean evict untouched: --prefill-clean-evict 0, the open has it on already, or a two-tier plan");
+      ce.restore(m,st,true);check(m.sets==0,"nothing to restore when it was not turned on");}
+     {CleanMock m;CacheTokenSite st(m);PrefillCleanEvict ce;(void)ce.begin(m,st,true,false,true,why);
+      try{throw std::runtime_error("mid-prefill failure");}catch(const std::exception&){ce.restore(m,st,false);}check(!m.on&&st.unusable().empty(),"abort mid-prefill: off again");}
+     {CleanMock m;m.fail_on=true;CacheTokenSite st(m);PrefillCleanEvict ce;
+      check(!ce.begin(m,st,true,false,true,why)&&why.find("injected set failure")!=std::string::npos&&!m.on&&!ce.on()&&st.unusable().empty(),"a failed set: off, reset, worker usable");}
+     {CleanMock m;CacheTokenSite st(m);PrefillCleanEvict ce;(void)ce.begin(m,st,true,false,true,why);m.fail_off=true;
+      rejects([&]{ce.restore(m,st,true);},"a failed reset at the prefill end fails the request");check(!st.unusable().empty(),"a failed reset retires the worker");}
+     {CleanMock m;m.fail_on=true;m.fail_off=true;CacheTokenSite st(m);PrefillCleanEvict ce;
+      rejects([&]{(void)ce.begin(m,st,true,false,true,why);},"a failed set whose reset fails throws");check(!st.unusable().empty(),"and retires the worker");}
+     {CleanMock m;m.on=true;CacheTokenSite st(m);PrefillCleanEvict ce;check(!ce.begin(m,st,true,true,true,why)&&m.on&&m.sets==0,"inherited ON: left on, untouched");
+      ce.restore(m,st,true);check(m.on&&m.sets==0,"inherited ON: nothing restored");}
+     {CleanMock m;CacheTokenSite st(m);PrefillCleanEvict ce;(void)ce.begin(m,st,true,false,true,why);m.fail_off=true;
+      ce.restore(m,st,false);check(!st.unusable().empty()&&!ce.on(),"abort path: a failed reset retires without a second throw");}
+     using N=PrefillCleanEvict;
+     check(N::note(true,true,false,false,"").rfind("off: two-tier",0)==0&&N::note(false,true,false,false,"").rfind("off: two-tier",0)==0,"note: a two-tier plan is off whatever the open says");
+     check(N::note(false,true,true,false,"").rfind("on: the open's own",0)==0,"note: --prefill-clean-evict 0 with --tier-clean-evict 1 is still on");
+     check(N::note(true,false,true,true,"").rfind("on: victims",0)==0&&N::note(false,false,true,false,"")=="off: option"&&N::note(true,false,true,false,"x")=="off: set failed (x)","note: override outcome");
+     check(DecodeOptions{}.prefill_clean_evict,"prefill clean eviction on by default");}
     std::cout<<"INFO prefill through the cache (mock reader/resident): 2 layers x 288 slot-bound descriptors == source bytes; overlap: 3 layers, two held at most\n";
 }
 void tier_mapping_tests(){
@@ -646,6 +710,15 @@ void production_admission_tests(){
      auto unbilled=three;unbilled.landing_blocks=32;check(tierstream_admission_probe(unbilled).first==-1,"landing blocks beyond the billed count refused before the library");
      auto q1=landing(48ULL<<30,1);auto r1=tierstream_admission_probe(q1);check(r1.first!=8&&r1.second.find("dg_disk_queue > 1")!=std::string::npos,"landing blocks with disk queue 1 refused by the library for that reason");
      std::cout<<"INFO landing admission: three-tier 16 blocks ok; two-tier none; disk queue 1 refused: "<<r1.second<<"\n";}
+    // Auto disk queue through the real library open (CPU backend), as runtime.cu passes it: the plan bills the
+    // readers, the open passes TS_DG_DISK_QUEUE_AUTO (0 here); without the billed readers it is refused before the library.
+    {TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=(3353+16+17)*stride;in.host_bytes=48ULL<<30;in.disk_readers_auto=8;
+     TierOpenConfig cfg;cfg.budget=tier_budget(in);cfg.descriptor_json=tierstream_descriptor(c,"OUT_DIR/glm-units.bin",std::string(64,'b')).dump();cfg.tiers=tier_assignment(cfg.budget,keys,{});cfg.unit_bytes=stride;cfg.cuda=false;
+     cfg.disk_queue=resolved_disk_queue(0,cfg.budget.disk_readers);check(cfg.budget.three_tier&&cfg.budget.disk_readers==8&&cfg.disk_queue==0,"auto plan: three-tier, 8 readers billed, library auto");
+     auto r=tierstream_admission_probe(cfg);check(r.first==8,("auto disk queue admitted by the library (got "+std::to_string(r.first)+": "+r.second+")").c_str());
+     auto unbilled=cfg;unbilled.budget.disk_readers=0;check(tierstream_admission_probe(unbilled).first==-1,"auto disk queue without billed readers refused before the library");
+     auto four=cfg;four.budget.disk_readers=4;auto short3=cfg;short3.budget.disk_readers=3;
+     check(tierstream_admission_probe(four).first==8&&tierstream_admission_probe(short3).first==-1,"unstriped auto open: 4 billed readers admitted (the library starts 4), 3 refused");}
     // Full-card shape with the DS placement: 5% spares, round-robin seed (dg_seed +
     // matching tier array), each boundary policy; all admitted by the library.
     {TierBudgetIn in;in.keys=keys;in.unit_bytes=stride;in.device_bytes=(6262ULL+17)*stride;in.host_bytes=~0ULL>>1;in.spare_permille=50;
@@ -716,7 +789,14 @@ void decode_budget_tests(){
         check(ap.tier.three_tier&&aq.refuse.empty()&&aq.tier.landing_blocks==16&&aq.tier.pinned+16<=ap.tier.pinned,"host-available bound: landing blocks reserved too");
         check((aq.tier.pinned+aq.tier.host_spares+aq.tier.staging)*stride+lb<=(ap.tier.pinned+ap.tier.host_spares+ap.tier.staging+1)*stride,"host-available bound: landing taken from the same room");
         auto b0=glm();b0.ram_total=0;b0.host_avail=1000*gib;const auto bp=plan_whole_device(b0);auto b1=b0;b1.tier.landing_blocks=16;const auto bq=plan_whole_device(b1);
-        check(!bp.tier.three_tier&&!bq.tier.three_tier&&bq.tier.landing_blocks==0&&bq.tier.pinned==bp.tier.pinned&&bq.host_fixed==bp.host_fixed,"two-tier whole-device: landing not billed");}
+        check(!bp.tier.three_tier&&!bq.tier.three_tier&&bq.tier.landing_blocks==0&&bq.tier.pinned==bp.tier.pinned&&bq.host_fixed==bp.host_fixed,"two-tier whole-device: landing not billed");
+        // Auto disk readers (opt-in; 8 = the most any open can start): the whole-device plan bills them as an explicit queue 8 when three-tier, none when two-tier.
+        auto r0=glm();r0.tier.disk_readers_auto=8;const auto rp=plan_whole_device(r0);auto r1=glm();r1.tier.disk_readers=8;const auto rq=plan_whole_device(r1);
+        check(rp.refuse.empty()&&rp.tier.three_tier&&rp.tier.disk_readers==8&&rp.tier.pinned==rq.tier.pinned&&rp.host_fixed==rq.host_fixed&&rp.host_fixed>p.host_fixed&&rp.tier.pinned+8<=p.tier.pinned&&rp.host_planned<=32*gib,"whole-device RAM cap: auto readers billed as queue 8, pinned tier smaller");
+        auto r3=a0;r3.tier.disk_readers_auto=8;const auto ra=plan_whole_device(r3);
+        check(ra.refuse.empty()&&ra.tier.three_tier&&ra.tier.disk_readers==8&&ra.tier.pinned+8<=ap.tier.pinned,"host-available bound: auto readers reserved too");
+        auto r2=b0;r2.tier.disk_readers_auto=8;const auto rt=plan_whole_device(r2);
+        check(!rt.tier.three_tier&&rt.tier.disk_readers==0&&rt.host_fixed==bp.host_fixed&&rt.tier.pinned==bp.tier.pinned,"two-tier whole-device: auto readers not billed");}
     {   // host growth after open (session snapshot + driver headroom) comes out of the pinned tier, not the cap
         auto grown=glm();const std::uint64_t snap=489406976;add_host_growth_parts(grown.pageable,snap);auto g=plan_whole_device(grown);
         check(g.refuse.empty()&&g.host_planned<=32*gib&&g.tier.pinned<p.tier.pinned,"host growth parts admitted under the RAM cap, fewer pinned units");

@@ -20,10 +20,11 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
     const auto& t=w.tier;expert_need(t.unit_bytes>0&&t.keys>0&&t.max_ids>=1,"tier budget inputs");
     const std::uint64_t ring=2ULL*t.max_ids+1,unit=t.unit_bytes;WholeDevicePlan r;
     r.device=w.device;r.pinned=w.pinned;r.device.push_back({"tierstream ring/guard slots",ring*unit});
-    // Landing blocks (dg_landing_blocks, one 4 KiB-rounded host stride each; run_plan passes them only for a
-    // three-tier placement): a pinned part under a RAM cap and taken off the host memory available, since the
+    // Landing blocks (dg_landing_blocks, one 4 KiB-rounded host stride each) and the disk readers' bounce buffers
+    // (dg_disk_queue > 1, one each; run_plan passes both only for a three-tier placement): pinned parts under a RAM
+    // cap (the readers inside the library's bounce part) and taken off the host memory available, since the
     // planner sizes the pinned tier from host_avail without the pinned parts.
-    const std::uint64_t landing=std::uint64_t(t.landing_blocks)*align_up(unit,4096);
+    const std::uint64_t landing=std::uint64_t(t.landing_blocks)*align_up(unit,4096),off_host=landing+std::uint64_t(t.disk_readers)*align_up(unit,4096);
     if(landing)r.pinned.push_back({"tierstream landing blocks",landing});
     if(library_parts){r.device.push_back({"tierstream unit table + controls",t.keys*4+(64ULL<<20)});r.pinned.push_back({"tierstream bounce + load ring",(5ULL+t.disk_readers)*align_up(unit,4096)+(80ULL<<20)});}
     auto comps=[](const std::vector<BudgetPart>& v){std::vector<ts_budget_component> c;c.reserve(v.size());for(auto& x:v)c.push_back({x.name.c_str(),x.bytes});return c;};
@@ -31,7 +32,7 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
     ts_budget_in in;ts_budget_in_defaults(&in);in.file_tier=t.file_tier?1u:0u;in.vram_total_bytes=w.vram_total;in.ram_total_bytes=caps?w.ram_total:0;in.device_context_bytes=w.context;
     in.device_fixed=d.data();in.n_device_fixed=std::uint32_t(d.size());in.pinned_fixed=p.data();in.n_pinned_fixed=std::uint32_t(p.size());in.pageable_fixed=g.data();in.n_pageable_fixed=std::uint32_t(g.size());
     in.host_spares=t.host_spares;in.keys=t.keys;in.slot_bytes=unit;in.unit_bytes=unit;in.arena_spares=t.spare_slots;in.staging=t.staging;in.min_resident=w.min_resident;in.vram_margin_bytes=w.vram_margin;in.ram_margin_bytes=w.ram_margin;
-    in.arena_units=w.arena_units==~0ULL?TS_BUDGET_AUTO:w.arena_units;in.ram_expert_bytes=w.ram_expert_bytes==~0ULL?TS_BUDGET_AUTO:w.ram_expert_bytes;in.host_avail_bytes=w.host_avail==~0ULL?TS_BUDGET_AUTO:(w.host_avail>landing?w.host_avail-landing:0);
+    in.arena_units=w.arena_units==~0ULL?TS_BUDGET_AUTO:w.arena_units;in.ram_expert_bytes=w.ram_expert_bytes==~0ULL?TS_BUDGET_AUTO:w.ram_expert_bytes;in.host_avail_bytes=w.host_avail==~0ULL?TS_BUDGET_AUTO:(w.host_avail>off_host?w.host_avail-off_host:0);
     ts_budget_out out{};out.struct_size=sizeof out;const auto s=ts_budget_plan(&in,&out);
     if(s!=TS_OK&&s!=TS_E_CAPACITY)ts_ok(s,"budget plan");
     r.device_fixed=out.device_fixed_bytes;r.device_planned=out.device_planned_bytes;r.host_fixed=out.host_fixed_bytes;r.host_planned=out.host_planned_bytes;
@@ -46,14 +47,17 @@ WholeDevicePlan run_plan_once(const WholeDeviceIn& w,bool library_parts,bool cap
     if(r.refuse.empty()){const auto nonres=b.pinned+b.disk;if(b.spare_slots>nonres){b.spare_slots=nonres;b.slots=b.resident+b.spare_slots;}if(!b.spare_slots)r.refuse="every unit resident: no spare slot (lower --tier-vram-gib)";}
     b.refuse=r.refuse;return r;
 }
-// Landing blocks exist only with a file tier (tierstream allocates none otherwise): one placement is planned
-// without them, then again with them charged when it has one (less host room only moves more units to the file,
-// so it stays three-tier). A refusal of the charged plan stands: the operator asked for the blocks. Applied to
-// each spare count below, so the plan chosen always carries blocks exactly when it is three-tier.
+// Landing blocks and disk readers exist only with a file tier (tierstream allocates none otherwise): one
+// placement is planned without them, then again with them charged when it has one (less host room only moves
+// more units to the file, so it stays three-tier). A refusal of the charged plan stands when the operator asked
+// for them (landing blocks, an explicit queue); auto readers alone that do not fit fall back to the bare plan
+// (queue 1). Applied to each spare count below, so the plan chosen carries blocks and readers only when it is three-tier.
 WholeDevicePlan run_plan_landing(const WholeDeviceIn& w,bool library_parts,bool caps){
-    auto w0=w;w0.tier.landing_blocks=0;auto bare=run_plan_once(w0,library_parts,caps);
-    if(!w.tier.landing_blocks||!bare.refuse.empty()||!bare.tier.three_tier)return bare;
-    return run_plan_once(w,library_parts,caps);
+    auto w0=w;w0.tier.landing_blocks=0;w0.tier.disk_readers=0;w0.tier.disk_readers_auto=0;auto bare=run_plan_once(w0,library_parts,caps);
+    if((!w.tier.landing_blocks&&!w.tier.disk_readers&&!w.tier.disk_readers_auto)||!bare.refuse.empty()||!bare.tier.three_tier)return bare;
+    auto w1=w;if(w.tier.disk_readers_auto)w1.tier.disk_readers=w.tier.disk_readers_auto;
+    auto charged=run_plan_once(w1,library_parts,caps);
+    return charged.refuse.empty()||w.tier.landing_blocks||w.tier.disk_readers?charged:bare;
 }
 // Spares as a share of the arena: one more planner call with the larger count
 // (the arena is the same bytes; residents give way to spares). A refusal of the

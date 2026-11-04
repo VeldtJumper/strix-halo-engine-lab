@@ -3627,6 +3627,40 @@ producing tokens; with nothing decoding the prompt is prefilled whole in one cal
 - **Measured gain:** 4 prompts of ~1,830 tokens arriving every 16 decode rounds into 4 running streams, 128 generated tokens each, cache off: longest decode stall of running streams across another prompt's prefill 6.65 -> 2.67 s (-60 %)
 - **Implementation / evidence:** [server](../apps/glm_serve_main.cpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
 
+<a id="glm-rtx-prefill-clean-evict"></a>
+
+### RTX prefill clean eviction
+
+**Engine:** `glm-rtx`. **Control:** `--prefill-clean-evict`. **Default:** ON.
+
+During a three-tier prefill through the tierstream cache, a decode resident displaced while no pinned block is free
+goes back to the unit file (which holds its bytes) instead of being copied to pinned memory and pushing a pinned unit
+out to the file, which the same prefill would read again. Decode keeps the open's `--tier-clean-evict` setting.
+
+- **Preconditions:** `glm_native_service` three-tier open (unit file tier) with prefill through the cache; with a free pinned block the unit is still written back.
+- **Automatic selection:** On for the prefill only; the open's setting is restored before decode.
+- **Fallback notice:** None; two-tier plans have no file tier and nothing changes.
+- **Exactness evidence:** Prefill state, tokens and logits bitwise equal on and off; 16 TTFT repeats bitwise equal across four alternating loads.
+- **Off switch:** --prefill-clean-evict 0
+- **Measured gain:** Full card, `--ttft-only`, disk queue 1, four alternating fresh-process loads (on / off / off / on): TTFT 8K 14.9 → 12.7 s first request and 13.2 → 11.6 s second (off → on, −15 % / −12 %), 32K 43.7-43.8 s in every load (tie); per load the prefill read 3.5-4.0 GB from the unit file instead of 9.6 GB (−60 %) and the decode residency restore took 2.5-2.9 s instead of 4.1-4.6 s
+- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md), [cache hook](../src/glm/rtxpf/producer/expert_tier.hpp)
+
+<a id="glm-rtx-disk-queue"></a>
+
+### RTX file reads in flight
+
+**Engine:** `glm-rtx`. **Control:** `--tier-disk-queue`. **Default:** 1 (`auto` opt-in).
+
+Unit-file reads in flight in a three-tier open; `auto` picks 4 / 6 / 8 from the read locations, at most the staging buffers.
+
+- **Preconditions:** Three-tier open that reads units from the unit file; each reader's bounce buffer is billed to pinned host memory.
+- **Automatic selection:** None by default; `auto` resolves from the unit file and the `--weight-dirs` stripe copies and uses 1 when the readers do not fit.
+- **Fallback notice:** Receipts report the resolved count; with `--tier-landing-blocks` a plan that does not fit is refused.
+- **Exactness evidence:** Same output bytes (tokens, logits, state) at any queue.
+- **Off switch:** --tier-disk-queue 1 (default)
+- **Measured gain:** Preliminary, `auto` vs 1 with 24 GiB VRAM + 32 GiB RAM on one drive: decode +11.9 % / +9.6 % at 1K cold / warm, +18.8 % at 8K cold, -3.4 % at 8K warm (drive read phases; not settled)
+- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md)
+
 ## Platform (kernel)
 
 <a id="platform-perfopt"></a>

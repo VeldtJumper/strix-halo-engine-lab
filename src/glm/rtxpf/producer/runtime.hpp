@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include "verified_manifest.hpp"
+#include "disk_queue.hpp"
 namespace strix::glm::rtxpf::producer {
 // Decode expert-tier selection and tierstream startup budget (decode only).
 struct DecodeOptions {
@@ -21,7 +22,10 @@ struct DecodeOptions {
     // Three-tier file reads in flight (ss_options.dg_disk_queue: 1 = one at a time, as before; 2..64,
     // at most tier_staging since each read holds a staging buffer) and clean eviction (dg_clean_evict:
     // a device victim with no free pinned block goes to its file with no D2H copy and displaces no
-    // pinned unit). Placement / IO only: same bytes. Defaults keep today's behaviour until measured.
+    // pinned unit). Placement / IO only: same bytes. Default 1 (one read at a time). 0 = auto (--tier-disk-queue
+    // auto, opt-in until its per-step policy is measured): the plan is made at queue 1 and, when it homes units on
+    // the file (three-tier), again with the readers tierstream's auto queue can start for these read locations
+    // billed (auto_disk_queue_bound); if that fits, the open passes TS_DG_DISK_QUEUE_AUTO, else queue 1.
     unsigned tier_disk_queue=1;bool tier_clean_evict=false;
     // Two-stage file prefetch (tierstream dg_landing_*): predictions of file-homed units are read into
     // landing_blocks pinned blocks (never a GPU slot); a demand copies from there. Needs a file tier and
@@ -30,6 +34,12 @@ struct DecodeOptions {
     // tierstream dg_landing_chunk (SS_DG_LANDING_YIELD): landing reads run in chunks that yield their reader to a
     // demand read (0 = 4 MiB chunks; 0xFFFFFFFF = whole, unchunked landing reads). Used only with landing blocks.
     std::uint32_t tier_landing_chunk=0;
+    // Opt-in prefill timeline (--prefill-profile 1): CUDA events per (layer, phase) and per routed-MoE group,
+    // with the prefill's CUDA graphs off (the same kernels launched directly). Events only: same bytes.
+    bool prefill_profile=false;
+    // Prefill clean eviction by phase (PrefillCleanEvict, --prefill-clean-evict 0|1): on for every three-tier prefill
+    // through the cache unless the open already has it (--tier-clean-evict); the open's setting again for decode.
+    bool prefill_clean_evict=true;
     double vram_total_gib=-1,ram_total_gib=-1; // whole-device caps (< 0: none = the device room / host above the floor)
     double tier_vram_gib=-1,tier_ram_gib=-1; // < 0: everything left after prefill residency / the host floor
     unsigned tier_spare_slots=16,tier_host_spares=8,tier_staging=8;
@@ -115,6 +125,11 @@ inline std::string row_kernels_name(const DecodeOptions& d){
 }
 // The library's disk readers that each hold a bounce buffer beyond its own one (none at queue 1).
 inline unsigned disk_bounce_readers(const DecodeOptions& d){return d.tier_disk_queue>1?d.tier_disk_queue:0;}
+// --tier-disk-queue auto: the readers billed only when the plan is three-tier (0 = none: an explicit queue,
+// or fewer than two staging buffers), and the queue an open passes from the readers its plan billed
+// (0 = the library's auto, which never exceeds them: auto_disk_queue_bound for these read locations).
+inline unsigned disk_auto_readers(const DecodeOptions& d){const unsigned q=auto_disk_queue_bound(d.weight_dirs,d.tier_staging);return d.tier_disk_queue||q<2?0:q;}
+inline unsigned resolved_disk_queue(unsigned asked,std::uint64_t billed_readers){return asked?asked:billed_readers>1?0u:1u;}
 using StateSink=std::function<void(unsigned rank,unsigned layer,unsigned component,std::span<const std::byte>)>;
 // Constructor is the first device work. The service validates the UUID and all
 // host arguments before constructing it. No CPU emulation hides a CUDA failure.
