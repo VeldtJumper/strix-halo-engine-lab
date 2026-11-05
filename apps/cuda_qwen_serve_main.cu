@@ -6,6 +6,8 @@
 //       [--max-positions 32768] [--bind 127.0.0.1] [--port 8090] [--api-key-file F] [--model-id ID]
 //       [--mtp-depth 7] [--min-p 0.7] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
 //       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N]
+//       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384]
+//       [--prefix-cache-host-mb N] [--prefix-cache-vram-mb 0]
 // Context cap: --max-positions P sizes every session (KV/index/pooled + MTP cache, 31,616 B per position + 233 MB).
 // Sessions of slots 1.. are allocated when a slot is first needed (one ahead of demand), only while cudaMemGetInfo free
 // VRAM >= session bytes + --slot-margin-mib (env STRIX_QRTX_SLOT_MARGIN_MIB, default 2048: the WDDM fallback engaged at ~1.4 GiB free); otherwise that slot is
@@ -20,7 +22,8 @@
 // draft chains, cuda_qwen_cohort_plan.hpp); a new request is prefilled in chunks of --prefill-chunk rows between the
 // steps (whole prompt blocks when nothing decodes). Every request's tokens equal it running alone.
 // --http-slots 1 or STRIX_QRTX_COHORT=0: the old serialized path (one request at a time, generate() to completion).
-// A request re-prefills its whole prompt (no prefix cache yet).
+// Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
+#include "cuda_qwen_prefix_cache.hpp"
 #include "strix/cuda_qwen_cohort.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
 #include "strix/serve/api.hpp"
@@ -51,6 +54,7 @@ std::string strix::render_preflight(const PreflightObservation&, const Preflight
 
 namespace qp = strix::cuda::qwen_prefill;
 namespace qc = strix::cuda::qwen_cohort;
+namespace px = strix::cuda::qwen_prefix;
 namespace serve = strix::serve;
 using Clock = std::chrono::steady_clock;
 
@@ -61,6 +65,7 @@ void on_signal(int) { g_stop.store(true); }
 
 struct Options {
     qp::Config engine;
+    px::Settings prefix;
     std::string bind = "127.0.0.1", api_key_file, model_id = "qwen3.8-flash-next";
     int port = 8090;
     std::uint32_t mtp_depth = 7, max_queue = 64;
@@ -78,6 +83,7 @@ struct Options {
 
 Options parse(int argc, char** argv) {
     Options o;
+    if (const char* v = std::getenv("STRIX_QRTX_PREFIX_CACHE")) o.prefix.enabled = v[0] != '0';
     o.engine.decode = true;
     o.engine.export_state = false;
     o.engine.release_by_layer = false;
@@ -89,7 +95,33 @@ Options parse(int argc, char** argv) {
             if (i + 1 >= argc) throw std::invalid_argument(a + " needs a value");
             return argv[++i];
         };
-        if (a == "--model") o.engine.model_gguf = next();
+        const auto mib = [&]() -> std::uint64_t {
+            const auto value = next();
+            std::size_t end = 0;
+            if (value.empty() || value[0] == '-') throw std::invalid_argument(a + " requires nonnegative MiB");
+            const auto n = std::stoull(value, &end);
+            if (end != value.size() || n > (std::numeric_limits<std::uint64_t>::max() >> 21U))
+                throw std::invalid_argument(a + " budget out of range");
+            return n << 20U;
+        };
+        const auto cache_count = [&]() -> std::uint32_t {
+            const auto value = next();
+            std::size_t end = 0;
+            if (value.empty() || value[0] == '-') throw std::invalid_argument(a + " requires nonnegative tokens");
+            const auto count = std::stoull(value, &end);
+            if (end != value.size() || count > UINT32_MAX) throw std::invalid_argument(a + " token count out of range");
+            return static_cast<std::uint32_t>(count);
+        };
+        if (a == "--prefix-cache") {
+            const auto value = next();
+            if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache is on or off");
+            o.prefix.enabled = value == "on";
+        }
+        else if (a == "--prefix-cache-block") o.prefix.block = cache_count();
+        else if (a == "--prefix-cache-stride") o.prefix.stride = cache_count();
+        else if (a == "--prefix-cache-host-mb") o.prefix.host_bytes = mib();
+        else if (a == "--prefix-cache-vram-mb") o.prefix.vram_bytes = mib();
+        else if (a == "--model") o.engine.model_gguf = next();
         else if (a == "--mtp-sidecar") o.engine.mtp_sidecar_gguf = next();
         else if (a == "--draft-vocab") o.engine.draft_vocab = next();
         else if (a == "--tables") o.engine.tables_dir = next();
@@ -125,6 +157,9 @@ Options parse(int argc, char** argv) {
     if (!(o.prefill_auto_k > 0)) throw std::invalid_argument("STRIX_QRTX_PREFILL_AUTO_K must be > 0");
     if (o.prefill_overlap_rows < 16) throw std::invalid_argument("--prefill-overlap-rows must be >= 16");
     if (o.cohort_depth != "fair" && o.cohort_depth != "max") throw std::invalid_argument("--cohort-depth is fair or max");
+    px::validate_block(o.prefix.block);
+    if (o.prefix.stride && o.prefix.stride % o.prefix.block)
+        throw std::invalid_argument("--prefix-cache-stride must be 0 or a multiple of --prefix-cache-block");
     return o;
 }
 
@@ -140,7 +175,7 @@ std::string read_key(const std::string& path) {
 
 class CudaQwenEngine final : public serve::GenerationEngine {
 public:
-    CudaQwenEngine(qp::Prefill& engine, const Options& o) : e_(engine), o_(o) {}
+    CudaQwenEngine(qp::Prefill& engine, const Options& o, px::Cache& cache) : e_(engine), o_(o), cache_(cache) {}
 
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         serve::GenerationStats st;
@@ -151,7 +186,18 @@ public:
         if (n < 2) throw serve::GenerationRequestError(st, "prompt needs at least 2 tokens");
         if (n >= cap) { st.error_status = 400; st.error_code = "context_length_exceeded"; throw serve::GenerationRequestError(st, "prompt longer than the context"); }
         if (job.on_progress) job.on_progress({serve::GenerationPhase::prefill, 0, 0, n});
-        e_.run(job.prompt, n - 1, [](const qp::Piece&) {});
+        double prefix_restore_ms = 0;
+        if (!cache_.enabled()) e_.run(job.prompt, n - 1, [](const qp::Piece&) {});
+        else {
+            auto prefilled = cache_.restore(e_, 0, job.prompt, prefix_restore_ms);
+            st.cached_tokens = prefilled;
+            const auto points = cache_.plan(n, prefilled);
+            while (prefilled < n - 1) {
+                const auto rows = px::clip_chunk(prefilled, UINT32_MAX, points);
+                prefilled = e_.prefill_chunk(0, job.prompt, n - 1, prefilled, rows);
+                if (std::binary_search(points.begin(), points.end(), prefilled)) cache_.capture(e_, 0, job.prompt, prefilled);
+            }
+        }
         const auto t1 = Clock::now();
         st.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, n, 0, n});
@@ -202,7 +248,7 @@ public:
                       st.prefill_ms, st.decode_ms);
         std::string extra = head;
         for (std::size_t i = 0; i < emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(emitted[i]);
-        extra += "]}";
+        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(prefix_restore_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);
         return st;
     }
@@ -211,6 +257,7 @@ public:
 private:
     qp::Prefill& e_;
     const Options& o_;
+    px::Cache& cache_;
 };
 
 // Continuous batching over up to http_slots requests (one engine session each): between scheduler steps it admits
@@ -219,7 +266,7 @@ private:
 // The tokens a request emits, its stop rule and its receipts follow CudaQwenEngine::generate() exactly.
 class CohortServer {
 public:
-    CohortServer(qp::Prefill& engine, const Options& o, serve::GenerationQueue& queue) : e_(engine), o_(o), queue_(queue) {
+    CohortServer(qp::Prefill& engine, const Options& o, serve::GenerationQueue& queue, px::Cache& cache) : e_(engine), o_(o), queue_(queue), cache_(cache) {
         mtp_ = !o_.engine.mtp_sidecar_gguf.empty() && o_.mtp_depth > 0;
         if (o_.prefill_overlap) e_.enable_prefill_overlap(o_.prefill_overlap_rows);
         // slot 0 is the engine's session 0; the others get theirs when first needed (ensure_session)
@@ -261,7 +308,8 @@ public:
                 if (slot && slot->job->ticket->cancelled()) { finish(*slot, {}, "cancelled"); slot = nullptr; }
                 if (slot) {
                     try {
-                        e_.prefill_chunk_async(slot->session, slot->job->job.prompt, slot->n - 1, slot->prefilled, next_chunk_rows(true));
+                        const auto rows = px::clip_chunk(slot->prefilled, next_chunk_rows(true), slot->capture_points);
+                        e_.prefill_chunk_async(slot->session, slot->job->job.prompt, slot->n - 1, slot->prefilled, rows);
                         inflight_ = slot;
                         inflight_steps_ = 0;
                     } catch (const std::exception& ex) {
@@ -309,6 +357,8 @@ private:
         std::optional<serve::TakenJob> job;
         Phase phase = Phase::prefill;
         std::uint64_t n = 0, prefilled = 0;
+        std::vector<std::uint64_t> capture_points;
+        double prefix_restore_ms = 0;
         qc::Stream stream;
         serve::GenerationStats st;
         Clock::time_point t0, t_decode;
@@ -409,7 +459,10 @@ private:
             s.job.reset();
             return;
         }
-        if (job.on_progress) job.on_progress({serve::GenerationPhase::prefill, 0, 0, s.n});
+        s.prefilled = cache_.restore(e_, s.session, job.prompt, s.prefix_restore_ms);
+        s.st.cached_tokens = s.prefilled;
+        s.capture_points = cache_.plan(s.n, s.prefilled);
+        if (job.on_progress) job.on_progress({serve::GenerationPhase::prefill, s.prefilled, 0, s.n});
     }
 
     bool decoding() const {
@@ -459,6 +512,8 @@ private:
             fit_chunk_time(rows, ms);
         }
         s.prefilled = length;
+        if (std::binary_search(s.capture_points.begin(), s.capture_points.end(), length))
+            cache_.capture(e_, s.session, s.job->job.prompt, length);
         (overlapped ? s.prefill_gpu_ms : s.prefill_sync_ms) += ms;
         ++s.prefill_chunks;
         s.overlapped_chunks += overlapped ? 1U : 0U;
@@ -487,7 +542,7 @@ private:
         const auto tc = Clock::now();
         std::uint64_t length = 0;
         try {
-            length = e_.prefill_chunk(s.session, s.job->job.prompt, s.n - 1, s.prefilled, chunk);
+            length = e_.prefill_chunk(s.session, s.job->job.prompt, s.n - 1, s.prefilled, px::clip_chunk(s.prefilled, chunk, s.capture_points));
         } catch (const std::exception& ex) {
             finish(s, ex.what(), "length");
             return;
@@ -578,7 +633,7 @@ private:
             o_.engine.max_positions, static_cast<double>(e_.session_bytes()) / 1048576.0, s.admit_free_mib, live_slots());
         std::string extra = head;
         for (std::size_t i = 0; i < s.emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(s.emitted[i]);
-        extra += "]}";
+        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);
         queue_.finish(*s.job, std::move(st), error);
         s.job.reset();
@@ -588,6 +643,7 @@ private:
     qp::Prefill& e_;
     const Options& o_;
     serve::GenerationQueue& queue_;
+    px::Cache& cache_;
     std::vector<Slot> slots_;
     bool mtp_ = false;
     std::uint32_t max_chunk_ = 1024, auto_rows_ = 256, first_rows_ = 0, fit_n_ = 0, inflight_steps_ = 0;
@@ -617,10 +673,13 @@ int main(int argc, char** argv) {
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
         serve::GenerationQueue queue(o.max_queue);
-        CudaQwenEngine adapter(engine, o);
+        px::Cache prefix_cache(o.engine, o.prefix);
+        config.state_cache_stats = [&prefix_cache] { return prefix_cache.stats_json(); };
+        config.status_extra = [&prefix_cache](serve::Json& status) { status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json())); };
+        CudaQwenEngine adapter(engine, o, prefix_cache);
         std::optional<CohortServer> cohort;  // --http-slots > 1: continuous batching; 1: the serialized queue.run path
         if (o.http_slots > 1) {
-            cohort.emplace(engine, o, queue);
+            cohort.emplace(engine, o, queue, prefix_cache);
             std::cerr << "strix-cuda-qwen-serve: " << o.http_slots << " slots (cohort decode), session state "
                       << engine.session_bytes() / 1000000 << " MB each, prefill chunk "
                       << (o.prefill_chunk ? std::to_string(o.prefill_chunk) + " rows" : std::string("auto"))

@@ -67,3 +67,18 @@ target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff
 add_executable(qwen_qsa_multi_test tests/cuda/qwen_qsa_multi_test.cu)
 target_link_libraries(qwen_qsa_multi_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+# Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
+add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/qwen_prefix_identity.cpp)
+target_include_directories(strix_qwen_prefix PUBLIC include)
+target_link_libraries(strix_qwen_prefix PUBLIC strix_qwen_handoff)
+target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_prefix)
+add_executable(qwen_prefix_cache_host_test tests/cuda/qwen_prefix_cache_host_test.cpp)
+target_link_libraries(qwen_prefix_cache_host_test PRIVATE strix_qwen_prefix)
+target_compile_definitions(qwen_prefix_cache_host_test PRIVATE STRIX_PREFIX_TEST_SOURCE="${CMAKE_SOURCE_DIR}")
+add_test(NAME qwen_prefix_cache_host COMMAND qwen_prefix_cache_host_test)
+add_executable(qwen_prefix_cache_e2e tests/cuda/qwen_prefix_cache_e2e.cu)
+target_link_libraries(qwen_prefix_cache_e2e PRIVATE strix_qwen_cuda strix_qwen_prefix)
+if(MSVC)
+    target_compile_options(qwen_prefix_cache_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
