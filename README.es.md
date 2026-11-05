@@ -177,7 +177,7 @@ determinista y exacto respecto a sí mismo. Detalles de los perfiles por motor:
 
 ## Uso de una GPU discreta (opcional)
 
-Todo lo anterior funciona solo con Strix Halo. Una RTX PRO 6000 (96 GB) añade cuatro rutas opcionales; ninguna cambia
+Todo lo anterior funciona solo con Strix Halo. Una RTX PRO 6000 (96 GB) añade cinco rutas opcionales; ninguna cambia
 los valores predeterminados de un nodo ni del par, y cada una tiene su propia identidad declarada y sus gates. Probado
 con Windows 11, controlador NVIDIA 617.14 y CUDA 13.0; seleccione la tarjeta por UUID (`CUDA_DEVICE_ORDER=PCI_BUS_ID`,
 `CUDA_VISIBLE_DEVICES=GPU-<uuid>`). Requisitos, una compilación o un lanzamiento por ruta, qué se ejecuta dónde, cuándo
@@ -198,6 +198,11 @@ no ayuda una ruta y solución de problemas: [uso de una GPU discreta](docs/discr
   transmitido al nodo conforme termina cada capa; el nodo decodifica. TTFT de 32K 8.99 s frente a 44.02 s en el mismo
   servidor sin la RTX; 64 tokens generados idénticos en todas las longitudes.
   [Resultados](docs/models/qwen3.8/README.es.md#qwen-prefill-offload).
+- **Qwen3.8-Flash-Next servido desde una RTX PRO 6000 (Windows).** `strix-cuda-qwen-serve` ofrece la API del nodo
+  (OpenAI y Anthropic, SSE, llamadas a herramientas) sobre el motor CUDA: prefill exacto y decode greedy exacto con
+  ventanas de verificación MTP, batching continuo sobre 4 slots y bloques de prefill entre los pasos de decode de las
+  demás sesiones.
+  [Compilación, ejecución y valores predeterminados](docs/models/qwen3.8/rtx-serve.md).
 - **GLM-5.3 Flash en una RTX PRO 6000 (borrador, opt-in, Windows).** Tronco, capas densas y expertos compartidos en la
   tarjeta; los 43 × 288 expertos enrutados se sirven a través de la caché por niveles de
   [tierstream](https://github.com/hyukudan/tierstream) entre VRAM, RAM pinned y disco. Prefill y decode exactos; TTFT

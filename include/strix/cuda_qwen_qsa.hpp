@@ -50,6 +50,11 @@ struct LayerWeights {
 struct LayerState {
     std::uint16_t* kv;
     std::uint16_t* raw_index;
+    // Optional decode cache of the pooled index keys of this layer ([max_blocks][128] FP32) and the host count of its
+    // valid blocks: layer_core then pools only the blocks it does not hold (a pooled block depends only on its 4 raw
+    // rows, so the values are the same); blocks touching rows >= first_position are recomputed.
+    float* pooled = nullptr;
+    std::uint32_t* pooled_valid = nullptr;
 };
 
 // Row buffers of `rows` consecutive positions first_position .. first_position + rows - 1 (row-major, dense).
@@ -114,6 +119,30 @@ void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t fir
     const auto complete = visible / kRatio;
     return (complete < kTopK ? complete : kTopK) * kRatio + visible % kRatio;
 }
+
+// ---- several sessions' rows in one window (decode cohorts): segment i = rows [first_row[i], first_row[i+1]) of the
+// row buffers at positions position[i].. of its own state. Device-side map of a multi-segment launch.
+inline constexpr std::uint32_t kMaxSegments = 8;
+struct SegmentMap {
+    std::uint32_t n = 0;
+    std::uint32_t first_row[kMaxSegments + 1] = {};
+    std::uint64_t position[kMaxSegments] = {};
+    std::uint16_t* kv[kMaxSegments] = {};
+    std::uint16_t* raw_index[kMaxSegments] = {};
+    float* pooled[kMaxSegments] = {};
+    std::uint32_t pool_first[kMaxSegments] = {}, pool_begin[kMaxSegments + 1] = {};   // pooled blocks to (re)compute
+    std::uint32_t scored[kMaxSegments] = {}, score_begin[kMaxSegments + 1] = {};      // block-score waves
+};
+struct SegmentState {
+    std::uint32_t rows = 0;
+    std::uint64_t first_position = 0;
+    LayerState state;
+};
+// layer_core for every segment of a window with one launch per step (each block runs one segment's single-call body):
+// the same values as layer_core per segment (rows = the segment's rows, b offset to its first row). Every session needs its
+// own pooled cache (LayerState::pooled). Falls back to one layer_core per segment beyond the multi-launch shapes.
+void layer_core_multi(const RowBuffers& rows_buf, const SegmentState* segments, std::uint32_t count, const LayerWeights& w,
+    const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream);
 
 // ---- the whole QSA core of one layer for rows [first_position, first_position + rows) ----
 // indexer projection, 3 norms, store, pool (blocks needed by the last row), then per chunk of workspace.chunk_rows rows:

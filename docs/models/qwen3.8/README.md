@@ -219,6 +219,10 @@ prompts more slowly than the one-node prefill row above (automatic row tiles). A
 that server. With the offload enabled, the router sends prompts of 1K tokens or more to the RTX PRO; shorter ones
 are read on the node.
 
+**Serving from the RTX PRO alone.** `strix-cuda-qwen-serve` serves the model from one RTX PRO 6000 with exact
+prefill and exact greedy MTP decode, the same APIs as the node server and continuous batching over 4 slots.
+[Build, run and defaults](rtx-serve.md).
+
 **Build `0117a140`** (measured against the release build in the same session, interleaved runs,
 every run exact): TTFT 2.3 % (1K), 3.4 % (4K) and 5.1 % (16K, 32K) lower; decode equal or up to 0.4 % faster;
 two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a 6.9 % lower TTFT at

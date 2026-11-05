@@ -174,7 +174,7 @@ Per-engine profile details: [Qwen](docs/models/qwen3.8/README.md#qwen-profile),
 
 ## Using a discrete GPU (optional)
 
-Everything above runs on Strix Halo alone. An RTX PRO 6000 (96 GB) adds four opt-in routes; none of them changes the
+Everything above runs on Strix Halo alone. An RTX PRO 6000 (96 GB) adds five opt-in routes; none of them changes the
 single-node or pair defaults, and each has its own declared identity and gates. Tested on Windows 11, NVIDIA driver
 617.14, CUDA 13.0; select the card by UUID (`CUDA_DEVICE_ORDER=PCI_BUS_ID`, `CUDA_VISIBLE_DEVICES=GPU-<uuid>`).
 Requirements, one build or launch per route, what runs where, when a route does not help and troubleshooting:
@@ -193,6 +193,10 @@ Requirements, one build or launch per route, what runs where, when a route does 
   streamed to the node as each layer finishes; the node decodes. 32K TTFT 8.99 s against 44.02 s on the same server
   without the RTX; 64 generated tokens identical at every length.
   [Results](docs/models/qwen3.8/README.md#qwen-prefill-offload).
+- **Qwen3.8-Flash-Next served from one RTX PRO 6000 (Windows).** `strix-cuda-qwen-serve` runs the node's API
+  (OpenAI and Anthropic, SSE, tool calls) over the CUDA engine: exact prefill and exact greedy decode with MTP verify
+  windows, continuous batching over 4 slots, prefill chunks between the other sessions' decode steps.
+  [Build, run and defaults](docs/models/qwen3.8/rtx-serve.md).
 - **GLM-5.3 Flash on one RTX PRO 6000 (draft, opt-in, Windows).** Trunk, dense layers and shared experts on the card;
   the 43 × 288 routed experts streamed through the [tierstream](https://github.com/hyukudan/tierstream) device-gated
   cache across VRAM, pinned RAM and disk. Exact prefill and decode; TTFT 11.4 / 30.5 s at 8K / 32K on the full card,

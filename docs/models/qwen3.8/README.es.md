@@ -222,6 +222,10 @@ los prompts más despacio que la fila de prefill de un nodo anterior (tiles de f
 ese servidor. Con la descarga activada, el router envía los prompts de 1K tokens o más a la RTX PRO; los más cortos
 se leen en el nodo.
 
+**Servicio solo desde la RTX PRO.** `strix-cuda-qwen-serve` sirve el modelo desde una RTX PRO 6000 con prefill
+exacto y decode MTP greedy exacto, las mismas API que el servidor del nodo y batching continuo sobre 4 slots.
+[Compilación, ejecución y valores predeterminados](rtx-serve.md).
+
 **Build `0117a140`** (medida frente a la compilación publicada en la misma sesión, ejecuciones intercaladas,
 todas exactas): TTFT un 2.3 % (1K), un 3.4 % (4K) y un 5.1 % (16K, 32K) menor; decode igual o hasta un 0.4 % más rápido;
 dos réplicas con concurrencia 4 y 8: un 3.9 % y un 3.6 % más de rendimiento de reloj, y un TTFT un 6.9 % menor con

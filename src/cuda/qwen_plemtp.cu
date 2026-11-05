@@ -371,7 +371,7 @@ __global__ __launch_bounds__(256) void ple_rows_gate_norm_kernel(PleTailArgs a, 
 __global__ __launch_bounds__(256) void ple_rows_conv_residual_kernel(PleTailArgs a, am::Tables t) {
     const std::uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
     if (channel >= kExpanded) return;
-    const std::uint16_t* state = a.conv_state + static_cast<std::uint64_t>(channel) * kConvHistory;
+    const std::uint16_t* state = (a.conv_state_slot ? *a.conv_state_slot : a.conv_state) + static_cast<std::uint64_t>(channel) * kConvHistory;
     float conv = 0.0F;
 #pragma unroll
     for (std::uint32_t tap = 0; tap < kConvKernel; ++tap) {
@@ -392,7 +392,7 @@ __global__ __launch_bounds__(256) void ple_rows_conv_residual_kernel(PleTailArgs
 __global__ __launch_bounds__(256) void ple_rows_conv_state_kernel(PleTailArgs a) {
     const std::uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= kExpanded) return;
-    std::uint16_t* state = a.conv_state + static_cast<std::uint64_t>(channel) * kConvHistory;
+    std::uint16_t* state = (a.conv_state_slot ? *a.conv_state_slot : a.conv_state) + static_cast<std::uint64_t>(channel) * kConvHistory;
     for (std::uint32_t i = 0; i < kConvHistory; ++i) {
         const std::uint32_t source = a.rows + i;   // ascending: reads only entries not yet rewritten
         state[i] = source < kConvHistory ? state[source]
@@ -400,6 +400,26 @@ __global__ __launch_bounds__(256) void ple_rows_conv_state_kernel(PleTailArgs a)
     }
 }
 }  // namespace
+
+// ple_rows_conv_state_kernel's rule for `keep` rows, reading the pre-window history from `before`.
+__global__ __launch_bounds__(256) void ple_conv_rollback_kernel(const std::uint16_t* __restrict__ before, const float* __restrict__ keys,
+    std::uint32_t key_stride, std::uint32_t keep, std::uint16_t* __restrict__ conv_state) {
+    const std::uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= kExpanded) return;
+    for (std::uint32_t i = 0; i < kConvHistory; ++i) {
+        const std::uint32_t source = keep + i;
+        conv_state[static_cast<std::uint64_t>(channel) * kConvHistory + i] = source < kConvHistory
+            ? before[static_cast<std::uint64_t>(channel) * kConvHistory + source]
+            : f2bf(keys[static_cast<std::uint64_t>(source - kConvHistory) * key_stride + channel]);
+    }
+}
+
+void launch_ple_conv_rollback(const std::uint16_t* before, const float* keys, std::uint32_t key_stride, std::uint32_t keep,
+    std::uint16_t* conv_state, cudaStream_t stream) {
+    ple_conv_rollback_kernel<<<(kExpanded + 255U) / 256U, 256, 0, stream>>>(before, keys, key_stride, keep, conv_state);
+    const auto e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("ple conv rollback launch: ") + cudaGetErrorString(e));
+}
 
 void launch_ple_tail(const PleTailArgs& args, const amdmath::Tables& tables, cudaStream_t stream) {
     if (!args.rows) return;

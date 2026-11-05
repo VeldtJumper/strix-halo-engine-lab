@@ -126,7 +126,7 @@ __global__ __launch_bounds__(256) void gates_kernel(const std::uint16_t* __restr
 // The HIP kernel walks all rows of a head in one block with an LDS ring. Rows are independent given their 3 predecessors'
 // raw BF16 inputs, so here a block owns (head, 32-row chunk); a prepass saves each chunk's 3 preceding raw rows (from the
 // workspace or the old history) and writes the new history, before any row is overwritten in place.
-__global__ __launch_bounds__(256) void conv_prepass_kernel(Rows rows, std::uint32_t count, std::uint16_t* conv_state,
+__device__ __forceinline__ void conv_prepass_body(const Rows& rows, std::uint32_t count, std::uint16_t* conv_state,
     std::uint16_t* __restrict__ boundary) {
     const unsigned ch = blockIdx.x * 256U + threadIdx.x;
     if (ch >= kConvWidth) return;
@@ -146,18 +146,47 @@ __global__ __launch_bounds__(256) void conv_prepass_kernel(Rows rows, std::uint3
     for (unsigned i = 0; i < kConvKernel; ++i)
         conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = raw(static_cast<int>(count) - 4 + static_cast<int>(i));
 }
+__global__ __launch_bounds__(256) void conv_prepass_kernel(Rows rows, std::uint32_t count, DevRef<std::uint16_t> conv_ref,
+    std::uint16_t* __restrict__ boundary) {
+    conv_prepass_body(rows, count, conv_ref.get(), boundary);
+}
+// Segment views: the rows of segment `seg` start at its row (every field shifts by the same stride).
+__device__ __forceinline__ Rows segment_rows(const Rows& rows, std::uint32_t row) {
+    const std::uint64_t o = static_cast<std::uint64_t>(row) * rows.stride;
+    return Rows{rows.qkv + o, rows.z + o, rows.beta + o, rows.gate + o, rows.core + o, rows.stride};
+}
+// one grid slice (blockIdx.y) per segment; boundary of segment i at boundary + i * 3 * kConvWidth (one chunk: count <= 32)
+__global__ __launch_bounds__(256) void conv_prepass_multi_kernel(Rows rows, Segments segs, std::uint16_t* __restrict__ boundary) {
+    const Segment& s = segs.s[blockIdx.y];
+    conv_prepass_body(segment_rows(rows, s.row), s.count, s.conv.get(), boundary + static_cast<std::uint64_t>(blockIdx.y) * 3U * kConvWidth);
+}
+
+// Conv history after the first `keep` rows of a window: the prepass rule (raw inputs of rows keep-4 .. keep-1, older taps
+// from the history before the window), from the saved raw rows (launch_core_split raw_qkv).
+__global__ __launch_bounds__(256) void conv_rollback_kernel(const float* __restrict__ raw_qkv, std::uint32_t keep,
+    const std::uint16_t* __restrict__ before, std::uint16_t* __restrict__ conv_state) {
+    const unsigned ch = blockIdx.x * 256U + threadIdx.x;
+    if (ch >= kConvWidth) return;
+#pragma unroll
+    for (unsigned i = 0; i < kConvKernel; ++i) {
+        const int row = static_cast<int>(keep) - 4 + static_cast<int>(i);
+        conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = row >= 0
+            ? float_to_bf16(raw_qkv[static_cast<std::uint64_t>(row) * kConvWidth + ch])
+            : before[static_cast<std::uint64_t>(ch) * kConvKernel + static_cast<unsigned>(row + 4)];
+    }
+}
 
 // gdn_prefill_conv_kernel body (:2838-2856): sum = fma(x0,w0,0), fma(x1,w1,.), ... oldest tap first; silu = sum/(1+expf(-sum));
 // value = round_bf16(silu); q/k: inv = rsqrtf(key_sum(value^2) + eps), value = (value*inv)*q_scale, q_scale = rsqrtf(128) or 1.
-__global__ __launch_bounds__(256) void conv_kernel(Rows rows, std::uint32_t count, const std::uint16_t* __restrict__ boundary,
-    const float* __restrict__ conv_w, float epsilon, am::Tables t) {
+__device__ __forceinline__ void conv_body(const Rows& rows, std::uint32_t count, const std::uint16_t* __restrict__ boundary,
+    const float* __restrict__ conv_w, float epsilon, const am::Tables& t, unsigned chunk) {
     __shared__ std::uint16_t raw[kConvChunk + 3U][kHeadDim];
     const unsigned thread = threadIdx.x, lane = thread % 32U, wave = thread / 32U;
-    const unsigned block = blockIdx.x, base = block * kHeadDim, first = blockIdx.y * kConvChunk;
+    const unsigned block = blockIdx.x, base = block * kHeadDim, first = chunk * kConvChunk;
     const bool is_qk = block < kKeyHeads * 2U, is_key = is_qk && block >= kKeyHeads;
     for (unsigned i = thread; i < (kConvChunk + 3U) * kHeadDim; i += 256U) {
         const unsigned rr = i / kHeadDim, c = i % kHeadDim;
-        if (rr < 3U) raw[rr][c] = boundary[(static_cast<std::uint64_t>(blockIdx.y) * 3U + rr) * kConvWidth + base + c];
+        if (rr < 3U) raw[rr][c] = boundary[(static_cast<std::uint64_t>(chunk) * 3U + rr) * kConvWidth + base + c];
         else if (first + rr - 3U < count)
             raw[rr][c] = float_to_bf16(rows.qkv[static_cast<std::uint64_t>(first + rr - 3U) * rows.stride + base + c]);
     }
@@ -190,6 +219,16 @@ __global__ __launch_bounds__(256) void conv_kernel(Rows rows, std::uint32_t coun
 #pragma unroll
         for (unsigned part = 0; part < 4U; ++part) out[part * 32U] = value[part];
     }
+}
+__global__ __launch_bounds__(256) void conv_kernel(Rows rows, std::uint32_t count, const std::uint16_t* __restrict__ boundary,
+    const float* __restrict__ conv_w, float epsilon, am::Tables t) {
+    conv_body(rows, count, boundary, conv_w, epsilon, t, blockIdx.y);
+}
+__global__ __launch_bounds__(256) void conv_multi_kernel(Rows rows, Segments segs, const std::uint16_t* __restrict__ boundary,
+    const float* __restrict__ conv_w, float epsilon, am::Tables t) {
+    const Segment& s = segs.s[blockIdx.y];
+    conv_body(segment_rows(rows, s.row), s.count, boundary + static_cast<std::uint64_t>(blockIdx.y) * 3U * kConvWidth, conv_w, epsilon,
+        t, 0U);
 }
 
 // ---------------------------------------------------------------------------------------------------------------- K5
@@ -224,8 +263,8 @@ __global__ __launch_bounds__(256) void decay_kernel(Rows rows, std::uint32_t cou
     decay[i] = am::amd_expf(t, rows.gate[static_cast<std::uint64_t>(i / kValueHeads) * rows.stride + i % kValueHeads]);
 }
 template <unsigned G>
-__global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_kernel(Rows rows, std::uint32_t count,
-    float* __restrict__ state, const float* __restrict__ decays) {
+__device__ __forceinline__ void recurrence_body(const Rows& rows, std::uint32_t count, const float* state_in, float* state_out,
+    const float* __restrict__ decays) {
     using Sh = RecShape<G>;
     constexpr unsigned Columns = Sh::Columns, Threads = Sh::Threads, K = Sh::K, Chunk = Sh::Chunk, KQ = Sh::KQ, VQ = Sh::VQ;
     static_assert(Chunk * 64 % Threads == 0 && 2 * Chunk <= Threads);
@@ -278,7 +317,7 @@ __global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_kernel(Rows r
     float S[K];
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        S[j] = state[(static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column];
+        S[j] = state_in[(static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column];
     const unsigned chunks = (count + Chunk - 1U) / Chunk;
     fetch(0U);
     commit(stage[0]);
@@ -340,7 +379,19 @@ __global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_kernel(Rows r
     }
 #pragma unroll
     for (unsigned j = 0; j < K; ++j)
-        state[(static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column] = S[j];
+        state_out[(static_cast<std::uint64_t>(value_head) * kHeadDim + sub + j * G) * kHeadDim + column] = S[j];
+}
+template <unsigned G>
+__global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_kernel(Rows rows, std::uint32_t count,
+    DevRef<float> in_ref, DevRef<float> out_ref, const float* __restrict__ decays) {
+    recurrence_body<G>(rows, count, in_ref.get(), out_ref.get(), decays);
+}
+// one grid slice (blockIdx.y) per segment: its rows, its state, its rows' decays (decay rows are window rows)
+template <unsigned G>
+__global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_multi_kernel(Rows rows, Segments segs, const float* __restrict__ decays) {
+    const Segment& s = segs.s[blockIdx.y];
+    recurrence_body<G>(segment_rows(rows, s.row), s.count, s.state_in.get(), s.state_out.get(),
+        decays + static_cast<std::uint64_t>(s.row) * kValueHeads);
 }
 
 
@@ -412,7 +463,20 @@ void launch_gates(const std::uint16_t* input, std::uint64_t input_stride, const 
     check(cudaGetLastError(), "gates launch");
 }
 
+namespace {
+void launch_conv_ref(const Rows& rows, std::uint32_t count, DevRef<std::uint16_t> conv_state, void* scratch, const Weights& w,
+    const amdmath::Tables& t, cudaStream_t stream);
+void launch_recurrence_ref(const Rows& rows, std::uint32_t count, DevRef<float> state_in, DevRef<float> state_out, void* scratch,
+    const amdmath::Tables& t, cudaStream_t stream, Tuning tuning);
+}  // namespace
+
 void launch_conv(const Rows& rows, std::uint32_t count, std::uint16_t* conv_state, void* scratch, const Weights& w,
+    const amdmath::Tables& t, cudaStream_t stream) {
+    launch_conv_ref(rows, count, DevRef<std::uint16_t>{conv_state}, scratch, w, t, stream);
+}
+
+namespace {
+void launch_conv_ref(const Rows& rows, std::uint32_t count, DevRef<std::uint16_t> conv_state, void* scratch, const Weights& w,
     const amdmath::Tables& t, cudaStream_t stream) {
     check_rows(rows);
     if (!count) return;
@@ -425,6 +489,13 @@ void launch_conv(const Rows& rows, std::uint32_t count, std::uint16_t* conv_stat
         boundary, w.conv, w.qk_l2_epsilon, t);
     check(cudaGetLastError(), "conv launch");
 }
+}  // namespace
+
+void launch_conv_rollback(const float* raw_qkv, std::uint32_t keep, const std::uint16_t* before, std::uint16_t* conv_state,
+    cudaStream_t stream) {
+    conv_rollback_kernel<<<(kConvWidth + 255U) / 256U, 256, 0, stream>>>(raw_qkv, keep, before, conv_state);
+    check(cudaGetLastError(), "conv rollback launch");
+}
 
 std::size_t decay_scratch_bytes(std::uint32_t count) { return static_cast<std::size_t>(count) * kValueHeads * sizeof(float); }
 std::size_t core_scratch_bytes(std::uint32_t count) {
@@ -433,6 +504,17 @@ std::size_t core_scratch_bytes(std::uint32_t count) {
 
 void launch_recurrence(const Rows& rows, std::uint32_t count, float* state, void* scratch, const amdmath::Tables& t,
     cudaStream_t stream, Tuning tuning) {
+    launch_recurrence_split(rows, count, state, state, scratch, t, stream, tuning);
+}
+
+void launch_recurrence_split(const Rows& rows, std::uint32_t count, const float* state_in, float* state_out, void* scratch,
+    const amdmath::Tables& t, cudaStream_t stream, Tuning tuning) {
+    launch_recurrence_ref(rows, count, DevRef<float>{const_cast<float*>(state_in)}, DevRef<float>{state_out}, scratch, t, stream, tuning);
+}
+
+namespace {
+void launch_recurrence_ref(const Rows& rows, std::uint32_t count, DevRef<float> state_in, DevRef<float> state_out, void* scratch,
+    const amdmath::Tables& t, cudaStream_t stream, Tuning tuning) {
     check_rows(rows);
     if (!count) return;
     if (rows.stride % 4U || reinterpret_cast<std::uintptr_t>(rows.qkv) % 16U)
@@ -441,7 +523,7 @@ void launch_recurrence(const Rows& rows, std::uint32_t count, float* state, void
     decay_kernel<<<(count * kValueHeads + 255U) / 256U, 256, 0, stream>>>(rows, count, decay, t);
     check(cudaGetLastError(), "decay launch");
     const auto go = [&](auto kernel, unsigned g) {
-        kernel<<<kValueHeads * (kHeadDim / 32U), 32U * g, 0, stream>>>(rows, count, state, decay);
+        kernel<<<kValueHeads * (kHeadDim / 32U), 32U * g, 0, stream>>>(rows, count, state_in, state_out, decay);
     };
     switch (tuning.lanes) {
     case 2: go(recurrence_kernel<2>, 2); break;
@@ -452,6 +534,7 @@ void launch_recurrence(const Rows& rows, std::uint32_t count, float* state, void
     }
     check(cudaGetLastError(), "recurrence launch");
 }
+}  // namespace
 
 void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8) {
@@ -466,10 +549,80 @@ void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const 
 void launch_core(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
     std::uint16_t* conv_state, float* state, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8, Tuning tuning) {
+    launch_core_split(input, input_stride, rows, count, conv_state, state, state, nullptr, scratch, w, t, stream, a8, tuning);
+}
+
+void launch_core_split(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
+    std::uint16_t* conv_state, const float* state_in, float* state_out, float* raw_qkv, void* scratch, const Weights& w,
+    const amdmath::Tables& t, cudaStream_t stream, const A8Out* a8, Tuning tuning) {
     launch_gates(input, input_stride, rows, count, w, t, stream);
+    if (raw_qkv)
+        check(cudaMemcpy2DAsync(raw_qkv, std::size_t{kConvWidth} * 4U, rows.qkv, rows.stride * 4U, std::size_t{kConvWidth} * 4U, count,
+            cudaMemcpyDeviceToDevice, stream), "raw qkv copy");
     launch_conv(rows, count, conv_state, scratch, w, t, stream);
-    launch_recurrence(rows, count, state, static_cast<unsigned char*>(scratch) + (conv_scratch_bytes(count) + 255U) / 256U * 256U, t,
-        stream, tuning);
+    launch_recurrence_split(rows, count, state_in, state_out,
+        static_cast<unsigned char*>(scratch) + (conv_scratch_bytes(count) + 255U) / 256U * 256U, t, stream, tuning);
+    launch_norm(rows, count, w, t, stream, a8);
+}
+
+std::size_t multi_scratch_bytes() {
+    return (std::size_t{kMaxSegments} * 3U * kConvWidth * sizeof(std::uint16_t) + 255U) / 256U * 256U +
+           decay_scratch_bytes(kMaxSegments * kConvChunk);
+}
+
+void launch_core_multi(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, const Segments& segs,
+    float* raw_qkv, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream, Tuning tuning) {
+    check_rows(rows);
+    if (segs.n == 0 || segs.n > kMaxSegments) throw std::invalid_argument("qwen_gdn multi: 1..8 segments");
+    std::uint32_t total = 0;
+    for (std::uint32_t i = 0; i < segs.n; ++i) {
+        if (segs.s[i].row != total || segs.s[i].count == 0 || segs.s[i].count > kConvChunk)
+            throw std::invalid_argument("qwen_gdn multi: segments must be contiguous from row 0, 1..32 rows each");
+        total += segs.s[i].count;
+    }
+    if (rows.stride % 4U || reinterpret_cast<std::uintptr_t>(rows.qkv) % 16U)
+        throw std::invalid_argument("qwen_gdn: qkv rows must be 16-byte aligned");
+    // K3 over all rows (row-wise)
+    launch_gates(input, input_stride, rows, total, w, t, stream);
+    if (raw_qkv)
+        check(cudaMemcpy2DAsync(raw_qkv, std::size_t{kConvWidth} * 4U, rows.qkv, rows.stride * 4U, std::size_t{kConvWidth} * 4U, total,
+            cudaMemcpyDeviceToDevice, stream), "raw qkv copy");
+    // K4 per segment (its conv history)
+    auto* boundary = static_cast<std::uint16_t*>(scratch);
+    auto* decay = reinterpret_cast<float*>(static_cast<unsigned char*>(scratch) +
+        (std::size_t{kMaxSegments} * 3U * kConvWidth * sizeof(std::uint16_t) + 255U) / 256U * 256U);
+    conv_prepass_multi_kernel<<<dim3((kConvWidth + 255U) / 256U, segs.n), 256, 0, stream>>>(rows, segs, boundary);
+    check(cudaGetLastError(), "conv prepass multi launch");
+    conv_multi_kernel<<<dim3(kKeyHeads * 2U + kValueHeads, segs.n), 256, 0, stream>>>(rows, segs, boundary, w.conv, w.qk_l2_epsilon, t);
+    check(cudaGetLastError(), "conv multi launch");
+    // decay over all rows (row-wise), K5 per segment (its state)
+    decay_kernel<<<(total * kValueHeads + 255U) / 256U, 256, 0, stream>>>(rows, total, decay, t);
+    check(cudaGetLastError(), "decay launch");
+    const auto go = [&](auto kernel, unsigned g) {
+        kernel<<<dim3(kValueHeads * (kHeadDim / 32U), segs.n), 32U * g, 0, stream>>>(rows, segs, decay);
+    };
+    switch (tuning.lanes) {
+    case 2: go(recurrence_multi_kernel<2>, 2); break;
+    case 4: go(recurrence_multi_kernel<4>, 4); break;
+    case 8: go(recurrence_multi_kernel<8>, 8); break;
+    case 16: go(recurrence_multi_kernel<16>, 16); break;
+    default: throw std::invalid_argument("qwen_gdn: lanes must be 2, 4, 8 or 16");
+    }
+    check(cudaGetLastError(), "recurrence multi launch");
+    // K6 over all rows (row-wise)
+    launch_norm(rows, total, w, t, stream, nullptr);
+}
+
+void launch_core_split_ref(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
+    DevRef<std::uint16_t> conv_state, DevRef<float> state_in, DevRef<float> state_out, float* raw_qkv, void* scratch,
+    const Weights& w, const amdmath::Tables& t, cudaStream_t stream, const A8Out* a8, Tuning tuning) {
+    launch_gates(input, input_stride, rows, count, w, t, stream);
+    if (raw_qkv)
+        check(cudaMemcpy2DAsync(raw_qkv, std::size_t{kConvWidth} * 4U, rows.qkv, rows.stride * 4U, std::size_t{kConvWidth} * 4U, count,
+            cudaMemcpyDeviceToDevice, stream), "raw qkv copy");
+    launch_conv_ref(rows, count, conv_state, scratch, w, t, stream);
+    launch_recurrence_ref(rows, count, state_in, state_out,
+        static_cast<unsigned char*>(scratch) + (conv_scratch_bytes(count) + 255U) / 256U * 256U, t, stream, tuning);
     launch_norm(rows, count, w, t, stream, a8);
 }
 

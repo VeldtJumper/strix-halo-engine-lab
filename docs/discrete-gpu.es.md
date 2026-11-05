@@ -27,6 +27,7 @@ El planificador de DeepSeek independiente rechaza presupuestos por debajo de uno
 | DeepSeek V4.1 Flash, RTX independiente | El modelo completo en la tarjeta: expertos enrutados Q2, densos Q8_0, caché de expertos en VRAM + memoria fijada del host, objetivo y borrador DSpark en la misma GPU | Tarjeta completa: 82.3 / 87.7 / 94.4 tok/s (código / inglés / español). 24 GiB de VRAM + 32 GiB de RAM, un NVMe, prompt de 96 tokens: 6.55 tok/s sin borrador, 6.75 tok/s con DSpark, con 4 lecturas de archivo en vuelo (5.45 tok/s con 1) | Con 24 GiB de VRAM + 32 GiB de RAM la mayoría de los expertos se leen del disco: 6.55 tok/s frente a 82-94 tok/s con la tarjeta completa |
 | DeepSeek V4.1 Flash, RTX + par | La RTX ejecuta las capas 0-21 con CUDA; los dos nodos Strix Halo ejecutan las capas 22-39 y la cabeza, por 1 GbE | Decode por lotes 60.1 / 97.5 / 137.2 tok/s con 2 / 4 / 8 filas; lectura del prompt en la RTX 3.64 / 4.39 / 12.20 s con 2K / 8K / 32K | La ubicación de expertos calientes empeora las ventanas DSpark de 4 o más |
 | Qwen3.8-Flash-Next, descarga del prefill | La RTX lee el prompt (prefill CUDA exacto) y envía el estado de atención y recurrente al nodo capa a capa; el nodo decodifica | TTFT 1.36 / 1.92 / 2.94 / 4.95 / 8.99 s con 1K / 4K / 8K / 16K / 32K, frente a 1.80 / 5.20 / 10.46 / 21.43 / 44.02 s en el mismo servidor sin la RTX | Por debajo de 1K tokens el enrutador mantiene los prompts en el nodo; con 1K el prefill de un nodo (1.12 s) es más rápido que la descarga (1.36 s) |
+| Qwen3.8-Flash-Next, servido desde una RTX | Todo el modelo en una RTX PRO 6000: prefill CUDA exacto y decode MTP greedy exacto detrás de las API del nodo (`strix-cuda-qwen-serve`), batching continuo sobre 4 slots | Salida greedy exacta con cualquier número de slots; aún no se publica una cifra de rendimiento | Requiere la tarjeta de 96 GB: una sesión nunca se desborda a la memoria del sistema y un prompt más largo que el contexto se rechaza |
 | GLM-5.3 Flash, una RTX (borrador) | Tronco, capas densas y expertos compartidos en la tarjeta; expertos enrutados servidos por la caché de [tierstream](https://github.com/hyukudan/tierstream) entre VRAM, RAM fijada y disco | Tarjeta completa: el solapamiento del prefill deja el TTFT en 0.56× con 8K y 0.66× con 32K; decode 6.0 / 6.2 tok/s en caliente con 1K / 8K. 24 GiB de VRAM + 32 GiB de RAM: TTFT 60.3 s con 1K, 62.4 s con 8K; decode 0.67 tok/s en caliente | Con presupuestos pequeños la mayoría de los expertos se leen del disco, así que el decode es lento |
 
 Cada fila es exacta frente a su referencia declarada: los ids de token (y, donde se indica, los logits y el estado)
@@ -34,6 +35,7 @@ son iguales a los de la ejecución de referencia. Detalles y condiciones:
 [DeepSeek independiente](models/deepseek-v4.1/README.es.md#deepseek-standalone-rtx-results),
 [DeepSeek RTX + par](models/deepseek-v4.1/README.es.md#deepseek-rtx-pipeline),
 [descarga del prefill de Qwen](models/qwen3.8/README.es.md#qwen-prefill-offload),
+[Qwen servido desde una RTX](models/qwen3.8/rtx-serve.md),
 [GLM en una RTX](models/glm-5.3/README.es.md#glm-rtx-results).
 
 ## Fije la GPU correcta
@@ -78,6 +80,13 @@ Contrato de lanzamiento de las etapas: [etapas de la canalización](models/deeps
 El lado del nodo usa `--rtx-state-import` con `--http-serve` (sin `--http-batch`); con la opción desactivada nada
 cambia. Compilación y protocolo del servicio: [servicio de prefill CUDA de Qwen](engine/serving/qwen-cuda-prefill.md) e
 [importación de estado de la RTX](rtx-state-import.md).
+
+## Qwen3.8-Flash-Next, servido desde una RTX
+
+`strix-cuda-qwen-serve` sirve el modelo desde una RTX PRO 6000 sin nodo: API de OpenAI y Anthropic, SSE, llamadas a
+herramientas y salida greedy exacta con cualquier número de slots. Compilación para Windows con
+`-DSTRIX_CUDA_QWEN_ONLY=ON`; las compilaciones de Strix Halo no compilan estos ficheros. Compilación, opciones,
+valores predeterminados e interruptores: [servicio Qwen en la RTX](models/qwen3.8/rtx-serve.md).
 
 ## GLM-5.3 Flash en una RTX (borrador)
 

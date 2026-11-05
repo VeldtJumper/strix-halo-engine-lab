@@ -3,6 +3,7 @@
 // the gfx1151 disassembly of hip_indexed_attention_launcher (S: line numbers).
 // Every FP operation is an explicit IEEE intrinsic (__fadd_rn, __fmul_rn, __fmaf_rn, __fdiv_rn) in the HIP order.
 #include "strix/cuda_qwen_qsa.hpp"
+#include "strix/cuda_vram_guard.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -116,7 +117,7 @@ __global__ __launch_bounds__(256) void indexer_kernel(const std::uint16_t* __res
 //   y = round_bf16((x*inv)*w) (S:314704, 314707: two v_mul);
 //   RoPE f < 64, pair = f % 32: res = a*cos (S:315272 v_mul) then f >= 32: fma(b, sin, a*cos) (S:315293 v_fmac),
 //   f < 32: fma(-b, sin, a*cos) (S:315302 v_fma -v0); b = y[f -/+ 32]; round_bf16.
-__global__ void norm_rope_kernel(float* __restrict__ values, std::uint64_t row_stride, std::uint32_t head_dim,
+__device__ __forceinline__ void norm_rope_kernel_body(float* __restrict__ values, std::uint64_t row_stride, std::uint32_t head_dim,
     std::uint32_t head_stride, const float* __restrict__ norm, std::uint64_t first_position, const float2* __restrict__ cs,
     am::Tables tables) {
     extern __shared__ float nsm[];
@@ -147,10 +148,15 @@ __global__ void norm_rope_kernel(float* __restrict__ values, std::uint64_t row_s
     }
     v[f] = round_bf16(result);
 }
+__global__ void norm_rope_kernel(float* __restrict__ values, std::uint64_t row_stride, std::uint32_t head_dim,
+    std::uint32_t head_stride, const float* __restrict__ norm, std::uint64_t first_position, const float2* __restrict__ cs,
+    am::Tables tables) {
+    norm_rope_kernel_body(values, row_stride, head_dim, head_stride, norm, first_position, cs, tables);
+}
 
 // ------------------------------------------------------------------------------------------------------------------
 // store_rows_kernel<Rows> (H:3647-3671): raw index key, K, V -> BF16 (exact for BF16-valued inputs).
-__global__ void store_kernel(const float* __restrict__ ik, const float* __restrict__ k, const float* __restrict__ v,
+__device__ __forceinline__ void store_kernel_body(const float* __restrict__ ik, const float* __restrict__ k, const float* __restrict__ v,
     std::uint64_t first_position, std::uint16_t* __restrict__ raw, std::uint16_t* __restrict__ kv) {
     const auto r = blockIdx.y;
     const auto f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -162,6 +168,10 @@ __global__ void store_kernel(const float* __restrict__ ik, const float* __restri
         kv[base + kKvWidth + f] = to_bf16(v[static_cast<std::uint64_t>(r) * kKvWidth + f]);
     }
 }
+__global__ void store_kernel(const float* __restrict__ ik, const float* __restrict__ k, const float* __restrict__ v,
+    std::uint64_t first_position, std::uint16_t* __restrict__ raw, std::uint16_t* __restrict__ kv) {
+    store_kernel_body(ik, k, v, first_position, raw, kv);
+}
 
 // ------------------------------------------------------------------------------------------------------------------
 // block_pool_kernel<f32> (H:4172-4208 via the listing at H:3973-4010; S:317565-318324). One block per 4-token block,
@@ -170,7 +180,7 @@ __global__ void store_kernel(const float* __restrict__ ik, const float* __restri
 //   sq = mean*mean (S:317641), LDS tree 64..1; inv = rsqrtf(sq/128 + eps) (S:317677-317705);
 //   round_bf16((mean*inv)*w) (S:317706, 317709); RoPE at position 4*block: fma(+-b, sin, a*cos) (S:318275, 318296,
 //   318305) exactly as norm_rope; round_bf16.
-__global__ void block_pool_kernel(const std::uint16_t* __restrict__ raw, std::uint32_t first_block,
+__device__ __forceinline__ void block_pool_kernel_body(const std::uint16_t* __restrict__ raw, std::uint32_t first_block,
     const float* __restrict__ key_norm, const float2* __restrict__ cs, am::Tables tables, float* __restrict__ pooled_keys) {
     __shared__ float pooled[kIndexDim], scratch[kIndexDim];
     const auto block = first_block + blockIdx.x;
@@ -199,6 +209,10 @@ __global__ void block_pool_kernel(const std::uint16_t* __restrict__ raw, std::ui
         rotated = f < kRotaryPairs ? __fmaf_rn(-pooled[f + kRotaryPairs], c.y, ac) : __fmaf_rn(pooled[f - kRotaryPairs], c.y, ac);
     }
     pooled_keys[static_cast<std::uint64_t>(block) * kIndexDim + f] = round_bf16(rotated);
+}
+__global__ void block_pool_kernel(const std::uint16_t* __restrict__ raw, std::uint32_t first_block,
+    const float* __restrict__ key_norm, const float2* __restrict__ cs, am::Tables tables, float* __restrict__ pooled_keys) {
+    block_pool_kernel_body(raw, first_block, key_norm, cs, tables, pooled_keys);
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -236,12 +250,12 @@ template <unsigned P> __device__ __forceinline__ unsigned scatter_head(unsigned 
 // partial = (p0+p2)+(p1+p3), scatter<4>; total = 0 + relu(h0) + relu(h1) + relu(h2) + relu(h3) (head order),
 // score = total / sqrtf(128). Written for blocks < complete(row) of rows with complete > 512.
 constexpr unsigned kScoreRowsPerWave = 4;
-__global__ __launch_bounds__(256) void block_score_kernel(const float* __restrict__ index_query, std::uint32_t rows,
+__device__ __forceinline__ void block_score_body(const float* __restrict__ index_query, std::uint32_t rows,
     std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
-    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    float* __restrict__ block_scores, std::uint32_t max_blocks, std::uint32_t wave_base) {
     constexpr unsigned R = kScoreRowsPerWave;
     const unsigned lane = threadIdx.x & 31U;
-    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
+    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U - wave_base;
     const auto chunks = (scored_blocks + 31U) / 32U;
     const auto r0 = wave / chunks * R, base = wave % chunks * 32U;
     if (r0 >= rows) return;
@@ -291,6 +305,11 @@ __global__ __launch_bounds__(256) void block_score_kernel(const float* __restric
     for (unsigned rr = 0; rr < R; ++rr)
         if (lane < last && base + lane < blocks[rr]) block_scores[static_cast<std::uint64_t>(r0 + rr) * max_blocks + base + lane] = result[rr];
 }
+__global__ __launch_bounds__(256) void block_score_kernel(const float* __restrict__ index_query, std::uint32_t rows,
+    std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
+    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    block_score_body(index_query, rows, first_position, pooled_keys, scored_blocks, block_scores, max_blocks, 0U);
+}
 
 // ------------------------------------------------------------------------------------------------------------------
 // select_rows_kernel<Rows> (H:3756-3766) -> select_blocks_parallel_body (H:1472-1557), 1024 threads per row: radix
@@ -319,7 +338,7 @@ __device__ __forceinline__ std::uint32_t select_scan(std::uint32_t value, std::u
     __syncthreads();
     return value;
 }
-__global__ __launch_bounds__(kSelectThreads) void select_kernel(float* __restrict__ all_scores, std::uint32_t max_blocks,
+__device__ __forceinline__ void select_kernel_body(float* __restrict__ all_scores, std::uint32_t max_blocks,
     std::uint64_t first_position, std::uint32_t* __restrict__ all_selected) {
     const auto r = blockIdx.x;
     const auto tid = threadIdx.x;
@@ -389,6 +408,10 @@ __global__ __launch_bounds__(kSelectThreads) void select_kernel(float* __restric
     const auto complete_tokens = num_blocks * kRatio, selected_complete = kTopK * kRatio;
     for (auto token = complete_tokens + tid; token < visible; token += kSelectThreads)
         selected[selected_complete + token - complete_tokens] = token;
+}
+__global__ __launch_bounds__(kSelectThreads) void select_kernel(float* __restrict__ all_scores, std::uint32_t max_blocks,
+    std::uint64_t first_position, std::uint32_t* __restrict__ all_selected) {
+    select_kernel_body(all_scores, max_blocks, first_position, all_selected);
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -481,7 +504,7 @@ template <unsigned P, unsigned Step = 1U> __device__ __forceinline__ void scatte
         scatter16<P, Step + 1U>(v, lane);
     }
 }
-__global__ __launch_bounds__(128) void attention_score_half_kernel(const float* __restrict__ q_gate, std::uint64_t first_position,
+__device__ __forceinline__ void attention_score_half_kernel_body(const float* __restrict__ q_gate, std::uint64_t first_position,
     const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv, float* __restrict__ all_scores) {
     const unsigned lane = threadIdx.x & 31U, warp = threadIdx.x >> 5U, l = lane & 15U, half = lane >> 4U;
     const auto run = blockIdx.x, kvh = blockIdx.y, r = blockIdx.z;
@@ -540,12 +563,16 @@ __global__ __launch_bounds__(128) void attention_score_half_kernel(const float* 
             scores[static_cast<std::uint64_t>(head0 + h) * kMaxSelected + slot] = __fdiv_rn(partial[0], scale);
     }
 }
+__global__ __launch_bounds__(128) void attention_score_half_kernel(const float* __restrict__ q_gate, std::uint64_t first_position,
+    const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv, float* __restrict__ all_scores) {
+    attention_score_half_kernel_body(q_gate, first_position, all_selected, kv, all_scores);
+}
 
 // attention_softmax_rows_kernel<64> -> attention_softmax_body (H:1680-1786; S:408329-408725). Grid (24 heads, rows),
 // 256 threads. max: fmaxf over slots l, l+256, ... then LDS fmaxf tree (order-free); local_sum += expf(s - max)
 // ascending (S:408533-408553: v_sub, OCML expf, v_add); LDS tree 128..1 (S:408571-408655);
 // weight = round_bf16(expf(s - max) / den) (S:408678-408712: correctly rounded division).
-__global__ __launch_bounds__(256) void softmax_kernel(float* __restrict__ all_scores, std::uint64_t first_position, am::Tables tables) {
+__device__ __forceinline__ void softmax_kernel_body(float* __restrict__ all_scores, std::uint64_t first_position, am::Tables tables) {
     __shared__ float scratch[256];
     const auto head = blockIdx.x, r = blockIdx.y, lane = threadIdx.x;
     const auto count = selected_count(first_position + r);
@@ -577,6 +604,9 @@ __global__ __launch_bounds__(256) void softmax_kernel(float* __restrict__ all_sc
     for (std::uint32_t i = lane; i < count; i += 256U)
         scores[i] = round_bf16(__fdiv_rn(scores[i], denominator));
 }
+__global__ __launch_bounds__(256) void softmax_kernel(float* __restrict__ all_scores, std::uint64_t first_position, am::Tables tables) {
+    softmax_kernel_body(all_scores, first_position, tables);
+}
 
 // attention_output_rows_group_prefetch_kernel<64,12> (H:4102-4163; S:414951). Per (row, head, feature):
 // sum = fma(w[slot], v[slot], sum) over all selected slots ascending from 0 (S: v_fmac/v_fma chain, `__builtin_fmaf`);
@@ -585,7 +615,7 @@ __global__ __launch_bounds__(256) void softmax_kernel(float* __restrict__ all_sc
 // CUDA: block per (row, KV head), 128 threads x 2 features x 12 heads (24 chains per thread); the weights of a chunk of
 // slots are staged in shared memory as [slot][12] (3 x 16-byte broadcast loads per slot), tokens too.
 constexpr unsigned kOutThreads = 128, kOutChunk = 256;
-__global__ __launch_bounds__(kOutThreads) void attention_output_kernel(const float* __restrict__ q_gate,
+__device__ __forceinline__ void attention_output_kernel_body(const float* __restrict__ q_gate,
     std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
     const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
     __shared__ __align__(16) float ws[kOutChunk * kG];
@@ -650,6 +680,131 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_kernel(const flo
         }
     }
 }
+__global__ __launch_bounds__(kOutThreads) void attention_output_kernel(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    attention_output_kernel_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
+}
+
+// Decode shape (few rows): one block per (query head, row), so a row runs 24 blocks instead of 2. Each thread keeps the
+// same two chains sum = fma(w[slot], v[slot], sum), slots ascending from 0, and the same epilogue.
+// STRIX_QRTX_DECODE_KERNELS=0 keeps the per-KV-head kernel (reference seam).
+bool decode_rows_enabled() {
+    static const bool on = [] { const char* e = std::getenv("STRIX_QRTX_DECODE_KERNELS"); return !(e && e[0] == '0'); }();
+    return on;
+}
+__device__ __forceinline__ void attention_output_head_kernel_body(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    __shared__ float ws[kOutChunk];
+    __shared__ std::uint32_t tok[kOutChunk];
+    const auto head = blockIdx.x, r = blockIdx.y, t = threadIdx.x, kvh = head / kG;
+    const auto count = selected_count(first_position + r);
+    const std::uint32_t* selected = all_selected + static_cast<std::uint64_t>(r) * kMaxSelected;
+    const float* scores = all_scores + (static_cast<std::uint64_t>(r) * kHeads + head) * kMaxSelected;
+    const std::uint16_t* vbase = kv + kKvWidth + kvh * kHeadDim + 2U * t;
+    float s0 = 0.0F, s1 = 0.0F;
+    for (std::uint32_t c0 = 0; c0 < count; c0 += kOutChunk) {
+        const auto n = min(kOutChunk, count - c0);
+        __syncthreads();
+        for (unsigned i = t; i < n; i += kOutThreads) { ws[i] = scores[c0 + i]; tok[i] = selected[c0 + i]; }
+        __syncthreads();
+        constexpr unsigned B = 8;
+        unsigned i = 0;
+        for (; i + B <= n; i += B) {
+            std::uint32_t raw[B];
+#pragma unroll
+            for (unsigned b = 0; b < B; ++b)
+                raw[b] = *reinterpret_cast<const std::uint32_t*>(vbase + static_cast<std::uint64_t>(tok[i + b]) * (kKvWidth * 2ULL));
+#pragma unroll
+            for (unsigned b = 0; b < B; ++b) {
+                const float w = ws[i + b];
+                s0 = __fmaf_rn(w, __uint_as_float(raw[b] << 16U), s0);
+                s1 = __fmaf_rn(w, __uint_as_float(raw[b] & 0xffff0000U), s1);
+            }
+        }
+        for (; i < n; ++i) {
+            const auto raw = *reinterpret_cast<const std::uint32_t*>(vbase + static_cast<std::uint64_t>(tok[i]) * (kKvWidth * 2ULL));
+            s0 = __fmaf_rn(ws[i], __uint_as_float(raw << 16U), s0);
+            s1 = __fmaf_rn(ws[i], __uint_as_float(raw & 0xffff0000U), s1);
+        }
+    }
+    const float* qg = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth;
+    float* out = output + static_cast<std::uint64_t>(r) * kAttnWidth;
+#pragma unroll
+    for (unsigned e = 0; e < 2U; ++e) {
+        const auto f = 2U * t + e;
+        const float attn = round_bf16(e ? s1 : s0);
+        const float g = qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f];
+        const float gate = round_bf16(__fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tables, -g))));
+        out[static_cast<std::uint64_t>(head) * kHeadDim + f] = round_bf16(__fmul_rn(attn, gate));
+    }
+}
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_kernel(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    attention_output_head_kernel_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// Multi-segment launches (decode cohort windows, layer_core_multi): one launch per step for every session of a window.
+// Every block (score kernel: every wave) belongs to one segment and runs the single-call body with that segment's
+// pointers; its first_position argument is position[s] - first_row[s] (modulo 2^64), so first_position + r, with r the
+// window row the block already uses for the row buffers, is the session's own position. Same code, same per-row and
+// per-head arithmetic as one call per session.
+__device__ __forceinline__ unsigned seg_of(const SegmentMap& m, unsigned row) {
+    unsigned seg = 0;
+    while (seg + 1U < m.n && row >= m.first_row[seg + 1U]) ++seg;
+    return seg;
+}
+__device__ __forceinline__ std::uint64_t base_position(const SegmentMap& m, unsigned seg) { return m.position[seg] - m.first_row[seg]; }
+
+__global__ void norm_rope_multi_kernel(float* __restrict__ values, std::uint64_t row_stride, std::uint32_t head_dim,
+    std::uint32_t head_stride, const float* __restrict__ norm, SegmentMap map, const float2* __restrict__ cs, am::Tables tables) {
+    norm_rope_kernel_body(values, row_stride, head_dim, head_stride, norm, base_position(map, seg_of(map, blockIdx.y)), cs, tables);
+}
+__global__ void store_multi_kernel(const float* __restrict__ ik, const float* __restrict__ k, const float* __restrict__ v, SegmentMap map) {
+    const unsigned seg = seg_of(map, blockIdx.y);
+    store_kernel_body(ik, k, v, base_position(map, seg), map.raw_index[seg], map.kv[seg]);
+}
+__global__ void block_pool_multi_kernel(SegmentMap map, const float* __restrict__ key_norm, const float2* __restrict__ cs,
+    am::Tables tables) {
+    unsigned seg = 0;
+    while (seg + 1U < map.n && blockIdx.x >= map.pool_begin[seg + 1U]) ++seg;
+    block_pool_kernel_body(map.raw_index[seg], map.pool_first[seg] - map.pool_begin[seg], key_norm, cs, tables, map.pooled[seg]);
+}
+__global__ __launch_bounds__(256) void block_score_multi_kernel(const float* __restrict__ index_query, SegmentMap map,
+    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
+    if (wave >= map.score_begin[map.n]) return;
+    unsigned seg = 0;
+    while (seg + 1U < map.n && wave >= map.score_begin[seg + 1U]) ++seg;
+    const auto row = map.first_row[seg];
+    block_score_body(index_query + static_cast<std::uint64_t>(row) * kIndexQWidth, map.first_row[seg + 1U] - row, map.position[seg],
+        map.pooled[seg], map.scored[seg], block_scores + static_cast<std::uint64_t>(row) * max_blocks, max_blocks, map.score_begin[seg]);
+}
+__global__ __launch_bounds__(kSelectThreads) void select_multi_kernel(float* __restrict__ all_scores, std::uint32_t max_blocks,
+    SegmentMap map, std::uint32_t* __restrict__ all_selected) {
+    select_kernel_body(all_scores, max_blocks, base_position(map, seg_of(map, blockIdx.x)), all_selected);
+}
+__global__ __launch_bounds__(128) void attention_score_half_multi_kernel(const float* __restrict__ q_gate, SegmentMap map,
+    const std::uint32_t* __restrict__ all_selected, float* __restrict__ all_scores) {
+    const unsigned seg = seg_of(map, blockIdx.z);
+    attention_score_half_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores);
+}
+__global__ __launch_bounds__(256) void softmax_multi_kernel(float* __restrict__ all_scores, SegmentMap map, am::Tables tables) {
+    softmax_kernel_body(all_scores, base_position(map, seg_of(map, blockIdx.y)), tables);
+}
+__global__ __launch_bounds__(kOutThreads) void attention_output_multi_kernel(const float* __restrict__ q_gate, SegmentMap map,
+    const std::uint32_t* __restrict__ all_selected, const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    const unsigned seg = seg_of(map, blockIdx.y);
+    attention_output_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
+}
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_kernel(const float* __restrict__ q_gate, SegmentMap map,
+    const std::uint32_t* __restrict__ all_selected, const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    const unsigned seg = seg_of(map, blockIdx.y);
+    attention_output_head_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
+}
 
 }  // namespace
 
@@ -664,6 +819,7 @@ Workspace allocate_workspace(std::uint32_t chunk_rows, std::uint64_t max_positio
     Workspace w;
     w.chunk_rows = chunk_rows;
     w.max_blocks = static_cast<std::uint32_t>((max_positions + kRatio - 1U) / kRatio);
+    strix::cuda::require_vram(workspace_bytes(chunk_rows, max_positions), "qsa workspace");
     check(cudaMalloc(&w.pooled_keys, std::max<std::size_t>(1, static_cast<std::size_t>(w.max_blocks) * kIndexDim * 4U)), "alloc pooled");
     check(cudaMalloc(&w.block_scores, std::max<std::size_t>(1, static_cast<std::size_t>(chunk_rows) * w.max_blocks * 4U)), "alloc block scores");
     check(cudaMalloc(&w.selected, static_cast<std::size_t>(chunk_rows) * kMaxSelected * 4U), "alloc selected");
@@ -754,8 +910,12 @@ void attention_softmax(std::uint32_t rows, std::uint64_t first_position, float* 
 void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, const float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream) {
     if (!rows) return;
-    attention_output_kernel<<<dim3(kKvHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
-        attention_output, tables);
+    if (rows <= 8U && decode_rows_enabled())
+        attention_output_head_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
+            attention_output, tables);
+    else
+        attention_output_kernel<<<dim3(kKvHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
+            attention_output, tables);
     check(cudaGetLastError(), "output launch");
 }
 void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
@@ -779,18 +939,123 @@ void layer_core(const RowBuffers& b, std::uint32_t rows, std::uint64_t first_pos
     // equals the HIP group-by-group order (H:5148-5159).
     store_rows(b.index_key, b.k, b.v, rows, first_position, state, stream);
     const auto last_complete = static_cast<std::uint32_t>((first_position + rows) / kRatio);
+    float* pooled = state.pooled ? state.pooled : ws.pooled_keys;
     if (last_complete > kTopK) {
         if (last_complete > ws.max_blocks) throw std::invalid_argument("qwen_qsa layer_core: max_blocks");
-        block_pool(state.raw_index, 0, last_complete, w.index_k_norm, cs, tables, ws.pooled_keys, stream);
+        std::uint32_t first = 0;
+        if (state.pooled) first = std::min(*state.pooled_valid, static_cast<std::uint32_t>(first_position / kRatio));
+        if (last_complete > first) block_pool(state.raw_index, first, last_complete - first, w.index_k_norm, cs, tables, pooled, stream);
+        if (state.pooled) *state.pooled_valid = last_complete;
     }
     for (std::uint32_t c = 0; c < rows; c += ws.chunk_rows) {
         const auto n = std::min(ws.chunk_rows, rows - c);
         const auto p0 = first_position + c;
-        block_scores(b.index_query + static_cast<std::uint64_t>(c) * kIndexQWidth, n, p0, ws.pooled_keys, ws.block_scores, ws.max_blocks, stream);
+        block_scores(b.index_query + static_cast<std::uint64_t>(c) * kIndexQWidth, n, p0, pooled, ws.block_scores, ws.max_blocks, stream);
         select_rows(ws.block_scores, ws.max_blocks, n, p0, ws.selected, stream);
         attention(b.q_gate + static_cast<std::uint64_t>(c) * kQGateWidth, n, p0, ws.selected, state.kv, ws.scores,
             b.attention_output + static_cast<std::uint64_t>(c) * kAttnWidth, tables, stream);
     }
+}
+
+void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32_t n, const LayerWeights& w, const RopeTable* cs,
+    const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream) {
+    if (n == 0 || n > kMaxSegments) throw std::invalid_argument("qwen_qsa layer_core_multi: 1..8 segments");
+    static const bool score_wave = [] { const char* v = std::getenv("STRIX_QSA_SCORE_WAVE"); return v && v[0] == '1'; }();
+    // Every check and the whole segment map before the first launch; the host pooled-valid counts are written only after
+    // the launches (a throw here leaves the sessions as they were).
+    SegmentMap map{};
+    map.n = n;
+    std::uint32_t rows = 0, max_rows = 0, min_rows = 0xffffffffU;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto& g = segs[i];
+        if (g.rows == 0) throw std::invalid_argument("qwen_qsa layer_core_multi: empty segment");
+        if (g.first_position + g.rows > static_cast<std::uint64_t>(ws.max_blocks) * kRatio + kRatio)
+            throw std::invalid_argument("qwen_qsa layer_core: workspace too small for the positions");
+        if (!g.state.pooled && n > 1) throw std::invalid_argument("qwen_qsa layer_core_multi: sessions need their own pooled cache");
+        if (static_cast<std::uint32_t>((g.first_position + g.rows) / kRatio) > ws.max_blocks && (g.first_position + g.rows) / kRatio > kTopK)
+            throw std::invalid_argument("qwen_qsa layer_core: max_blocks");
+        map.first_row[i] = rows;
+        map.position[i] = g.first_position;
+        map.kv[i] = g.state.kv;
+        map.raw_index[i] = g.state.raw_index;
+        rows += g.rows;
+        max_rows = std::max(max_rows, g.rows);
+        min_rows = std::min(min_rows, g.rows);
+    }
+    map.first_row[n] = rows;
+    // the output kernel per-segment layer_core chooses for each segment (head kernel: <= 8 rows with the decode kernels on);
+    // the multi launch needs one choice for all, else per segment
+    const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
+    if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) {  // outside the multi-launch shapes: one call per segment
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::uint64_t r = map.first_row[i];
+            const RowBuffers sb{b.hidden + r * kHidden, b.q_gate + r * kQGateWidth, b.k + r * kKvWidth, b.v + r * kKvWidth,
+                                b.index_query + r * kIndexQWidth, b.index_key + r * kIndexDim, b.attention_output + r * kAttnWidth};
+            layer_core(sb, segs[i].rows, segs[i].first_position, w, segs[i].state, cs, tables, ws, stream);
+        }
+        return;
+    }
+    // pooled keys per session (host-side valid counts, as layer_core), block-score waves, attention slots
+    std::uint32_t pool = 0, waves = 0, slots = 0;
+    std::uint32_t valid_after[kMaxSegments] = {};
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto& g = segs[i];
+        const auto last_complete = static_cast<std::uint32_t>((g.first_position + g.rows) / kRatio);
+        map.pooled[i] = g.state.pooled ? g.state.pooled : ws.pooled_keys;
+        map.pool_begin[i] = pool;
+        map.pool_first[i] = 0;
+        if (g.state.pooled) valid_after[i] = *g.state.pooled_valid;
+        if (last_complete > kTopK) {
+            std::uint32_t first = 0;
+            if (g.state.pooled) first = std::min(*g.state.pooled_valid, static_cast<std::uint32_t>(g.first_position / kRatio));
+            map.pool_first[i] = first;
+            if (last_complete > first) pool += last_complete - first;
+            valid_after[i] = last_complete;
+        }
+        // block scores: as block_scores() for this segment's rows
+        map.score_begin[i] = waves;
+        const auto scored = last_complete;  // (first_position + rows) / kRatio: complete blocks of the segment's last row
+        map.scored[i] = scored;
+        if (scored > kTopK) waves += static_cast<std::uint32_t>((g.rows + kScoreRowsPerWave - 1U) / kScoreRowsPerWave * ((scored + 31U) / 32U));
+        for (std::uint64_t p = g.first_position; p < g.first_position + g.rows && slots < kMaxSelected; ++p) slots = std::max(slots, selected_count(p));
+    }
+    map.pool_begin[n] = pool;
+    map.score_begin[n] = waves;
+    indexer_projection(b.hidden, rows, w, b.index_query, b.index_key, stream);  // row-wise
+    norm_rope_multi_kernel<<<dim3(kIndexHeads, rows), kIndexDim, 2U * kIndexDim * sizeof(float), stream>>>(b.index_query, kIndexQWidth,
+        kIndexDim, kIndexDim, w.index_q_norm, map, cs, tables);
+    norm_rope_multi_kernel<<<dim3(kHeads, rows), kHeadDim, 2U * kHeadDim * sizeof(float), stream>>>(b.q_gate, kQGateWidth, kHeadDim,
+        kHeadDim * 2U, w.q_norm, map, cs, tables);
+    norm_rope_multi_kernel<<<dim3(kKvHeads, rows), kHeadDim, 2U * kHeadDim * sizeof(float), stream>>>(b.k, kKvWidth, kHeadDim, kHeadDim,
+        w.k_norm, map, cs, tables);
+    check(cudaGetLastError(), "norm_rope multi launch");
+    store_multi_kernel<<<dim3(kKvWidth / 256U, rows), 256, 0, stream>>>(b.index_key, b.k, b.v, map);
+    check(cudaGetLastError(), "store multi launch");
+    if (pool) {
+        block_pool_multi_kernel<<<pool, kIndexDim, 0, stream>>>(map, w.index_k_norm, cs, tables);
+        check(cudaGetLastError(), "block pool multi launch");
+    }
+    if (waves) {
+        block_score_multi_kernel<<<(waves + 7U) / 8U, 256, 0, stream>>>(b.index_query, map, ws.block_scores, ws.max_blocks);
+        check(cudaGetLastError(), "block score multi launch");
+    }
+    select_multi_kernel<<<rows, kSelectThreads, 0, stream>>>(ws.block_scores, ws.max_blocks, map, ws.selected);
+    check(cudaGetLastError(), "select multi launch");
+    attention_score_half_multi_kernel<<<dim3((slots + kRun - 1U) / kRun, kKvHeads, rows), 128, 0, stream>>>(b.q_gate, map, ws.selected,
+        ws.scores);
+    check(cudaGetLastError(), "score multi launch");
+    softmax_multi_kernel<<<dim3(kHeads, rows), 256, 0, stream>>>(ws.scores, map, tables);
+    check(cudaGetLastError(), "softmax multi launch");
+    // keyed on the segment rows (as per-segment layer_core), not on the window total
+    if (head_all)
+        attention_output_head_multi_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
+            b.attention_output, tables);
+    else
+        attention_output_multi_kernel<<<dim3(kKvHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
+            b.attention_output, tables);
+    check(cudaGetLastError(), "output multi launch");
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (segs[i].state.pooled) *segs[i].state.pooled_valid = valid_after[i];
 }
 
 }  // namespace strix::cuda::qwen_qsa

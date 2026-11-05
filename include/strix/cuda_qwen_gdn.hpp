@@ -29,6 +29,16 @@ constexpr std::uint64_t kConvStateHalfs = std::uint64_t{kConvWidth} * kConvKerne
 constexpr std::uint32_t kConvChunk = 32;                                           // rows per conv block
 constexpr std::uint32_t kA8Pitch = 256;                                            // fused A8 delta pitch (kDenseA8WideRows)
 
+// A device pointer given directly, or read at kernel start from a device word (`slot`, e.g. an entry of a per-segment
+// descriptor table written before a graph replay) plus `offset` elements. Only where the pointer comes from changes; the
+// arithmetic is the same.
+template <class T> struct DevRef {
+    T* direct = nullptr;
+    T* const* slot = nullptr;
+    std::uint64_t offset = 0;
+    __host__ __device__ T* get() const { return slot ? *slot + offset : direct; }
+};
+
 struct Rows {
     float* qkv; float* z; float* beta; float* gate; float* core;
     std::uint64_t stride;  // floats between consecutive rows (same for every field)
@@ -71,6 +81,10 @@ void launch_conv(const Rows& rows, std::uint32_t count, std::uint16_t* conv_stat
 // scratch: decay_scratch_bytes(count).
 void launch_recurrence(const Rows& rows, std::uint32_t count, float* state, void* scratch, const amdmath::Tables& t,
     cudaStream_t stream, Tuning tuning = {});
+// K5 reading the state from state_in and writing the final state to state_out (may alias state_in; same bits). Decode
+// windows keep S0 so a partial accept can replay the kept rows from it.
+void launch_recurrence_split(const Rows& rows, std::uint32_t count, const float* state_in, float* state_out, void* scratch,
+    const amdmath::Tables& t, cudaStream_t stream, Tuning tuning = {});
 // K6: gated RMSNorm of core in place (FP32), optionally also the fused A8 codes/deltas.
 void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8 = nullptr);
@@ -78,5 +92,41 @@ void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const 
 void launch_core(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
     std::uint16_t* conv_state, float* state, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8 = nullptr, Tuning tuning = {});
+
+// launch_core with the split recurrence; raw_qkv (optional, [count][10240] FP32) receives the conv inputs (the rows'
+// qkv before K4 rewrites them in place) for a later conv-state rollback.
+void launch_core_split(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
+    std::uint16_t* conv_state, const float* state_in, float* state_out, float* raw_qkv, void* scratch, const Weights& w,
+    const amdmath::Tables& t, cudaStream_t stream, const A8Out* a8 = nullptr, Tuning tuning = {});
+
+// launch_core_split with every session pointer as a DevRef (decode graphs over a per-segment descriptor table).
+void launch_core_split_ref(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
+    DevRef<std::uint16_t> conv_state, DevRef<float> state_in, DevRef<float> state_out, float* raw_qkv, void* scratch,
+    const Weights& w, const amdmath::Tables& t, cudaStream_t stream, const A8Out* a8 = nullptr, Tuning tuning = {});
+
+// Multi-segment core (decode cohort windows): the window's rows hold several sessions' segments back to back
+// (segment i = rows [row, row + count), count <= 32, segments ascending from row 0). Row-wise steps (K3 gates, decay,
+// K6 norm) run once over all rows; the steps that carry a session's history (K4 conv prepass + conv, K5 recurrence)
+// run with one grid slice per segment, each slice exactly the single-segment launch_core_split_ref of its segment (same
+// per-row and per-head arithmetic, its own conv history and recurrent state). raw_qkv receives all rows' conv inputs.
+// scratch: multi_scratch_bytes().
+inline constexpr std::uint32_t kMaxSegments = 8;
+struct Segment {
+    std::uint32_t row = 0, count = 0;
+    DevRef<std::uint16_t> conv;
+    DevRef<float> state_in, state_out;
+};
+struct Segments {
+    std::uint32_t n = 0;
+    Segment s[kMaxSegments];
+};
+[[nodiscard]] std::size_t multi_scratch_bytes();
+void launch_core_multi(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, const Segments& segments,
+    float* raw_qkv, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream, Tuning tuning = {});
+
+// conv_state = the history after the first `keep` rows of a window whose pre-window history was `before` and whose raw
+// conv inputs are raw_qkv [rows][10240] (launch_core_split). Same values the window's K4 prepass writes for count = keep.
+void launch_conv_rollback(const float* raw_qkv, std::uint32_t keep, const std::uint16_t* before, std::uint16_t* conv_state,
+    cudaStream_t stream);
 
 }  // namespace strix::cuda::qwen_gdn

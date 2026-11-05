@@ -12,7 +12,7 @@ endif()
 add_library(strix_qwen_cuda STATIC
     src/cuda/qwen_prefill_driver.cu src/cuda/qwen_hc.cu src/cuda/qwen_dense.cu
     src/cuda/qwen_gdn.cu src/cuda/qwen_qsa.cu src/cuda/qwen_moe.cu
-    src/cuda/qwen_plemtp.cu src/cuda/qwen_amd_math_tables.cu src/gguf_reader.cpp)
+    src/cuda/qwen_plemtp.cu src/cuda/qwen_mtp_draft.cu src/cuda/qwen_transcode.cu src/cuda/qwen_amd_math_tables.cu src/gguf_reader.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda)
 target_compile_options(strix_qwen_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
@@ -37,3 +37,33 @@ target_link_libraries(qwen_handoff_codec_test PRIVATE strix_qwen_handoff)
 enable_testing()
 add_test(NAME qwen_prefill_schedule COMMAND qwen_prefill_schedule_test)
 add_test(NAME qwen_handoff_codec COMMAND qwen_handoff_codec_test)
+add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
+target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
+add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
+target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
+# Serving front end of the node (OpenAI/Anthropic API, SSE, GGUF BPE tokenizer, Qwen chat template) for the RTX engine.
+add_library(strix_serve_win STATIC
+    src/serve/json_constraint.cpp src/serve/constraint_selection.cpp src/serve/bpe_tokenizer.cpp
+    src/serve/chat_template.cpp src/serve/deepseek_chat.cpp src/serve/engine.cpp src/serve/api.cpp src/serve/request_fields.cpp src/serve/health.cpp src/serve/http_server.cpp)
+target_include_directories(strix_serve_win PUBLIC include PRIVATE src/serve)
+target_link_libraries(strix_serve_win PUBLIC strix_qwen_handoff)
+add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
+target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
+if(MSVC)
+    target_compile_options(strix-cuda-qwen-serve PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+add_executable(qwen_quant_host_test tests/cuda/qwen_quant_host_test.cpp src/ggml_dequant.cpp src/iq4_nl.cpp src/gguf_reader.cpp)
+target_include_directories(qwen_quant_host_test PRIVATE include)
+add_executable(qwen_quant_device_test tests/cuda/qwen_quant_device_test.cu src/ggml_dequant.cpp src/iq4_nl.cpp)
+target_link_libraries(qwen_quant_device_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_quant_device_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# Multi-session decode: cohort window packing (host test) and the cohort gate/bench (GPU).
+add_executable(qwen_cohort_plan_test tests/cuda/qwen_cohort_plan_test.cpp)
+target_include_directories(qwen_cohort_plan_test PRIVATE include)
+add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
+add_executable(qwen_cohort_e2e tests/cuda/qwen_cohort_e2e.cu)
+target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
+# Multi-segment QSA core == per-segment layer_core on random data (device, no model): qwen_qsa_multi_test <tables dir>
+add_executable(qwen_qsa_multi_test tests/cuda/qwen_qsa_multi_test.cu)
+target_link_libraries(qwen_qsa_multi_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
