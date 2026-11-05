@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -253,6 +254,31 @@ Prefetcher::Prefetcher(Config config, const PleHashContract& contract, std::span
     startup::Phase hash_marker(config_.credit_only ? "preflight_ple_hash" : "runtime_ple_hash");
     auto plan = plan_prompt(config_, contract, prompt);
     hash_marker.end();
+    // Validate the *actual* syscall sets before opening readers, starting
+    // workers, or discarding anything. Both syscalls use these exact extents;
+    // no length-zero/whole-file fadvise and no subtraction after validation.
+    std::vector<DiscardRange> discard;
+    std::ostringstream diagnostic;
+    diagnostic << "ple-discard-safety: registered=[";
+    for (const auto& r : config_.registered_backings)
+        diagnostic << r.name << ":va=" << r.address << '+' << r.bytes << ":file="
+            << r.device << ':' << r.inode << ':' << r.file_offset << '+' << r.bytes << ';';
+    diagnostic << "] madvise=[";
+    for (const auto& r : config_.reclaim) {
+        discard.push_back({discard_end(config_.mapping_base,r.begin),r.end-r.begin,
+            config_.file_device,config_.file_inode,r.begin});
+        diagnostic << discard.back().address << '+' << discard.back().bytes << ';';
+    }
+    diagnostic << "] fadvise=[";
+    for (const auto& r : discard)
+        diagnostic << r.device << ':' << r.inode << ':' << r.file_offset << '+' << r.bytes << ';';
+    diagnostic << "] verdict=";
+    try { validate_discard_set(page,discard,discard,config_.registered_backings); }
+    catch (const DiscardSafetyError&) {
+        std::fprintf(stderr,"%srefused\n",diagnostic.str().c_str());
+        throw;
+    }
+    std::fprintf(stderr,"%sdisjoint\n",diagnostic.str().c_str());
     heads_ = contract.head_count;
     positions_ = prompt.size();
     rows_ = std::move(plan.rows);

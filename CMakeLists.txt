@@ -1193,6 +1193,21 @@ if(BUILD_TESTING)
     add_test(NAME strix-ple-rolling-tests COMMAND strix-ple-rolling-tests)
     set_tests_properties(strix-ple-rolling-tests PROPERTIES TIMEOUT 120)
 
+    add_executable(strix-ple-discard-safety-tests tests/ple_discard_safety_tests.cpp)
+    target_include_directories(strix-ple-discard-safety-tests PRIVATE include)
+    target_compile_features(strix-ple-discard-safety-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-ple-discard-safety-tests)
+    add_test(NAME strix-ple-discard-safety-tests COMMAND strix-ple-discard-safety-tests)
+
+    add_executable(strix-hip-model-residency-release-host-tests
+        tests/hip_model_residency_release_host_tests.cpp src/hip_model_residency.cpp)
+    target_include_directories(strix-hip-model-residency-release-host-tests PRIVATE tests/stubs/hip_model_residency)
+    target_link_libraries(strix-hip-model-residency-release-host-tests PRIVATE strix_core)
+    strix_target_warnings(strix-hip-model-residency-release-host-tests)
+    add_test(NAME strix-hip-model-residency-release-host-tests COMMAND strix-hip-model-residency-release-host-tests)
+    set_tests_properties(strix-hip-model-residency-release-host-tests PROPERTIES
+        LABELS "cpu" SKIP_RETURN_CODE 77 TIMEOUT 30)
+
     add_executable(strix-ple-iq4-nl-tests tests/ple_iq4_nl_tests.cpp)
     target_link_libraries(strix-ple-iq4-nl-tests PRIVATE strix_core)
     strix_target_warnings(strix-ple-iq4-nl-tests)

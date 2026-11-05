@@ -13,6 +13,8 @@ void bind_ple_reclaim_mapping(ple_reclaim::Config& config,
     config.mapping_base = mapping->base_address();
     config.mapping_bytes = mapping->bytes();
     const auto backing = mapping->file_backing_identity();
+    config.file_device = backing[0];
+    config.file_inode = backing[1];
     config.backing_identity = std::to_string(backing[0]) + ":" +
         std::to_string(backing[1]) + ":" + std::to_string(config.table_offset);
     config.backing_owner = mapping;

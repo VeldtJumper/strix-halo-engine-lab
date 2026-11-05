@@ -1,7 +1,10 @@
 #pragma once
+#include "qwen_yarn_memory.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/ple_discard_safety.hpp"
+#include "strix/registered_backing_lifetime.hpp"
 #include <map>
 #include <optional>
 #include "strix/serve/json.hpp"
@@ -14,6 +17,7 @@
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 #if defined(__linux__)
 #include <unistd.h>
@@ -26,6 +30,16 @@ class YarnBundleCalibrationFailure : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
+// Keep golden-generation classification shared with the host failure-path tests.
+template<class Work> void with_mtp_bundle_golden_errors(Work&& work) {
+    try { std::forward<Work>(work)(); }
+    catch (const YarnMemoryPressure&) { throw; }
+    catch (const ple_reclaim::DiscardSafetyError&) { throw; }
+    catch (const RegisteredPageLockError&) { throw; }
+    catch (const std::exception& error) {
+        throw YarnBundleCalibrationFailure(error.what());
+    }
+}
 class YarnBundleSerialRetry {
 public:
     YarnBundleSerialRetry() : previous_(yarn_bundle_serial_retry) {yarn_bundle_serial_retry=true;}
@@ -96,6 +110,9 @@ private:
 };
 inline std::optional<int> retry_mtp_bundle_setup(const MtpBundleSetupRetry& state,
     const std::exception& error,const std::function<int()>& run) {
+    // Safety refusals remain fatal through the entry function's generic catch.
+    if(dynamic_cast<const ple_reclaim::DiscardSafetyError*>(&error) ||
+       dynamic_cast<const RegisteredPageLockError*>(&error)) return {};
     if(!state.selected || state.target_mutated || yarn_bundle_serial_retry) return {};
     state.restore();
     return retry_mtp_bundle_serial(error,run);
