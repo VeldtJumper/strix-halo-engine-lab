@@ -221,6 +221,7 @@ are read on the node.
 
 **Serving from the RTX PRO alone.** `strix-cuda-qwen-serve` serves the model from one RTX PRO 6000 with exact
 prefill and exact greedy MTP decode, the same APIs as the node server and continuous batching over 4 slots.
+An exact prompt prefix cache is ON by default (`--prefix-cache off` disables it).
 [Build, run and defaults](rtx-serve.md).
 
 **Build `0117a140`** (measured against the release build in the same session, interleaved runs,

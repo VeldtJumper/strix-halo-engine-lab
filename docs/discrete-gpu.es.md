@@ -88,6 +88,10 @@ herramientas y salida greedy exacta con cualquier número de slots. Compilación
 `-DSTRIX_CUDA_QWEN_ONLY=ON`; las compilaciones de Strix Halo no compilan estos ficheros. Compilación, opciones,
 valores predeterminados e interruptores: [servicio Qwen en la RTX](models/qwen3.8/rtx-serve.md).
 
+Una caché exacta de prefijos del prompt está activada por defecto (`--prefix-cache off` o
+`STRIX_QRTX_PREFIX_CACHE=0` la desactiva): los turnos siguientes de un agente restauran su prefijo en caché y solo
+hacen prefill de los tokens nuevos. [Caché de prefijos del prompt](models/qwen3.8/rtx-serve.md#prompt-prefix-cache).
+
 ## GLM-5.3 Flash en una RTX (borrador)
 
 Compilación y después la ejecución medida (exactitud y velocidad; un servidor HTTP para esta ruta aún no se ha probado

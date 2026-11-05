@@ -74,8 +74,40 @@ Opt-in and OFF by default:
 | `STRIX_QRTX_ALLOW_SYSMEM=1` | Allow an allocation to spill to system memory (refused by default). |
 | `STRIX_QRTX_NVTX=1` | NVTX profiling ranges. |
 
+## Prompt prefix cache
+
+The server keeps exact checkpoints of the prompt state in blocks of 256 tokens. A request restores the longest
+cached prefix of its token ids (at most n-2 tokens) and prefills only the rest. It matches token ids, not a
+session id, so it also hits when an agent client resends the conversation without the previous turn's reasoning.
+Checkpoints are taken at the last block boundary before the final prompt token and every 16,384 tokens, in pinned
+host RAM, LRU-evicted; row segments are shared between checkpoints of the same prefix.
+
+- **Default:** ON. **Off switch:** `--prefix-cache off` or `STRIX_QRTX_PREFIX_CACHE=0` (the previous code path).
+- **Budgets:** `--prefix-cache-host-mb N` (default: the smaller of 8,192 MiB and 25 % of the available RAM at
+  startup; pinned host memory is reserved in slabs of 32 segments as checkpoints are captured and stays reserved
+  until shutdown) and `--prefix-cache-vram-mb N` (default 0). A capture that does not fit is skipped; a request
+  never fails because of the cache.
+- **Tuning:** `--prefix-cache-block T` (default 256), `--prefix-cache-stride S` (default 16384, 0 = only the last
+  block boundary; a multiple of T).
+- **Reporting:** `usage.prompt_tokens_details.cached_tokens` is the number of restored tokens. The `strix.rtx`
+  receipt adds `prefix_cached`, `prefix_restore_ms` and `prefix_capture_ms`. `GET /v1/cache/stats` and the
+  `prefix_cache` object of `/api/status` report lookups, hits, captures, bytes, evictions, capture time and the
+  reserved host bytes.
+- **Compatibility:** a checkpoint is used only by the same process and the same key: SHA-256 over the layout
+  version, block size, model, MTP sidecar, draft vocabulary, rope and table files (path, size, mtime), context
+  cap, block schedule, PLE placement and every engine environment variable that selects kernels. Nothing is
+  written to disk.
+- **Exactness:** restored state, 64 decoded ids and their logits are bit-identical to a fresh prefill
+  (`qwen_prefix_cache_e2e`: checkpoint-continue, restore into another session, changed suffix, changed boundary
+  token; sync and overlapped prefill). With MTP, a checkpoint at position P also records token P and is restored
+  only when it matches. Over HTTP, 48-50K-token agent turns gave identical output with the cache on and off (8/8).
+- **Cost to other slots:** a restore copies the saved rows on the decode stream, so the other sessions' decode
+  pauses for the copy (measured on the RTX PRO 6000: 6.6 / 29 / 50 ms at 256 / 16K / 32K restored
+  tokens).
+
 ## Tests
 
 `qwen_decode_e2e` (decode gate, rollback arms, draft invariance), `qwen_cohort_e2e` and `qwen_cohort_plan_test`
 (multi-session equality and window packing), `qwen_qsa_multi_test`, `qwen_quant_host_test` and
-`qwen_quant_device_test` (GGUF decoders against the host reference), and the `qwen_decode_bench` timing bench.
+`qwen_quant_device_test` (GGUF decoders against the host reference), and the `qwen_decode_bench` timing bench. Prefix cache: `qwen_prefix_cache_host_test` (planner, identity,
+store, slab pool, batched capture) and `qwen_prefix_cache_e2e`.

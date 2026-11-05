@@ -180,6 +180,11 @@ struct SessionState {
     std::uint64_t bytes = 0;
 };
 
+struct StateCopyStream {
+    cudaStream_t stream = nullptr;
+    ~StateCopyStream() { if (stream) cudaStreamDestroy(stream); }
+};
+
 // One session's rows of a block (prefill: one segment; cohort windows: one per session, concatenated).
 struct Segment {
     SessionState* s;
@@ -408,6 +413,17 @@ struct Prefill::Impl : BlockFields {
 
     std::string describe;
     std::uint32_t transcoded = 0;              // tensors transcoded at load
+    StateCopyStream state_copy;
+    cudaStream_t state_copy_stream(SessionState& s) {
+        if (s.window_open || s.prefilling || cohort_open)
+            throw std::logic_error("state copy with an open window or chunk in flight");
+        if (!state_copy.stream)
+            ck(cudaStreamCreateWithFlags(&state_copy.stream, cudaStreamNonBlocking), "state copy stream");
+        ck(cudaStreamSynchronize(stream), "state copy producer");
+        return state_copy.stream;
+    }
+    void copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing);
+    void copy_fixed(SessionState& s, void* data, bool importing);
 
     void upload_model();
     void upload_ple();
@@ -1763,6 +1779,87 @@ void Prefill::destroy_session(SessionId session) {
 std::uint64_t Prefill::session_bytes() const { return impl_->session(0).bytes; }
 
 std::uint64_t Prefill::length(SessionId session) const { return impl_->session(session).length; }
+
+std::uint64_t Prefill::row_bytes() const { return (12ULL + (impl_->mtp ? 1ULL : 0ULL)) * (2048 + 256); }
+
+std::uint64_t Prefill::fixed_bytes() const {
+    return 36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
+}
+
+void Prefill::Impl::copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing) {
+    auto* cursor = static_cast<std::uint8_t*>(data);
+    const auto copy = [&](std::uint16_t* dev, std::uint64_t width) {
+        const auto bytes = count * width;
+        auto* row = reinterpret_cast<std::uint8_t*>(dev) + first * width;
+        ck(cudaMemcpyAsync(importing ? row : cursor, importing ? cursor : row, bytes,
+                           cudaMemcpyDefault, state_copy.stream), "prefix rows");
+        cursor += bytes;
+    };
+    for (auto* kv : s.kv) copy(kv, 2048);
+    for (auto* index : s.raw_index) copy(index, 256);
+    if (mtp) { copy(s.mtp_kv, 2048); copy(s.mtp_index, 256); }
+}
+
+void Prefill::Impl::copy_fixed(SessionState& s, void* data, bool importing) {
+    auto* cursor = static_cast<std::uint8_t*>(data);
+    const auto copy = [&](void* state, std::uint64_t bytes) {
+        ck(cudaMemcpyAsync(importing ? state : cursor, importing ? cursor : state, bytes,
+                           cudaMemcpyDefault, state_copy.stream), "prefix fixed");
+        cursor += bytes;
+    };
+    // Preserve the current-buffer parity: pointer graphs key it and table graphs read it at replay.
+    copy(s.gdn_state, 36ULL * gdn::kMatrixFloats * sizeof(float));
+    copy(s.gdn_conv, 36ULL * gdn::kConvStateHalfs * 2);
+    copy(s.ple_conv, 10240ULL * 9 * 2);
+    copy(s.ngram, sizeof(s.ngram));
+}
+
+void Prefill::export_rows(SessionId session, std::uint64_t first, std::uint64_t count, void* dst) {
+    export_segments(session, {{first, count, dst}}, nullptr);
+}
+
+void Prefill::export_fixed(SessionId session, void* dst) {
+    if (!dst) throw std::invalid_argument("prefix export fixed pointer");
+    export_segments(session, {}, dst);
+}
+
+void Prefill::export_segments(SessionId session, const std::vector<RowSegment>& segments, void* fixed_dst) {
+    auto& m = *impl_;
+    auto& s = m.session(session);
+    for (const auto& seg : segments)
+        if (!seg.data || seg.first > s.length || seg.count > s.length - seg.first)
+            throw std::invalid_argument("prefix export rows range");
+    const auto stream = m.state_copy_stream(s);
+    try {
+        for (const auto& seg : segments) m.copy_rows(s, seg.first, seg.count, const_cast<void*>(seg.data), false);
+        if (fixed_dst) m.copy_fixed(s, fixed_dst, false);
+        ck(cudaStreamSynchronize(stream), "prefix export segments");
+    }
+    catch (...) { cudaStreamSynchronize(stream); throw; }
+}
+
+void Prefill::import_state(SessionId session, std::uint64_t length, const std::vector<RowSegment>& segments, const void* fixed) {
+    auto& m = *impl_;
+    auto& s = m.session(session);
+    if (!fixed || length == 0 || length >= m.cfg.max_positions) throw std::invalid_argument("prefix import length/fixed");
+    std::uint64_t end = 0;
+    for (const auto& seg : segments) {
+        if (!seg.data || seg.first != end || seg.count == 0 || seg.count > length - end)
+            throw std::invalid_argument("prefix import segments must cover [0,length)");
+        end += seg.count;
+    }
+    if (end != length) throw std::invalid_argument("prefix import incomplete rows");
+    const auto stream = m.state_copy_stream(s);
+    s.length = 0;  // a failed transfer must never expose a partially restored session
+    try {
+        for (const auto& seg : segments) m.copy_rows(s, seg.first, seg.count, const_cast<void*>(seg.data), true);
+        m.copy_fixed(s, const_cast<void*>(fixed), true);
+        ck(cudaStreamSynchronize(stream), "prefix import");
+    } catch (...) { cudaStreamSynchronize(stream); throw; }
+    for (auto& valid : s.pooled_valid) valid = 0;
+    s.mtp_pooled_valid = 0;
+    s.length = length;
+}
 
 void Prefill::set_graphs(bool on) { impl_->use_graphs = on; }
 

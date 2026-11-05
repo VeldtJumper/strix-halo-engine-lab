@@ -201,7 +201,9 @@ no ayuda una ruta y solución de problemas: [uso de una GPU discreta](docs/discr
 - **Qwen3.8-Flash-Next servido desde una RTX PRO 6000 (Windows).** `strix-cuda-qwen-serve` ofrece la API del nodo
   (OpenAI y Anthropic, SSE, llamadas a herramientas) sobre el motor CUDA: prefill exacto y decode greedy exacto con
   ventanas de verificación MTP, batching continuo sobre 4 slots y bloques de prefill entre los pasos de decode de las
-  demás sesiones.
+  demás sesiones. Una caché exacta de prefijos del prompt (activada por defecto, `--prefix-cache off` para
+  desactivarla) restaura el prefijo en caché más largo de los ids de tokens de la petición, de modo que los turnos
+  siguientes de un agente solo hacen prefill de sus tokens nuevos.
   [Compilación, ejecución y valores predeterminados](docs/models/qwen3.8/rtx-serve.md).
 - **GLM-5.3 Flash en una RTX PRO 6000 (borrador, opt-in, Windows).** Tronco, capas densas y expertos compartidos en la
   tarjeta; los 43 × 288 expertos enrutados se sirven a través de la caché por niveles de

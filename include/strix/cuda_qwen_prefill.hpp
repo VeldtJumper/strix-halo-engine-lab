@@ -102,6 +102,10 @@ struct GraphCounters {
 // window bookkeeping. Weights and the activation scratch are shared. Session 0 is the implicit session of the
 // single-session API (run/step/verify/commit/draft without an id), created with the engine.
 using SessionId = std::uint32_t;
+struct RowSegment {
+    std::uint64_t first = 0, count = 0;
+    const void* data = nullptr;
+};
 // One session's draft chain request (draft_cohort).
 struct DraftRequest {
     SessionId session = 0;
@@ -148,6 +152,24 @@ public:
     void destroy_session(SessionId session);        // not session 0; drops the graphs that captured it
     [[nodiscard]] std::uint64_t session_bytes() const;  // device bytes of one session's state
     [[nodiscard]] std::uint64_t length(SessionId session) const;
+    // Component-major rows: 12 KV arrays (count * 1024 BF16 each), 12 raw-index arrays
+    // (count * 128 BF16 each), then MTP KV and raw index when a sidecar is loaded.
+    // At an intermediate prefill boundary P < position, all MTP pairs [0,P) are complete.
+    // At the final prefill boundary, the last MTP pair is not yet written.
+    [[nodiscard]] std::uint64_t row_bytes() const;
+    // Fixed layout: current GDN matrices (FP32), GDN conv (BF16), PLE conv (BF16),
+    // ngram[2] (uint32). No padding, pooled keys, held row or decode-window scratch.
+    [[nodiscard]] std::uint64_t fixed_bytes() const;
+    // Synchronous copies on a dedicated stream; no open window or chunk in this session.
+    // Destinations and import sources may be pinned host or device pointers (UVA).
+    void export_rows(SessionId session, std::uint64_t first, std::uint64_t count, void* dst);
+    void export_fixed(SessionId session, void* dst);
+    // One producer fence and one completion fence for all requested destinations.
+    // Segments may omit already cached rows; fixed_dst may be null.
+    void export_segments(SessionId session, const std::vector<RowSegment>& segments, void* fixed_dst);
+    // Segments must cover [0,length) in order. Resume prefill with at least one row;
+    // the caller must ensure the MTP boundary pair belongs to the resumed prompt.
+    void import_state(SessionId session, std::uint64_t length, const std::vector<RowSegment>& segments, const void* fixed);
     // run() into a session (the same computation; the implicit-session run() is run(0, ...)).
     Timing run(SessionId session, const std::vector<std::uint32_t>& tokens, std::uint64_t position, const Sink& sink,
                const RunOptions& options = {});
