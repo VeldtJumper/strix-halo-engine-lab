@@ -1541,7 +1541,8 @@ static int run_decode_entry(
             yarn_preflight_reclaimer = std::make_unique<strix::ple_reclaim::Prefetcher>(*config,
                 strix::build_ple_hash_contract(model),candidate.tokens,true);
             return yarn_preflight_reclaimer->credit_bytes();
-        } catch (const std::exception& error) {
+        } catch (const strix::ple_reclaim::DiscardSafetyError&) { throw; }
+        catch (const std::exception& error) {
             yarn_preflight_reclaimer.reset();
             const bool required = strix::decode_cli::env_is(environment,"STRIX_PLE_RECLAIMABLE","1");
             if (required) throw std::runtime_error(std::string("YaRN required PLE preflight refused: ") + error.what());
@@ -2495,6 +2496,12 @@ static int run_decode_entry(
             config.mapping_base = mapped.base_address();
             config.mapping_bytes = mapped.bytes();
             config.page = page;
+            config.registered_backings = model_residency.registered_file_backings();
+            if (ple_mtp_assets) {
+                auto sidecar = ple_mtp_assets->sidecar_residency()->registered_file_backings();
+                for (auto& range : sidecar) range.name = "mtp.sidecar.registered-host";
+                config.registered_backings.insert(config.registered_backings.end(),sidecar.begin(),sidecar.end());
+            }
             config.table_offset = table->absolute_offset;
             config.table_rows = table->dimensions[1];
             config.stored_row_bytes = table->ggml_type == 20 ? table->dimensions[0] / 32U * 18U : table->dimensions[0] * 2U;
@@ -4453,7 +4460,7 @@ static int run_decode_entry(
         const auto fresh_session = session;
         auto request_options = options;
         if (!options.mtp_bundle_path.empty()) {
-            try {
+            strix::decode_cli::with_mtp_bundle_golden_errors([&] {
                 const auto identity=strix::decode_cli::mtp_bundle_golden_identity(options,model);
                 const auto golden=strix::decode_cli::ensure_mtp_bundle_golden(options.mtp_bundle_path,identity,
                     [&](const std::filesystem::path& temp) {
@@ -4477,10 +4484,7 @@ static int run_decode_entry(
                 request_options.mtp.golden=golden.string();
                 request_options.mtp.golden_sha256=strix::model_content_identity_hex(
                     strix::sha256_file_content(golden,strix::FileHashPolicy::cached));
-            } catch (const strix::decode_cli::YarnMemoryPressure&) { throw; }
-            catch (const std::exception& error) {
-                throw strix::decode_cli::YarnBundleCalibrationFailure(error.what());
-            }
+            });
         }
         for (std::uint32_t repeat = 0; repeat < options.mtp.sample_repeats; ++repeat) {
             if (repeat) {

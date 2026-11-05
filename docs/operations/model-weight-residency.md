@@ -86,11 +86,21 @@ that restore can take minutes or not complete, and the next GPU submission
 waits indefinitely. Locked pages stay resident and are no longer reported as
 `MemAvailable`, so automatic HTTP slot sizing sees the real headroom.
 
-When the limit is too small, or `mlock2` fails, startup prints one notice and
-the pages stay unlocked (previous behaviour). HTTP slot sizing then subtracts
-the unlocked registered bytes from `MemAvailable`, because reclaiming them is
-not free capacity for this process. Weight bytes, kernels and arithmetic are
-unchanged.
+With the automatic default (the variable unset), an unreadable or insufficient
+`RLIMIT_MEMLOCK`, or a failed `mlock2`, prints the existing notice and continues
+unlocked, as before. An explicit `STRIX_MODEL_REGISTER_MLOCK=1` requires locking
+and refuses startup on either failure, including sidecar setup and golden
+generation; automatic or serial bundle fallback cannot bypass this refusal.
+HTTP slot sizing still subtracts unlocked registered bytes from `MemAvailable`,
+because reclaiming them is not free capacity for this process.
+
+Before either discard syscall, PLE checks actual target and sidecar registrations
+against both virtual and file-backed page sets (`ple-discard-safety`). Overlaps
+refuse even in automatic/strict-off modes and cannot enter resident or bundle
+fallback. Teardown drains before checked unregister, unlock and mapping release;
+failed unregister retains the strong mapping, or fail-stops borrowed backing.
+Weight bytes, kernels, arithmetic and default residency selection are unchanged.
+Host callback tests do not qualify Linux/HIP execution or driver completion.
 
 Off switch: `STRIX_MODEL_REGISTER_MLOCK=0` (unlocked pages; slot sizing still
 subtracts them).

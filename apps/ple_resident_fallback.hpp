@@ -17,6 +17,7 @@ template<class Setup, class Teardown, class Admit, class Warm>
 std::shared_ptr<ple_reclaim::Prefetcher> setup_ple_or_resident(ple_reclaim::Mode mode,
     Setup setup, Teardown teardown, Admit admit, Warm warm) {
     try { return setup(); }
+    catch (const ple_reclaim::DiscardSafetyError&) { throw; } // Never substitute after a safety refusal.
     catch (const std::exception& error) {
         if (mode == ple_reclaim::Mode::required)
             throw std::runtime_error(std::string("required PLE setup refused before prompt mutation: ") + error.what());

@@ -19,6 +19,7 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -49,6 +50,13 @@ struct Fake {
     }
 };
 void windows() {
+    bool fallback = false;
+    refuses([&] {
+        (void)decode_cli::setup_ple_or_resident(Mode::automatic,
+            []() -> std::shared_ptr<Prefetcher> { throw DiscardSafetyError("fixture overlap"); },
+            [&] { fallback = true; },[&] { fallback = true; },[&] { fallback = true; });
+    });
+    expect(!fallback,"automatic mode must not fall back after a discard safety refusal");
     Fake io;
     // Consecutive windows share page 2, then it disappears and returns.
     std::vector<std::uint32_t> rows(256U * 5U, 0U);
@@ -610,6 +618,10 @@ struct Table {
     ~Table() { if (base) munmap(base,bytes); if (fd >= 0) close(fd); }
 };
 void direct_config(Config& c, const Table& file) {
+    struct stat backing{};
+    if (::fstat(file.fd,&backing)) throw std::runtime_error("temporary table fstat");
+    c.file_device = static_cast<std::uint64_t>(backing.st_dev);
+    c.file_inode = static_cast<std::uint64_t>(backing.st_ino);
     const auto path = "/proc/self/fd/" + std::to_string(file.fd);
     int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
     void* aligned = nullptr;
@@ -784,6 +796,18 @@ void verified_credit() {
     direct_config(c, file);
     const auto contract = build_ple_hash_contract(ModelContract{});
     const std::array<std::uint32_t,4> prompt{1,2,3,4};
+    {
+        auto overlap=c;
+        bool dropped=false;
+        overlap.strict=false; // Diagnostic mode cannot bypass discard safety.
+        overlap.registered_backings.push_back({"separate-file-alias",c.mapping_base+c.mapping_bytes+4096,4096,
+            c.file_device,c.file_inode,c.reclaim.front().begin});
+        overlap.drop_page_cache=[&](auto,auto) { dropped=true; return 0; };
+        bool safety_refused=false;
+        try { Prefetcher rejected(overlap,contract,prompt,true); }
+        catch (const DiscardSafetyError&) { safety_refused=true; }
+        expect(safety_refused && !dropped,"file alias safety refuses before any discard, even with strict off");
+    }
     verified_preflight_mapping(contract,prompt);
     Prefetcher verified(c,contract,prompt);
     expect(verified.credit_bytes() == 25193033728ULL, "runtime getter exposes rolling credit only after verified setup");

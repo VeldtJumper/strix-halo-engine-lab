@@ -24,8 +24,8 @@ Añada `--print-effective-config` para inspeccionar antes de la inicialización 
 Los prompts de CLI simple que lo admiten seleccionan automáticamente el prefill por tiles con prefijo conocido (T8192 para prompts largos,
 T4096 a 4K), la unión de expertos, las filas del router y `fast-prefill-f16wmma-v1`. El contexto se dimensiona automáticamente;
 por encima de 8192 el resolutor añade `--unqualified-context`. La residencia registrada (`--residency register`)
-es la predeterminada en UMA; las páginas registradas del modelo se bloquean en memoria por defecto cuando `RLIMIT_MEMLOCK`
-las cubre (`STRIX_MODEL_REGISTER_MLOCK=0`), véase [Bloqueo de páginas registradas](../../operations/model-weight-residency.md#registered-page-lock). El prefill FP16 tiene su propia referencia exacta y no es idéntico bit a bit al prefill serial A8 denso.
+es la predeterminada en UMA; si falla el bloqueo automático, se avisa y se continúa sin bloqueo, como antes.
+La petición explícita `STRIX_MODEL_REGISTER_MLOCK=1` rechaza el arranque si falla el bloqueo; `STRIX_MODEL_REGISTER_MLOCK=0` lo desactiva, véase [Bloqueo de páginas registradas](../../operations/model-weight-residency.md#registered-page-lock). El prefill FP16 tiene su propia referencia exacta y no es idéntico bit a bit al prefill serial A8 denso.
 El MTP nativo simple conserva su contrato de prefill dependiente de los assets. El servicio HTTP ahora admite automáticamente
 T8192 (recurriendo a tiles más pequeños bajo presión de memoria), con su aritmética existente y
 checkpoints de 1024 filas para una caché de prefijos configurada. Esto es independiente del prefill FP16 automático de la CLI.

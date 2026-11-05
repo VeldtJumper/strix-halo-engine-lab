@@ -2,6 +2,7 @@
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/registered_backing_lifetime.hpp"
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
 #include "strix/hip_model_residency_diagnostic.hpp"
 #endif
@@ -501,6 +502,19 @@ HipModelResidency::~HipModelResidency() {
     release();
 }
 
+std::vector<ple_reclaim::RegisteredBacking> HipModelResidency::registered_file_backings() const {
+    std::vector<ple_reclaim::RegisteredBacking> result;
+    if (registered_ranges_.empty()) return result;
+    if (!source_mapping_) throw ple_reclaim::DiscardSafetyError("registered model has no file backing witness");
+    const auto file = source_mapping_->file_backing_identity();
+    for (const auto& r : registered_ranges_) {
+        if (r.host_base < source_base_ || !file[1])
+            throw ple_reclaim::DiscardSafetyError("registered model file backing is unverifiable");
+        result.push_back({"weights.registered-host",r.host_base,r.bytes,file[0],file[1],r.host_base-source_base_});
+    }
+    return result;
+}
+
 HipModelResidency HipModelResidency::create(std::shared_ptr<const MappedModelFile> mapped,
     const ModelManifest& manifest, AllocationGenerationSource& generations, HipModelResidencyPolicy policy) {
     if (!mapped) throw std::invalid_argument("HIP residency requires an actual shared mapping owner");
@@ -673,22 +687,26 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                 mapped,
                 manifest,
                 policy);
+        if (!ranges.empty() && !result.selective_guard_)
+            result.selective_guard_ = std::make_shared<const HipSetupQuiescenceGuard>();
 
 #if defined(__linux__) && defined(MLOCK_ONFAULT)
         // Registered pages are kept off the reclaim LRU by default. A reclaimed or migrated page invalidates its
         // userptr registration and the driver evicts every queue of the process until the whole registration is
         // revalidated; under startup memory pressure that restore can stall indefinitely. Needs RLIMIT_MEMLOCK >=
-        // the registered bytes, otherwise the pages stay unlocked (previous behaviour). Off: STRIX_MODEL_REGISTER_MLOCK=0.
-        bool lock = [] { const char* v = std::getenv("STRIX_MODEL_REGISTER_MLOCK"); return !(v && v[0] == '0'); }();
-        if (lock) {
+        // the registered bytes. Automatic failures warn as before; explicit =1 must succeed.
+        // Off: STRIX_MODEL_REGISTER_MLOCK=0.
+        RegisteredPageLockPolicy lock(std::getenv("STRIX_MODEL_REGISTER_MLOCK"));
+        if (lock.enabled) {
             std::uint64_t planned = 0;
             for (const auto range : ranges) planned = checked_add(planned, range.end - range.begin);
             rlimit limit{};
             if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0 ||
                 (limit.rlim_cur != RLIM_INFINITY && static_cast<std::uint64_t>(limit.rlim_cur) < planned)) {
-                std::fprintf(stderr, "model residency: RLIMIT_MEMLOCK below %llu registered bytes; registered pages stay "
-                    "unlocked (reclaim can evict GPU queues)\n", static_cast<unsigned long long>(planned));
-                lock = false;
+                lock.failed("model residency: requested registered-page lock exceeds RLIMIT_MEMLOCK; refusing unlocked userptr backing", [&] {
+                    std::fprintf(stderr, "model residency: RLIMIT_MEMLOCK below %llu registered bytes; registered pages stay "
+                        "unlocked (reclaim can evict GPU queues)\n", static_cast<unsigned long long>(planned));
+                });
             }
         }
 #endif
@@ -709,39 +727,36 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                             range.begin);
 
                 startup::Phase registration_marker("registration_chunk", range.begin);
-                check_hip(
-                    selective_enabled ? selective_register(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes)) :
-                    hipHostRegister(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes), model_register_flags()),
-                    "hipHostRegister(model range)");
-
-                // Track the registration immediately: a device-alias query
-                // failure must use the same owner-preserving cleanup path.
-                result.registered_ranges_.
-                    push_back(
-                        RegisteredRange{
-                            host,
-                            0,
-                            bytes,
-                        });
-                void* device = nullptr;
-                check_hip(selective_enabled ? selective_alias(&device, reinterpret_cast<void*>(host)) :
-                    hipHostGetDevicePointer(&device, reinterpret_cast<void*>(host), 0),
-                    "hipHostGetDevicePointer(model range)");
-                result.registered_ranges_.back().device_base = reinterpret_cast<std::uintptr_t>(device);
+                acquire_registered_backing([&] {
+                    check_hip(selective_enabled ? selective_register(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes)) :
+                        hipHostRegister(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes), model_register_flags()),
+                        "hipHostRegister(model range)");
+                }, [&] {
+                    // Track before querying the alias so failure retains the backing.
+                    result.registered_ranges_.push_back(RegisteredRange{host,0,bytes});
+                }, [&] {
+                    void* device = nullptr;
+                    check_hip(selective_enabled ? selective_alias(&device, reinterpret_cast<void*>(host)) :
+                        hipHostGetDevicePointer(&device, reinterpret_cast<void*>(host), 0),
+                        "hipHostGetDevicePointer(model range)");
+                    result.registered_ranges_.back().device_base = reinterpret_cast<std::uintptr_t>(device);
+                });
                 result.registered_bytes_ =
                     checked_add(
                         result.registered_bytes_,
                         bytes);
 #if defined(__linux__) && defined(MLOCK_ONFAULT)
                 // With vm.compact_unevictable_allowed=0 compaction does not migrate locked pages either.
-                if (lock) {
+                if (lock.enabled) {
                     if (mlock2(reinterpret_cast<const void*>(host), static_cast<std::size_t>(bytes), MLOCK_ONFAULT) == 0) {
                         result.registered_ranges_.back().locked = true;
                         result.registered_locked_bytes_ = checked_add(result.registered_locked_bytes_, bytes);
                     } else {
-                        std::fprintf(stderr, "model residency: mlock of %llu registered bytes failed (%s); continuing unlocked\n",
-                            static_cast<unsigned long long>(bytes), std::strerror(errno));
-                        lock = false;
+                        const int lock_errno = errno;
+                        lock.failed(std::string("model residency: requested registered-page lock failed; refusing unlocked userptr backing: ") + std::strerror(lock_errno), [&] {
+                            std::fprintf(stderr, "model residency: mlock of %llu registered bytes failed (%s); continuing unlocked\n",
+                                static_cast<unsigned long long>(bytes), std::strerror(lock_errno));
+                        });
                     }
                 }
 #endif
@@ -1049,28 +1064,38 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
 }
 
 void HipModelResidency::release() noexcept {
-    if (selective_guard_) {
-        try { selective_guard_->run([] {}); }
-        catch (...) { selective_guard_->recover_or_fail_stop(); }
-    }
+    const auto drain = [&] {
+        if (selective_guard_) {
+            try { selective_guard_->run([] {}); }
+            catch (...) { selective_guard_->recover_or_fail_stop(); }
+        } else if (!registered_ranges_.empty()) std::terminate();
+    };
+    if (registered_ranges_.empty()) drain();
     bool unregister_failed = false;
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
     std::vector<std::uintptr_t> failed_registrations;
 #endif
-    for (const auto& range :
-         registered_ranges_) {
+    const bool retired = retire_registered_backings(registered_ranges_, drain, [&](const auto& range) {
         const auto error = copy_tier_ != HipModelCopyTier::none ?
             selective_unregister(reinterpret_cast<void*>(range.host_base)) : hipHostUnregister(reinterpret_cast<void*>(range.host_base));
-#if defined(__linux__) && defined(MLOCK_ONFAULT)
-        if (error == hipSuccess && range.locked)
-            (void)munlock(reinterpret_cast<const void*>(range.host_base), static_cast<std::size_t>(range.bytes));
-#endif
         if (error != hipSuccess) {
             unregister_failed = true;
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
             if (copy_tier_ != HipModelCopyTier::none) failed_registrations.push_back(range.host_base);
 #endif
         }
+        return error == hipSuccess;
+    }, [](const auto& range) {
+#if defined(__linux__) && defined(MLOCK_ONFAULT)
+        if (range.locked) (void)munlock(reinterpret_cast<const void*>(range.host_base), static_cast<std::size_t>(range.bytes));
+#else
+        (void)range;
+#endif
+    });
+    if (!retired) unregister_failed = true;
+    if (unregister_failed && !mapping_owner_) {
+        std::fputs("model residency: unregister failed on borrowed backing; terminating without unmapping\n",stderr);
+        std::_Exit(3);
     }
     if (unregister_failed && mapping_owner_) {
         // Quarantine only this failed strong lease. Do not unmap storage while

@@ -24,8 +24,8 @@ Add `--print-effective-config` to inspect before HIP initialization. See [Defaul
 Eligible plain CLI prompts automatically select known-prefix tiled prefill (T8192 for long prompts,
 T4096 at 4K), expert union, router rows and `fast-prefill-f16wmma-v1`. Context is sized automatically;
 beyond 8192 the resolver adds `--unqualified-context`. Registered residency (`--residency register`)
-is the default on UMA; registered model pages are locked by default when `RLIMIT_MEMLOCK` covers them
-(`STRIX_MODEL_REGISTER_MLOCK=0`), see [Registered page lock](../../operations/model-weight-residency.md#registered-page-lock). FP16 prefill has its own exact reference and is not bit-identical to dense-A8 serial prefill.
+is the default on UMA; automatic page locking warns and continues unlocked on failure, as before.
+An explicit `STRIX_MODEL_REGISTER_MLOCK=1` refuses startup if locking fails; `STRIX_MODEL_REGISTER_MLOCK=0` disables locking, see [Registered page lock](../../operations/model-weight-residency.md#registered-page-lock). FP16 prefill has its own exact reference and is not bit-identical to dense-A8 serial prefill.
 Plain native MTP retains its asset-dependent prefill contract. HTTP serving now automatically admits
 T8192 (falling back through smaller tiles under memory pressure), with its existing arithmetic and
 1024-row checkpoints for a configured prefix cache. This is separate from CLI FP16 auto prefill.

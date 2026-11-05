@@ -528,7 +528,8 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                     result.reason = "experimental-yarn";
                     result.admitted = true;
                     return result;
-                } catch (const std::overflow_error&) { throw; }
+                } catch (const ple_reclaim::DiscardSafetyError&) { throw; }
+                  catch (const std::overflow_error&) { throw; }
                   catch (const std::exception& error) { failure = error.what(); }
                 if (!result.tile_fallback.empty()) result.tile_fallback += ',';
                 result.tile_fallback += "T" + std::to_string(rows) + ":insufficient-memory";
@@ -564,6 +565,7 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                 if (!memory_refusal) break;
             }
         }
-    } catch (const std::exception& error) { return refuse(std::string("YaRN admission refused: ") + error.what()); }
+    } catch (const ple_reclaim::DiscardSafetyError&) { throw; }
+      catch (const std::exception& error) { return refuse(std::string("YaRN admission refused: ") + error.what()); }
     return refuse("YaRN admission refused");
 }

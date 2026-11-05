@@ -3,6 +3,7 @@
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_rolling.hpp"
 #include "strix/ple_direct.hpp"
+#include "strix/ple_discard_safety.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -42,6 +43,9 @@ struct Interval {
 struct Config {
     std::uintptr_t mapping_base = 0;
     std::uint64_t mapping_bytes = 0;
+    // MappedModelFile maps the file from offset zero; reclaim offsets are file offsets too.
+    std::uint64_t file_device = 0, file_inode = 0;
+    std::vector<RegisteredBacking> registered_backings;
     std::uint64_t page = 4096;
     std::uint64_t table_offset = 0;      // file offset of the table's first stored row
     std::uint64_t table_rows = 0;

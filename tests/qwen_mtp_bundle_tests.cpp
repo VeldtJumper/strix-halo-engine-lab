@@ -154,8 +154,8 @@ int main(int argc,char** argv) try {
     write(dir/"blocked","file");
     const auto serial_on_failure=[&](const std::function<void()>& attempt) {
         bool fell_back=false;
-        try {attempt();}
-        catch(const std::exception& error) {
+        try {with_mtp_bundle_golden_errors(attempt);}
+        catch(const YarnBundleCalibrationFailure& error) {
             env("STRIX_QWEN_YARN_MTP","1");
             const auto status=retry_mtp_bundle_serial(error,[&] {
                 fell_back=true;require(!parse(base).mtp.enabled,"failed calibration uses fresh serial route");return 0;
@@ -169,6 +169,46 @@ int main(int argc,char** argv) try {
     // Admission, preflight and bridge setup use the same retry seam. Fresh serial
     // resolution must see the caller's environment, not the failed MTP defaults.
     write(sidecar,"abc");
+    {
+        MtpBundleSetupRetry state;
+        state.selected=true;
+        unsigned attempts=0;
+        const auto no_safety_retry=[&]<class Error>(const Error& failure,const char* identity) {
+            bool caught=false;
+            try {
+                with_mtp_bundle_golden_errors([&] {
+                    ensure_mtp_bundle_golden(bundle,identity,[&](const auto& temp) {
+                        write(temp,"partial");
+                        throw failure;
+                    },[&]{return cache;});
+                });
+            } catch(const Error& error) {
+                caught=true;
+                require(std::string(error.what())==failure.what(),"golden safety diagnostic survives classification");
+                const auto status=retry_mtp_bundle_setup(state,error,[&] {
+                    ++attempts;
+                    return 17;
+                });
+                require(!status && attempts==0,
+                    "golden safety refusal cannot enter the outer bundle retry");
+            }
+            require(caught,"golden safety exception retains its type");
+            require(!std::filesystem::exists(cache/(std::string(identity)+".golden")),
+                "safety-refused golden is not published");
+            for(const auto& entry:std::filesystem::directory_iterator(cache)) {
+                require(entry.path().filename().string().find(".tmp-")==std::string::npos,
+                    "safety refusal cleans temporary golden");
+            }
+        };
+        no_safety_retry(ple_reclaim::DiscardSafetyError("fixture overlap"),"discard-refused");
+        no_safety_retry(RegisteredPageLockError("fixture lock failure"),"lock-refused");
+        bool pressure_caught=false;
+        try {with_mtp_bundle_golden_errors([] {throw YarnMemoryPressure("fixture pressure receipt");});}
+        catch(const YarnMemoryPressure& error) {
+            pressure_caught=error.receipt()=="fixture pressure receipt";
+        }
+        require(pressure_caught,"golden classification preserves memory-pressure receipt");
+    }
     const MtpBundleSetupRetry identity_test_state;
     detail::prefill_identity_override()={};
     env("STRIX_PREFILL_EXACT_FP16","");env("STRIX_PREFILL_HC_OUTPUT_WMMA","1");

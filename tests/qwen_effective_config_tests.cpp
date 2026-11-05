@@ -1638,6 +1638,16 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     failed_drop.estimate = [&](const Options&) { ++estimates_after_drop_failure; return PrefillRequirements{}; };
     expect(resolve(request,failed_drop).error.find("required drop not verified") != std::string::npos && !estimates_after_drop_failure,
         "YaRN required reclaim failure refuses before candidate growth or device setup");
+    unsigned safety_attempts = 0;
+    failed_drop.verify_ple_credit = [&](const Options&, const Environment&) -> std::uint64_t {
+        ++safety_attempts;
+        throw ple_reclaim::DiscardSafetyError("fixture registered-page overlap");
+    };
+    bool safety_refused = false;
+    try { (void)resolve(request,failed_drop); }
+    catch (const ple_reclaim::DiscardSafetyError&) { safety_refused = true; }
+    expect(safety_refused && safety_attempts == 1U && !estimates_after_drop_failure,
+        "YaRN safety refusal propagates without tile/storage retry or resident fallback");
     large.available = gib_bytes;
     expect(!resolve(request,large).admitted,"YaRN credit never inflates available headroom");
     auto fallback = memory;

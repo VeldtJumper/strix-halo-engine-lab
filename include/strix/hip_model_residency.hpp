@@ -5,6 +5,7 @@
 #include "strix/model_runtime_binding.hpp"
 #include "strix/runtime_allocator.hpp"
 #include "strix/uma_owner_inventory.hpp"
+#include "strix/ple_discard_safety.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -128,6 +129,7 @@ public:
         std::shared_ptr<const MappedModelFile> mapped_owner = {},
         UmaMemoryObservation observation = {}) const;
     [[nodiscard]] const HipModelResidencyReservation& reservation() const noexcept { return reservation_; }
+    [[nodiscard]] std::vector<ple_reclaim::RegisteredBacking> registered_file_backings() const;
 
     [[nodiscard]] const ModelRuntimeBinding&
     binding() const noexcept {
