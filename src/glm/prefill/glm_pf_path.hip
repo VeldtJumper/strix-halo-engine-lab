@@ -146,6 +146,10 @@ public:
         if (ex && std::string(ex) != "0" && std::string(ex) != "1")
             throw std::invalid_argument("STRIX_GLM_PF_EXACT_LIN must be 0 or 1");
         exact_on_ = !(ex && std::string(ex) == "0");  // default ON (exact, gated 6322/0 + synthetic 6-layer engine gate; 0 = strix_gemv blocks)
+        const char* kp = std::getenv("STRIX_GLM_PF_KDA_PACK");
+        if (kp && std::string(kp) != "0" && std::string(kp) != "1")
+            throw std::invalid_argument("STRIX_GLM_PF_KDA_PACK must be 0 or 1");
+        kda_pack_ = kp && std::string(kp) == "1";  // 1 = contiguous KDA projections + pack_qkv (the pre-strided form)
         (void)exact::tile_rows();
         route_ids_.resize(R * kTopE);
         route_weights_.resize(R * kTopE);
@@ -230,11 +234,20 @@ public:
         const unsigned R = rows(c), H = w.heads, C = H * kKdaDim;
         if (H != Hk_) throw std::invalid_argument("glm pf path: KDA heads");
         const std::uint32_t slot = c.rows[0].slot;
-        linear(c, w.qkv[0], x, tq_, R, kHidden, C);
-        linear(c, w.qkv[1], x, tk_, R, kHidden, C);
-        linear(c, w.qkv[2], x, tv_, R, kHidden, C);
-        pack_qkv_kernel<<<dim3((C + 255) / 256, R), 256, 0, c.stream>>>(tq_, tk_, tv_, qkv_, C, R);
-        ok(hipGetLastError(), "pack_qkv");
+        const bool strided = !kda_pack_ && tb_ != TierB::wmma && exact_on_ && exact::supported(w.qkv[0]) &&
+                             exact::supported(w.qkv[1]) && exact::supported(w.qkv[2]);
+        if (strided) {
+            // exact core: each projection writes its column block of [R][q | k | v] (row stride 3C) - the same bits as
+            // the contiguous outputs + pack_qkv, only the output placement differs (STRIX_GLM_PF_KDA_PACK=1 restores it)
+            for (unsigned i = 0; i < 3; ++i)
+                exact::linear_rows(w.qkv[i], x, kHidden, qkv_ + static_cast<std::size_t>(i) * C, 3 * C, R, exact_ws_, exact_wsb_, c.stream);
+        } else {
+            linear(c, w.qkv[0], x, tq_, R, kHidden, C);
+            linear(c, w.qkv[1], x, tk_, R, kHidden, C);
+            linear(c, w.qkv[2], x, tv_, R, kHidden, C);
+            pack_qkv_kernel<<<dim3((C + 255) / 256, R), 256, 0, c.stream>>>(tq_, tk_, tv_, qkv_, C, R);
+            ok(hipGetLastError(), "pack_qkv");
+        }
         dense_rows(x, w.f_a, D::WType::F16, kHidden, 0, kKdaDim, ta_, R, c.stream);
         dense_rows(ta_, w.f_b, D::WType::F16, kKdaDim, 0, C, f_, R, c.stream);
         dense_rows(x, w.g_a, D::WType::F16, kHidden, 0, kKdaDim, tb128_, R, c.stream);
@@ -521,6 +534,7 @@ private:
     void* exact_ws_ = nullptr;
     std::size_t exact_wsb_ = 0;
     bool exact_on_ = false;
+    bool kda_pack_ = false;
     void* moe_ws_;
     std::size_t moe_wsb_;
     float *eo_, *ge_, *ue_, *ae_, *sh1_;
