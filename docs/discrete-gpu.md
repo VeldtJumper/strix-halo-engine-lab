@@ -26,12 +26,14 @@ minimum it needs.
 | DeepSeek V4.1 Flash, standalone RTX | Whole model on the card: Q2 routed experts, Q8_0 dense, VRAM + pinned-host expert cache, target and DSpark draft on the same GPU | Full card: 82.3 / 87.7 / 94.4 tok/s (code / English / Spanish). 24 GiB VRAM + 32 GiB RAM, one NVMe, 96-token prompt: 6.55 tok/s plain, 6.75 tok/s with DSpark, with 4 file reads in flight (5.45 tok/s with 1) | With 24 GiB VRAM + 32 GiB RAM most experts are read from disk: 6.55 tok/s against 82-94 tok/s on the full card |
 | DeepSeek V4.1 Flash, RTX + pair | RTX runs layers 0-21 with CUDA; the two Strix Halo nodes run layers 22-39 and the head, over 1 GbE | Batched decode 60.1 / 97.5 / 137.2 tok/s at 2 / 4 / 8 rows; prompt reading on the RTX 3.64 / 4.39 / 12.20 s at 2K / 8K / 32K | Hot-expert placement degrades DSpark windows of 4 or more |
 | Qwen3.8-Flash-Next, prefill offload | RTX reads the prompt (exact CUDA prefill) and streams attention and recurrent state to the node layer by layer; the node decodes | TTFT 1.36 / 1.92 / 2.94 / 4.95 / 8.99 s at 1K / 4K / 8K / 16K / 32K, vs 1.80 / 5.20 / 10.46 / 21.43 / 44.02 s on the same server without the RTX | Below 1K tokens the router keeps prompts on the node; at 1K the one-node prefill (1.12 s) is faster than the offload (1.36 s) |
+| Qwen3.8-Flash-Next, served from one RTX | Whole model on one RTX PRO 6000: exact CUDA prefill and exact greedy MTP decode behind the node's APIs (`strix-cuda-qwen-serve`), continuous batching over 4 slots | Exact greedy output at any slot count; no throughput figure published yet | Needs the 96 GB card: a session never spills to system memory, and a prompt longer than the context is refused |
 | GLM-5.3 Flash, one RTX (draft) | Trunk, dense layers and shared experts on the card; routed experts streamed through the [tierstream](https://github.com/hyukudan/tierstream) cache across VRAM, pinned RAM and disk | Full card: prefill overlap cuts TTFT to 0.56× at 8K and 0.66× at 32K; decode 6.0 / 6.2 tok/s warm at 1K / 8K. 24 GiB VRAM + 32 GiB RAM: TTFT 60.3 s at 1K, 62.4 s at 8K; decode 0.67 tok/s warm | Small budgets read most experts from disk, so decode is slow |
 
 Every row is exact against its declared reference: token IDs (and, where listed, logits and state) are equal to the
 reference run. Details and conditions: [DeepSeek standalone](models/deepseek-v4.1/README.md#deepseek-standalone-rtx-results),
 [DeepSeek RTX + pair](models/deepseek-v4.1/README.md#deepseek-rtx-pipeline),
 [Qwen prefill offload](models/qwen3.8/README.md#qwen-prefill-offload),
+[Qwen served from one RTX](models/qwen3.8/rtx-serve.md),
 [GLM on one RTX](models/glm-5.3/README.md#glm-rtx-results).
 
 ## Pin the right GPU
@@ -73,6 +75,12 @@ The pipeline TCP port has no authentication: keep it on a private network. Stage
 The node side uses `--rtx-state-import` with `--http-serve` (without `--http-batch`); with the flag off nothing
 changes. Service build and protocol: [Qwen CUDA prefill service](engine/serving/qwen-cuda-prefill.md) and
 [RTX state import](rtx-state-import.md).
+
+## Qwen3.8-Flash-Next, served from one RTX
+
+`strix-cuda-qwen-serve` serves the model from one RTX PRO 6000 without a node: OpenAI and Anthropic APIs, SSE,
+tool calls, exact greedy output at any slot count. Windows build with `-DSTRIX_CUDA_QWEN_ONLY=ON`; Strix Halo builds
+do not compile these files. Build, flags, defaults and switches: [Qwen RTX serve](models/qwen3.8/rtx-serve.md).
 
 ## GLM-5.3 Flash on one RTX (draft)
 
