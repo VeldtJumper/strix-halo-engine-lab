@@ -128,6 +128,18 @@ std::chrono::microseconds worker_spin() {
     return us;
 }
 
+// Whether a caller that has spun past wait_until()'s budget sleeps instead of spinning on
+// (STRIX_DIST_WAIT_SLEEP_US, default 1 = on; sleep starts at 10 us and doubles to 500 us).
+// A rank with no work waits in wait_until() for the peer's next message; spinning forever there
+// keeps one core hot. STRIX_DIST_WAIT_SLEEP_US=0 restores the pure spin.
+std::chrono::microseconds wait_sleep() {
+    static const auto us = [] {
+        const char* v = std::getenv("STRIX_DIST_WAIT_SLEEP_US");
+        return std::chrono::microseconds(v && *v ? std::stoll(v) : 1LL);
+    }();
+    return us;
+}
+
 class Worker {
 public:
     Worker() : thread_([this] { run(); }) {}
@@ -185,7 +197,18 @@ public:
     // The same with a deadline: false if the job has not finished by then (it keeps running).
     bool wait_until(std::chrono::steady_clock::time_point deadline) {
         const auto target = posted_.load(std::memory_order_relaxed);
+        // Spin first: consecutive exchanges finish in microseconds, so the fast path keeps zero wake-up
+        // latency. Past the budget (a rank with no work, waiting for the peer's next message) sleep in
+        // steps that double to 500 us, so an idle rank costs ~0 CPU instead of pinning a core.
+        const auto sleep_us = wait_sleep();
+        unsigned backoff = 10U;
         for (unsigned i = 0; finished_.load(std::memory_order_acquire) != target; ++i) {
+            if (sleep_us.count() > 0 && i >= 16384U) {
+                if (std::chrono::steady_clock::now() >= deadline) return false;
+                std::this_thread::sleep_for(std::chrono::microseconds(backoff));
+                if (backoff < 500U) backoff *= 2U;
+                continue;
+            }
             if ((i & 1023U) == 0U && std::chrono::steady_clock::now() >= deadline) return false;
             cpu_relax();
         }
