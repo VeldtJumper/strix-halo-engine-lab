@@ -98,6 +98,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: indexer scores v3 same keys as v2, 5.3 vs 9.6 us/row per DSA layer at t0 28672 (=2 restores v2)"},
         {"pf-select-v2", "STRIX_GLM_PF_SELECT", "2", "1", false, true,
          "Measurement: indexer select v2 same token lists as v1, 0.38 vs 0.99 us/row at t0 28672, 0.08 vs 0.50 at t0 4096"},
+        {"pf-dense-rows-v2", "STRIX_GLM_PF_DENSE_ROWS", "2", "1", false, true,
+         "Measurement: prefill dense rows v2 (8 x 4 chains per thread, packed weight loads, same ascending fmaf chain) bitwise == v1 on the pair at 1K / 8K, KDA f_b / g_b 1.19-1.21x, 8K TTFT 15.06 -> 14.92 s (=1 restores v1)"},
         {"max-rows-auto", "STRIX_GLM_MAX_ROWS_AUTO", "1", "0", false, true,
          "Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank"},
         {"pf-staged", "STRIX_GLM_PF_STAGED", "1", "0", false, true,

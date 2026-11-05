@@ -69,6 +69,9 @@ void mla_attention_rows_versions(const dev::DsaSlot& slot, const std::uint32_t* 
 // VALU GEMM (each weight tile read once per 64 rows instead of once per row). `in` must be a multiple of 32.
 void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y, unsigned rows,
                 hipStream_t s);
+// Read-once STRIX_GLM_PF_DENSE_ROWS=2 (default) | 1; explicit selector bypasses the environment for bitwise gates/timing.
+void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y,
+                          unsigned rows, hipStream_t s, unsigned version);
 
 // ---- mHC pre for many rows: = dev::hc_pre bit for bit (same outputs F, mix, x_collapsed), with the 24 R1 chains over
 // the 16384 normalized values as a VALU GEMM. z: workspace [rows][24]. F remains materialized on both paths.
