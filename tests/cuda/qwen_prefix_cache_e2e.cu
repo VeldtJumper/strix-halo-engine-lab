@@ -186,8 +186,9 @@ int main(int argc, char** argv) {
             });
             const auto capture = [&](std::uint64_t position) {
                 if (!px::capture(store, identity, a, block, position, mtp, e.row_bytes(), e.fixed_bytes(),
-                    [&](auto first, auto count, void* dst) { e.export_rows(x, first, count, dst); },
-                    [&](void* dst) { e.export_fixed(x, dst); })) throw std::runtime_error("checkpoint capture declined");
+                    [&](const std::vector<qp::RowSegment>& segments, void* fixed) {
+                        e.export_segments(x, segments, fixed);
+                    })) throw std::runtime_error("checkpoint capture declined");
             };
             const auto restore = [&](const strix::PrefixCacheCheckpoint& cp) {
                 std::vector<qp::RowSegment> segments;

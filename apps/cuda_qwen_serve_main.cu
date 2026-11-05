@@ -186,7 +186,7 @@ public:
         if (n < 2) throw serve::GenerationRequestError(st, "prompt needs at least 2 tokens");
         if (n >= cap) { st.error_status = 400; st.error_code = "context_length_exceeded"; throw serve::GenerationRequestError(st, "prompt longer than the context"); }
         if (job.on_progress) job.on_progress({serve::GenerationPhase::prefill, 0, 0, n});
-        double prefix_restore_ms = 0;
+        double prefix_restore_ms = 0, prefix_capture_ms = 0;
         if (!cache_.enabled()) e_.run(job.prompt, n - 1, [](const qp::Piece&) {});
         else {
             auto prefilled = cache_.restore(e_, 0, job.prompt, prefix_restore_ms);
@@ -195,7 +195,7 @@ public:
             while (prefilled < n - 1) {
                 const auto rows = px::clip_chunk(prefilled, UINT32_MAX, points);
                 prefilled = e_.prefill_chunk(0, job.prompt, n - 1, prefilled, rows);
-                if (std::binary_search(points.begin(), points.end(), prefilled)) cache_.capture(e_, 0, job.prompt, prefilled);
+                if (std::binary_search(points.begin(), points.end(), prefilled)) prefix_capture_ms += cache_.capture(e_, 0, job.prompt, prefilled);
             }
         }
         const auto t1 = Clock::now();
@@ -248,7 +248,8 @@ public:
                       st.prefill_ms, st.decode_ms);
         std::string extra = head;
         for (std::size_t i = 0; i < emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(emitted[i]);
-        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(prefix_restore_ms) + "}";
+        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(prefix_restore_ms)
+            + ",\"prefix_capture_ms\":" + std::to_string(prefix_capture_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);
         return st;
     }
@@ -358,7 +359,7 @@ private:
         Phase phase = Phase::prefill;
         std::uint64_t n = 0, prefilled = 0;
         std::vector<std::uint64_t> capture_points;
-        double prefix_restore_ms = 0;
+        double prefix_restore_ms = 0, prefix_capture_ms = 0;
         qc::Stream stream;
         serve::GenerationStats st;
         Clock::time_point t0, t_decode;
@@ -513,7 +514,7 @@ private:
         }
         s.prefilled = length;
         if (std::binary_search(s.capture_points.begin(), s.capture_points.end(), length))
-            cache_.capture(e_, s.session, s.job->job.prompt, length);
+            s.prefix_capture_ms += cache_.capture(e_, s.session, s.job->job.prompt, length);
         (overlapped ? s.prefill_gpu_ms : s.prefill_sync_ms) += ms;
         ++s.prefill_chunks;
         s.overlapped_chunks += overlapped ? 1U : 0U;
@@ -633,7 +634,8 @@ private:
             o_.engine.max_positions, static_cast<double>(e_.session_bytes()) / 1048576.0, s.admit_free_mib, live_slots());
         std::string extra = head;
         for (std::size_t i = 0; i < s.emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(s.emitted[i]);
-        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms) + "}";
+        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
+            + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);
         queue_.finish(*s.job, std::move(st), error);
         s.job.reset();

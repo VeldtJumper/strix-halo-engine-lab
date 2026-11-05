@@ -164,6 +164,9 @@ public:
     // Destinations and import sources may be pinned host or device pointers (UVA).
     void export_rows(SessionId session, std::uint64_t first, std::uint64_t count, void* dst);
     void export_fixed(SessionId session, void* dst);
+    // One producer fence and one completion fence for all requested destinations.
+    // Segments may omit already cached rows; fixed_dst may be null.
+    void export_segments(SessionId session, const std::vector<RowSegment>& segments, void* fixed_dst);
     // Segments must cover [0,length) in order. Resume prefill with at least one row;
     // the caller must ensure the MTP boundary pair belongs to the resumed prompt.
     void import_state(SessionId session, std::uint64_t length, const std::vector<RowSegment>& segments, const void* fixed);

@@ -1,5 +1,6 @@
 #include "strix/cuda_qwen_prefix_identity.hpp"
 #include "strix/cuda_qwen_prefix_store.hpp"
+#include "strix/cuda_qwen_prefix_pool.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -160,9 +161,151 @@ void store_usage() {
     check(allocation_failed && failed.stats().host_bytes == 0, "failed allocation releases reservation");
     std::cout << "PASS store: dropped-reasoning LCP, cross-turn dedupe, MTP boundaries, LRU eviction, budget/allocation failure\n";
 }
+
+void slab_pool() {
+    std::uint64_t allocations = 0, frees = 0;
+    const auto allocator = [&](std::uint64_t bytes) -> PrefixCacheBuffer {
+        ++allocations;
+        return {std::shared_ptr<std::byte>(new std::byte[bytes], [&](std::byte* p) { ++frees; delete[] p; }), bytes};
+    };
+    {
+        px::SlabPool pool(100, 8, allocator, 4);
+        check(pool.usage().reserved == 0, "pool is lazy");
+        auto a = pool.allocate(8), b = pool.allocate(8);
+        check(allocations == 1 && b.data.get() == a.data.get() + 8, "contiguous slab slots");
+        check(pool.usage().live == 16 && pool.usage().reserved == 32, "reservation includes live and idle slots");
+        auto* old = a.data.get();
+        a = {};
+        check(pool.usage().live == 8 && pool.usage().reserved == 32 && frees == 0, "free retains reservation");
+        a = pool.allocate(8);
+        check(a.data.get() == old && allocations == 1, "free list reuse");
+        std::memset(a.data.get(), 17, 8);
+        check(std::to_integer<unsigned>(a.data.get()[7]) == 17, "slot writable");
+        auto fixed = pool.allocate(20);
+        fixed = {};
+        fixed = pool.allocate(20);
+        check(allocations == 2 && pool.usage().live == 36 && pool.usage().reserved == 52, "fixed class reuse");
+    }
+    check(frees == allocations, "shutdown releases slabs");
+    {
+        px::SlabPool pool(40, 8, allocator, 4);
+        std::vector<PrefixCacheBuffer> slots;
+        for (unsigned i = 0; i < 5; ++i) slots.push_back(pool.allocate(8));
+        check(pool.usage().live == 40 && pool.usage().reserved == 40, "exact-size fallback at cap");
+        bool failed = false;
+        try { (void)pool.allocate(8); } catch (const PrefixCacheAllocationFailure&) { failed = true; }
+        check(failed && pool.usage().reserved == 40, "full budget declines allocation");
+        slots[0] = {};
+        failed = false;
+        try { (void)pool.allocate(20); } catch (const PrefixCacheAllocationFailure&) { failed = true; }
+        check(failed && pool.usage().live == 32, "partially live slabs cannot be reclaimed");
+        slots.clear();
+        const auto before = frees;
+        auto fixed = pool.allocate(20);
+        check(frees == before + 1 && pool.usage().reserved == 28 && pool.usage().live == 20,
+              "idle slab reclaimed for other class");
+    }
+    {
+        unsigned attempts = 0;
+        std::byte* backing = nullptr;
+        px::SlabPool pool(64, 8, [&](std::uint64_t bytes) {
+            ++attempts;
+            if (bytes > 8) throw PrefixCacheAllocationFailure();
+            auto buffer = heap(bytes);
+            backing = buffer.data.get();
+            return buffer;
+        }, 4);
+        auto slot = pool.allocate(8);
+        check(attempts == 2 && pool.usage().reserved == 8 && slot.data.get() == backing,
+              "failed slab pin falls back to slot zero of exact allocation");
+        std::memset(slot.data.get(), 9, 8);
+    }
+    {
+        PrefixCacheBuffer lease;
+        const auto before = frees;
+        {
+            px::SlabPool pool(32, 8, allocator, 4);
+            lease = pool.allocate(8);
+        }
+        check(frees == before, "lease outlives pool owner");
+        lease = {};
+        check(frees == before + 1, "last lease releases orphaned pool");
+    }
+    {
+        px::SlabPool pool(60, 8, allocator, 2);
+        PrefixStateCachePolicy policy{60, {}, 0, PrefixCacheRetention::lru};
+        PrefixStateCache store(policy, [&](auto bytes) { return pool.allocate(bytes); });
+        const auto identity = id("pooled LRU");
+        const auto put = [&](auto tokens) {
+            return px::capture(store, identity, tokens, 4, 8, false, 2, 20,
+                [](const std::vector<strix::cuda::qwen_prefill::RowSegment>&, void*) {});
+        };
+        const auto before = allocations;
+        check(put(prompt(22)), "pooled capture");
+        check(put(prompt(22, 500)), "pooled LRU capture");
+        check(store.stats().evicted == 1 && allocations == before + 2, "LRU returns row and fixed slots");
+        check(pool.usage().live == 36 && pool.usage().reserved == 36, "LRU physical budget");
+    }
+    {
+        px::SlabPool pool(40, 8, allocator, 4);
+        PrefixStateCache store({40, {}, 0, PrefixCacheRetention::lru}, [&](auto bytes) { return pool.allocate(bytes); });
+        bool failed = false, exported = false;
+        try {
+            (void)px::capture(store, id("reservation full"), prompt(22), 4, 8, false, 2, 20,
+                [&](const std::vector<strix::cuda::qwen_prefill::RowSegment>&, void*) { exported = true; });
+        } catch (const PrefixCacheAllocationFailure&) { failed = true; }
+        check(failed && !exported && store.stats().host_bytes == 0 && pool.usage().live == 0,
+              "slab slack budget decline rolls back capture before export");
+        check(pool.usage().reserved == 32, "rolled-back slots remain reserved");
+    }
+    check(frees == allocations, "all pooled allocations released");
+    std::cout << "PASS slab pool: lazy allocation, free-list reuse, reservation cap, exact fallback, skip, class reclaim, LRU, lease lifetime\n";
+}
+
+void batched_capture() {
+    using strix::cuda::qwen_prefill::RowSegment;
+    PrefixStateCache store({4096, {}, 0, PrefixCacheRetention::lru}, heap);
+    const auto identity = id("batched export");
+    const auto tokens = prompt(22);
+    unsigned calls = 0;
+    std::vector<std::uint64_t> firsts;
+    px::CaptureTiming timing;
+    const auto put = [&](std::uint64_t position) {
+        return px::capture(store, identity, tokens, 4, position, false, 2, 20,
+            [&](const std::vector<RowSegment>& segments, void* fixed) {
+                ++calls;
+                firsts.clear();
+                for (const auto& segment : segments) {
+                    check(segment.count == 4 && segment.data, "batch segment destination");
+                    firsts.push_back(segment.first);
+                    std::memset(const_cast<void*>(segment.data), static_cast<int>(segment.first), 8);
+                }
+                check(fixed != nullptr, "batch includes fixed destination");
+                std::memset(fixed, 42, 20);
+            }, &timing);
+    };
+    check(put(8) && calls == 1 && firsts == std::vector<std::uint64_t>({0, 4}), "one export with all new rows in order");
+    check(put(16) && calls == 2 && firsts == std::vector<std::uint64_t>({8, 12}), "one export excludes reused rows");
+    check(!put(16) && calls == 2, "duplicate checkpoint does not export");
+    const auto cp = store.find_longest(identity, tokens, 4, 16);
+    check(cp && cp->segments.size() == 4 && cp->fixed.data.get()[19] == std::byte{42}, "batch fixed bytes retained");
+    for (unsigned i = 0; i < 4; ++i)
+        check(cp->segments[i]->payload.data.get()[7] == static_cast<std::byte>(i * 4), "batch row bytes retained");
+    check(timing.ms > 0 && timing.alloc_ms > 0 && timing.copy_ms > 0 && timing.ms >= timing.alloc_ms + timing.copy_ms,
+          "capture timing separates allocation and copy");
+    px::CaptureTiming failed;
+    bool threw = false;
+    try {
+        (void)px::capture(store, identity, prompt(22, 1000), 4, 8, false, 2, 20,
+            [](const std::vector<RowSegment>&, void*) { throw std::runtime_error("copy failed"); }, &failed);
+    } catch (const std::runtime_error&) { threw = true; }
+    check(threw && failed.ms > 0 && failed.alloc_ms > 0 && failed.copy_ms > 0 && store.stats().inserted == 2,
+          "failed export timed and never published");
+    std::cout << "PASS batched capture: one ordered export, dedupe, payload bytes, duplicate skip, allocation/copy timing, failed export rollback\n";
+}
 }  // namespace
 
 int main() {
-    try { planner(); identity(); store_usage(); std::cout << "PASS qwen_prefix_cache_host_test\n"; return 0; }
+    try { planner(); identity(); store_usage(); slab_pool(); batched_capture(); std::cout << "PASS qwen_prefix_cache_host_test\n"; return 0; }
     catch (const std::exception& ex) { std::cerr << "FAIL " << ex.what() << '\n'; return 1; }
 }

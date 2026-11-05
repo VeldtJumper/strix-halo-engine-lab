@@ -1815,20 +1815,26 @@ void Prefill::Impl::copy_fixed(SessionState& s, void* data, bool importing) {
 }
 
 void Prefill::export_rows(SessionId session, std::uint64_t first, std::uint64_t count, void* dst) {
-    auto& m = *impl_;
-    auto& s = m.session(session);
-    if (!dst || first > s.length || count > s.length - first) throw std::invalid_argument("prefix export rows range");
-    const auto stream = m.state_copy_stream(s);
-    try { m.copy_rows(s, first, count, dst, false); ck(cudaStreamSynchronize(stream), "prefix export rows"); }
-    catch (...) { cudaStreamSynchronize(stream); throw; }
+    export_segments(session, {{first, count, dst}}, nullptr);
 }
 
 void Prefill::export_fixed(SessionId session, void* dst) {
+    if (!dst) throw std::invalid_argument("prefix export fixed pointer");
+    export_segments(session, {}, dst);
+}
+
+void Prefill::export_segments(SessionId session, const std::vector<RowSegment>& segments, void* fixed_dst) {
     auto& m = *impl_;
     auto& s = m.session(session);
-    if (!dst) throw std::invalid_argument("prefix export fixed pointer");
+    for (const auto& seg : segments)
+        if (!seg.data || seg.first > s.length || seg.count > s.length - seg.first)
+            throw std::invalid_argument("prefix export rows range");
     const auto stream = m.state_copy_stream(s);
-    try { m.copy_fixed(s, dst, false); ck(cudaStreamSynchronize(stream), "prefix export fixed"); }
+    try {
+        for (const auto& seg : segments) m.copy_rows(s, seg.first, seg.count, const_cast<void*>(seg.data), false);
+        if (fixed_dst) m.copy_fixed(s, fixed_dst, false);
+        ck(cudaStreamSynchronize(stream), "prefix export segments");
+    }
     catch (...) { cudaStreamSynchronize(stream); throw; }
 }
 

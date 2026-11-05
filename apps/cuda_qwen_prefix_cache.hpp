@@ -2,6 +2,7 @@
 
 #include "strix/cuda_qwen_prefix_identity.hpp"
 #include "strix/cuda_qwen_prefix_store.hpp"
+#include "strix/cuda_qwen_prefix_pool.hpp"
 #include "strix/cuda_vram_guard.hpp"
 
 #include <cuda_runtime.h>
@@ -20,13 +21,15 @@ struct Settings {
 };
 
 class Cache {
-    struct Usage { std::atomic<std::uint64_t> host{0}, vram{0}; };
+    struct Usage { std::atomic<std::uint64_t> vram{0}; };
     Settings settings_;
     bool mtp_;
     std::shared_ptr<Usage> usage_ = std::make_shared<Usage>();
+    std::shared_ptr<SlabPool> host_pool_;
     ModelContentIdentity identity_;
     std::unique_ptr<PrefixStateCache> store_;
     std::atomic<std::uint64_t> restore_failures_{0};
+    std::atomic<double> capture_ms_{0}, capture_alloc_ms_{0}, capture_copy_ms_{0};
 
 public:
     Cache(const qwen_prefill::Config& config, const Settings& settings) : settings_(settings), mtp_(!config.mtp_sidecar_gguf.empty()) {
@@ -35,18 +38,27 @@ public:
             PrefixStateCachePolicy policy;
             policy.host_byte_budget = settings_.host_bytes + settings_.vram_bytes;
             policy.retention = PrefixCacheRetention::lru;
-            store_ = std::make_unique<PrefixStateCache>(policy, [usage = usage_, settings](std::uint64_t bytes) -> PrefixCacheBuffer {
+            const auto row_slot_bytes = settings_.block * (12ULL + (mtp_ ? 1ULL : 0ULL)) * (2048 + 256);
+            host_pool_ = std::make_shared<SlabPool>(settings_.host_bytes, row_slot_bytes,
+                [](std::uint64_t bytes) -> PrefixCacheBuffer {
+                    void* ptr = nullptr;
+                    if (cudaMallocHost(&ptr, bytes) != cudaSuccess) {
+                        (void)cudaGetLastError();
+                        throw PrefixCacheAllocationFailure();
+                    }
+                    return {std::shared_ptr<std::byte>(static_cast<std::byte*>(ptr), [](std::byte* p) { cudaFreeHost(p); }), bytes};
+                });
+            store_ = std::make_unique<PrefixStateCache>(policy, [usage = usage_, pool = host_pool_, settings](std::uint64_t bytes) -> PrefixCacheBuffer {
                 void* ptr = nullptr;
                 const bool device = bytes <= settings.vram_bytes - usage->vram.load();
-                auto& used = device ? usage->vram : usage->host;
-                if (!device && bytes > settings.host_bytes - used.load()) throw PrefixCacheAllocationFailure();
-                if (device) strix::cuda::require_vram(bytes, "prefix cache");
-                const auto rc = device ? cudaMalloc(&ptr, bytes) : cudaMallocHost(&ptr, bytes);
+                if (!device) return pool->allocate(bytes);
+                strix::cuda::require_vram(bytes, "prefix cache");
+                const auto rc = cudaMalloc(&ptr, bytes);
                 if (rc != cudaSuccess) { (void)cudaGetLastError(); throw PrefixCacheAllocationFailure(); }
-                used.fetch_add(bytes);
-                return {std::shared_ptr<std::byte>(static_cast<std::byte*>(ptr), [usage, device, bytes](std::byte* p) {
-                    if (device) cudaFree(p); else cudaFreeHost(p);
-                    (device ? usage->vram : usage->host).fetch_sub(bytes);
+                usage->vram.fetch_add(bytes);
+                return {std::shared_ptr<std::byte>(static_cast<std::byte*>(ptr), [usage, bytes](std::byte* p) {
+                    cudaFree(p);
+                    usage->vram.fetch_sub(bytes);
                 }), bytes};
             });
         }
@@ -83,13 +95,15 @@ public:
         }
     }
 
-    void capture(qwen_prefill::Prefill& engine, qwen_prefill::SessionId session,
+    double capture(qwen_prefill::Prefill& engine, qwen_prefill::SessionId session,
                   const std::vector<std::uint32_t>& prompt, std::uint64_t position) noexcept {
-        if (!store_) return;
+        if (!store_) return 0;
+        CaptureTiming timing;
         try {
             qwen_prefix::capture(*store_, identity_, prompt, settings_.block, position, mtp_, engine.row_bytes(), engine.fixed_bytes(),
-                [&](std::uint64_t first, std::uint64_t count, void* dst) { engine.export_rows(session, first, count, dst); },
-                [&](void* dst) { engine.export_fixed(session, dst); });
+                [&](const std::vector<qwen_prefill::RowSegment>& segments, void* fixed) {
+                    engine.export_segments(session, segments, fixed);
+                }, &timing);
         } catch (const std::exception& ex) {
             store_->record_capture_failure();
             std::cerr << "qwen prefix capture skipped: " << ex.what() << std::endl;
@@ -97,16 +111,24 @@ public:
             store_->record_capture_failure();
             std::cerr << "qwen prefix capture skipped: unknown failure" << std::endl;
         }
+        capture_ms_.fetch_add(timing.ms);
+        capture_alloc_ms_.fetch_add(timing.alloc_ms);
+        capture_copy_ms_.fetch_add(timing.copy_ms);
+        return timing.ms;
     }
 
     std::string stats_json() const {
         const auto s = store_ ? store_->stats() : PrefixStateCacheStats{};
+        const auto host = host_pool_ ? host_pool_->usage() : SlabPool::Usage{};
         std::ostringstream out;
         out << "{\"enabled\":" << (enabled() ? "true" : "false") << ",\"lookups\":" << s.lookups
             << ",\"hits\":" << s.host_hits << ",\"hit_tokens\":" << s.hit_tokens << ",\"captures\":" << s.inserted
             << ",\"bytes\":" << s.host_bytes << ",\"evictions\":" << s.evicted << ",\"budget_skips\":" << s.budget_skips
             << ",\"capture_failures\":" << s.capture_failures << ",\"restore_failures\":" << restore_failures_.load()
-            << ",\"host_bytes\":" << usage_->host.load() << ",\"vram_bytes\":" << usage_->vram.load() << '}';
+            << ",\"capture_ms\":" << capture_ms_.load() << ",\"capture_alloc_ms\":" << capture_alloc_ms_.load()
+            << ",\"capture_copy_ms\":" << capture_copy_ms_.load()
+            << ",\"host_bytes\":" << host.live << ",\"host_reserved_bytes\":" << host.reserved
+            << ",\"vram_bytes\":" << usage_->vram.load() << '}';
         return out.str();
     }
 };

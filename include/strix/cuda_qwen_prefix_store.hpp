@@ -1,13 +1,24 @@
 #pragma once
 
 #include "strix/cuda_qwen_prefix_plan.hpp"
+#include "strix/cuda_qwen_prefill.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/prefix_state_cache.hpp"
 
 #include <cstring>
+#include <chrono>
 #include <functional>
 
 namespace strix::cuda::qwen_prefix {
+
+struct CaptureTiming { double ms = 0, alloc_ms = 0, copy_ms = 0; };
+struct CaptureTimer {
+    double* elapsed;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~CaptureTimer() {
+        if (elapsed) *elapsed += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+};
 
 // MTP pair i includes token i+1. A row segment therefore has a one-token
 // lookahead dependency, even though checkpoint lookup uses the prefix chain.
@@ -32,8 +43,9 @@ inline bool boundary_matches(const PrefixCacheCheckpoint& cp, std::span<const st
 inline bool capture(PrefixStateCache& store, const ModelContentIdentity& identity,
                     std::span<const std::uint32_t> tokens, std::uint32_t block, std::uint64_t position,
                     bool mtp, std::uint64_t row_bytes, std::uint64_t fixed_bytes,
-                    const std::function<void(std::uint64_t, std::uint64_t, void*)>& rows,
-                    const std::function<void(void*)>& fixed) {
+                    const std::function<void(const std::vector<qwen_prefill::RowSegment>&, void*)>& export_segments,
+                    CaptureTiming* timing = nullptr) {
+    CaptureTimer total{timing ? &timing->ms : nullptr};
     validate_block(block);
     if (!position || position % block || position > lookup_limit(tokens.size()))
         throw std::invalid_argument("prefix capture must precede the final prefill row");
@@ -60,6 +72,7 @@ inline bool capture(PrefixStateCache& store, const ModelContentIdentity& identit
     }
     auto reservation = store.reserve(need);
     if (!reservation) return false;
+    std::vector<qwen_prefill::RowSegment> exports;
     for (std::size_t k = 0; k < chains.size(); ++k) {
         if (cp->segments[k]) continue;
         auto segment = std::make_shared<PrefixCacheSegment>();
@@ -69,13 +82,35 @@ inline bool capture(PrefixStateCache& store, const ModelContentIdentity& identit
         segment->block_index = k;
         segment->block_rows = block;
         segment->tokens.assign(tokens.begin() + k * block, tokens.begin() + (k + 1) * block);
-        segment->payload = store.allocate(block * row_bytes, reservation, true);
-        rows(k * block, block, segment->payload.data.get());
+        {
+            CaptureTimer allocation{timing ? &timing->alloc_ms : nullptr};
+            segment->payload = store.allocate(block * row_bytes, reservation, true);
+        }
+        exports.push_back({k * block, block, segment->payload.data.get()});
         cp->segments[k] = std::move(segment);
     }
-    cp->fixed = store.allocate(fixed_bytes, reservation);
-    fixed(cp->fixed.data.get());
+    {
+        CaptureTimer allocation{timing ? &timing->alloc_ms : nullptr};
+        cp->fixed = store.allocate(fixed_bytes, reservation);
+    }
+    {
+        CaptureTimer copies{timing ? &timing->copy_ms : nullptr};
+        export_segments(exports, cp->fixed.data.get());
+    }
     return store.insert(std::move(cp), &reservation);
+}
+
+// Compatibility adapter for callers that only need the per-buffer host-test API.
+inline bool capture(PrefixStateCache& store, const ModelContentIdentity& identity,
+                    std::span<const std::uint32_t> tokens, std::uint32_t block, std::uint64_t position,
+                    bool mtp, std::uint64_t row_bytes, std::uint64_t fixed_bytes,
+                    const std::function<void(std::uint64_t, std::uint64_t, void*)>& rows,
+                    const std::function<void(void*)>& fixed) {
+    return capture(store, identity, tokens, block, position, mtp, row_bytes, fixed_bytes,
+        [&](const std::vector<qwen_prefill::RowSegment>& segments, void* dst) {
+            for (const auto& seg : segments) rows(seg.first, seg.count, const_cast<void*>(seg.data));
+            fixed(dst);
+        });
 }
 
 }  // namespace strix::cuda::qwen_prefix
