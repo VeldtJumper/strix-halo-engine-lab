@@ -1195,7 +1195,7 @@ __global__ void __launch_bounds__(128) group_scores_kernel(const float* q, Linea
         maxima[std::size_t(rh0 + threadIdx.x) * chunks + chunk] = m;
     }
 }
-template <bool Quant = false, unsigned Batch = 8>
+template <bool Quant = false, unsigned Batch = 8, bool Dim2 = false>
 __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* reads, unsigned heads_count,
                                                                   unsigned dim, unsigned stride, const float* scores,
                                                                   const float* maxima, float* partials, float* out,
@@ -1254,31 +1254,67 @@ __global__ void __launch_bounds__(256) group_partial_merge_kernel(const KvRead* 
                 denominator = denominator + e[threadIdx.x][p - first];
             partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (dim + 1U) + dim] = denominator;
         }
-        for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
-            float numerator[group] = {};
-            for (auto p = begin; p < end; p += Batch) {
-                float v[Batch];
+        constexpr unsigned ValueBatch = Dim2 ? 8U : Batch;
+        if constexpr (Dim2) {
+            const unsigned i = threadIdx.x;
+            float numerator[2][group] = {};
+            for (auto p = begin; p < end; p += ValueBatch) {
+                float v[2][ValueBatch];
                 unsigned present = 0;
 #pragma unroll
-                for (unsigned j = 0; j < Batch; ++j)
+                for (unsigned j = 0; j < ValueBatch; ++j)
                     if (p + j < end) {
                         const auto* pointer = values[p + j - first];
                         if (pointer) {
-                            v[j] = pointer[kv_head * dim + i];
+                            v[0][j] = pointer[kv_head * dim + i];
+                            v[1][j] = pointer[kv_head * dim + i + 256U];
                             present |= 1U << j;
                         }
                     }
 #pragma unroll
-                for (unsigned j = 0; j < Batch; ++j)
+                for (unsigned j = 0; j < ValueBatch; ++j)
                     if (present & (1U << j))
 #pragma unroll
-                        for (unsigned h = 0; h < group; ++h)
-                            numerator[h] = numerator[h] + e[h][p + j - first] * v[j];
+                        for (unsigned h = 0; h < group; ++h) {
+                            const float coefficient = e[h][p + j - first];
+                            numerator[0][h] = numerator[0][h] + coefficient * v[0][j];
+                            numerator[1][h] = numerator[1][h] + coefficient * v[1][j];
+                        }
             }
 #pragma unroll
-            for (unsigned h = 0; h < group; ++h) {
-                finite_flag(numerator[h], failure);
-                partials[(std::size_t(rh0 + h) * chunks + chunk) * (dim + 1U) + i] = numerator[h];
+            for (unsigned c = 0; c < 2; ++c)
+#pragma unroll
+                for (unsigned h = 0; h < group; ++h) {
+                    finite_flag(numerator[c][h], failure);
+                    partials[(std::size_t(rh0 + h) * chunks + chunk) * (dim + 1U) + i + c * 256U] = numerator[c][h];
+                }
+        } else {
+            for (unsigned i = threadIdx.x; i < dim; i += blockDim.x) {
+                float numerator[group] = {};
+                for (auto p = begin; p < end; p += Batch) {
+                    float v[Batch];
+                    unsigned present = 0;
+#pragma unroll
+                    for (unsigned j = 0; j < Batch; ++j)
+                        if (p + j < end) {
+                            const auto* pointer = values[p + j - first];
+                            if (pointer) {
+                                v[j] = pointer[kv_head * dim + i];
+                                present |= 1U << j;
+                            }
+                        }
+#pragma unroll
+                    for (unsigned j = 0; j < Batch; ++j)
+                        if (present & (1U << j))
+#pragma unroll
+                            for (unsigned h = 0; h < group; ++h)
+                                numerator[h] = numerator[h] + e[h][p + j - first] * v[j];
+                }
+#pragma unroll
+                for (unsigned h = 0; h < group; ++h) {
+                    finite_flag(numerator[h], failure);
+                    partials[(std::size_t(rh0 + h) * chunks + chunk) * (dim + 1U) + i] = numerator[h];
+                }
             }
         }
     }
@@ -1407,6 +1443,14 @@ static bool attention_final() {
     }();
     return enabled;
 }
+// STRIX_G4_GROUP_DIM2 (default on, read once per process): pair Dim-512 feature columns; =0 keeps separate passes.
+static bool attention_group_dim2() {
+    static const bool enabled = [] {
+        const auto* p = std::getenv("STRIX_G4_GROUP_DIM2");
+        return !p || std::string_view(p) != "0";
+    }();
+    return enabled;
+}
 static bool attention_compact() {
     static const bool enabled = [] {
         const auto* p = std::getenv("STRIX_G4_ATTN_COMPACT");
@@ -1484,17 +1528,22 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
                 hipLaunchKernelGGL((group_scores_kernel<256>), groups, dim3(128), 0, stream, q, q_norm, positions, table, reads,
                                    heads_count, stride, scores, maxima, parallel, bounded, intervals, failure);
             launch_checked();
-            const auto group_merge = [&](auto quantized, auto batch) {
-                hipLaunchKernelGGL((group_partial_merge_kernel<decltype(quantized)::value, decltype(batch)::value>), groups,
-                                   dim3(256), 0, stream, reads, heads_count, dim, stride, scores, maxima, partials, out,
-                                   counters, failure, quant);
+            const auto group_merge = [&](auto quantized, auto batch, auto dim2) {
+                hipLaunchKernelGGL((group_partial_merge_kernel<decltype(quantized)::value, decltype(batch)::value,
+                                                                decltype(dim2)::value>),
+                                   groups, dim3(256), 0, stream, reads, heads_count, dim, stride, scores, maxima, partials,
+                                   out, counters, failure, quant);
             };
-            const auto group_batch = [&](auto quantized) {
-                if (merge_batch_wide()) group_merge(quantized, std::integral_constant<unsigned, 32>{});
-                else group_merge(quantized, std::integral_constant<unsigned, 8>{});
+            const auto group_batch = [&](auto quantized, auto dim2) {
+                if (merge_batch_wide()) group_merge(quantized, std::integral_constant<unsigned, 32>{}, dim2);
+                else group_merge(quantized, std::integral_constant<unsigned, 8>{}, dim2);
             };
-            if (quantize) group_batch(std::true_type{});
-            else group_batch(std::false_type{});
+            const auto group_dim = [&](auto quantized) {
+                if (global && dim == 512U && attention_group_dim2()) group_batch(quantized, std::true_type{});
+                else group_batch(quantized, std::false_type{});
+            };
+            if (quantize) group_dim(std::true_type{});
+            else group_dim(std::false_type{});
             launch_checked();
             return true;
         }
