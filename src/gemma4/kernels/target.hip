@@ -6,6 +6,7 @@
 #include "capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
 #include "attention_fast_decode.hpp"
+#include <atomic>
 #include <iostream>
 #include <algorithm>
 #include <cfenv>
@@ -400,6 +401,15 @@ DeviceTarget::DeviceTarget(const HostWeights& host, RopeTables tables, DeviceOpt
     if (identity && std::string_view(identity) != arithmetic_id && std::string_view(identity) != a8::arithmetic_id)
         throw std::runtime_error(std::string("unknown gemma4 numerical identity: ") + identity);
     b.stats.a8 = identity && std::string_view(identity) == a8::arithmetic_id;
+    // ON by default under g4-a8-v1 (DeviceOptions); STRIX_G4_A8_FFN_PLE_FUSE=0 (or off) runs the separate epilogue.
+    if (const auto* fuse = std::getenv("STRIX_G4_A8_FFN_PLE_FUSE"))
+        b.options.a8_ffn_ple_fuse &= std::string_view(fuse) != "0" && std::string_view(fuse) != "off";
+    b.stats.a8_ffn_ple_fuse = b.stats.a8 && b.options.a8_ffn_ple_fuse;
+    // Witness once per distinct resolved state (on, off) in the process.
+    static std::atomic<unsigned> fuse_witnessed{0};
+    const unsigned fuse_bit = b.stats.a8_ffn_ple_fuse ? 2U : 1U;
+    if ((fuse_witnessed.fetch_or(fuse_bit) & fuse_bit) == 0)
+        std::cerr << "gemma4 a8 ffn ple fuse " << (b.stats.a8_ffn_ple_fuse ? "on" : "off") << std::endl;
     b.stats.identity = b.stats.a8 ? a8::arithmetic_id : arithmetic_id;
     hip_checked(hipStreamCreateWithFlags(&b.queue, hipStreamNonBlocking));
     b.stats.shared_weights = b.options.shared_weights;
@@ -895,9 +905,29 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
                     });
                 }
                 b.dot("down", y.down, b.gate, b.out, n);
-                // FFN epilogue and PLE gate/activation in one launch when admitted (g4-v1 gate only).
+                // FFN epilogue and PLE gate/activation in one launch when admitted.
                 bool gated = false;
-                if (b.options.fusion && b.stats.norm_group && b.stats.store_fusion && b.options.shared_weights &&
+                if (b.stats.a8_ffn_ple_fuse && b.options.fusion && b.stats.norm_group && b.stats.store_fusion &&
+                    b.options.shared_weights && a8::quantized(y.ple_gate.format)) {
+                    const bool quantized_output = y.ple_gate.outputs % 32U == 0;
+                    b.run("a8_ffn_epilogue_ple_gate", [&] {
+                        gated = a8_ffn_ple_gate(b.out.as<float>(), y.post_ffn_norm, b.residual.as<float>(), y.ple_gate,
+                                                b.ple.as<float>() + std::size_t(l) * c.ple_dim, c.layers * c.ple_dim,
+                                                n, b.gate.as<float>(), b.a8_rows(c.hidden, 0), b.failure.as<unsigned>(),
+                                                b.tickets.as<unsigned>(), b.queue,
+                                                quantized_output ? b.a8_rows(c.ple_dim, 1) : A8Rows{});
+                    }, true);
+                    if (gated) {
+                        ++b.stats.a8_ffn_ple_launches;
+                        b.a8_produced(0, b.residual);
+                        for (auto& source : b.a8_source)
+                            if (source == b.gate.data())
+                                source = nullptr;
+                        if (quantized_output)
+                            b.a8_source[1] = b.gate.data();
+                    }
+                }
+                if (!gated && b.options.fusion && b.stats.norm_group && b.stats.store_fusion && b.options.shared_weights &&
                     y.ple_gate.format != WeightFormat::exl3_mul1 && !(b.stats.a8 && a8::quantized(y.ple_gate.format)))
                     b.run("ffn_epilogue_ple_gate", [&] {
                         gated = ffn_ple_gate(b.out.as<float>(), y.post_ffn_norm, b.residual.as<float>(), y.ple_gate,

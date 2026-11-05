@@ -33,6 +33,12 @@ constexpr Lever table[] = {
      .builtin = "exact", .required = {false, true, false}, .ready = {true, false, true}, .runnable = {true, true, true},
      .kind = Kind::bit_changing, .apps = engine | decode_bench, .target = "g4-dattn-f2",
      .source = "pending: g4-dattn-f2 qualification receipt (fast-parity, decode after 8K/32K/64K prompts)"},
+    // A8 FFN epilogue fused into the A8 PLE-gate linear prologue: active whenever the g4-a8-v1 decode identity
+    // runs (a no-op otherwise); ids and bytes equal the separate epilogue. STRIX_G4_A8_FFN_PLE_FUSE=0 switches it off.
+    {.name = "a8_ffn_ple_fuse", .env = "STRIX_G4_A8_FFN_PLE_FUSE", .value = {"1", "1", "1"}, .builtin = "1",
+     .required = {false, false, false}, .ready = {true, true, true}, .runnable = {true, true, true},
+     .kind = Kind::exact, .apps = engine | decode_bench, .off = "0",
+     .source = "g4-a8-v1 FFN epilogue fused into the PLE-gate linear: ids and bytes == separate epilogue (0 = off)"},
     // Drafter: <model dir>/drafter-mtp when present, --draft-mtp DIR overrides, --draft off or
     // STRIX_G4_DRAFT=0 switches it off. Missing weights never fail: decode runs exact without it.
     {.name = "draft", .env = "STRIX_G4_DRAFT", .option = "--draft-mtp", .value = {"mtp-auto", "mtp-auto", "mtp-auto"},

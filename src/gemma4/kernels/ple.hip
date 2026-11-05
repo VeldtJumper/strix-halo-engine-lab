@@ -74,27 +74,6 @@ __device__ void stage_norm_row(const float* input, float* staged, unsigned width
             staged[i] = values[j];
     }
 }
-template <bool Scaled = false> __device__ float square_sum(const float* x, unsigned width, bool prefetch) {
-    float sum = 0.0F;
-    unsigned i = threadIdx.x;
-    if (prefetch)
-        for (; i < width && width - i > 224U; i += 256U) {
-            float values[8];
-#pragma unroll
-            for (unsigned j = 0; j < 8; ++j)
-                values[j] = x[i + 32U * j];
-#pragma unroll
-            for (unsigned j = 0; j < 8; ++j) {
-                const float a = Scaled ? values[j] * model_ple_scale : values[j];
-                sum = sum + a * a;
-            }
-        }
-    for (; i < width; i += 32U) {
-        const float a = Scaled ? x[i] * model_ple_scale : x[i];
-        sum = sum + a * a;
-    }
-    return wave_sum(sum);
-}
 __device__ float norm_factor(const float* x, unsigned width, bool prefetch, bool parallel = false, bool bounded = true,
                              bool intervals = false) {
     const float sum = square_sum(x, width, prefetch);
@@ -147,15 +126,6 @@ __global__ void norm_group_kernel(const float* x, LinearView w, float* out, unsi
         if constexpr (Quant)
             a8_quantize_lane(value, quant, blockIdx.x, i);
     }
-}
-template <bool Parallel>
-__device__ float epilogue_factor(const float* x, unsigned width, bool prefetch, bool bounded, bool intervals,
-                                bool seeded = false) {
-    const float sum = square_sum(x, width, prefetch);
-    if ((bit_cast<std::uint32_t>(sum) & 0x7f800000U) == 0x7f800000U)
-        return bit_cast<float>(0x7fc00000U);
-    const float u = sum / float(width) + norm_eps;
-    return Parallel ? wave_rsqrt(u, bounded, intervals, seeded) : pow32_rsqrt(u);
 }
 // Staged epilogue with every independent operand loaded before the first
 // reduction: the branch row, residual, norm weights and following-norm weights

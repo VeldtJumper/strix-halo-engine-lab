@@ -154,4 +154,35 @@ __device__ inline void finite_flag(float x, std::uint32_t* failure) {
     if ((bit_cast<std::uint32_t>(x) & 0x7f800000U) == 0x7f800000U)
         atomicOr(failure, 1U);
 }
+// Ordered norm reduction shared by the separate epilogue and A8 consumer prologue.
+template <bool Scaled = false> __device__ inline float square_sum(const float* x, unsigned width, bool prefetch) {
+    float sum = 0.0F;
+    unsigned i = threadIdx.x;
+    if (prefetch)
+        for (; i < width && width - i > 224U; i += 256U) {
+            float values[8];
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j)
+                values[j] = x[i + 32U * j];
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j) {
+                const float a = Scaled ? values[j] * model_ple_scale : values[j];
+                sum = sum + a * a;
+            }
+        }
+    for (; i < width; i += 32U) {
+        const float a = Scaled ? x[i] * model_ple_scale : x[i];
+        sum = sum + a * a;
+    }
+    return wave_sum(sum);
+}
+template <bool Parallel>
+__device__ inline float epilogue_factor(const float* x, unsigned width, bool prefetch, bool bounded, bool intervals,
+                                       bool seeded = false) {
+    const float sum = square_sum(x, width, prefetch);
+    if ((bit_cast<std::uint32_t>(sum) & 0x7f800000U) == 0x7f800000U)
+        return bit_cast<float>(0x7fc00000U);
+    const float u = sum / float(width) + norm_eps;
+    return Parallel ? wave_rsqrt(u, bounded, intervals, seeded) : pow32_rsqrt(u);
+}
 } // namespace strix::gemma4::gpu

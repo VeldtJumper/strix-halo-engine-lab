@@ -11,6 +11,7 @@ struct DeviceOptions {
     bool graph_timing = false;
     // Numerical identity name ("g4-v1" or the opt-in "g4-a8-v1"); null: STRIX_G4_IDENTITY, else g4-v1.
     const char* identity = nullptr;
+    bool a8_ffn_ple_fuse = true; // g4-a8-v1 only; STRIX_G4_A8_FFN_PLE_FUSE=0 switches it off
 };
 struct DeviceStats {
     std::size_t resident_weight_bytes = 0, pass_weight_bytes = 0;
@@ -41,6 +42,9 @@ struct DeviceStats {
     bool store_fusion = false;
     bool multi_linear = false;
     bool a8 = false;
+    bool a8_ffn_ple_fuse = false;
+    // Cumulative successful eager/captured fused layer launches; cached graph replays are excluded.
+    std::size_t a8_ffn_ple_launches = 0;
     std::string identity = arithmetic_id;
     double gpu_pass_ms = 0.0;
     std::map<std::string, double> kernel_ms;

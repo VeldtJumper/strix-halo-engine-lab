@@ -36,10 +36,10 @@ inline std::vector<std::uint8_t> packed(WeightFormat f, unsigned outputs, unsign
     }
     return b;
 }
-inline ModelManifest tiny(unsigned count = 42, bool quant = false) {
+inline ModelManifest tiny(unsigned count = 42, bool quant = false, unsigned hidden_width = 0) {
     ModelManifest m;
     auto& c = m.config;
-    c.hidden = quant ? 256U : 32U;
+    c.hidden = hidden_width ? hidden_width : (quant ? 256U : 32U);
     c.layers = count;
     c.inter = quant ? 256U : 48U;
     c.vocab = 37;
