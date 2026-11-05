@@ -143,6 +143,124 @@ double run(const Case& t, bool bench) {
                   << ",\"shared_ms\":" << ms[1] << ",\"group_ms\":" << ms[2] << "}\n";
     return ms[1];
 }
+
+// Separate digest: keep the original gate's case sequence and bytes intact.
+std::size_t holes_cases = 0, graph_replays = 0;
+std::uint64_t holes_digest = 1469598103934665603ULL;
+void holes_absorb(const Buffer& x) {
+    std::vector<std::uint8_t> bytes(x.size());
+    x.download(bytes.data(), bytes.size());
+    for (const auto c : bytes) holes_digest = (holes_digest ^ c) * 1099511628211ULL;
+}
+bool holes_same(const Buffer& x, const Buffer& y) {
+    if (x.size() != y.size()) return false;
+    std::vector<std::uint8_t> a(x.size()), b(y.size());
+    x.download(a.data(), a.size()); y.download(b.data(), b.size());
+    return a == b;
+}
+void punch_holes(Cache& c) {
+    std::vector<std::uint64_t> tags(c.slots);
+    c.tags.download(tags.data(), c.tags.size());
+    const auto first = !c.global && c.frontier > c.slots ? c.frontier - c.slots : 0ULL;
+    // A complete aligned chunk inside even the sliding window, plus sparse
+    // holes and the first/last committed positions in this cache snapshot.
+    const auto chunk = ((first + attention_chunk - 1U) / attention_chunk + 1U) * attention_chunk;
+    for (auto p = first; p < c.frontier; ++p)
+        if (p % 37U == 0U || (p >= chunk && p < chunk + attention_chunk) || p == first || p + 1U == c.frontier)
+            tags[c.global ? p : p % c.slots] = UINT64_MAX;
+    c.tags.upload(tags.data(), c.tags.size());
+}
+struct AttentionReplay {
+    hipStream_t stream = nullptr;
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t executable = nullptr;
+    AttentionReplay() { CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) == hipSuccess); }
+    ~AttentionReplay() {
+        if (executable) (void)hipGraphExecDestroy(executable);
+        if (graph) (void)hipGraphDestroy(graph);
+        if (stream) (void)hipStreamDestroy(stream);
+    }
+};
+void run_holes(const Case& t, bool replay = false) {
+    const unsigned dim = t.global ? 512U : 256U, hcount = heads, width = hcount * dim;
+    auto a = cache(t.frontier, t.global, 11 + t.frontier),
+         b = t.two_streams ? cache(t.frontier + 3, t.global, 7) : Cache{};
+    punch_holes(a);
+    if (t.two_streams) punch_holes(b);
+    std::vector<KvRead> reads;
+    std::vector<std::uint64_t> positions;
+    for (unsigned r = 0; r < t.rows; ++r) {
+        const bool second = t.two_streams && (r & 1U);
+        reads.push_back(read(second ? b : a, r / (t.two_streams ? 2U : 1U)));
+        positions.push_back(reads.back().position);
+    }
+    const unsigned stride = unsigned(t.frontier) + 3U + 8U;
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    std::vector<float> q(std::size_t(t.rows) * width), norm(dim), table(std::size_t(stride) * dim);
+    fill(q, 5); fill(table, 9);
+    for (auto& w : norm) w = 1.0F + std::ldexp(float(int(&w - norm.data()) % 17 - 8), -6);
+    auto dq = device(q), dnorm = device(norm), dtable = device(table), dreads = device(reads), dpos = device(positions);
+    const LinearView q_norm{dnorm.as<std::uint8_t>(), 1, dim, dim * 4U, WeightFormat::f32};
+    Buffer scores(std::size_t(t.rows) * hcount * stride * 4), maxima(std::size_t(t.rows) * hcount * (chunks + 1) * 4),
+        partials(std::size_t(t.rows) * hcount * chunks * (dim + 1) * 4), counters(std::size_t(t.rows) * hcount * 4);
+    Buffer out[3] = {Buffer(std::size_t(t.rows) * width * 4), Buffer(std::size_t(t.rows) * width * 4),
+                     Buffer(std::size_t(t.rows) * width * 4)};
+    Buffer codes[3] = {Buffer(std::size_t(t.rows) * width), Buffer(std::size_t(t.rows) * width), Buffer(std::size_t(t.rows) * width)};
+    Buffer meta[3] = {Buffer(std::size_t(t.rows) * (width / 32U) * sizeof(a8::Meta)),
+                      Buffer(std::size_t(t.rows) * (width / 32U) * sizeof(a8::Meta)),
+                      Buffer(std::size_t(t.rows) * (width / 32U) * sizeof(a8::Meta))};
+    Buffer failure(3 * sizeof(unsigned));
+    counters.zero(); failure.zero();
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        out[mode].zero(); codes[mode].zero(); meta[mode].zero();
+        const auto launch = [&](Buffer& output, Buffer& code, Buffer& metadata, unsigned* flag, hipStream_t stream) {
+            const A8Rows quant = t.quant ? A8Rows{code.as<std::int8_t>(), metadata.as<a8::Meta>(), width} : A8Rows{};
+            CHECK(fused_attention(dq.as<float>(), q_norm, dpos.as<std::uint64_t>(), dtable.as<float>(), dreads.as<KvRead>(),
+                                  t.rows, hcount, dim, stride, t.global, output.as<float>(), flag, stream,
+                                  true, false, false, scores.as<float>(), maxima.as<float>(), partials.as<float>(),
+                                  counters.as<unsigned>(), quant, int(mode)));
+        };
+        launch(out[mode], codes[mode], meta[mode], failure.as<unsigned>() + mode, nullptr);
+        synchronize();
+        if (replay) {
+            AttentionReplay graph;
+            Buffer replay_out(out[mode].size()), replay_codes(codes[mode].size()), replay_meta(meta[mode].size()),
+                replay_failure(sizeof(unsigned));
+            CHECK(hipStreamBeginCapture(graph.stream, hipStreamCaptureModeGlobal) == hipSuccess);
+            launch(replay_out, replay_codes, replay_meta, replay_failure.as<unsigned>(), graph.stream);
+            CHECK(hipStreamEndCapture(graph.stream, &graph.graph) == hipSuccess);
+            CHECK(hipGraphInstantiate(&graph.executable, graph.graph, nullptr, nullptr, 0) == hipSuccess);
+            unsigned direct_flag = 0;
+            failure.download(&direct_flag, sizeof(direct_flag), mode * sizeof(unsigned));
+            for (unsigned pass = 0; pass < 2; ++pass) {
+                CHECK(hipMemsetAsync(replay_out.data(), 0, replay_out.size(), graph.stream) == hipSuccess);
+                CHECK(hipMemsetAsync(replay_codes.data(), 0, replay_codes.size(), graph.stream) == hipSuccess);
+                CHECK(hipMemsetAsync(replay_meta.data(), 0, replay_meta.size(), graph.stream) == hipSuccess);
+                CHECK(hipMemsetAsync(replay_failure.data(), 0, replay_failure.size(), graph.stream) == hipSuccess);
+                CHECK(hipGraphLaunch(graph.executable, graph.stream) == hipSuccess);
+                CHECK(hipStreamSynchronize(graph.stream) == hipSuccess);
+                unsigned replay_flag = 0;
+                replay_failure.download(&replay_flag, sizeof(replay_flag));
+                CHECK(replay_flag == direct_flag);
+                CHECK(holes_same(out[mode], replay_out));
+                CHECK(holes_same(codes[mode], replay_codes));
+                CHECK(holes_same(meta[mode], replay_meta));
+                holes_absorb(replay_out); holes_absorb(replay_codes); holes_absorb(replay_meta); holes_absorb(replay_failure);
+                ++graph_replays;
+            }
+        }
+    }
+    unsigned flags[3] = {};
+    failure.download(flags, sizeof(flags));
+    CHECK(flags[0] == 2U && flags[0] == flags[1] && flags[0] == flags[2]);
+    for (unsigned mode = 1; mode < 3; ++mode) {
+        CHECK(holes_same(out[0], out[mode]));
+        CHECK(holes_same(codes[0], codes[mode]));
+        CHECK(holes_same(meta[0], meta[mode]));
+    }
+    holes_absorb(out[0]); holes_absorb(codes[0]); holes_absorb(meta[0]); holes_absorb(failure);
+    ++holes_cases;
+}
 } // namespace
 int main(int argc, char** argv) {
     try {
@@ -164,6 +282,19 @@ int main(int argc, char** argv) {
                 }
         std::cout << "{\"gate\":\"attention-kv-shared-vs-chunk-fastest\",\"cases\":" << cases << ",\"digest\":\"" << std::hex << digest << std::dec
                   << "\",\"verdict\":\"EXACT\"}\n";
+        for (const std::uint64_t frontier : {8192ULL, 32768ULL, 65528ULL})
+            for (const bool global : {false, true}) {
+                if (!global && frontier == 65528ULL) continue;
+                for (const unsigned rows : {1U, 3U, 8U})
+                    for (const bool two_streams : {false, true})
+                        run_holes({frontier, global, rows, two_streams, two_streams ? rows == 3U : rows == 8U});
+            }
+        // Quantized single-row and multi-row graphs cover all three modes;
+        // each graph replays twice after clearing its outputs and failure word.
+        run_holes({32768ULL, true, 1U, false, true}, true);
+        run_holes({32768ULL, true, 8U, true, true}, true);
+        std::cout << "{\"gate\":\"attention-holes-replay\",\"cases\":" << holes_cases << ",\"replays\":" << graph_replays
+                  << ",\"digest\":\"" << std::hex << holes_digest << std::dec << "\",\"verdict\":\"EXACT\"}\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

@@ -950,6 +950,171 @@ __global__ void __launch_bounds__(64) chunk_final_kernel(const KvRead* reads, un
     if constexpr (Quant)
         a8_quantize_lane(value, quant, rh / heads_count, head * dim + i);
 }
+// One-row global long spans (STRIX_G4_ATTN_KVONCE, default on): one block per
+// (KV head, chunk) loads each K and V row once for the group's query heads.
+// Scores retain each head's ordered dot and wave tree; chunk maxima scan LDS
+// in position order. The partial launch has no tickets: chunk_final_kernel
+// keeps the existing ordered final merge and quantized output.
+// Scores use four waves, or eight with =8. Batch 32 keeps one set of value
+// loads and four numerator chains; only loads are batched, never additions.
+template <unsigned Waves>
+__global__ void __launch_bounds__(Waves * 32U) kv_scores_kernel(const float* q, LinearView q_norm,
+                                                              const std::uint64_t* positions, const float* table,
+                                                              const KvRead* reads, unsigned stride, float* scores,
+                                                              float* maxima, bool parallel, bool bounded,
+                                                              bool intervals, unsigned* failure) {
+    static_assert(group == 4U && (Waves == 4U || Waves == 8U));
+    constexpr unsigned Dim = 512U;
+    const unsigned kv_head = blockIdx.x, rh0 = kv_head * group;
+    const auto r = reads[0];
+    const auto range = visible(r.position, r.global, r.window);
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    const unsigned chunk = compact_chunk(blockIdx.y, gridDim.y, chunks, range);
+    const std::uint64_t begin = std::uint64_t(chunk) * attention_chunk;
+    const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
+    if (begin > range.last || begin + attention_chunk <= range.first) {
+        if (threadIdx.x < group && chunk < chunks)
+            maxima[std::size_t(rh0 + threadIdx.x) * chunks + chunk] = bit_cast<float>(0xff800000U);
+        return;
+    }
+    __shared__ float query[group][Dim];
+    __shared__ float chunk_score[group][attention_chunk];
+    if (wave < group) {
+        float v[Dim / 32U];
+#pragma unroll
+        for (unsigned j = 0; j < Dim / 32U; ++j)
+            v[j] = q[std::size_t(rh0 + wave) * Dim + lane + 32U * j];
+        register_head_values<Dim>(v, q_norm, table + std::size_t(positions[0]) * Dim, parallel, bounded, intervals);
+#pragma unroll
+        for (unsigned j = 0; j < Dim / 32U; ++j) {
+            query[wave][lane + 32U * j] = v[j];
+            finite_flag(v[j], failure);
+        }
+    }
+    __syncthreads();
+    for (unsigned j = wave; j < attention_chunk; j += Waves) {
+        const auto p = begin + j;
+        if (p < range.first || p > range.last)
+            continue;
+        const auto* k = kv_at(r, p, false, failure);
+        float key[Dim / 32U];
+        if (k) {
+#pragma unroll
+            for (unsigned c = 0; c < Dim / 32U; ++c)
+                key[c] = k[kv_head * Dim + lane + 32U * c];
+        }
+#pragma unroll
+        for (unsigned h = 0; h < group; ++h) {
+            float sum_h = 0.0F;
+            if (k) {
+#pragma unroll
+                for (unsigned c = 0; c < Dim / 32U; ++c)
+                    sum_h = sum_h + query[h][lane + 32U * c] * key[c];
+            }
+            sum_h = wave_sum(sum_h);
+            if (lane == 0) {
+                finite_flag(sum_h, failure);
+                scores[std::size_t(rh0 + h) * stride + p] = sum_h;
+                chunk_score[h][j] = sum_h;
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < group) {
+        float m = bit_cast<float>(0xff800000U);
+        for (unsigned j = 0; j < attention_chunk; ++j) {
+            const auto p = begin + j;
+            if (p >= range.first && p <= range.last) {
+                const float x = chunk_score[threadIdx.x][j];
+                m = x > m ? x : m;
+            }
+        }
+        maxima[std::size_t(rh0 + threadIdx.x) * chunks + chunk] = m;
+    }
+}
+__global__ void __launch_bounds__(256) kv_partial_kernel(const KvRead* reads, unsigned stride, const float* scores,
+                                                        const float* maxima, float* partials, unsigned* failure) {
+    static_assert(group == 4U);
+    constexpr unsigned Dim = 512U, Batch = 32U;
+    const unsigned kv_head = blockIdx.x, rh0 = kv_head * group;
+    const auto r = reads[0];
+    const auto range = visible(r.position, r.global, r.window);
+    const unsigned chunks = (stride + attention_chunk - 1U) / attention_chunk;
+    const unsigned chunk = compact_chunk(blockIdx.y, gridDim.y, chunks, range);
+    const auto first = std::uint64_t(chunk) * attention_chunk;
+    if (first > range.last || first + attention_chunk <= range.first)
+        return;
+    __shared__ float e[group][attention_chunk];
+    __shared__ const float* values[attention_chunk];
+    __shared__ float maximum[group], wave_maxima[8][group];
+    const auto first_chunk = range.first / attention_chunk, last_chunk = range.last / attention_chunk;
+    // Same shared block maximum as chunk_partial_merge_kernel; zero signs
+    // cannot change declared_exp(score - maximum).
+#pragma unroll
+    for (unsigned h = 0; h < group; ++h) {
+        float m = bit_cast<float>(0xff800000U);
+        for (auto c = first_chunk + threadIdx.x; c <= last_chunk; c += blockDim.x) {
+            const float a = maxima[std::size_t(rh0 + h) * chunks + c];
+            m = a > m ? a : m;
+        }
+#pragma unroll
+        for (unsigned d = 16; d != 0; d >>= 1U) {
+            const float a = __shfl_xor(m, int(d), 32);
+            m = a > m ? a : m;
+        }
+        if (threadIdx.x % 32U == 0) wave_maxima[threadIdx.x / 32U][h] = m;
+    }
+    __syncthreads();
+    if (threadIdx.x < group) {
+        float m = wave_maxima[0][threadIdx.x];
+        for (unsigned w = 1; w < blockDim.x / 32U; ++w)
+            m = wave_maxima[w][threadIdx.x] > m ? wave_maxima[w][threadIdx.x] : m;
+        maximum[threadIdx.x] = m;
+    }
+    __syncthreads();
+    const auto begin = max(first, range.first), end = min(first + attention_chunk, range.last + 1);
+    for (auto p = begin + threadIdx.x; p < end; p += blockDim.x) {
+#pragma unroll
+        for (unsigned h = 0; h < group; ++h)
+            e[h][p - first] = declared_exp(scores[std::size_t(rh0 + h) * stride + p] - maximum[h]);
+        values[p - first] = kv_at(r, p, true, failure);
+    }
+    __syncthreads();
+    if (threadIdx.x < group) {
+        float denominator = 0.0F;
+        for (auto p = begin; p < end; ++p)
+            denominator = denominator + e[threadIdx.x][p - first];
+        partials[(std::size_t(rh0 + threadIdx.x) * chunks + chunk) * (Dim + 1U) + Dim] = denominator;
+    }
+    for (unsigned i = threadIdx.x; i < Dim; i += blockDim.x) {
+        float numerator[group] = {};
+        for (auto p = begin; p < end; p += Batch) {
+            float v[Batch];
+            unsigned present = 0;
+#pragma unroll
+            for (unsigned j = 0; j < Batch; ++j)
+                if (p + j < end) {
+                    const auto* pointer = values[p + j - first];
+                    if (pointer) {
+                        v[j] = pointer[kv_head * Dim + i];
+                        present |= 1U << j;
+                    }
+                }
+            // Missing V rows skip only the numerator term, as before.
+#pragma unroll
+            for (unsigned j = 0; j < Batch; ++j)
+                if (present & (1U << j))
+#pragma unroll
+                    for (unsigned h = 0; h < group; ++h)
+                        numerator[h] = numerator[h] + e[h][p + j - first] * v[j];
+        }
+#pragma unroll
+        for (unsigned h = 0; h < group; ++h) {
+            finite_flag(numerator[h], failure);
+            partials[(std::size_t(rh0 + h) * chunks + chunk) * (Dim + 1U) + i] = numerator[h];
+        }
+    }
+}
 // Grouped long-span launches (STRIX_G4_ATTN_KV_SHARED=2): one block per
 // (row, key/value head, chunk) serves the group's query heads, so each key and
 // value is loaded once for all of them. Grid (row x kv head, chunk) as in the
@@ -1249,6 +1414,15 @@ static bool attention_compact() {
     }();
     return enabled;
 }
+// STRIX_G4_ATTN_KVONCE (read once per process): =0 keeps the shared head
+// blocks, =8 uses eight score waves, every other value defaults to four.
+static unsigned attention_kv_once_waves() {
+    static const unsigned waves = [] {
+        const auto* p = std::getenv("STRIX_G4_ATTN_KVONCE");
+        return p && std::string_view(p) == "0" ? 0U : p && std::string_view(p) == "8" ? 8U : 4U;
+    }();
+    return waves;
+}
 bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* positions, const float* table,
                      const KvRead* reads, unsigned rows, unsigned heads_count, unsigned dim, unsigned stride,
                      bool global, float* out, unsigned* failure, Queue queue, bool parallel, bool bounded,
@@ -1278,6 +1452,29 @@ bool fused_attention(const float* q, LinearView q_norm, const std::uint64_t* pos
         // Sliding layers see at most fused_chunks chunks: a compact grid launches only those (the stride's chunk
         // count only sizes the layouts), instead of one mostly empty block per chunk of the longest context.
         const unsigned slots = !global && attention_compact() ? span : chunks;
+        if (global && dim == 512U && rows == 1U && mode == 1 && attention_final() && heads_count % group == 0U &&
+            attention_kv_once_waves() != 0U) {
+            const dim3 groups(heads_count / group, slots);
+            const auto kv_scores = [&](auto waves) {
+                hipLaunchKernelGGL((kv_scores_kernel<decltype(waves)::value>), groups,
+                                   dim3(decltype(waves)::value * 32U), 0, stream, q, q_norm, positions, table, reads,
+                                   stride, scores, maxima, parallel, bounded, intervals, failure);
+            };
+            if (attention_kv_once_waves() == 8U) kv_scores(std::integral_constant<unsigned, 8>{});
+            else kv_scores(std::integral_constant<unsigned, 4>{});
+            launch_checked();
+            hipLaunchKernelGGL(kv_partial_kernel, groups, dim3(256), 0, stream, reads, stride, scores, maxima,
+                               partials, failure);
+            launch_checked();
+            const auto kv_final = [&](auto quantized) {
+                hipLaunchKernelGGL((chunk_final_kernel<decltype(quantized)::value>), dim3(heads_count, dim / 64U),
+                                   dim3(64), 0, stream, reads, heads_count, dim, stride, partials, out, failure, quant);
+            };
+            if (quantize) kv_final(std::true_type{});
+            else kv_final(std::false_type{});
+            launch_checked();
+            return true;
+        }
         if (mode == 2) {
             const dim3 groups(rows * (heads_count / group), slots);
             if (global)
