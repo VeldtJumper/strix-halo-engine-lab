@@ -6,7 +6,8 @@ must allow long argv, e.g. ``ulimit -s 65536``):
       --binary bin/strix-hip-decode-token --model MODEL.gguf --model-receipt RECEIPT --out OUT \
       --soft-seconds 430 [--cases ID,...] [--predict 8192=40,32768=70] [--keep-logits]
 
-ARMS.json: {"arms": {NAME: {"env": {VAR: VALUE}, "argv": [extra arguments]}}}. Every arm, the
+ARMS.json: {"arms": {NAME: {"env": {VAR: VALUE}, "argv": [extra arguments]}}}. An arm may also
+set both "model" and "model_receipt" paths in --replay mode only, overriding the run defaults. Every arm, the
 reference included, is teacher-forced on the case's recorded continuation; the logits of every token
 selection are reduced against the reference in a separate process while the next arm runs. Nothing
 outlives the soft deadline: a run or reduction still going then is stopped, and the next invocation
@@ -27,8 +28,9 @@ import sys
 import time
 import uuid
 
-from .common import (VERSION, atomic, canonical, diagnostic_records, file_sha, kit_commit, read_id_text,
-                     read_journal, read_journal_lines)
+from .common import captured_text
+from .common import (VERSION, atomic, canonical, decode_log, diagnostic_records, file_sha, kit_commit, read_id_text,
+                     witness_problem, read_journal, read_journal_lines, sha)
 from . import manifest as manifest_mod
 from . import plan as plan_mod
 from .records import STEP_HEADER
@@ -61,14 +63,16 @@ def clean_env(arm_env, base=None):
     return env
 
 
-def load_arms(path, needed):
-    arms = json.loads(Path(path).read_text())["arms"]
+def load_arms(path, needed, *, data=None):
+    arms = json.loads(captured_text(Path(path).read_bytes() if data is None else data))["arms"]
     for name in needed:
         if name not in arms:
             raise ValueError(f"arms file lacks arm {name}")
         spec = arms[name]
-        if set(spec) - {"env", "argv"}:
-            raise ValueError(f"arm {name}: only env and argv are allowed")
+        if set(spec) - {"env", "argv", "model", "model_receipt"}:
+            raise ValueError(f"arm {name}: only env, argv, model and model_receipt are allowed")
+        if ("model" in spec) != ("model_receipt" in spec):
+            raise ValueError(f"arm {name}: model and model_receipt must be specified together")
         if set(spec.get("env", {})) & set(HOOK_ENV):
             raise ValueError(f"arm {name}: the measurement hook variables are set by the runner")
     return arms
@@ -284,7 +288,8 @@ class Runner:
         plan_mod.require_runnable(self.plan, self.manifest_sha)
         if self.manifest.get("fake_tokenizer") and not a.allow_fake_for_tests:
             raise ValueError("manifest was built with a fake tokenizer")
-        receipt_sha = file_sha(a.model_receipt)
+        receipt_bytes = Path(a.model_receipt).read_bytes()     # hashed and parsed from the same buffer
+        receipt_sha = sha(receipt_bytes)
         if not self.manifest.get("fake_tokenizer") and \
                 self.manifest["tokenizer"].get("model_receipt_sha256") != receipt_sha:
             raise ValueError("model receipt differs from the receipt the manifest was tokenized with")
@@ -296,15 +301,49 @@ class Runner:
             raise ValueError("unknown case ID or case outside the plan's split/lengths")
         manifest_mod.verify(a.manifest, case_ids=[c["case_id"] for c in self.cases])
         self.arm_names = plan_mod.arms_needed(self.plan)
-        self.arms = load_arms(a.arms, self.arm_names)
-        self.binary, self.model = str(Path(a.binary).resolve()), str(Path(a.model).resolve())
+        arms_bytes = Path(a.arms).read_bytes()
+        self.arms = load_arms(a.arms, self.arm_names, data=arms_bytes)
+        self.require_replay = evidence.has_model_overrides(self.arms)
+        if self.require_replay and not a.replay:
+            raise ValueError("per-arm model overrides require --replay; direct runs cannot verify arm model provenance")
+        self.binary = str(Path(a.binary).resolve())
         self.meta = {"kit": VERSION, "kit_commit": kit_commit(), "plan_sha256": self.plan_sha,
-                     "manifest_sha256": self.manifest_sha, "arms_sha256": file_sha(a.arms),
+                     "manifest_sha256": self.manifest_sha, "arms_sha256": sha(arms_bytes),
                      "binary_sha256": file_sha(self.binary), "model_receipt_sha256": receipt_sha,
                      "split": self.plan["split"]}
+        self.models, self.model_shas, receipt_shas = {}, {}, {}
+        for name in self.arm_names:
+            spec = self.arms[name]
+            raw = Path(spec["model_receipt"]).read_bytes() if "model_receipt" in spec else receipt_bytes
+            fields = raw.decode("utf-8", "replace").split()
+            self.models[name] = str(Path(spec.get("model", a.model)).resolve())
+            self.model_shas[name] = fields[0] if fields else None
+            receipt_shas[name] = sha(raw)
+        self.meta["arm_model_receipt_sha256"] = receipt_shas
         self.predict = parse_predict(a.predict)
         self.repeats = set(self.plan.get("ref_repeat_cases", []))
         self.launcher = [sys.executable] if a.python_binary_for_tests else []
+        self.replay = Path(a.replay).resolve() if a.replay else None
+        self.replay_labels = dict(x.split("=", 1) for x in a.replay_label)
+        if self.replay is not None:
+            if not self.replay.is_dir():
+                raise ValueError(f"--replay {a.replay} is not a directory")
+            journal = self.replay / "runs.jsonl"
+            if not journal.exists():
+                raise ValueError("--replay needs the engine's runs.jsonl (one committed line per capture)")
+            raw = journal.read_bytes()           # one snapshot: every pair is matched against these bytes
+            self.meta["replay_dir"] = str(self.replay)
+            self.meta["replay_runs_sha256"] = sha(raw)
+            if not all(self.model_shas.values()):
+                raise ValueError("--replay needs a model receipt that names the model (empty receipt)")
+            self.replay_entries = {}
+            for line in raw.decode("utf-8", "replace").splitlines():
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue                     # an incomplete last line is not a capture
+                if isinstance(e, dict) and e.get("status") == "complete" and isinstance(e.get("capture_id"), str):
+                    self.replay_entries.setdefault((e.get("case_id"), e.get("label")), []).append(e)
         self.bad = 0        # FAILED or INVALID outcomes of this invocation
         self.invocation = uuid.uuid4().hex[:16]     # unique; never derived from a recoverable journal
         self.reduce_cost = 10.0     # seconds; raised to the slowest reduction seen
@@ -317,15 +356,21 @@ class Runner:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
     def preflight(self):
-        for first in _lines(self.out / "run-meta.json")[:1]:
+        for first in _lines(self.out / "run-meta.json"):
+            old_receipts = evidence.normalize_arm_receipts(
+                first, self.arm_names, allow_legacy=not evidence.has_model_overrides(self.arms))
             for key in ("plan_sha256", "manifest_sha256", "split", "arms_sha256", "binary_sha256",
-                        "model_receipt_sha256"):
-                if first.get(key) != self.meta[key]:
+                        "model_receipt_sha256", "arm_model_receipt_sha256"):
+                old = old_receipts if key == "arm_model_receipt_sha256" else first.get(key)
+                if old != self.meta[key]:
                     raise ValueError(f"output directory was started with another {key}; use a new --out")
         for r in read_journal_lines(self.out / "runs.jsonl")[0]:
+            if self.require_replay and evidence.run_ok(r, self.meta) and not evidence.replay_provenance(r):
+                raise ValueError("successful run lacks replay provenance; reimport historical captures into a new --out")
             # Run records carry the identity too, so a lost metadata journal cannot hide a mismatch.
+            expected = evidence.arm_identity(self.meta, r.get("arm")) if isinstance(r, dict) else {}
             for key in evidence.RUN_IDENTITY:
-                if isinstance(r, dict) and isinstance(r.get(key), str) and r[key] != self.meta[key] and \
+                if isinstance(r, dict) and isinstance(r.get(key), str) and r[key] != expected[key] and \
                         evidence.run_record(r):
                     raise ValueError(f"output directory holds runs with another {key}; use a new --out")
         copy = self.out / "arms.json"
@@ -334,13 +379,16 @@ class Runner:
         if file_sha(copy) != self.meta["arms_sha256"]:
             raise ValueError("output directory holds another arms file")
         longest = max(self.cases, key=lambda c: c["prompt_tokens"], default=None)
-        if longest is not None:
+        if longest is not None and self.replay is None:
             from tools.qualification.longctx_fidelity.run_cli import argv_check
             ids = read_id_text(Path(self.a.manifest) / longest["prompt_file"])
-            argv_check(self.launcher + [self.binary, self.model, *map(str, ids), "--generate",
-                                        str(longest["cont_tokens"])], clean_env({}))
+            for name in self.arm_names:
+                argv_check(self.launcher + [self.binary, self.models[name], *map(str, ids), "--generate",
+                                            str(longest["cont_tokens"])], clean_env({}))
         stamp = dict(self.meta, started_utc=datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"), cases=len(self.cases), invocation=self.invocation)
+        if not self.require_replay:
+            stamp.pop("arm_model_receipt_sha256", None)
         self.append("run-meta.json", stamp)
         if self.plan["split"] == "holdout":
             self.append("holdout-ledger.jsonl", stamp)
@@ -373,7 +421,7 @@ class Runner:
 
     def ledger(self):
         lines, _, raws = read_journal_lines(self.out / "runs.jsonl")
-        return evidence.Ledger(lines, _lines(self.out / "resets.jsonl"), self.meta, raws)
+        return evidence.Ledger(lines, _lines(self.out / "resets.jsonl"), self.meta, raws, require_replay=self.require_replay)
 
     def reset_bad(self):
         """Malformed or contradictory journal lines are never edited away: the case they belong to (all
@@ -426,7 +474,7 @@ class Runner:
                                            "of_run": mark["run_id"], "case_id": cid, "arm": label,
                                            "error": "reconstructed from its failure marker before a reset",
                                            "reconstructed": True,
-                                           **{k: self.meta[k] for k in evidence.RUN_IDENTITY}})
+                                           **{k: evidence.arm_identity(self.meta, label)[k] for k in evidence.RUN_IDENTITY}})
 
     def attempts(self, case, arm):
         """Failures of a pair, rebuilt from the run journal (evidence.Ledger.failed), never from a marker."""
@@ -456,7 +504,7 @@ class Runner:
             self.run_seq += 1
             self.append("runs.jsonl", {"event": "reduction_failed", "run_id": f"{self.invocation}-e{self.run_seq}",
                                        "of_run": run_id, "case_id": case, "arm": arm, "error": why,
-                                       **{k: self.meta[k] for k in evidence.RUN_IDENTITY}})
+                                       **{k: evidence.arm_identity(self.meta, arm)[k] for k in evidence.RUN_IDENTITY}})
         self.mark(case, arm, {"status": "FAILED", "attempts": self.attempts(case, arm),
                               "max_attempts": self.a.max_attempts, "error": why, "run_id": run_id})
         self.bad += 1
@@ -566,7 +614,7 @@ class Runner:
                                                        "not enough budget in this invocation"})
                 continue
             spec = self.arms[name]
-            argv = self.launcher + [self.binary, self.model, *map(str, ids), "--generate",
+            argv = self.launcher + [self.binary, self.models[name], *map(str, ids), "--generate",
                                     str(first["cont_tokens"]), *spec.get("argv", []), "--print-effective-config"]
             try:
                 r = subprocess.run(argv, env=clean_env(spec.get("env", {})), capture_output=True, timeout=budget)
@@ -588,7 +636,7 @@ class Runner:
         env = clean_env(spec.get("env", {}))
         env["STRIX_BITCALC_LOGITS_OUT"] = str(bin_path)
         env["STRIX_BITCALC_FORCE_TOKENS"] = str(cont_file)
-        argv = self.launcher + [self.binary, self.model, *map(str, ids), "--generate", str(case["cont_tokens"]),
+        argv = self.launcher + [self.binary, self.models[arm_name], *map(str, ids), "--generate", str(case["cont_tokens"]),
                                 *spec.get("argv", [])]
         cap = self.cap(case["nominal_length"])
         room = (self.remaining() - self.a.reserve_seconds - self.post_cost()
@@ -600,7 +648,7 @@ class Runner:
         start = self.now()
         record = {"case_id": case["case_id"], "arm": arm_label, "nominal_length": case["nominal_length"],
                   "plan_sha256": self.plan_sha, "binary_sha256": self.meta["binary_sha256"],
-                  "arms_sha256": self.meta["arms_sha256"], "model_receipt_sha256": self.meta["model_receipt_sha256"],
+                  "arms_sha256": self.meta["arms_sha256"], "model_receipt_sha256": self.meta["arm_model_receipt_sha256"][arm_name],
                   "argv_tail": [*argv[len(self.launcher) + 2 + len(ids):]],
                   "env": {k: v for k, v in env.items() if k.startswith(DROP_PREFIX)}, "prompt_tokens": len(ids),
                   "allowed_seconds": round(allowed, 1), "cap_seconds": round(cap, 1), "shortened": shortened,
@@ -611,15 +659,23 @@ class Runner:
         exec_seconds = None
         interrupted = False
         try:
-            try:
-                r = subprocess.run(argv, env=env, capture_output=True, timeout=allowed)
-                rc, stdout, stderr = r.returncode, r.stdout, r.stderr
-            except subprocess.TimeoutExpired as e:
-                timed_out, stdout, stderr = True, e.stdout or b"", e.stderr or b""
+            if self.replay is not None:
+                self.replay_capture = None
+                rc, stdout, stderr, why = self.replay_run(case, arm_label, arm_name, bin_path, cont_file)
+                if why is not None:          # no engine output for this pair yet: not run, never a failure
+                    interrupted, record["replay"] = True, why
+                elif self.replay_capture is not None:
+                    record["replay_capture"] = self.replay_capture
+            else:
+                try:
+                    r = subprocess.run(argv, env=env, capture_output=True, timeout=allowed)
+                    rc, stdout, stderr = r.returncode, r.stdout, r.stderr
+                except subprocess.TimeoutExpired as e:
+                    timed_out, stdout, stderr = True, e.stdout or b"", e.stderr or b""
             exec_seconds = round(self.now() - start, 3)
             atomic(str(stem) + ".stdout", stdout)
             atomic(str(stem) + ".stderr", stderr)
-            result = parse_result(stdout.decode("utf-8", "replace"))
+            result = parse_result(decode_log(stdout))
             raw_forced = (result or {}).get("bitcalc_forced_steps") if isinstance(result, dict) else None
             # Engine output is normalised before it becomes evidence: a non-integer count is kept only
             # as a diagnostic, so the run record always stays well-formed (and its failure counts).
@@ -639,6 +695,13 @@ class Runner:
                         interrupted = True
                     else:
                         rows, problem, digest = int(checked["rows"]), checked["problem"], checked["sha256"]
+                        if self.replay is not None and digest is not None and self.replay_capture is not None \
+                                and digest != self.replay_capture["bin_sha256"]:
+                            problem, digest = "replay: validated logits differ from the committed capture", None
+                        why = witness_problem(self.plan.get("witness", {}).get(arm_name), result,
+                                              decode_log(stderr))
+                        if digest is not None and why:
+                            problem, digest = f"witness: {why}", None
             elif not timed_out:
                 problem = f"exit code {rc}"
         except (OSError, ValueError, struct.error) as e:
@@ -654,9 +717,72 @@ class Runner:
                       exec_seconds=wall if exec_seconds is None else min(exec_seconds, wall), rows=rows,
                       route=[l.strip() for l in stderr.decode("utf-8", "replace").splitlines() if "auto-prefill" in l],
                       forced_steps=forced, problem=problem, complete=complete, logits_sha256=digest,
-                      interrupted=interrupted)
+                      interrupted=interrupted, stdout_sha256=sha(stdout), stderr_sha256=sha(stderr))
         self.append("runs.jsonl", record)
         return record, (bin_path if complete else None)
+
+    def replay_run(self, case, arm_label, arm_name, bin_path, cont_file):
+        """(rc, stdout, stderr, missing) of one pair taken from the --replay directory. The result must name this
+        case and the sha256 of its prompt and continuation files, else the run is a failed attempt (rc 3); a pair
+        without output is reported as missing (not run)."""
+        cid = case["case_id"]
+        label = self.replay_label(arm_label)
+        entries = self.replay_entries.get((cid, label), [])
+        if not entries:
+            return None, b"", b"", f"no committed capture for {cid}.{label}"
+        bad = lambda why: (3, b"", f"replay: {why}\n".encode(), None)
+        if len(entries) != 1:
+            return bad(f"{len(entries)} committed captures for {cid}.{label}")
+        e = entries[0]
+        # The capture names this case, the frozen manifest inputs and the binary the kit hashed.
+        if e.get("prompt_sha256") != case["prompt_sha256"] or e.get("cont_sha256") != case["cont_sha256"]:
+            return bad("capture inputs are not this case's frozen prompt / continuation")
+        if e.get("binary_sha256") != self.meta["binary_sha256"]:
+            return bad("capture was made by another binary")
+        if not isinstance(e.get("model_sha256"), str) or not e["model_sha256"] or e["model_sha256"] != self.model_shas[arm_name]:
+            return bad("capture names another model (model_sha256 differs from the model receipt)")
+        if not e.get("capture_id") or not e.get("collection_id"):
+            return bad("capture lacks capture_id / collection_id")
+        if arm_label.endswith(REPEAT_SUFFIX):
+            # The reference repeat must be an independent capture (equal logits bytes are expected).
+            mark = self.done(cid, self.plan["reference"]) or {}
+            kept = self.ledger().by_id(mark.get("run_id")) if mark.get("run_id") else None
+            cap = (kept or {}).get("replay_capture") or {}
+            if not evidence.replay_provenance(kept) or cap["capture_id"] == e["capture_id"] \
+                    or cap["collection_id"] == e["collection_id"]:
+                return bad("reference repeat is not an independent capture of the retained reference run")
+        try:
+            stdout = (self.replay / f"{cid}.{label}.json").read_bytes()
+            err = self.replay / f"{cid}.{label}.stderr"
+            stderr = err.read_bytes() if err.exists() else b""
+            shutil.copyfile(self.replay / f"{cid}.{label}.bin", bin_path)
+        except OSError as x:
+            return bad(f"capture files unreadable ({type(x).__name__})")
+        # stderr feeds the route gate and any stderr witness, so it is committed like the other files
+        # (an engine without stderr commits the digest of the empty file and writes none).
+        if not isinstance(e.get("stderr_sha256"), str):
+            bin_path.unlink()
+            return bad("capture commits no stderr digest")
+        if sha(stdout) != e.get("json_sha256") or file_sha(bin_path) != e.get("bin_sha256") or \
+                sha(stderr) != e["stderr_sha256"]:
+            bin_path.unlink()
+            return bad("capture bytes differ from the committed journal entry")
+        result = parse_result(decode_log(stdout))
+        want = {"case_id": cid, "prompt_sha256": case["prompt_sha256"], "cont_sha256": case["cont_sha256"]}
+        if not isinstance(result, dict) or any(result.get(k) != v for k, v in want.items()):
+            bin_path.unlink()
+            return bad("result does not name this case / prompt / continuation")
+        if file_sha(cont_file) != case["cont_sha256"]:
+            bin_path.unlink()
+            return bad("continuation file changed since the manifest was frozen")
+        self.replay_capture = {"capture_id": e["capture_id"], "collection_id": e["collection_id"], "label": label,
+                               "bin_sha256": e["bin_sha256"]}
+        return 0, stdout, stderr, None
+
+    def replay_label(self, arm_label):
+        """The engine's label of a kit label: an explicit mapping, else the same name (the repeat is never folded
+        into the reference)."""
+        return self.replay_labels.get(arm_label, arm_label)
 
     def logits_sha(self, path):
         """Hash of a retained logits file, computed in a child stopped at the deadline (BudgetStop)."""
@@ -743,7 +869,7 @@ class Runner:
             self.append("runs.jsonl", {"event": "reduction_failed", "run_id": f"{self.invocation}-e{self.run_seq}",
                                        "of_run": mark["run_id"], "case_id": cid, "arm": label,
                                        "error": "reconstructed from its failure marker", "reconstructed": True,
-                                       **{k: self.meta[k] for k in evidence.RUN_IDENTITY}})
+                                       **{k: evidence.arm_identity(self.meta, label)[k] for k in evidence.RUN_IDENTITY}})
 
     def settle_recorded_failures(self, case):
         """A marker left on a run that the journal already records as failed (e.g. interrupted between
@@ -913,11 +1039,17 @@ class Runner:
         return outcome()
 
     def run(self):
-        failed = False
-        captured = not self.a.effective_config
+        failed = waiting = False
+        captured = not self.a.effective_config or self.replay is not None
         try:
             self.preflight()
             for case in self.cases:
+                missing = self.replay_missing(case)
+                if missing:
+                    # Replay: this case has no engine output yet; it is not run (and never a failure).
+                    waiting = True
+                    print(f"{case['case_id']}: no engine output yet ({', '.join(missing)})", flush=True)
+                    continue
                 state = self.run_case(case)
                 if not captured and state != "budget":
                     self.effective_configs()     # after the first case: it never shortens a first run
@@ -935,7 +1067,21 @@ class Runner:
             self.reductions.stop_all()
         bad = any(self.status(c["case_id"], lab) in ("FAILED", "INVALID")
                   for c in self.cases for lab in [self.plan["reference"]] + [l for l, _ in self.labels(c["case_id"])])
-        return 1 if failed or self.bad or bad else 0
+        return 1 if failed or self.bad or bad else (2 if waiting else 0)
+
+    def replay_missing(self, case):
+        """Engine labels of this case's still-needed pairs that have no output in the --replay directory."""
+        if self.replay is None:
+            return []
+        cid, ref = case["case_id"], self.plan["reference"]
+        settled = ("COMPLETE", "RAN", "FAILED", "INVALID")
+        need = []
+        if not self.finished(cid, ref) and self.status(cid, ref) not in settled and \
+                not (self.out / "logits" / f"{cid}.{ref}.bin").exists():
+            need.append(ref)
+        need += [lab for lab, _ in self.labels(cid) if self.status(cid, lab) not in settled]
+        return [self.replay_label(lab) for lab in need
+                if not self.replay_entries.get((cid, self.replay_label(lab)))]
 
 
 def parse_args(argv=None):
@@ -962,6 +1108,14 @@ def parse_args(argv=None):
                    help="the execution cap is at least this many seconds above the predicted run time")
     p.add_argument("--no-effective-config", dest="effective_config", action="store_false",
                    help="do not record each arm's --print-effective-config output")
+    p.add_argument("--replay", default="",
+                   help="DIR of a many-case engine run: each (case, arm) is taken from DIR/<case>.<label>.json "
+                        "(the engine's result, used as the run's stdout; it must name the case and the sha256 of "
+                        "its prompt and continuation files) and DIR/<case>.<label>.bin (its logits) instead of "
+                        "starting the engine; --binary is still the engine that produced them (hashed as usual)")
+    p.add_argument("--replay-label", action="append", default=[],
+                   help="ARM=LABEL: the engine's label of a plan arm in --replay (default: the arm name; the "
+                        "reference repeat arm is REF" + REPEAT_SUFFIX + ")")
     p.add_argument("--allow-fake-for-tests", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--python-binary-for-tests", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args(argv)

@@ -1,5 +1,7 @@
 """Shared helpers: canonical JSON, hashes, atomic writes, ID files."""
+import io
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -36,14 +38,16 @@ def read_journal(path):
     return records, (tail if tail.strip() else None)
 
 
-def read_journal_lines(path):
+def read_journal_lines(path, *, data=None):
     """Like read_journal, but tolerant: returns (lines, tail, raws). A line that does not parse is
     returned as its raw text (the run journal keeps every line; the evidence ledger decides what a bad
-    line means); ``raws`` are the exact bytes of every line, for binding resets to a journal prefix."""
+    line means); ``raws`` are the exact bytes of every line, for binding resets to a journal prefix.
+    ``data`` lets callers retain and hash the complete buffer parsed here, including its tail."""
     path = Path(path)
-    if not path.exists():
-        return [], None, []
-    data = path.read_bytes()
+    if data is None:
+        if not path.exists():
+            return [], None, []
+        data = path.read_bytes()
     body, sep, tail = data.rpartition(b"\n")
     if not sep:
         body, tail = b"", data
@@ -75,6 +79,38 @@ def diagnostic_records(path, after_damage=False):
     return records, damaged + (tail is not None)
 
 
+def decode_log(data):
+    """Text of captured engine output, decoded the same way at run time and when the analysis re-checks the saved
+    bytes (no newline translation)."""
+    return data.decode("utf-8", "replace")
+
+
+def witness_problem(spec, result, stderr_text):
+    """Why a run does not carry its arm's witness (None when it does, or when no witness is declared).
+
+    ``spec`` = {"stdout": {key: value}, "stderr_forbid": [text], "stderr_require": [regex]}: every listed key of the
+    run's JSON result equals its value (JSON-typed: 1, true and "1" differ), no forbidden text and every required
+    pattern occurs in the run's stderr. A miss means the engine did not run what the arm declares (for example a lever
+    declined, or the route fell back), so the run is not evidence for that arm."""
+    if not spec:
+        return None
+
+    def j(v):
+        return json.dumps(v, sort_keys=True, separators=(",", ":"))   # JSON-typed: 1, true and "1" differ
+    for key, want in sorted(spec.get("stdout", {}).items()):
+        got = result.get(key, None) if isinstance(result, dict) else None
+        if not isinstance(result, dict) or key not in result or j(got) != j(want):
+            return f"result {key} = {'absent' if not isinstance(result, dict) or key not in result else j(got)}, " \
+                   f"declared {j(want)}"
+    for text in spec.get("stderr_forbid", []):
+        if text in stderr_text:
+            return f"stderr contains {text!r}"
+    for pattern in spec.get("stderr_require", []):
+        if not re.search(pattern, stderr_text):
+            return f"stderr lacks {pattern!r}"
+    return None
+
+
 def write_id_text(path, ids):
     atomic(path, (",".join(str(int(i)) for i in ids) + "\n").encode("ascii"))
 
@@ -96,3 +132,9 @@ def kit_commit():
         return result.stdout.strip() or None if result.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def captured_text(data, encoding=None):
+    """Decode captured bytes with Path.read_text semantics, including universal newlines."""
+    with io.TextIOWrapper(io.BytesIO(data), encoding=encoding) as stream:
+        return stream.read()

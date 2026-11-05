@@ -37,8 +37,20 @@ def _exact(f, n, what):
     return data
 
 
-def read_steps(path):
-    with open(path, "rb") as f:
+class _Hashing:
+    """A file whose read() also feeds every returned byte to a hasher (the digest of the bytes actually read)."""
+    def __init__(self, f, hasher):
+        self.f, self.h = f, hasher
+
+    def read(self, n=-1):
+        data = self.f.read(n)
+        self.h.update(data)
+        return data
+
+
+def read_steps(path, hasher=None):
+    with open(path, "rb") as raw:
+        f = _Hashing(raw, hasher) if hasher is not None else raw
         while True:
             head = f.read(STEP_HEADER.size)
             if not head:
@@ -54,8 +66,9 @@ def read_steps(path):
             yield Row(step, position, argmax, emitted, logits)
 
 
-def read_spool(path):
-    with open(path, "rb") as f:
+def read_spool(path, hasher=None):
+    with open(path, "rb") as raw:
+        f = _Hashing(raw, hasher) if hasher is not None else raw
         if f.read(8) != SPOOL_MAGIC:
             raise ValueError("bad spool magic")
         vocab, rows, count = struct.unpack("<QQQ", _exact(f, 24, "spool header"))

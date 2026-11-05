@@ -20,19 +20,21 @@ import re
 
 import numpy as np
 
-from .common import (VERSION, JournalError, diagnostic_records, atomic, canonical, file_sha, kit_commit, read_id_text, read_journal,
+from .common import captured_text
+from .common import (VERSION, JournalError, witness_problem, decode_log, diagnostic_records, atomic, canonical, file_sha, kit_commit, read_id_text, read_journal,
                      read_journal_lines, sha)
 from . import manifest as manifest_mod
 from . import plan as plan_mod
 from .receipt import render_md, render_summary_md
-from .reduce import load as load_red
+from .reduce import load as load_red, load_bytes as load_red_bytes
 from .run import REPEAT_SUFFIX
 from . import evidence
 from .stats import resample_indices, upper_bound
 
 NEAR_TIE = 0.05
 ORDER = {"PASS": 0, "INCOMPLETE": 1, "FAIL": 2, "INVALID": 3}  # an observed failure outranks missing data
-IDENTITY = ("plan_sha256", "manifest_sha256", "split", "arms_sha256", "binary_sha256", "model_receipt_sha256")
+IDENTITY = ("plan_sha256", "manifest_sha256", "split", "arms_sha256", "binary_sha256", "model_receipt_sha256",
+            "arm_model_receipt_sha256")
 
 
 def _worst(*verdicts):
@@ -55,29 +57,40 @@ def _journal(path, problems):
 class RunDir:
     """One runner output directory, validated on its own."""
 
-    def __init__(self, path):
+    def __init__(self, path, required):
         self.path = Path(path)
         self.problems = []
         meta = _journal(self.path / "run-meta.json", self.problems)
         self.identity = None
+        self.arms = None
+        arms_path = self.path / "arms.json"
+        arms_bytes = (arms_path.read_bytes()
+                      if meta and isinstance(meta[0], dict) and arms_path.exists() else None)
+        if meta and isinstance(meta[0], dict) and arms_bytes is not None and sha(arms_bytes) == meta[0].get("arms_sha256"):
+            self.arms = json.loads(captured_text(arms_bytes))["arms"]
+        elif meta:
+            self.problems.append(f"{self.path.name}: arms.json copy missing or not the stamped arms file")
         if not meta:
             self.problems.append(f"{self.path.name}: run-meta.json missing (no provenance)")
         else:
-            ids = {tuple(m.get(k) for k in IDENTITY) for m in meta}
-            if len(ids) != 1 or None in next(iter(ids)):
-                self.problems.append(f"{self.path.name}: invocations disagree or lack identity fields")
-            else:
-                self.identity = dict(zip(IDENTITY, next(iter(ids))))
-        self.arms = None
-        arms_path = self.path / "arms.json"
-        if arms_path.exists() and self.identity and file_sha(arms_path) == self.identity["arms_sha256"]:
-            self.arms = json.loads(arms_path.read_text())["arms"]
-        elif self.identity:
-            self.problems.append(f"{self.path.name}: arms.json copy missing or not the stamped arms file")
+            try:
+                ids = set()
+                for m in meta:
+                    receipts = evidence.normalize_arm_receipts(
+                        m, required, allow_legacy=self.arms is not None and not evidence.has_model_overrides(self.arms))
+                    ids.add(canonical(dict({k: m.get(k) for k in IDENTITY}, arm_model_receipt_sha256=receipts)))
+                if len(ids) != 1 or None in json.loads(next(iter(ids))).values():
+                    raise ValueError("invocations disagree or lack identity fields")
+                self.identity = json.loads(next(iter(ids)))
+            except (ValueError, TypeError, AttributeError) as e:
+                self.problems.append(f"{self.path.name}: {e}")
         if not (self.path / "runs.jsonl").exists():
             self.problems.append(f"{self.path.name}: runs.jsonl missing (no provenance)")
+        self.runs_bytes = None
         try:
-            lines, tail, raws = read_journal_lines(self.path / "runs.jsonl")
+            ledger_path = self.path / "runs.jsonl"
+            self.runs_bytes = ledger_path.read_bytes() if ledger_path.exists() else b""
+            lines, tail, raws = read_journal_lines(self.path / "runs.jsonl", data=self.runs_bytes)
         except OSError as e:
             lines, tail, raws = [], None, []
             self.problems.append(f"{self.path.name}: runs.jsonl unreadable ({e})")
@@ -85,7 +98,9 @@ class RunDir:
             self.problems.append(f"{self.path.name}: runs.jsonl ends with an incomplete record "
                                  "(run the runner again to quarantine it)")
         resets = _journal(self.path / "resets.jsonl", self.problems)
-        self.ledger = evidence.Ledger(lines, resets, self.identity or {}, raws)
+        self.require_replay = self.arms is not None and evidence.has_model_overrides(self.arms)
+        self.ledger = evidence.Ledger(lines, resets, self.identity or {}, raws,
+                                      require_replay=self.require_replay)
         if self.ledger.bad_resets:
             self.problems.append(f"{self.path.name}: resets.jsonl holds resets not bound to this run journal "
                                  "(run the runner again to repair)")
@@ -125,6 +140,9 @@ class RunDir:
     def failure_count(self, case, label):
         return len(self.ledger.failed(case, label))
 
+    def witness_failure_count(self, case, label):
+        return len(self.ledger.witness_failed(case, label))
+
     def reduction(self, case, label):
         stem = self.path / "red" / f"{case}.{label}"
         return load_red(stem) if Path(str(stem) + ".json").exists() else None
@@ -135,10 +153,11 @@ class RunDir:
         npz, js = Path(str(stem) + ".npz"), Path(str(stem) + ".json")
         if not (npz_sha and json_sha and npz.exists() and js.exists()):
             return None
-        if file_sha(npz) != npz_sha or file_sha(js) != json_sha:
-            return None
         try:
-            return load_red(stem)
+            npz_bytes, json_bytes = npz.read_bytes(), js.read_bytes()
+            if sha(npz_bytes) != npz_sha or sha(json_bytes) != json_sha:
+                return None
+            return load_red_bytes(npz_bytes, json_bytes)
         except (OSError, ValueError, KeyError):
             return None
 
@@ -147,12 +166,17 @@ class RunDir:
         return path if path.exists() else None
 
 
-def analyze(manifest_dir, plan_path, run_dirs):
+def analyze(manifest_dir, plan_path, run_dirs, *, _captured=None):
     plan, plan_digest = plan_mod.load(plan_path)
     manifest, manifest_digest = manifest_mod.load(manifest_dir)
     if plan["manifest_sha256"] != manifest_digest:
         raise ValueError("plan was made for another manifest")
-    dirs = [RunDir(d) for d in run_dirs]
+    dirs = [RunDir(d, plan_mod.arms_needed(plan)) for d in run_dirs]
+    if _captured is not None:
+        # Private verification channel; never changes public summaries or receipt bytes.
+        _captured.update(plan_sha256=plan_digest,
+                         ledgers={d.path.resolve(): sha(d.runs_bytes) if d.runs_bytes is not None else None
+                                  for d in dirs})
     ref, ctrl = plan["reference"], plan.get("control")
     qualified = plan["options"] + [c["name"] for c in plan["compositions"]]
     arms = ([ctrl] if ctrl else []) + qualified
@@ -162,8 +186,8 @@ def analyze(manifest_dir, plan_path, run_dirs):
     # --- global gates: identity, provenance, plan, calibration source
     for d in dirs:
         problems["*"].extend(("INVALID", p) for p in d.problems)
-    identities = {tuple(sorted(d.identity.items())) for d in dirs if d.identity}
-    identity = dict(next(iter(identities))) if len(identities) == 1 else None
+    identities = {canonical(d.identity) for d in dirs if d.identity}
+    identity = json.loads(next(iter(identities))) if len(identities) == 1 else None
     if len(identities) > 1:
         problems["*"].append(("INVALID", "run directories have different identities (plan/binary/arms/receipt)"))
     if identity:
@@ -184,6 +208,14 @@ def analyze(manifest_dir, plan_path, run_dirs):
     arm_defs = next((d.arms for d in dirs if d.arms), None)
     source = plan.get("calibration_source")
     if source is not None and identity and not plan_problem:
+        try:
+            summary = source.get("search_summary", {})
+            source_meta = dict(summary, model_receipt_sha256=source["model_receipt_sha256"])
+            calibrated = evidence.normalize_arm_receipts(source_meta, [n for n in (ref, ctrl) if n])
+            if any(identity["arm_model_receipt_sha256"][n] != digest for n, digest in calibrated.items()):
+                problems["*"].append(("INVALID", "effective reference/control model receipts differ from calibrated SEARCH receipts"))
+        except ValueError as e:
+            problems["*"].append(("INVALID", f"calibration source: {e}"))
         if (identity["binary_sha256"], identity["model_receipt_sha256"]) != \
                 (source["binary_sha256"], source["model_receipt_sha256"]) or arm_defs is None or \
                 arm_defs.get(ref) != source["reference_def"] or arm_defs.get(ctrl) != source["control_def"]:
@@ -233,6 +265,10 @@ def analyze(manifest_dir, plan_path, run_dirs):
                 or (raw is not None and file_sha(raw) != ref_sha)):
             problems["*"].append(("INVALID", f"{cid}: reference result not bound to a validated run"))
             continue
+        why = kept_witness(d.path, cid, ref, ref_rec, plan.get("witness", {}).get(ref))
+        if why:
+            problems["*"].append(("INVALID", f"{cid}: {ref} kept run lacks its witness: {why}"))
+            continue
         if int(ref_red[0]["nonfinite"].sum()):
             problems["*"].append(("FAIL", f"{cid}: non-finite reference logits"))
             continue
@@ -255,9 +291,14 @@ def analyze(manifest_dir, plan_path, run_dirs):
                 problems[key].append(("INVALID", f"{cid}: {lab}: {mark.get('error')}"))
                 continue
             if mark["status"] == "FAILED":
-                final = d.failure_count(cid, lab) >= mark.get("max_attempts", 2)
+                # A witness miss (the engine did not run what the arm declares: lever declined, route fell
+                # back) is missing evidence, never a failed option: it never counts toward FAIL. Classified
+                # from the journal's run records, not from the marker's text.
+                misses = d.witness_failure_count(cid, lab) if plan.get("witness") else 0
+                final = d.failure_count(cid, lab) - misses >= mark.get("max_attempts", 2)
                 problems[key].append(("FAIL" if final else "INCOMPLETE",
-                                      f"{cid}: {lab} run failed ({mark.get('attempts', 1)} attempts)"))
+                                      f"{cid}: {lab} run failed ({mark.get('attempts', 1)} attempts"
+                                      + (f", {misses} witness misses)" if misses else ")")))
                 continue
             if mark["status"] != "COMPLETE":
                 problems[key].append(("INCOMPLETE", f"{cid}: {lab} {mark['status']}"))
@@ -276,8 +317,23 @@ def analyze(manifest_dir, plan_path, run_dirs):
                     or arrays["label"].tolist() != cont):
                 problems[key].append(("INVALID", f"{cid}: {lab} result not bound to a validated run and reference"))
                 continue
-            routes[lab] = d.bound(cid, run_label, info["cand_sha256"], c["cont_tokens"], mark, plan_digest)["route"]
+            rec = d.bound(cid, run_label, info["cand_sha256"], c["cont_tokens"], mark, plan_digest)
+            routes[lab] = rec["route"]
+            why = kept_witness(d.path, cid, lab, rec, plan.get("witness", {}).get(
+                lab[:-len(REPEAT_SUFFIX)] if lab.endswith(REPEAT_SUFFIX) else lab))
+            if why:
+                problems[key].append(("INVALID", f"{cid}: {lab} kept run lacks its witness: {why}"))
+                continue
             if lab.endswith(REPEAT_SUFFIX):
+                # A replayed repeat must be another capture of another engine invocation than the accepted
+                # reference (equal logits bytes are expected; equal capture identity is not a repeat).
+                rc_ref, rc_rep = (ref_rec or {}).get("replay_capture"), (rec or {}).get("replay_capture")
+                if d.require_replay or rc_ref is not None or rc_rep is not None:
+                    if not (evidence.replay_provenance(ref_rec) and evidence.replay_provenance(rec)
+                            and rc_ref["capture_id"] != rc_rep["capture_id"]
+                            and rc_ref["collection_id"] != rc_rep["collection_id"]):
+                        problems["*"].append(("INVALID", f"{cid}: reference repeat is not an independent capture"))
+                        continue
                 # Identity of the repeat is decided by the two validated logits files themselves.
                 if info["cand_sha256"] != ref_sha or not mark.get("bitwise_identical"):
                     problems["*"].append(("FAIL", f"{cid}: reference repeat not bitwise identical"))
@@ -414,7 +470,33 @@ def analyze(manifest_dir, plan_path, run_dirs):
                "stratum_weights": plan.get("stratum_weights"),
                "effective_config_damaged_lines": effective_damaged,
                "global_problems": [f"{v}: {t}" for v, t in problems["*"]]}
+    if arm_defs and evidence.has_model_overrides(arm_defs):
+        context["arm_model_receipt_sha256"] = identity["arm_model_receipt_sha256"] if identity else {}
+        if (plan["split"] == "search" and control_means is not None
+                and not any(problems.values())
+                and all(complete(arm, pid) for arm in arms for pid in in_scope)):
+            context["replay_policy"] = plan_mod.REPLAY_POLICY
     return context, results, control_report, control_means
+
+
+def kept_witness(run_dir, cid, lab, rec, spec):
+    """Why the kept run ``rec`` of (case, label) does not carry its arm's witness (None when it does or none is
+    declared), re-checked on its saved stdout/stderr logs: the exact bytes the run record binds, decoded as at run
+    time. A run record without log hashes (older kit) cannot show a witness."""
+    if not spec:
+        return None
+    if not isinstance(rec.get("stdout_sha256"), str) or not isinstance(rec.get("stderr_sha256"), str):
+        return "run record does not bind its logs"
+    stem = Path(run_dir) / "log" / f"{cid}.{lab}"
+    try:
+        out = (stem.parent / (stem.name + ".stdout")).read_bytes()
+        err = (stem.parent / (stem.name + ".stderr")).read_bytes()
+    except OSError as e:
+        return f"logs unreadable ({type(e).__name__})"
+    if sha(out) != rec["stdout_sha256"] or sha(err) != rec["stderr_sha256"]:
+        return "logs are not the ones the run recorded"
+    from .run import parse_result
+    return witness_problem(spec, parse_result(decode_log(out)), decode_log(err))
 
 
 def evaluate(specs, guard_specs, opt, ctrl, pp, strata, level, idx, weights=None):
@@ -516,13 +598,27 @@ def finite(value):
     return value
 
 
-def write(receipts, context, results, control_report, control_means):
+def build_summary(context, results, control_report, control_means):
+    """Build the canonical summary in memory, without writing receipts or mutating inputs."""
     context, results = finite(context), finite(results)
-    control_report, control_means = finite(control_report), finite(control_means)
+    replay_policy = context.pop("replay_policy", None)
+    prefix = "" if context["qualification"] else "SEARCH-"
+    rows = [{"option": name, "verdict": prefix + r["verdict"]} for name, r in results.items()]
+    summary = dict(context, verdicts=rows, control=context["control"], control_means=finite(control_means),
+                   control_report=finite(control_report))
+    if replay_policy is not None:
+        summary["replay_policy"] = replay_policy
+    summary["self_sha256"] = sha(canonical(summary))
+    return summary
+
+
+def write(receipts, context, results, control_report, control_means):
+    summary = build_summary(context, results, control_report, control_means)
+    context, results = finite(context), finite(results)
+    context.pop("replay_policy", None)
     out = Path(receipts)
     out.mkdir(parents=True, exist_ok=True)
     prefix = "" if context["qualification"] else "SEARCH-"
-    rows = []
     for name, r in results.items():
         receipt = dict(context, option=name, verdict=prefix + r["verdict"], **{k: v for k, v in r.items()
                                                                                if k != "verdict"})
@@ -530,10 +626,6 @@ def write(receipts, context, results, control_report, control_means):
             receipt["secondary"] = dict(r["secondary"], verdict=prefix + r["secondary"]["verdict"])
         atomic(out / f"{name}.receipt.json", canonical(receipt))
         atomic(out / f"{name}.receipt.md", render_md(receipt).encode())
-        rows.append({"option": name, "verdict": receipt["verdict"]})
-    summary = dict(context, verdicts=rows, control=context["control"], control_means=control_means,
-                   control_report=control_report)
-    summary["self_sha256"] = sha(canonical(summary))
     atomic(out / "summary.json", canonical(summary))
     atomic(out / "summary.md", render_summary_md(summary, results).encode())
     return summary

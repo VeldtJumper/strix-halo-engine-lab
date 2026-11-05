@@ -9,12 +9,15 @@ position, label and vocabulary. Any difference raises; nothing is skipped. Write
 array per metric) and STEM.json (row count, vocabulary, file hashes, bitwise identity flag).
 """
 import argparse
+import hashlib
+import io
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
+from .common import captured_text
 from .common import atomic, canonical, file_sha
 from .metrics import FIELDS, SELF_FIELDS, compare, self_metrics
 from .records import reader
@@ -37,7 +40,8 @@ def _arrays(rows, fields):
 def reduce_pair(ref_path, cand_path, fmt="steps"):
     read = reader(fmt)
     rows, labels, identical, vocab = [], [], True, None
-    ref_iter, cand_iter = read(ref_path), read(cand_path)
+    h_ref, h_cand = hashlib.sha256(), hashlib.sha256()     # digests of the bytes actually reduced
+    ref_iter, cand_iter = read(ref_path, h_ref), read(cand_path, h_cand)
     while True:
         a = next(ref_iter, None)
         b = next(cand_iter, None)
@@ -57,14 +61,15 @@ def reduce_pair(ref_path, cand_path, fmt="steps"):
         raise HistoryMismatch("no rows")
     arrays = _arrays(rows, FIELDS)
     arrays["label"] = np.asarray(labels, dtype=np.int64)
-    info = {"rows": len(rows), "vocab": vocab, "format": fmt, "ref_sha256": file_sha(ref_path),
-            "cand_sha256": file_sha(cand_path), "bitwise_identical": bool(identical)}
+    info = {"rows": len(rows), "vocab": vocab, "format": fmt, "ref_sha256": h_ref.hexdigest(),
+            "cand_sha256": h_cand.hexdigest(), "bitwise_identical": bool(identical)}
     return arrays, info
 
 
 def reduce_self(ref_path, fmt="steps"):
     rows, labels, vocab = [], [], None
-    for r in reader(fmt)(ref_path):
+    h_ref = hashlib.sha256()
+    for r in reader(fmt)(ref_path, h_ref):
         rows.append(self_metrics(r.logits, r.label))
         labels.append(r.label)
         vocab = r.logits.size
@@ -72,7 +77,7 @@ def reduce_self(ref_path, fmt="steps"):
         raise HistoryMismatch("no rows")
     arrays = _arrays(rows, SELF_FIELDS)
     arrays["label"] = np.asarray(labels, dtype=np.int64)
-    return arrays, {"rows": len(rows), "vocab": vocab, "format": fmt, "ref_sha256": file_sha(ref_path)}
+    return arrays, {"rows": len(rows), "vocab": vocab, "format": fmt, "ref_sha256": h_ref.hexdigest()}
 
 
 def save(stem, arrays, info):
@@ -84,11 +89,16 @@ def save(stem, arrays, info):
     atomic(str(stem) + ".json", canonical(info))
 
 
+def load_bytes(npz_bytes, json_bytes):
+    """Parse exactly the captured reduction buffers (also used by hash verification)."""
+    with np.load(io.BytesIO(npz_bytes)) as data:
+        arrays = {k: data[k] for k in data.files}
+    return arrays, json.loads(captured_text(json_bytes))
+
+
 def load(stem):
     stem = Path(stem)
-    with np.load(str(stem) + ".npz") as data:
-        arrays = {k: data[k] for k in data.files}
-    return arrays, json.loads(Path(str(stem) + ".json").read_text())
+    return load_bytes(Path(str(stem) + ".npz").read_bytes(), Path(str(stem) + ".json").read_bytes())
 
 
 def main(argv=None):

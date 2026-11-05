@@ -266,6 +266,70 @@ class ArmsFileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_predict("8192=x")
 
+    def test_ledger_binds_arm_receipts_and_failure_events(self):
+        from tools.qualification.option_qual.evidence import Ledger, run_ok
+        ident = {k: "default" for k in ("plan_sha256", "binary_sha256", "arms_sha256", "model_receipt_sha256")}
+        ident["arm_model_receipt_sha256"] = {"REF": "ref-receipt", "A": "option-receipt"}
+        rec = dict({k: ident[k] for k in ("plan_sha256", "binary_sha256", "arms_sha256")},
+                   model_receipt_sha256="option-receipt", case_id="c.L8", arm="A", run_id="r1", route=[],
+                   rc=0, timeout=False, complete=True, shortened=False, rows=4, forced_steps=4, problem=None,
+                   logits_sha256="f", nominal_length=8, wall_seconds=1.0)
+        event = dict({k: rec[k] for k in ident if k != "arm_model_receipt_sha256"},
+                     event="reduction_failed", case_id="c.L8", arm="A", run_id="e1", of_run="r1", error="failed")
+        led = Ledger([rec, event], [], ident)
+        self.assertFalse(led.bad)
+        self.assertEqual(led.failed("c.L8", "A"), ["r1"])
+        self.assertTrue(run_ok(rec, ident))
+        wrong = dict(rec, model_receipt_sha256="default")
+        self.assertFalse(run_ok(wrong, ident))
+        self.assertTrue(Ledger([wrong], [], ident).bad)
+        repeat = dict(rec, arm="REF@repeat", model_receipt_sha256="ref-receipt")
+        self.assertTrue(run_ok(repeat, ident))
+
+    def test_replay_provenance_is_required_by_the_ledger_policy(self):
+        from tools.qualification.option_qual.evidence import Ledger, RUN_IDENTITY, replay_provenance
+        ident = {k: "identity" for k in RUN_IDENTITY}
+        rec = dict(ident, case_id="c.L8", arm="REF", run_id="r1", route=[], rc=0, timeout=False,
+                   complete=True, shortened=False, rows=4, forced_steps=4, problem=None,
+                   logits_sha256="a" * 64, nominal_length=8, wall_seconds=1.)
+        cap = dict(capture_id="capture", collection_id="collection", label="REF", bin_sha256="a" * 64)
+        good = dict(rec, replay_capture=cap)
+        self.assertTrue(replay_provenance(good))
+        self.assertFalse(Ledger([good], [], ident, require_replay=True).bad)
+        invalid = [None, [], {}, "capture"]
+        for key in cap:
+            for value in (None, "", 1):
+                invalid.append(dict(cap, **{key: value}))
+        invalid.extend([dict(cap, bin_sha256="b" * 64), dict(cap, bin_sha256="not-a-digest")])
+        for value in invalid:
+            with self.subTest(capture=value):
+                bad = dict(rec, replay_capture=value)
+                self.assertFalse(replay_provenance(bad))
+                self.assertTrue(Ledger([bad], [], ident, require_replay=True).bad)
+                self.assertFalse(Ledger([bad], [], ident).bad)
+        self.assertFalse(replay_provenance(rec))
+        self.assertTrue(Ledger([rec], [], ident, require_replay=True).bad)
+        # Failed attempts do not need a successful capture and retain their retry accounting.
+        failed = dict(rec, complete=False, rc=3, problem="capture rejected")
+        led = Ledger([failed], [], ident, require_replay=True)
+        self.assertFalse(led.bad)
+        self.assertEqual(led.failed("c.L8", "REF"), ["r1"])
+
+    def test_per_arm_model_pair(self):
+        from tools.qualification.option_qual.run import load_arms
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "arms.json"
+            spec = {"model": "option.gguf", "model_receipt": "option.receipt"}
+            path.write_text(json.dumps({"arms": {"REF": {}, "X": spec}}))
+            self.assertEqual(load_arms(path, ["REF", "X"])["X"], spec)
+            for key in ("model", "model_receipt"):
+                path.write_text(json.dumps({"arms": {"X": {key: spec[key]}}}))
+                with self.assertRaisesRegex(ValueError, "specified together"):
+                    load_arms(path, ["X"])
+            path.write_text(json.dumps({"arms": {"X": dict(spec, unknown=True)}}))
+            with self.assertRaises(ValueError):
+                load_arms(path, ["X"])
+
     def test_option_switches_allowed_hook_variables_refused(self):
         from tools.qualification.option_qual.run import load_arms
         with tempfile.TemporaryDirectory() as d:
@@ -453,7 +517,7 @@ class ManifestPlanTests(unittest.TestCase):
         refused(pl)
         self.assertEqual(cal["secondary"]["endpoints"]["E2"]["calibration"]["metric"], "loss")
         self.assertEqual(cal["calibration_source"]["search_summary"]["control_means"]["loss"], 0.01)
-        # the r26 case: the embedded SEARCH summary's mean, the records and the margins edited together
+        # the embedded SEARCH summary's mean, the records and the margins edited together
         pl = copy.deepcopy(cal)
         pl["calibration_source"]["search_summary"]["control_means"]["loss"] = 0.4
         for specs in (pl["secondary"]["endpoints"],):
@@ -463,13 +527,13 @@ class ManifestPlanTests(unittest.TestCase):
         pl = copy.deepcopy(cal)                      # a bound identity that is not the summary's
         pl["calibration_source"]["binary_sha256"] = "c" * 64
         refused(pl)
-        pl = copy.deepcopy(cal)                      # r27: scope edited after calibration
+        pl = copy.deepcopy(cal)                      # scope edited after calibration
         pl["lengths"] = [512]
         refused(pl)
         pl = copy.deepcopy(cal)
         pl["control"] = "CTRL2"
         refused(pl)
-        # r27: a calibrated SEARCH plan in the earlier form (no tier, no embedded summary) stays usable
+        # a calibrated SEARCH plan in the earlier form (no tier, no embedded summary) stays usable
         legacy = copy.deepcopy(cal)
         legacy["split"] = "search"
         del legacy["tier"]
@@ -477,7 +541,7 @@ class ManifestPlanTests(unittest.TestCase):
         legacy.pop("secondary")
         self.assertIsNone(plan.check(legacy))
         self.assertIsNotNone(plan.check(dict(legacy, split="holdout")))   # never for HOLDOUT
-        # r27: the legacy exemption covers the primary set only; explicit secondary tiers are checked
+        # the legacy exemption covers the primary set only; explicit secondary tiers are checked
         sec_long = copy.deepcopy(legacy)
         sec_long["secondary"] = {"tier": "fast-parity-long", "endpoints": {"E1": {"fixed": 0.05}}, "guards": {}}
         self.assertIsNotNone(plan.check(sec_long))
