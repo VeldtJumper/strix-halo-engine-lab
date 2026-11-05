@@ -91,10 +91,10 @@ At such budgets the DSpark drafter usually costs more than it gives: its windows
 plain decode. `--drafter auto` (the default) leaves it unloaded when experts will certainly be read from a single drive and
 lets its 4.47 GB hold more experts; DSpark requests then run plain decode with the same tokens. On one RTX PRO 6000 with one
 NVMe drive: 24+32 GiB 8.2 tok/s without the drafter vs 6-7.8 with DSpark, 48+32 32.2 vs 21.8, 64+32 52.2 vs 51.8; with
-expert stripes on two drives DSpark wins again (9.3 vs 7.8 at 24+32) and `auto` keeps it, as with no file tier (full card:
-DSpark 105-108 tok/s). Exception: at 48+32 with stripes on two drives `auto` keeps DSpark, which is slower there (about
-21 vs 31.5 tok/s without the drafter); use `--drafter off` in that setup until the rule is updated. `--drafter on` / `off`
-force it.
+expert stripes on two drives DSpark wins at 24+32 (9.3 vs 7.8) and `auto` keeps it while the device expert room is below
+18 GiB, as with no file tier (full card: DSpark 105-108 tok/s); at 48+32 on two drives DSpark is slower (about 21 vs 31.5
+tok/s), so `auto` runs it without the drafter, and 32+32 on two drives (not measured there) also runs without it.
+`--drafter on` / `off` force it.
 
 <a id="how-fast"></a>
 

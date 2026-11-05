@@ -236,12 +236,14 @@ Measured on the PRO (one NVMe drive, the same chat tokens in every arm):
 | 64 GiB + 32 GiB, one drive | 52.2 | 47.4-51.8 | |
 
 With `auto` at 24 GiB + 32 GiB the replica measured 8.05-8.13 tok/s (the drafter-free number), and in every row above
-`auto` picks the faster or an equal arm: off on one drive with a file tier, on with stripes on two drives or without a
-file tier. The exception is 48 GiB + 32 GiB with stripes on two drives, where `auto` keeps DSpark and it is about 32 %
-slower; use `--drafter off` there until the rule is updated.
+`auto` picks the faster or an equal arm: off on one drive with a file tier, on with stripes on two drives while the
+device expert room is below 18 GiB (24 GiB + 32 GiB, room about 14 GiB), off with stripes on two drives and a larger
+room (48 GiB + 32 GiB: 31.5 instead of 20.9-21.6 tok/s), on without a file tier. 32 GiB + 32 GiB on two drives
+(room about 22 GiB) is not measured and runs without the drafter.
 
-`auto` turns the drafter off exactly when a file tier is certain and the
-expert reads have fewer than 2 read locations. A file tier is certain when both
+`auto` turns the drafter off exactly when a file tier is certain, unless the
+expert reads have 2 or more read locations and the device expert room is below
+18 GiB. A file tier is certain when both
 sides are bounded (VRAM: `--vram-total-gib` or an explicit `--vram-expert-gib`;
 RAM: `--ram-total-gib` or an explicit `--ram-expert-gib`) and the room for
 experts is below every routed expert's bytes (layers x experts x one expert,

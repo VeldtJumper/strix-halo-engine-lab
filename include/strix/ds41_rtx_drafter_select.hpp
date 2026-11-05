@@ -4,11 +4,13 @@
 // drafter. Exact either way: only whether the drafter is loaded and whether requests run DSpark windows or plain decode
 // changes; the committed tokens are the same by construction.
 //
-// auto = OFF iff a file tier is certain AND the expert reads have fewer than 2 read locations; else ON. Measured on the
-// PRO (one NVMe drive): 24+32 plain 8.2 tok/s without the drafter vs DSpark 5.9-7.8; 32+32 plain 10.9 vs DSpark 10.2;
-// full budget (no file tier) DSpark 105-108 vs plain 26.7; 24+32 with the stripes on 2 drives DSpark 9.2-9.3 (above plain
-// on one drive). "A file tier is certain" = the expert room is bounded on both sides (VRAM: --vram-total-gib or an
-// explicit --vram-expert-gib; RAM: --ram-total-gib or an explicit --ram-expert-gib) and VRAM room + RAM room < every
+// auto = OFF iff a file tier is certain, unless the expert reads have >= 2 read locations AND the device expert room is
+// below kDrafterStripeMaxVramRoom (then ON); no file tier certain -> ON. Measured on the PRO: one drive, plain without the
+// drafter vs DSpark: 24+32 8.2 vs 5.9-7.8 tok/s, 32+32 10.9 vs 10.2, 48+32 32.2 vs 21.8, 64+32 52.2 vs 51.8; full budget
+// (no file tier) DSpark 105-108 vs plain 27; stripes on 2 drives: 24+32 DSpark 9.2-9.3 vs plain 7.8 (drafter ahead),
+// 48+32 DSpark 20.9-21.6 vs plain 31.5 (drafter behind). "A file tier is certain" = the expert room is bounded on both
+// sides (VRAM: --vram-total-gib or an explicit --vram-expert-gib; RAM: --ram-total-gib or an explicit --ram-expert-gib)
+// and VRAM room + RAM room < every
 // routed expert's bytes. The room is a pre-load estimate that never undercounts: the caps minus their margins minus the
 // declared fixed parts known before loading (the trunk's GGUF bytes on the device; nothing on the host), so a doubtful
 // case keeps the drafter (today's behaviour). Pure CPU (no CUDA).
@@ -85,6 +87,12 @@ struct DrafterSelect {
     }
 };
 
+// the device expert room below which DSpark still pays with expert stripes on >= 2 drives: just above the measured 24+32
+// cell (room ~14 GiB, DSpark ahead); 48+32 (room ~38 GiB) measured DSpark behind. 32+32 (room ~22 GiB) is not measured
+// on 2 drives yet, so it stays on the plain side (the only 32+32 cell, one drive, has plain ahead) until a PRO pair
+// shows DSpark ahead there.
+inline constexpr std::uint64_t kDrafterStripeMaxVramRoom = std::uint64_t{18} << 30;
+
 inline DrafterSelect drafter_select(const DrafterSelectIn& in) {
     DrafterSelect s;
     s.mode = in.mode;
@@ -106,11 +114,13 @@ inline DrafterSelect drafter_select(const DrafterSelectIn& in) {
         s.reason = "auto: routed expert bytes unknown (model header not read)";
     } else if (!s.file_tier_expected) {
         s.reason = "auto: every routed expert fits the VRAM + RAM room (no file tier)";
-    } else if (in.read_locations >= 2U) {
-        s.reason = "auto: file tier with " + std::to_string(in.read_locations) + " read locations (DSpark ahead with 2 drives)";
+    } else if (in.read_locations >= 2U && in.vram_room < kDrafterStripeMaxVramRoom) {
+        s.reason = "auto: file tier with " + std::to_string(in.read_locations) +
+                   " read locations and a small device expert room (DSpark ahead)";
     } else {
         s.on = false;
-        s.reason = "auto: file tier certain on 1 read location (plain decode measured faster)";
+        s.reason = in.read_locations >= 2U ? "auto: file tier with a large device expert room (plain decode measured faster)"
+                                           : "auto: file tier certain on 1 read location (plain decode measured faster)";
     }
     s.loaded = in.wanted && s.on;
     if (!in.wanted) s.reason += in.draft_given ? "; not loaded: no speculative phase" : "; not loaded: no --draft";

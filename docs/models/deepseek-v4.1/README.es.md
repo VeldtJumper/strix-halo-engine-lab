@@ -92,10 +92,11 @@ Con esos presupuestos el drafter DSpark suele costar más de lo que aporta: sus 
 la decodificación normal. `--drafter auto` (por defecto) no lo carga cuando los expertos se leerán seguro de una sola
 unidad, y sus 4.47 GB guardan más expertos; las peticiones DSpark se ejecutan entonces como decodificación normal con los
 mismos tokens. En una RTX PRO 6000 con una unidad NVMe: 24+32 GiB 8.2 tok/s sin drafter frente a 6-7.8 con DSpark, 48+32
-32.2 frente a 21.8, 64+32 52.2 frente a 51.8; con los expertos repartidos en dos unidades DSpark vuelve a ganar (9.3 frente
-a 7.8 en 24+32) y `auto` lo mantiene, igual que sin nivel de fichero (tarjeta completa: DSpark 105-108 tok/s). Excepción: con 48+32 y los expertos repartidos en dos unidades,
-`auto` mantiene DSpark, que ahí es más lento (unos 21 frente a 31.5 tok/s sin drafter); use `--drafter off` en esa
-configuración hasta que se actualice la regla. `--drafter on` / `off` lo fuerzan.
+32.2 frente a 21.8, 64+32 52.2 frente a 51.8; con los expertos repartidos en dos unidades DSpark gana en 24+32 (9.3 frente
+a 7.8) y `auto` lo mantiene mientras el espacio de expertos en el dispositivo sea inferior a 18 GiB, igual que sin nivel
+de fichero (tarjeta completa: DSpark 105-108 tok/s); con 48+32 y dos unidades DSpark es más lento (unos 21 frente a 31.5
+tok/s), así que `auto` lo ejecuta sin drafter, y 32+32 con dos unidades (sin medir en ese caso) también se ejecuta sin él.
+`--drafter on` / `off` lo fuerzan.
 
 <a id="how-fast"></a>
 

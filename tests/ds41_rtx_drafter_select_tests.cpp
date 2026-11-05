@@ -52,6 +52,12 @@ int main() {
         // the same caps with stripes on a second drive -> on
         auto s = drafter_select(capped(24, 32, 2));
         check(s.on && s.loaded && s.file_tier_expected && s.read_locations == 2, "caps, two locations: on");
+        // two locations but a large device expert room (48+32, 64+32 measured plain faster; 32+32 plain until measured) -> off
+        for (const auto v : {32ULL, 48ULL, 64ULL}) {
+            const auto t = drafter_select(capped(v, 32, 2));
+            check(!t.on && !t.loaded && t.file_tier_expected && t.read_locations == 2, "caps, two locations, large room: off");
+            check(t.reason.find("large device expert room") != std::string::npos, "reason names the room");
+        }
         // no caps (full budget) -> on, no file tier expected
         DrafterSelectIn full;
         full.draft_given = full.wanted = true;
