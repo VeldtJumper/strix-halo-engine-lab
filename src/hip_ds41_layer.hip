@@ -13,6 +13,7 @@
 #include <hip/hip_runtime.h>
 
 #include <array>
+#include <type_traits>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -1900,8 +1901,18 @@ void launch_f16_tiled(const F16RowsView& v, hipStream_t stream) {
 // slab's arithmetic and published to LDS after its last barrier. WR = 6 (48 x 64, 1024 threads) keeps the prefetch spill-free
 // (164 VGPRs; the 64 x 64 / WR 8 form needs 192 and spills). Lane l still adds elements l, l + 32, ... in ascending order with
 // separate multiply and add rounding from 0.0F, then the same butterfly and storing lane: the bits of f16_rows_kernel.
-template <unsigned RB, unsigned OB, unsigned GROUP, unsigned WR>
-__global__ __launch_bounds__(RB / WR * (OB / 16U) * 32U) void f16_tiled_pf_kernel(F16RowsView v, unsigned row_tiles, unsigned output_tiles) {
+// FUSED runs fmaf(w, x, acc) instead. When every x of the dispatch is a BF16 value (low 16 bits zero) that is zero or of
+// magnitude 2^-100 <= |x| < 2^101, the product with a finite F16 w (subnormal included) is zero (sign kept) or has at most
+// 11 + 8 significant bits and lies in 2^-124 .. 2^117 (normal, no overflow), so w * x is exact and fmaf rounds the same sum
+// the separate add rounds (cancellation, signed zeros, infinite acc and overflow alike): one instruction instead of two. An
+// infinite w gives the same infinity (or NaN with a zero x) in both forms; a NaN w gives NaN in both (payload may differ).
+// engram_x_exact_scan sets *wide_flag when any x is outside that set (Engram rows are e4m3 x e8m0 then BF16, so only
+// extreme scales); both forms are launched and the one that does not match the flag exits at once. A null wide_flag runs
+// the form unconditionally.
+template <unsigned RB, unsigned OB, unsigned GROUP, unsigned WR, bool FUSED>
+__device__ __forceinline__ void f16_tiled_pf_body(const F16RowsView& v, unsigned row_tiles, unsigned output_tiles,
+                                                  const unsigned* wide_flag) {
+    if (wide_flag && (*wide_flag != 0U) == FUSED) return;
     constexpr unsigned S = f16t_slab, WO = 16U, T = RB / WR * (OB / WO) * 32U;
     constexpr unsigned NX = (RB * S / 4U + T - 1U) / T, NW = (OB * S / 8U + T - 1U) / T;
     static_assert(RB % WR == 0 && OB % WO == 0 && T <= 1024U && (RB + OB) * S * sizeof(float) <= 65536U);
@@ -1987,7 +1998,10 @@ __global__ __launch_bounds__(RB / WR * (OB / 16U) * 32U) void f16_tiled_pf_kerne
 #pragma unroll
                 for (unsigned r = 0; r < WR; ++r)
 #pragma unroll
-                    for (unsigned j = 0; j < WO; ++j) acc[r][j] = acc[r][j] + wv[j][t] * xv[t][r];
+                    for (unsigned j = 0; j < WO; ++j) {
+                        if constexpr (FUSED) acc[r][j] = __builtin_fmaf(wv[j][t], xv[t][r], acc[r][j]);
+                        else acc[r][j] = acc[r][j] + wv[j][t] * xv[t][r];
+                    }
         }
         __syncthreads();  // all readers finish before the next publish
     }
@@ -1999,6 +2013,37 @@ __global__ __launch_bounds__(RB / WR * (OB / 16U) * 32U) void f16_tiled_pf_kerne
             const unsigned row = r0 + wr + r, o = o0 + wo + j;
             if (l == j && row < v.rows && o < v.count) v.out[static_cast<std::size_t>(row) * v.out_stride + o] = t;
         }
+}
+template <unsigned RB, unsigned OB, unsigned GROUP, unsigned WR, bool FUSED>
+__global__ __launch_bounds__(RB / WR * (OB / 16U) * 32U) void f16_tiled_pf_kernel(F16RowsView v, unsigned row_tiles, unsigned output_tiles,
+                                                                                        const unsigned* wide_flag) {
+    f16_tiled_pf_body<RB, OB, GROUP, WR, FUSED>(v, row_tiles, output_tiles, wide_flag);
+}
+// Two-resident form: a 512-thread tile capped at 8 waves per SIMD (<= 192 VGPRs), so two blocks share a WGP and one block's
+// slab barriers overlap the other's arithmetic (the 1024-thread 48 x 64 tile fills a WGP alone). Same per-output chain.
+template <unsigned RB, unsigned OB, unsigned GROUP, unsigned WR, bool FUSED>
+__global__ __attribute__((amdgpu_flat_work_group_size(1, 512), amdgpu_waves_per_eu(8))) void f16_tiled_pf2_kernel(F16RowsView v, unsigned row_tiles,
+                                                                                                             unsigned output_tiles,
+                                                                                                             const unsigned* wide_flag) {
+    static_assert(RB / WR * (OB / 16U) * 32U == 512U);
+    f16_tiled_pf_body<RB, OB, GROUP, WR, FUSED>(v, row_tiles, output_tiles, wide_flag);
+}
+// Sets *flag when any x of the view is not zero or a BF16 value of magnitude 2^-100 <= |x| < 2^101 (see f16_tiled_pf_body);
+// Inf and NaN have biased exponent 255 and are flagged.
+__global__ __launch_bounds__(256) void engram_x_exact_scan(F16RowsView v, unsigned* flag) {
+    const std::size_t per_row = v.width / 4U, total = per_row * v.rows;
+    bool wide = false;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x; i < total; i += static_cast<std::size_t>(gridDim.x) * 256U) {
+        const std::size_t row = i / per_row, c = i - row * per_row;
+        const uint4 e = *reinterpret_cast<const uint4*>(v.x + row * v.x_stride + c * 4U);
+        const unsigned words[4] = {e.x, e.y, e.z, e.w};
+#pragma unroll
+        for (unsigned k = 0; k < 4; ++k) {
+            const unsigned m = words[k] & 0x7FFFFFFFU;  // zero, or BF16 with biased exponent 27 .. 227
+            wide = wide || (words[k] & 0xFFFFU) != 0U || (m != 0U && (m < (27U << 23U) || m >= (228U << 23U)));
+        }
+    }
+    if (wide) atomicOr(flag, 1U);
 }
 
 // ---- embedding and argmax ---------------------------------------------------------------------------
@@ -2565,6 +2610,31 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     check(hipGetLastError(), "F16 rows launch");
 }
 
+// One flag word per (device, stream), allocated on first use and kept. The caller holds the entry's mutex from the reset
+// through both tile launches, so two host threads enqueueing on the same stream cannot interleave one call's reset, scan
+// and launches with another's (the stream then runs each call's four operations back to back).
+struct EngramWideFlag {
+    std::mutex submit;
+    unsigned* p = nullptr;
+};
+struct EngramWideFlags {
+    std::mutex mu;
+    std::map<std::pair<int, void*>, EngramWideFlag> flags;
+};
+static EngramWideFlags& engram_wide_flags() {
+    static EngramWideFlags f;
+    return f;
+}
+static EngramWideFlag& engram_wide_flag(void* stream) {
+    EngramWideFlags& all = engram_wide_flags();
+    int device = 0;
+    check(hipGetDevice(&device), "Engram flag device");
+    const std::lock_guard<std::mutex> lock(all.mu);
+    EngramWideFlag& f = all.flags[{device, stream}];
+    if (!f.p) check(hipMalloc(reinterpret_cast<void**>(&f.p), sizeof(unsigned)), "Engram flag alloc");
+    return f;
+}
+
 bool engram_f16_pf_supported(const F16RowsView& v) noexcept {
     return v.weight && !v.weight_f8 && v.x && v.out && v.width == 6144U && v.count == 25600U && v.first == 0U && v.rows >= 32U &&
            v.rows <= 8192U && v.x_stride >= v.width && v.x_stride % 4U == 0U && v.out_stride >= v.count &&
@@ -2573,11 +2643,104 @@ bool engram_f16_pf_supported(const F16RowsView& v) noexcept {
 
 void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
     require(engram_f16_pf_supported(v), "Engram F16 prefetch tile view");
-    const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
-    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U), 0,
-                       as_stream(stream), v, row_tiles, output_tiles);
+    // STRIX_DS41_ENGRAM_PF_TILE (read per call): 24 = 24 x 64 and 48x32 = 48 x 32 two-resident 512-thread tiles (the row
+    // extent of a raster group stays 384 rows), 48 = the 48 x 64 1024-thread tile. All give the same bits.
+    // STRIX_DS41_ENGRAM_PF_FMA (read per call): =0 runs only the separate multiply and add form (same bits). Otherwise the
+    // 48 x 64 tile scans x for values outside the exact-product set, and the fused and separate forms are both launched
+    // behind that flag (measured 4.5 % faster at 8192 rows). The 512-thread tiles keep the separate form: their fused body
+    // reaches the 192-register cap and spills (measured 10-12 % slower at 1056 and 2048 rows).
+    // A stream under graph capture keeps the separate form: the flag allocation is not capturable and graphs captured on
+    // one stream would share the flag word when replayed on different streams. So does the per-thread default stream:
+    // one handle names a different stream on every host thread, so a flag keyed by the handle would be shared.
+    const char* f = std::getenv("STRIX_DS41_ENGRAM_PF_FMA");
+    bool fma = !(f && f[0] == '0') && as_stream(stream) != hipStreamPerThread;
+    if (fma) {
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram capture status");
+        fma = capture == hipStreamCaptureStatusNone;
+    }
+    // Tile unset = auto: 48 x 64 whenever the fused form can run (measured up to 3.8 % faster than 48 x 32 at 1056 and 2048
+    // rows); with the separate form only, 48 x 32 up to 2048 rows (0.2-0.8 % faster there) and 48 x 64 above.
+    const char* e = std::getenv("STRIX_DS41_ENGRAM_PF_TILE");
+    const std::string tile = e && e[0] ? e : (fma || v.rows > 2048U ? "48" : "48x32");
+    fma = fma && tile != "24" && tile != "48x32";
+    unsigned* flag = nullptr;
+    std::unique_lock<std::mutex> submit;
+    if (fma) {
+        EngramWideFlag& w = engram_wide_flag(stream);
+        submit = std::unique_lock<std::mutex>(w.submit);
+        flag = w.p;
+        check(hipMemsetAsync(flag, 0, sizeof(unsigned), as_stream(stream)), "Engram x scan reset");
+        hipLaunchKernelGGL(engram_x_exact_scan, dim3(256), dim3(256), 0, as_stream(stream), v, flag);
+    }
+    const auto launch = [&](auto fused) {
+        constexpr bool F = decltype(fused)::value;
+        if constexpr (F) {
+            const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
+            hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles),
+                               dim3(48U / 6U * (64U / 16U) * 32U), 0, as_stream(stream), v, row_tiles, output_tiles, flag);
+        } else if (tile == "24") {
+            const unsigned row_tiles = (v.rows + 23U) / 24U, output_tiles = (v.count + 63U) / 64U;
+            hipLaunchKernelGGL((f16_tiled_pf2_kernel<24, 64, 16, 6, F>), dim3(row_tiles * output_tiles), dim3(512), 0,
+                               as_stream(stream), v, row_tiles, output_tiles, flag);
+        } else if (tile == "48x32") {
+            const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 31U) / 32U;
+            hipLaunchKernelGGL((f16_tiled_pf2_kernel<48, 32, 8, 6, F>), dim3(row_tiles * output_tiles), dim3(512), 0,
+                               as_stream(stream), v, row_tiles, output_tiles, flag);
+        } else {
+            const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
+            hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, F>), dim3(row_tiles * output_tiles),
+                               dim3(48U / 6U * (64U / 16U) * 32U), 0, as_stream(stream), v, row_tiles, output_tiles, flag);
+        }
+    };
+    if (fma) launch(std::true_type{});
+    launch(std::false_type{});
     check(hipGetLastError(), "Engram F16 prefetch tile launch");
 }
+
+#if STRIX_DS41_ENGRAM_DIAG
+// Test-enabled builds only (hip_ds41_engram_diag.hpp).
+bool engram_f16_pf_x_exact(const F16RowsView& v) {
+    require(engram_f16_pf_supported(v), "Engram F16 prefetch tile view");
+    unsigned* flag = nullptr;
+    check(hipMalloc(reinterpret_cast<void**>(&flag), sizeof(unsigned)), "Engram scan flag");
+    unsigned h = 1U;
+    hipError_t e = hipMemset(flag, 0, sizeof(unsigned));
+    if (e == hipSuccess) {
+        hipLaunchKernelGGL(engram_x_exact_scan, dim3(256), dim3(256), 0, nullptr, v, flag);
+        e = hipGetLastError();
+    }
+    if (e == hipSuccess) e = hipMemcpy(&h, flag, sizeof(unsigned), hipMemcpyDeviceToHost);
+    (void)hipFree(flag);
+    check(e, "Engram scan");
+    return h == 0U;
+}
+
+void enqueue_engram_f16_pf_fused_unchecked(const F16RowsView& v, void* stream) {
+    require(engram_f16_pf_supported(v), "Engram F16 prefetch tile view");
+    const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
+    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, true>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
+                       0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(nullptr));
+    check(hipGetLastError(), "Engram F16 fused launch");
+}
+
+int engram_f16_pf_stream_flag(void* stream) {
+    EngramWideFlags& all = engram_wide_flags();
+    int device = 0;
+    check(hipGetDevice(&device), "Engram flag device");
+    unsigned* p = nullptr;
+    {
+        const std::lock_guard<std::mutex> lock(all.mu);
+        const auto it = all.flags.find({device, stream});
+        if (it == all.flags.end()) return -1;
+        p = it->second.p;
+    }
+    check(hipStreamSynchronize(as_stream(stream)), "Engram flag sync");
+    unsigned h = 0U;
+    check(hipMemcpy(&h, p, sizeof(unsigned), hipMemcpyDeviceToHost), "Engram flag read");
+    return static_cast<int>(h);
+}
+#endif
 
 bool engram_f16_pf_admitted(const F16RowsView& v) noexcept {
     // The 48-row tile is ~14 % faster per padded row than the 64 x 64 default; admit it while its row padding is at most

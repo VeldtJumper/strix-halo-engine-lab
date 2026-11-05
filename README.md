@@ -91,6 +91,10 @@ conditions, repetition counts, exactness evidence and off switches.
 | **MiniMax H3** | 2 nodes over USB4 | Text to video + audio, 1344x768, 124 frames (5.17 s) + stereo audio, seed 42: 6-step LoRA, sparse attention tau 0.75, fast VAE | **405.5 s** (DiT 300.2 s, video VAE 42.4 s) | dense reference 8 steps: ~16 min on 1 node, ~8 min on the pair | h3 block `9d9d523b` |
 | llama.cpp `74a4fb00`, same machine, same Q4_K_M | 1 node | Reference: C1 plain / C4 / C8; prefill 2K / 8K / 32K; server at 8 clients | 55.5 / 193.3 / 279.9 tok/s; 2,062 / 1,881 / 1,376 tok/s; 227.1 tok/s | measured in the same session as the Nemotron rows | `74a4fb00` |
 
+DeepSeek prefill Engram projection: pieces use an exact fused multiply-add (bit-identical output), 4.4 % faster per
+8192-row piece (about 0.11 s per rank at 32K, extrapolated) and up to 3.8 % faster at 1056 / 2048 rows; the TTFT rows above
+predate it.
+
 Model pages: [Qwen](docs/models/qwen3.8/README.md) · [DeepSeek](docs/models/deepseek-v4.1/README.md) ·
 [MiniMax](docs/models/minimax-m3.1/README.md) · [GLM](docs/models/glm-5.3/README.md) ·
 [Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.md) · [MiniMax H3](docs/models/minimax-h3/README.md). The changelog of every shipped default with its measured
