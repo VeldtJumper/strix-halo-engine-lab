@@ -267,6 +267,19 @@ void product_table() {
         check(status(r, "decode_attention") == pr::Status::builtin && value(r, "decode_attention") == "exact",
               "default keeps the exact decode attention");
     }
+    // The A8 FFN/PLE fusion is exact: ON in every profile (the kernel applies it only under g4-a8-v1), =0 off.
+    // The value is the builtin, so apply() exports nothing: the kernel default carries the ON value.
+    for (const auto app : {pr::App::engine, pr::App::decode_bench}) {
+        for (const auto p : {pr::Name::standard, pr::Name::fast, pr::Name::quality}) {
+            r = pr::resolve(p, app, p == pr::Name::quality ? in({{"exl3_route", "/m4"}}) : in());
+            check(status(r, "a8_ffn_ple_fuse") == pr::Status::builtin && value(r, "a8_ffn_ple_fuse") == "1",
+                  "A8 fuse on by default");
+        }
+        r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_A8_FFN_PLE_FUSE", "0"}})));
+        check(status(r, "a8_ffn_ple_fuse") == pr::Status::off && !r.active("a8_ffn_ple_fuse"), "A8 fuse =0 off");
+        check(r.json().find("\"a8_ffn_ple_fuse\":{\"value\":\"off\",\"status\":\"off\"") != std::string::npos,
+              "A8 fuse off recorded in result JSON");
+    }
     // The prefill bench cannot run exact prefill: it refuses every profile without --allow-pending.
     refuses([] { (void)pr::resolve(pr::Name::fast, pr::App::prefill_bench, in()); }, "--allow-pending",
             "fast prefill bench refuses and names --allow-pending");

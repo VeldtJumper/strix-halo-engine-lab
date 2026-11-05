@@ -237,6 +237,73 @@ __device__ inline unsigned split_tree(float (&va)[split_rows(Rows)], float (&vb)
     }
     return row;
 }
+struct FfnPrologue {
+    const float* branch = nullptr;
+    LinearView norm;
+    float* residual = nullptr;
+    unsigned* ticket = nullptr;
+    bool prefetch = true, bounded = true, intervals = false, seeded = true;
+};
+// Each block consumes the old residual into private LDS before taking a ticket. Only the last
+// consumer publishes global residual/A8 bytes; all dots read private codes (no inter-block races).
+template <unsigned Rows, unsigned Threads>
+__device__ void ffn_prologue(const FfnPrologue& p, A8Rows published, A8Rows local, float (&x)[Rows][2560],
+                             unsigned* failure) {
+    constexpr unsigned J = 2560U / Threads;
+    __shared__ float factor;
+    for (unsigned r = 0; r < Rows; ++r) {
+        float b[J], h[J], g[J];
+        if (threadIdx.x < Threads) {
+#pragma unroll
+            for (unsigned j = 0; j < J; ++j) {
+                const unsigned i = threadIdx.x + Threads * j;
+                b[j] = p.branch[std::size_t(r) * 2560U + i];
+                h[j] = p.residual[std::size_t(r) * 2560U + i];
+                g[j] = p.norm.format == WeightFormat::f32
+                           ? reinterpret_cast<const float*>(p.norm.data)[i]
+                           : bf16_value(reinterpret_cast<const std::uint16_t*>(p.norm.data)[i]);
+                x[r][i] = b[j];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 32U) {
+            const float f = epilogue_factor<true>(x[r], 2560U, p.prefetch, p.bounded, p.intervals, p.seeded);
+            if (threadIdx.x == 0)
+                factor = f;
+        }
+        __syncthreads();
+        if (threadIdx.x < Threads) {
+#pragma unroll
+            for (unsigned j = 0; j < J; ++j) {
+                const unsigned i = threadIdx.x + Threads * j;
+                const float normalized = (b[j] * factor) * g[j];
+                finite_flag(normalized, failure);
+                const float value = h[j] + normalized;
+                finite_flag(value, failure);
+                x[r][i] = value;
+                a8_quantize_lane(value, local, r, i);
+            }
+        }
+        __syncthreads();
+    }
+    __shared__ bool last;
+    if (threadIdx.x == 0)
+        last = atomicAdd(p.ticket, 1U) == gridDim.x - 1U;
+    __syncthreads();
+    if (last) {
+        for (unsigned r = 0; r < Rows; ++r) {
+            for (unsigned i = threadIdx.x; i < 2560U; i += blockDim.x) {
+                p.residual[std::size_t(r) * 2560U + i] = x[r][i];
+                published.codes[std::size_t(r) * 2560U + i] = local.codes[std::size_t(r) * 2560U + i];
+            }
+            for (unsigned g = threadIdx.x; g < 80U; g += blockDim.x)
+                published.meta[std::size_t(r) * 80U + g] = local.meta[std::size_t(r) * 80U + g];
+        }
+        // The next launch/replay is stream ordered after every block, including these stores.
+        if (threadIdx.x == 0)
+            *p.ticket = 0U;
+    }
+}
 // Waves of four per block, two outputs per wave: lanes 0..15 own the first output, 16..31 the second.
 __device__ inline unsigned select_view(const LinearEpilogue& ep, LinearView& w, float*& out) {
     unsigned block = blockIdx.x;
@@ -253,9 +320,18 @@ __device__ inline unsigned select_view(const LinearEpilogue& ep, LinearView& w, 
 // Mode bit 1 (STRIX_G4_A8_PIPE): the next visit's weight groups are loaded before the current one is
 // accumulated (as pipelined_linear_kernel). Mode bit 2 (STRIX_G4_A8_STREAM): weights use nontemporal loads so
 // they do not displace the reused activation codes. Neither changes a visit or an operation.
-template <unsigned Rows, bool Gate, WeightFormat Format, bool Quant, unsigned Mode>
+template <unsigned Rows, bool Gate, WeightFormat Format, bool Quant, unsigned Mode, bool Ffn = false>
 __global__ void __launch_bounds__(Quant ? 512 : 128) a8_linear_kernel(LinearView w, LinearView up, A8Rows x, float* out,
-                                                                      unsigned* failure, LinearEpilogue ep, A8Rows quant) {
+                                                                      unsigned* failure, LinearEpilogue ep, A8Rows quant,
+                                                                      FfnPrologue prologue) {
+    if constexpr (Ffn) {
+        __shared__ float residual_rows[Rows][2560];
+        __shared__ __align__(16) std::int8_t codes[Rows * 2560U];
+        __shared__ __align__(16) Meta meta[Rows * 80U];
+        const A8Rows local{codes, meta, 2560U};
+        ffn_prologue<Rows, Quant ? 256U : 128U>(prologue, x, local, residual_rows, failure);
+        x = local;
+    }
     constexpr bool pipe = Mode & 1U, stream = Mode & 2U;
     using G = Group<Format, stream>;
     constexpr unsigned waves = Quant ? 16U : 4U;
@@ -440,7 +516,7 @@ void pair(LinearView w, LinearView up, A8Rows x, float* out, unsigned* failure, 
     const auto stream = static_cast<hipStream_t>(q);
     const dim3 threads(Quant ? 512 : 128);
     const auto run = [&](auto kernel) {
-        hipLaunchKernelGGL(kernel, dim3(blocks), threads, 0, stream, w, up, x, out, failure, ep, quant);
+        hipLaunchKernelGGL(kernel, dim3(blocks), threads, 0, stream, w, up, x, out, failure, ep, quant, FfnPrologue{});
     };
     switch (pair_mode()) {
     case 0:
@@ -507,12 +583,88 @@ bool dispatch(LinearView w, LinearView up, A8Rows x, unsigned rows, float* out, 
         throw std::runtime_error("g4-a8-v1 quantized-output geometry");
     return dispatch_format<Gate, true>(w, up, x, rows, out, failure, ep, w.outputs / 32U, q, quant);
 }
+template <WeightFormat Format, bool Quant>
+void launch_ffn(LinearView gate, A8Rows input, unsigned rows, float* out, unsigned* failure,
+                LinearEpilogue ep, Queue q, A8Rows quant, const FfnPrologue& p) {
+#define G4_A8_FFN(R)                                                                                                    \
+    case R:                                                                                                             \
+        hipLaunchKernelGGL((a8_linear_kernel<R, false, Format, Quant, 0, true>),                                           \
+                           dim3(Quant ? gate.outputs / 32U : (gate.outputs + 7U) / 8U),                                  \
+                           dim3(Quant ? 512 : 128), 0, static_cast<hipStream_t>(q), gate, LinearView{}, input, out,      \
+                           failure, ep, quant, p);                                                                      \
+        break
+    switch (rows) {
+        G4_A8_FFN(1);
+        G4_A8_FFN(2);
+        G4_A8_FFN(3);
+        G4_A8_FFN(4);
+    }
+#undef G4_A8_FFN
+}
+template <bool Quant>
+bool dispatch_ffn(LinearView gate, A8Rows input, unsigned rows, float* out, unsigned* failure,
+                  LinearEpilogue ep, Queue q, A8Rows quant, const FfnPrologue& p) {
+    switch (gate.format) {
+    case WeightFormat::q8_0:
+        launch_ffn<WeightFormat::q8_0, Quant>(gate, input, rows, out, failure, ep, q, quant, p);
+        break;
+    case WeightFormat::q4_k:
+        launch_ffn<WeightFormat::q4_k, Quant>(gate, input, rows, out, failure, ep, q, quant, p);
+        break;
+    case WeightFormat::q6_k:
+        launch_ffn<WeightFormat::q6_k, Quant>(gate, input, rows, out, failure, ep, q, quant, p);
+        break;
+    default:
+        return false;
+    }
+    launch_checked();
+    return true;
+}
 void check_input(LinearView w, const A8Rows& x, unsigned rows, const unsigned* failure) {
     valid_rows(rows);
     if (!w.data || !w.outputs || !w.inputs || w.inputs % 256U || x.width != w.inputs || !x.codes || !x.meta || !failure)
         throw std::runtime_error("g4-a8-v1 linear geometry");
 }
 } // namespace
+bool a8_ffn_ple_gate(const float* branch, LinearView norm, float* residual, LinearView gate,
+                      const float* ple, unsigned product_stride, unsigned rows, float* out, A8Rows input,
+                      unsigned* failure, unsigned* ticket, Queue q, A8Rows quant) {
+    const auto on = [](const char* name) {
+        const auto* v = std::getenv(name);
+        return !v || std::string_view(v) != "0";
+    };
+    const auto* early = std::getenv("STRIX_G4_EPILOGUE_EARLY_LOADS");
+    const auto overlap = [](const void* a, std::size_t na, const void* b, std::size_t nb) {
+        const auto x = reinterpret_cast<std::uintptr_t>(a), y = reinterpret_cast<std::uintptr_t>(b);
+        return x < y + nb && y < x + na;
+    };
+    const auto bytes = std::size_t(rows) * 2560U * sizeof(float);
+    if (!rows || rows > 4U || gate.inputs != 2560U || !gate.outputs || !gate.data || !branch || !residual || !out ||
+        !ple || product_stride < gate.outputs || !failure || !ticket || !norm.data || norm.outputs != 1U ||
+        norm.inputs != 2560U || (norm.format != WeightFormat::f32 && norm.format != WeightFormat::bf16) ||
+        reinterpret_cast<std::uintptr_t>(norm.data) % (norm.format == WeightFormat::f32 ? 4U : 2U) ||
+        !input.codes || !input.meta || input.width != 2560U || half_groups() || pair_mode() != 0U ||
+        !on("STRIX_G4_FAST_EPILOGUE") || !on("STRIX_G4_NORM_STAGE") || !on("STRIX_G4_NORM_SEARCH") ||
+        (early && std::string_view(early) == "1") || overlap(branch, bytes, residual, bytes) ||
+        overlap(out, std::size_t(rows) * gate.outputs * 4U, branch, bytes) ||
+        overlap(out, std::size_t(rows) * gate.outputs * 4U, residual, bytes) ||
+        (quant.codes && (!quant.meta || quant.width != gate.outputs || gate.outputs % 32U ||
+                         overlap(input.codes, std::size_t(rows) * input.width, quant.codes,
+                                 std::size_t(rows) * quant.width) ||
+                         overlap(input.meta, std::size_t(rows) * input.width / 32U * sizeof(Meta), quant.meta,
+                                 std::size_t(rows) * quant.width / 32U * sizeof(Meta)))))
+        return false;
+    LinearEpilogue ep;
+    ep.product = ple;
+    ep.product_stride = product_stride;
+    ep.hardware_half = hardware_half();
+    ep.split_tree = split_tree_enabled();
+    const auto* intervals = std::getenv("STRIX_G4_NORM_INTERVALS");
+    const FfnPrologue p{branch, norm, residual, ticket, on("STRIX_G4_NORM_PREFETCH"), on("STRIX_G4_NORM_BOUNDS"),
+                         intervals && std::string_view(intervals) == "1", on("STRIX_G4_SEEDED_RSQRT")};
+    return quant.codes ? dispatch_ffn<true>(gate, input, rows, out, failure, ep, q, quant, p)
+                       : dispatch_ffn<false>(gate, input, rows, out, failure, ep, q, quant, p);
+}
 void a8_quantize(const float* x, unsigned rows, unsigned width, A8Rows out, Queue q) {
     valid_rows(rows);
     if (!width || width % 256U || out.width != width || !out.codes || !out.meta)
