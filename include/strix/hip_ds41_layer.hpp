@@ -271,7 +271,8 @@ struct F16RowsView {
 };
 void enqueue_f16_rows(const F16RowsView& view, void* stream);
 // Engram prefill projection (F16 6144 -> 25600, first 0, 32..8192 rows (default admission below), 16-byte aligned x / weights, valid strides): a 48 x 64
-// LDS tile that prefetches the next slab into registers (the bits of enqueue_f16_rows). Default on; STRIX_DS41_ENGRAM_F16_PF=0
+// LDS tile that prefetches the next slab into registers (the bits of enqueue_f16_rows for finite F16 weights; a NaN weight
+// gives NaN in both, possibly with another payload). Default on; STRIX_DS41_ENGRAM_F16_PF=0
 // (read on every call) restores enqueue_f16_rows, which also serves every other view.
 void enqueue_engram_f16_rows(const F16RowsView& view, void* stream);
 // Explicit entry for tests / microbench: rejects unsupported views, ignores the switch.

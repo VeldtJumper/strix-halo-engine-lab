@@ -94,6 +94,10 @@ filas con sus condiciones, número de repeticiones, evidencia de exactitud e int
 | **MiniMax H3** | 2 nodos sobre USB4 | Texto a vídeo + audio, 1344x768, 124 fotogramas (5.17 s) + audio estéreo, semilla 42: LoRA de 6 pasos, atención dispersa tau 0.75, VAE rápido | **405.5 s** (DiT 300.2 s, VAE de vídeo 42.4 s) | referencia densa de 8 pasos: ~16 min en 1 nodo, ~8 min en el par | h3 block `9d9d523b` |
 | llama.cpp `74a4fb00`, misma máquina, mismo Q4_K_M | 1 nodo | Referencia: C1 simple / C4 / C8; prefill 2K / 8K / 32K; servidor con 8 clientes | 55.5 / 193.3 / 279.9 tok/s; 2,062 / 1,881 / 1,376 tok/s; 227.1 tok/s | medido en la misma sesión que las filas de Nemotron | `74a4fb00` |
 
+Proyección Engram del prefill de DeepSeek: las piezas usan una multiplicación-suma fusionada exacta (salida idéntica bit a
+bit), un 4.4 % más rápida por pieza de 8192 filas (unos 0.11 s por rango con 32K, extrapolado) y hasta un 3.8 % más rápida con
+1056 / 2048 filas; las filas de TTFT de arriba son anteriores.
+
 Páginas de los modelos: [Qwen](docs/models/qwen3.8/README.es.md) · [DeepSeek](docs/models/deepseek-v4.1/README.es.md) ·
 [MiniMax](docs/models/minimax-m3.1/README.es.md) · [GLM](docs/models/glm-5.3/README.es.md) ·
 [Nemotron](docs/models/nemotron-3.5-bolt-e4b/README.es.md) · [MiniMax H3](docs/models/minimax-h3/README.es.md). El registro de cambios de cada valor predeterminado
