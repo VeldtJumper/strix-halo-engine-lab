@@ -63,14 +63,15 @@ void identity() {
                             "draft_vocab.path", "rope.path", "tables.path", "max_positions", "segment_rows", "block_rows", "ple_host_pinned"})
         check(has_field(name), "required compatibility field present");
     // Guard: every getenv("LITERAL") in the Qwen CUDA sources and headers (src/cuda/qwen_*.{cu,cuh,cpp,hpp},
-    // include/strix/cuda_qwen_*.hpp) must be an identity field, and no other getenv form may appear there (a
-    // variable or helper-wrapped name would not be visible to this scan). qwen_prefix_identity.cpp is the reader.
+    // include/strix/cuda_qwen_*.hpp, apps/cuda_qwen_*, include/strix/cuda_vram_guard.hpp) must be an identity field
+    // or listed below, and no other getenv form may appear there (a variable or helper-wrapped name would not be
+    // visible to this scan). qwen_prefix_identity.cpp is the reader.
     const std::regex getenv_pattern(R"re(getenv\("([^"]+)"\))re");
     const std::regex any_getenv(R"re(getenv\s*\()re");
     // Read only to decline startup (the Prefill constructor throws when the BF16 MoE route is requested), so no
     // saved state can depend on them.
     const std::set<std::string> refuse_only = {"STRIX_QPF2K_MOE_ROUTE_BF16", "STRIX_BASELINE", "STRIX_QPF2K_DEFAULTS"};
-    const auto scan = [&](const std::string& dir, const std::string& prefix) {
+    const auto scan = [&](const std::string& dir, const std::string& prefix, const std::set<std::string>& exempt) {
         for (const auto& entry : std::filesystem::directory_iterator(dir)) {
             const auto name = entry.path().filename().string();
             const auto ext = entry.path().extension().string();
@@ -80,13 +81,22 @@ void identity() {
             const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             std::size_t literal = 0, all = 0;
             for (auto it = std::sregex_iterator(source.begin(), source.end(), getenv_pattern); it != std::sregex_iterator(); ++it, ++literal)
-                check(has_field((*it)[1].str()) || refuse_only.count((*it)[1].str()) != 0, "every Qwen CUDA getenv is covered by identity");
+                check(has_field((*it)[1].str()) || refuse_only.count((*it)[1].str()) != 0 || exempt.count((*it)[1].str()) != 0, "every Qwen CUDA getenv is covered by identity");
             for (auto it = std::sregex_iterator(source.begin(), source.end(), any_getenv); it != std::sregex_iterator(); ++it) ++all;
             check(all == literal, "Qwen CUDA getenv reads use a literal name");
         }
     };
-    scan(root + "/src/cuda", "qwen_");
-    scan(root + "/include/strix", "cuda_qwen_");
+    scan(root + "/src/cuda", "qwen_", {});
+    scan(root + "/include/strix", "cuda_qwen_", {});
+    // Serve app and VRAM guard: these only schedule sessions, size buffers or decline startup; saved rows and the
+    // restored output are the same under any value, so they are exempt from identity (listed, not pattern-matched).
+    const std::set<std::string> serve_only = {"STRIX_QRTX_PREFIX_CACHE", "STRIX_QRTX_HTTP_SLOTS",
+                                              "STRIX_QRTX_SLOT_MARGIN_MIB", "STRIX_QRTX_COHORT",
+                                              "STRIX_QRTX_PREFILL_OVERLAP", "STRIX_QRTX_PREFILL_POLL",
+                                              "STRIX_QRTX_PREFILL_AUTO_K", "STRIX_QRTX_ALLOW_SYSMEM",
+                                              "STRIX_QRTX_VRAM_HEADROOM_MIB"};
+    scan(root + "/apps", "cuda_qwen_", serve_only);
+    scan(root + "/include/strix", "cuda_vram_guard", serve_only);
     for (std::size_t i = 0; i < fields.size(); ++i) {
         auto changed = fields;
         changed[i].second += "changed";

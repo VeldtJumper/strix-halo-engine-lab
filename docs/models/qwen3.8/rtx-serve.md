@@ -102,8 +102,7 @@ host RAM, LRU-evicted; row segments are shared between checkpoints of the same p
   token; sync and overlapped prefill). With MTP, a checkpoint at position P also records token P and is restored
   only when it matches. Over HTTP, 48-50K-token agent turns gave identical output with the cache on and off (8/8).
 - **Cost to other slots:** a restore copies the saved rows on the decode stream, so the other sessions' decode
-  pauses for the copy (measured on the RTX PRO 6000: 6.6 / 29 / 50 ms at 256 / 16K / 32K restored
-  tokens).
+  pauses for the copy; the pause grows with the number of restored tokens.
 
 ## Tests
 

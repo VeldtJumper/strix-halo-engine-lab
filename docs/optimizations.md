@@ -3926,7 +3926,7 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Fallback notice:** A miss, a key mismatch or a skipped capture runs the full prefill; a request never fails because of the cache.
 - **Exactness evidence:** `qwen_prefix_cache_e2e` 16/16: state digests, 64 ids and logit hashes of a fresh prefill equal checkpoint-continue, restore into another session, changed suffix and changed boundary token, sync and overlapped prefill. HTTP on vs off, 48-50K-token agent turns: outputs identical 8/8.
 - **Off switch:** `--prefix-cache off`; `STRIX_QRTX_PREFIX_CACHE=0`
-- **Measured gain:** Pending the on/off window (20 alternating pairs). Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
+- **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
 
 ## Platform (kernel)
