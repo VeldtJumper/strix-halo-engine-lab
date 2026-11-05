@@ -1808,6 +1808,15 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/queue_trace_evidence_tests.py)
         add_test(NAME strix-runtime-inventory-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/runtime_inventory_tests.py)
+        # Option qualification kit (needs numpy). Package imports, so run from the source root.
+        add_test(NAME strix-option-qual-core-tests
+            COMMAND ${Python3_EXECUTABLE} -B -m unittest tools.qualification.option_qual.tests.test_core
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+        add_test(NAME strix-option-qual-end-to-end-tests
+            COMMAND ${Python3_EXECUTABLE} -B -m unittest tools.qualification.option_qual.tests.test_end_to_end
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+        set_tests_properties(strix-option-qual-core-tests strix-option-qual-end-to-end-tests PROPERTIES
+            TIMEOUT 3600 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
     endif()
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-dual-transport-runner-tests
