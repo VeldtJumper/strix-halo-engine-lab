@@ -3675,7 +3675,7 @@ over to batched plain steps.
 - **Fallback notice:** Startup says when multi-slot verify is unavailable.
 - **Exactness evidence:** `--selftest 8` on the pair: every stream's tokens equal the same prompt run alone (C=1 plain reference) at C2 / C4 / C6 / C8; multi-slot verify windows bitwise equal single-slot verify calls (device test).
 - **Off switch:** STRIX_GLM_SERVE_G2=0 (batched plain steps); STRIX_GLM_SERVE_MTP=0 turns off MTP at every C
-- **Measured gain:** `--selftest 8` (8 built-in short chat prompts in the GLM chat template, 22-59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, cache off, the server has no prompt cache), steady-state aggregate decode, G2 on (off): C2 53.03 (37.83) tok/s (+40 %), C4 59.88 (53.64) (+12 %), C6 62.50 (62.44), C8 69.48 (69.37) (handed over); C1 39.97 tok/s through MTP vs 25.30 plain
+- **Measured gain:** `--selftest 8` (8 built-in short chat prompts in the GLM chat template, 22-59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, prefix cache off), steady-state aggregate decode, G2 on (off): C2 53.03 (37.83) tok/s (+40 %), C4 59.88 (53.64) (+12 %), C6 62.50 (62.44), C8 69.48 (69.37) (handed over); C1 39.97 tok/s through MTP vs 25.30 plain
 - **Implementation / evidence:** [server](../apps/glm_serve_main.cpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
 
 <a id="glm-serve-prefill-chunk"></a>
@@ -3695,6 +3695,25 @@ producing tokens; with nothing decoding the prompt is prefilled whole in one cal
 - **Off switch:** --prefill-chunk 0 (always whole)
 - **Measured gain:** 4 prompts of ~1,830 tokens arriving every 16 decode rounds into 4 running streams, 128 generated tokens each, cache off: longest decode stall of running streams across another prompt's prefill 6.65 -> 2.67 s (-60 %)
 - **Implementation / evidence:** [server](../apps/glm_serve_main.cpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
+
+<a id="glm-serve-prefix-cache"></a>
+
+### Server prompt-prefix state cache
+
+**Engine:** `glm`. **Control:** `--prefix-cache-gib`. **Default:** 4 (GiB per rank).
+
+Both ranks keep a host-RAM LRU of slot snapshots (KDA state, DSA latent and indexer rows up to the prompt
+frontier, MTP cache) keyed by the full prompt token ids; with MTP the key is the prompt plus its first greedy
+token. A request whose prompt extends a stored key restores the longest one and prefills only the suffix
+through the usual chunk scheduler. `strix.prefix_cache` reports `hit_tokens`, `prefill_tokens` and `restore_ms`.
+
+- **Preconditions:** `strix-glm5-serve`; the same budget on both ranks (unequal budgets are refused at the handshake).
+- **Automatic selection:** A store commits only when both ranks snapshot the same bytes and each rank has at least 16 GiB MemAvailable; a miss or a refused store prefills the whole prompt.
+- **Fallback notice:** None.
+- **Exactness evidence:** Turn-2 tokens equal the same request replayed after clearing the cache (8/8 long, 16/16 short prompts), alone and batched, on both ranks; MTP prefix restore equals a cold run (`--selftest N --selftest-prefix`).
+- **Off switch:** --prefix-cache-gib 0
+- **Measured gain:** Two-turn conversations, first turn ~4,100 tokens, turn 2 adds 53 (4,120-token prompt, 4,067 restored): turn-2 admit-to-ready 8.57-8.98 -> 0.82-0.89 s (459-481 -> 4,629-5,024 tok/s, ~10x); restore 9-11 ms
+- **Implementation / evidence:** [cache](../src/glm/serve/glm_serve_prefix_cache.hpp), [lead loop](../src/glm/serve/glm_serve_lead.hpp)
 
 <a id="glm-rtx-prefill-clean-evict"></a>
 

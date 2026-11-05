@@ -20,11 +20,12 @@
 #include <vector>
 
 #include "glm/serve/glm_serve_import.hpp"
+#include "glm/serve/glm_serve_prefix_cache.hpp"
 
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 6;  // 3: chunked prefill (ppos); 4: batched spec (spec_verify / spec_draft); 5: import_expect / import_state / state_digest; 6: import settings in Hello (moves every later field by 16 bytes), import_drop
+inline constexpr std::uint32_t kControlVersion = 7;  // paired prefix snapshot prepare / commit / restore / clear
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
@@ -45,7 +46,7 @@ inline constexpr std::uint64_t kNoRound = ~std::uint64_t{0};
 // spec_draft: one more draft for slot pslot (an MTP extension step of its drafter chain).
 enum class Cmd : std::uint32_t { reply = 0, hello = 1, prefill = 2, step = 3, heartbeat = 4, shutdown = 5,
                                  mtp_enter = 6, mtp_run = 7, mtp_leave = 8, spec_verify = 9, spec_draft = 10,
-                                 import_state = 11, import_expect = 12, state_digest = 13, import_drop = 14 };
+                                 import_state = 11, import_expect = 12, state_digest = 13, import_drop = 14, prefix_prepare = 15, prefix_commit = 16, prefix_restore = 17, prefix_clear = 18, prefix_evict = 19 };
 // state_digest (import gate): both ranks digest slot pslot's state up to frontier ppos (Engine::state_bytes_upto, per
 // component: fnv64 + size, as u32 words); rank 1 sends its digests to rank 0. No engine state changes.
 // import_expect: every rank starts receiving the RTX hand-off for import_id (plen prompt tokens follow); its replies then
@@ -59,6 +60,11 @@ enum class Cmd : std::uint32_t { reply = 0, hello = 1, prefill = 2, step = 3, he
 
 inline const char* cmd_name(Cmd c) {
     switch (c) {
+        case Cmd::prefix_prepare: return "prefix_prepare";
+        case Cmd::prefix_commit: return "prefix_commit";
+        case Cmd::prefix_restore: return "prefix_restore";
+        case Cmd::prefix_clear: return "prefix_clear";
+        case Cmd::prefix_evict: return "prefix_evict";
         case Cmd::reply: return "reply";
         case Cmd::hello: return "hello";
         case Cmd::import_state: return "import_state";
@@ -103,6 +109,7 @@ struct Hello {
     std::uint32_t import_wire = 0;
     std::uint32_t import_pad = 0;
     std::uint64_t import_model_hash = 0;
+    std::uint64_t prefix_cache_bytes = 0;
     bool operator==(const Hello&) const = default;
 };
 
@@ -126,6 +133,11 @@ struct Control {
     std::uint32_t sbudget[kMaxRows]{};   // spec_verify: per window
     std::uint32_t import_id = 0, import_status = 0;  // import_state / import_expect; replies: this rank's staging status
     std::uint32_t import_token = 0, pad2 = 0;          // replies: the first token of this rank's import_state
+    // Prefix prepare: key tokens follow (plen), ppos = snapshot frontier, pflags = MTP.
+    // Paired votes carry id / ok / charged bytes; commit accepts only after both votes match.
+    // Restore names a committed id, identity, frontier and MTP setting; its paired vote precedes suffix work.
+    std::uint64_t prefix_id = 0, prefix_identity = 0, prefix_bytes = 0;
+    std::uint32_t prefix_ok = 0, prefix_pad = 0;
 };
 static_assert(sizeof(Control) <= kControlBytes);
 static_assert(sizeof(WireRow) == 16);
@@ -133,18 +145,21 @@ static_assert(sizeof(WireRow) == 16);
 // kControlVersion (decode checks magic and version before reading any other field, so a peer with another layout is
 // refused there instead of misreading commands).
 static_assert(offsetof(Control, magic) == 0 && offsetof(Control, version) == 4, "GLMC: magic / version lead the block");
-static_assert(offsetof(Control, hello) == 200 && sizeof(Hello) == 72, "GLMC v6 layout: Hello");
-static_assert(offsetof(Control, pflags) == 272 && offsetof(Control, budget) == 276 && offsetof(Control, cycles) == 280 &&
-                  offsetof(Control, ppos) == 288 && offsetof(Control, sbudget) == 296 && offsetof(Control, import_id) == 328 &&
-                  offsetof(Control, import_status) == 332 && offsetof(Control, import_token) == 336 && sizeof(Control) == 344,
-              "GLMC v6 layout changed: bump kControlVersion and update these offsets");
-static_assert(offsetof(Control, pad1) == 284 && offsetof(Control, pad2) == 340, "GLMC v6 layout: reserved fields");
+static_assert(offsetof(Control, hello) == 200 && sizeof(Hello) == 80, "GLMC v7 layout: Hello");
+static_assert(offsetof(Control, pflags) == 280 && offsetof(Control, budget) == 284 && offsetof(Control, cycles) == 288 &&
+                  offsetof(Control, pad1) == 292 && offsetof(Control, ppos) == 296 && offsetof(Control, sbudget) == 304 &&
+                  offsetof(Control, import_id) == 336 && offsetof(Control, import_status) == 340 &&
+                  offsetof(Control, import_token) == 344 && offsetof(Control, pad2) == 348 &&
+                  offsetof(Control, prefix_id) == 352 && offsetof(Control, prefix_identity) == 360 &&
+                  offsetof(Control, prefix_bytes) == 368 && offsetof(Control, prefix_ok) == 376 &&
+                  offsetof(Control, prefix_pad) == 380 && sizeof(Control) == 384,
+              "GLMC v7 layout changed: bump kControlVersion and update these offsets");
 static_assert(offsetof(Hello, model_hash) == 0 && offsetof(Hello, identity_hash) == 8 && offsetof(Hello, capacity) == 16 &&
                   offsetof(Hello, slots) == 24 && offsetof(Hello, max_rows) == 28 && offsetof(Hello, step_rows) == 32 &&
                   offsetof(Hello, world) == 36 && offsetof(Hello, mtp) == 40 && offsetof(Hello, mtp_kmax) == 44 &&
                   offsetof(Hello, g2) == 48 && offsetof(Hello, import_flags) == 52 && offsetof(Hello, import_wire) == 56 &&
-                  offsetof(Hello, import_pad) == 60 && offsetof(Hello, import_model_hash) == 64,
-              "GLMC v6 Hello layout changed: bump kControlVersion and update these offsets");
+                  offsetof(Hello, import_pad) == 60 && offsetof(Hello, import_model_hash) == 64 && offsetof(Hello, prefix_cache_bytes) == 72,
+              "GLMC v7 Hello layout changed: bump kControlVersion and update these offsets");
 
 inline std::uint32_t fnv1a32(std::span<const std::uint32_t> tokens, std::uint32_t h = 2166136261U) {
     for (const std::uint32_t t : tokens)
@@ -179,7 +194,7 @@ inline Control decode(const Block& b) {
     if (c.version != kControlVersion)
         throw ProtocolError("control channel: protocol version " + std::to_string(c.version) + " from the peer, expected " +
                             std::to_string(kControlVersion));
-    if (c.cmd > static_cast<std::uint32_t>(Cmd::import_drop)) throw ProtocolError("control channel: unknown command");
+    if (c.cmd > static_cast<std::uint32_t>(Cmd::prefix_evict)) throw ProtocolError("control channel: unknown command");
     if (c.cycles > kMaxMtpCycles) throw ProtocolError("control channel: too many MTP cycles");
     if (c.nrows > kMaxRows) throw ProtocolError("control channel: more than 8 rows");
     if (c.pslot >= 32) throw ProtocolError("control channel: prefill slot out of range");
@@ -209,6 +224,7 @@ inline std::string hello_mismatch(const Hello& mine, const Hello& peer) {
     f("import_flags", mine.import_flags, peer.import_flags);
     f("import_wire", mine.import_wire, peer.import_wire);
     f("import_model_hash", mine.import_model_hash, peer.import_model_hash);
+    f("prefix_cache_bytes", mine.prefix_cache_bytes, peer.prefix_cache_bytes);
     return s;
 }
 
@@ -355,13 +371,88 @@ private:
 // mtp_leave(slot); spec_verify(rows, budgets) -> per window [count, tokens..]; spec_draft(slot) -> draft. `prompt`: the lead's prompt (sent), or empty on the follower (received). Returns the produced tokens.
 template<class Eng>
 std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::vector<std::uint32_t>& prompt, bool sender,
-                                  std::uint32_t slots, std::uint64_t capacity) {
+                                  std::uint32_t slots, std::uint64_t capacity, PrefixCache* cache = nullptr) {
     const auto cmd = static_cast<Cmd>(c.cmd);
     if (slots < 32 && (c.resets >> slots) != 0) throw ProtocolError("control channel: reset of a slot out of range");
     for (std::uint32_t s = 0; s < slots && s < 32; ++s)
         if ((c.resets >> s) & 1U) eng.reset(s);
     std::vector<std::uint32_t> out;
     switch (cmd) {
+        case Cmd::prefix_evict:
+            if (!cache || !cache->erase(c.prefix_id)) throw ProtocolError("prefix cache: eviction key missing");
+            return out;
+        case Cmd::prefix_clear:
+            if (!cache) throw ProtocolError("prefix cache unavailable");
+            cache->clear();
+            return out;
+        case Cmd::prefix_commit:
+            if (!cache) throw ProtocolError("prefix cache unavailable");
+            if (c.prefix_ok && (cache->pending_bytes() == 0 || cache->replacement_id() != 0 ||
+                                cache->bytes() > cache->budget() - cache->pending_bytes()))
+                throw ProtocolError("prefix cache: commit without paired preparation / lead eviction");
+            cache->commit(c.prefix_ok != 0);
+            return out;
+        case Cmd::prefix_prepare: {
+            if (!cache || c.pslot >= slots || c.ppos == 0 || c.ppos >= capacity || c.prefix_id == 0 ||
+                c.plen != c.ppos + ((c.pflags & kPrefillMtp) ? 1U : 0U))
+                throw ProtocolError("prefix cache: invalid snapshot");
+            ch.tokens(prompt, c.plen, sender);
+            bool ok = false;
+            try {
+                if constexpr (requires { eng.state_bytes_upto(c.pslot, c.ppos); }) {
+                    bool available = false;
+                    if constexpr (requires { eng.prefix_store_allowed(); }) available = eng.prefix_store_allowed();
+                    else available = prefix_memory_available();
+                    if (available) {
+                        PrefixCache::Entry e;
+                        e.id = c.prefix_id;
+                        e.identity = c.prefix_identity;
+                        e.mtp = (c.pflags & kPrefillMtp) != 0;
+                        e.frontier = c.ppos;
+                        e.ids = prompt;
+                        e.hash = prefix_hash(e.ids);
+                        e.state = eng.state_bytes_upto(c.pslot, c.ppos);
+                        ok = cache->prepare(std::move(e));
+                    }
+                }
+            } catch (...) { ok = false; }
+            if (!ok) cache->commit(false);
+            // Both ranks report before the lead's commit decision. No token echo changes.
+            Control vote;
+            vote.cmd = static_cast<std::uint32_t>(Cmd::reply);
+            vote.prefix_id = c.prefix_id;
+            vote.prefix_ok = ok ? 1U : 0U;
+            vote.prefix_bytes = cache->pending_bytes();
+            const auto peer = ch.exchange(vote);
+            if (!peer.prefix_ok || peer.prefix_id != c.prefix_id || peer.prefix_bytes != vote.prefix_bytes) cache->commit(false);
+            out.push_back(cache->pending_bytes() != 0 ? 1U : 0U);
+            return out;
+        }
+        case Cmd::prefix_restore: {
+            bool ok = false;
+            try {
+                if (cache && c.pslot < slots) {
+                    const auto* e = cache->get(c.prefix_id);
+                    if (e && e->frontier == c.ppos && e->identity == c.prefix_identity &&
+                        e->mtp == ((c.pflags & kPrefillMtp) != 0)) {
+                        if constexpr (requires { eng.restore_state(c.pslot, e->state, c.ppos); }) {
+                            eng.reset(c.pslot);
+                            eng.restore_state(c.pslot, e->state, c.ppos);
+                            cache->touch(c.prefix_id);
+                            ok = true;
+                        }
+                    }
+                }
+            } catch (...) { ok = false; }
+            Control vote;
+            vote.cmd = static_cast<std::uint32_t>(Cmd::reply);
+            vote.prefix_id = c.prefix_id;
+            vote.prefix_ok = ok ? 1U : 0U;
+            const auto peer = ch.exchange(vote);
+            if (!ok || !peer.prefix_ok || peer.prefix_id != c.prefix_id)
+                throw ProtocolError("prefix cache: paired restore failed or key missing");
+            return out;
+        }
         case Cmd::prefill: {
             if (c.pslot >= slots || (c.ppos == 0 && ((c.resets >> c.pslot) & 1U) == 0))
                 throw ProtocolError("control channel: prefill without its slot reset");

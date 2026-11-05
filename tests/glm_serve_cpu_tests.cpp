@@ -193,6 +193,22 @@ struct FakeEng {
         ++frontier[s];
         return tok(h[s]);
     }
+    bool refuse_prefix = false, fail_prefix_restore = false;
+    bool prefix_store_allowed() const { return !refuse_prefix; }
+    std::vector<std::uint8_t> state_bytes_upto(std::uint32_t s, std::uint64_t p) {
+        if (frontier.at(s) != p) throw std::runtime_error("fake snapshot frontier");
+        std::vector<std::uint8_t> bytes(sizeof(std::uint64_t));
+        std::memcpy(bytes.data(), &h.at(s), bytes.size());
+        return bytes;
+    }
+    void restore_state(std::uint32_t s, const std::vector<std::uint8_t>& bytes, std::uint64_t p) {
+        if (fail_prefix_restore) throw std::runtime_error("fake prefix restore failure");
+        if (!ready.at(s) || frontier[s] != 0 || bytes.size() != sizeof(std::uint64_t)) throw std::runtime_error("fake prefix restore");
+        std::memcpy(&h.at(s), bytes.data(), bytes.size());
+        frontier[s] = p;
+        spec[s] = {};
+        log.push_back("restore " + std::to_string(s) + " @" + std::to_string(p));
+    }
     void reset(std::uint32_t s) {
         plain_call();
         spec.at(s) = {};
@@ -470,7 +486,7 @@ struct PairRun {
 PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t tokens, std::uint32_t corrupt = 0,
                  gs::Hello h1 = hello_for(8, 4096, 2), bool mtp = false, unsigned chunk = 0, unsigned long_n = 0,
                  unsigned delay_us = 0, bool skip_basic = false, bool g2 = false, std::uint64_t* multi = nullptr,
-                 std::uint64_t import_min = 0, bool fail_import = false, bool fail_restore = false, std::uint8_t binding_salt = 0) {
+                 std::uint64_t import_min = 0, bool fail_import = false, bool fail_restore = false, std::uint8_t binding_salt = 0, bool prefix = false, bool refuse_prefix = false, std::uint64_t prefix_budget = 1ULL << 20) {
     PairRun out;
     Loopback lb;
     FakeEng e0(slots), e1(slots);
@@ -483,7 +499,9 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     e1.fail_restore = fail_restore;  // the follower's restore fails after both staged -> reset + fallback, still exact
     e1.binding_salt = binding_salt;  // the follower staged another hand-off -> the prepare vote aborts both
     gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
-    const gs::Hello h0 = hello_for(slots, 4096, 2);
+    gs::Hello h0 = hello_for(slots, 4096, 2);
+    if (prefix) h0.prefix_cache_bytes = h1.prefix_cache_bytes = prefix_budget;
+    e1.refuse_prefix = refuse_prefix;
     if (h1.slots == 8 && slots != 8) h1.slots = slots;
     std::thread follower([&] {
         try {
@@ -495,6 +513,7 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     std::atomic<bool> stop{false};
     sv::GenerationQueue queue(64);
     gs::LeadConfig lc;
+    lc.prefix_cache_bytes = h0.prefix_cache_bytes;
     lc.slots = slots;
     lc.capacity = 4096;
     lc.batch = batch;
@@ -528,7 +547,10 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
                     for (unsigned k = 0; k < 1000 + 37 * i; ++k) t.push_back(2000U + 7U * i + k % 911U);
                     hooks.long_prompts.push_back(std::move(t));
                 }
-                out.result = gs::run_selftest(queue, prompts(n), tokens, gs::default_stop_ids(), slots, [](const std::string& l) {
+                if (prefix) out.result.exact = gs::run_prefix_selftest(queue, prompts(n), tokens, gs::default_stop_ids(), {17, 23},
+                    [&lead] { lead.clear_prefix_cache(); }, [&lead] { return lead.stats().prefix_hits; },
+                    [](const std::string& line) { std::printf("%s\n", line.c_str()); });
+                else out.result = gs::run_selftest(queue, prompts(n), tokens, gs::default_stop_ids(), slots, [](const std::string& l) {
                     std::printf("  %s\n", l.c_str());
                 }, hooks);
             } catch (const std::exception& e) {
@@ -559,6 +581,107 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
 }  // namespace
 
 int main() {
+    // ---- prefix key semantics, byte LRU, full-token collision checks and admission parsing
+    {
+        auto entry = [](std::uint64_t id, std::vector<std::uint32_t> ids, bool mtp = false, std::uint64_t identity = 7) {
+            gs::PrefixCache::Entry e;
+            e.id = id; e.ids = std::move(ids); e.hash = gs::prefix_hash(e.ids);
+            e.mtp = mtp; e.identity = identity; e.frontier = e.ids.size() - (mtp ? 1U : 0U);
+            e.state.assign(16, 42);
+            return e;
+        };
+        gs::PrefixCache c(4096);
+        CHECK(c.prepare(entry(1, {1, 2}))); c.commit(true);
+        CHECK(c.prepare(entry(2, {1, 2, 3}))); c.commit(true);
+        const std::vector<std::uint32_t> p{1, 2, 3, 4};
+        CHECK(c.find(p, false, 7)->id == 2);
+        CHECK(c.find(std::span(p).first(3), false, 7)->id == 1);  // exact key forbidden
+        CHECK(!c.find(std::span(p).first(2), false, 7));
+        CHECK(!c.find(p, true, 7) && !c.find(p, false, 8));
+        CHECK(c.prepare(entry(3, {1, 2, 3}, true))); c.commit(true);
+        CHECK(c.find(p, true, 7)->frontier == 2);  // A + y0 key; restore at |A|
+        auto collision = entry(4, {9, 9, 9});
+        collision.hash = gs::prefix_hash(std::span(p).first(3));
+        CHECK(c.prepare(std::move(collision))); c.commit(true);
+        CHECK(c.find(p, false, 7)->id == 2);  // matching hash alone is insufficient
+        const auto e = entry(5, {2, 3});
+        gs::PrefixCache lru(e.bytes() * 2);
+        CHECK(lru.prepare(entry(1, {1, 2}))); lru.commit(true);
+        CHECK(lru.prepare(entry(2, {2, 3}))); lru.commit(true);
+        lru.touch(1);
+        CHECK(lru.prepare(entry(3, {3, 4}))); lru.commit(true);
+        CHECK(lru.get(1) && !lru.get(2) && lru.get(3) && lru.evictions == 1);
+        auto huge = entry(4, {4, 5}); huge.state.resize(4096);
+        CHECK(!lru.prepare(std::move(huge)) && lru.bytes() == e.bytes() * 2);
+        CHECK(lru.prepare(entry(5, {5, 6}))); lru.commit(false);
+        CHECK(!lru.get(5) && lru.get(1));
+        CHECK(lru.prepare(entry(6, {1, 2}))); lru.commit(true);
+        CHECK(!lru.get(1) && lru.get(6) && lru.get(3) && lru.bytes() == e.bytes() * 2);
+        CHECK(gs::prefix_budget_bytes("0") == 0 && gs::prefix_budget_bytes("0.5") == (1ULL << 29));
+        for (const auto* v : {"-1", "nan", "inf", "1x", "17179869184", "1e-20"})
+            CHECK(throws_with([&] { (void)gs::prefix_budget_bytes(v); }, "--prefix-cache-gib"));
+        for (const auto* v : {"", "MemAvailable: -1 kB", "MemAvailable: 16777215 kB", "MemAvailable: bad kB"}) {
+            std::istringstream in(v); CHECK(!gs::prefix_memory_available(in));
+        }
+        std::istringstream in("MemFree: 0 kB\nMemAvailable: 16777216 kB\n");
+        CHECK(gs::prefix_memory_available(in));
+        auto hello = hello_for(2, 4096, 2), peer = hello;
+        peer.prefix_cache_bytes = 1;
+        CHECK(gs::hello_mismatch(hello, peer).find("prefix_cache_bytes") != std::string::npos);
+    }
+    {
+        // A budget holding only one snapshot forces the lead to publish explicit eviction victims.
+        const auto r = run_pair(3, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
+                                nullptr, 0, false, false, 0, true, false, 256);
+        CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty());
+        CHECK(r.stats.prefix_evictions > 0 && r.stats.prefix_bytes <= 256 && r.log0 == r.log1);
+        // Native prefix caching must not replace the optional imported numerical identity.
+        const auto imported = run_pair(2, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
+                                       nullptr, 1, false, false, 0, true);
+        CHECK(imported.lead_error.empty() && imported.follow_error.empty() && imported.driver_error.empty());
+        CHECK(imported.stats.imports > 0 && imported.stats.prefix_hits == 0 && imported.stats.prefix_stores == 0);
+    }
+    // Missing peer key and a local restore exception must be observed on BOTH ranks before suffix collectives.
+    for (const bool missing : {false, true}) {
+        Loopback lb;
+        gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
+        FakeEng e0(1), e1(1);
+        gs::PrefixCache k0(4096), k1(4096);
+        gs::PrefixCache::Entry e;
+        e.id = 1; e.identity = 7; e.frontier = 2; e.ids = {11, 22}; e.hash = gs::prefix_hash(e.ids);
+        e0.reset(0); (void)e0.prefill(0, e.ids, 0);
+        e.state = e0.state_bytes_upto(0, 2);
+        CHECK(k0.prepare(e)); k0.commit(true);
+        if (!missing) { CHECK(k1.prepare(e)); k1.commit(true); e1.fail_prefix_restore = true; }
+        gs::Control c;
+        c.cmd = static_cast<std::uint32_t>(gs::Cmd::prefix_restore);
+        c.prefix_id = 1; c.prefix_identity = 7; c.ppos = 2;
+        bool failed0 = false, failed1 = false;
+        std::thread peer([&] {
+            gs::Control reply;
+            const auto cmd = c1.exchange(reply);
+            std::vector<std::uint32_t> p;
+            failed1 = throws_with([&] { (void)gs::replay(e1, c1, cmd, p, false, 1, 64, &k1); }, "paired restore failed");
+        });
+        (void)c0.exchange(c);
+        std::vector<std::uint32_t> p;
+        failed0 = throws_with([&] { (void)gs::replay(e0, c0, c, p, true, 1, 64, &k0); }, "paired restore failed");
+        peer.join();
+        CHECK(failed0 && failed1 && e1.prefills == 0);
+    }
+    // PC2 through the actual lead/follower replay, plain and MTP/G2; independent rank-1 refusal must discard both.
+    for (const bool mtp : {false, true}) {
+        auto r = run_pair(3, 4, true, 16, 0, hello_for(4, 4096, 2), mtp, 7, 0, 0, false, mtp,
+                          nullptr, 0, false, false, 0, true);
+        CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty());
+        CHECK(r.result.exact && r.stats.prefix_hits >= 3 && r.stats.prefix_stores > 0);
+        CHECK(r.log0 == r.log1);
+        auto f = run_pair(2, 4, true, 16, 0, hello_for(4, 4096, 2), mtp, 7, 0, 0, false, mtp,
+                          nullptr, 0, false, false, 0, true, true);
+        CHECK(f.lead_error.empty() && f.follow_error.empty() && f.driver_error.empty());
+        CHECK(!f.result.exact && f.stats.prefix_hits == 0 && f.stats.prefix_stores == 0);
+    }
+
     // ---- import commit votes: both ranks fail together on any rank's failure, binding or frontier mismatch
     {
         std::printf("import commit votes:\n");
@@ -839,8 +962,8 @@ int main() {
             auto blk = gs::encode(c);
             const std::uint32_t v5 = 5;
             std::memcpy(blk.data() + offsetof(gs::Control, version), &v5, sizeof v5);
-            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 6"));
-            CHECK(gs::decode(gs::encode(c)).version == 6);
+            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 7"));
+            CHECK(gs::decode(gs::encode(c)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};

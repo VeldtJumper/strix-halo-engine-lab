@@ -98,6 +98,75 @@ inline std::vector<SelftestStream> selftest_batch(strix::serve::GenerationQueue&
     return out;
 }
 
+// PC2: replay the exact two-turn requests with the cache cleared before each reference
+// request. A warm arm must really hit: refused memory admission never counts as a pass.
+inline bool run_prefix_selftest(strix::serve::GenerationQueue& queue,
+                               const std::vector<std::vector<std::uint32_t>>& prompts, std::uint32_t max_tokens,
+                               const std::vector<std::uint32_t>& stops, const std::vector<std::uint32_t>& followup,
+                               const std::function<void()>& clear, const std::function<std::uint64_t()>& hits,
+                               const std::function<void(const std::string&)>& out) {
+    unsigned equal = 0, total = 0;
+    std::uint64_t warm_hits = 0;
+    auto run = [&](const std::vector<std::uint32_t>& p) {
+        double wall = 0;
+        return selftest_batch(queue, {p}, {0}, max_tokens, stops, wall).at(0);
+    };
+    auto compare = [&](const SelftestStream& a, const SelftestStream& b) {
+        ++total;
+        if (a.error.empty() && b.error.empty() && a.tokens == b.tokens) ++equal;
+        else out("prefix selftest stream " + std::to_string(total) + " DIFF: " + a.error + " / " + b.error);
+    };
+    // Each prompt alone exercises C1. The second arm admits all turn-2 requests together,
+    // exercising decode-first suffix chunks and G2 when enabled and capacity allows it.
+    for (const bool batched : {false, true}) {
+        clear();
+        std::vector<SelftestStream> first, second;
+        std::vector<std::vector<std::uint32_t>> next;
+        std::vector<std::size_t> idx;
+        for (const auto& p : prompts) {
+            if (!batched) clear();
+            first.push_back(run(p));
+            auto q = p;
+            q.insert(q.end(), first.back().tokens.begin(), first.back().tokens.end());
+            q.insert(q.end(), followup.begin(), followup.end());
+            next.push_back(std::move(q));
+            idx.push_back(idx.size());
+            if (!batched) {
+                const auto before = hits();
+                second.push_back(run(next.back()));
+                warm_hits += hits() - before;
+            }
+        }
+        if (batched) {
+            double wall = 0;
+            const auto before = hits();
+            second = selftest_batch(queue, next, idx, max_tokens, stops, wall);
+            warm_hits += hits() - before;
+        }
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            clear();
+            compare(first[i], run(prompts[i]));
+            clear();
+            const auto cold = run(next[i]);
+            compare(second[i], cold);
+            // PC3 timing: the turn-2 request served from the cache vs the same request with the cache cleared.
+            const auto& w = second[i].stats;
+            auto cache = [](const strix::serve::GenerationStats& s) {
+                for (const auto& [k, v] : s.engine_extra)
+                    if (k == "prefix_cache") return v;
+                return std::string("-");
+            };
+            char line[160];
+            std::snprintf(line, sizeof line, "prefix timing %s %zu: prompt %llu, admit-to-ready %.1f ms (cold %.1f ms), ",
+                          batched ? "batched" : "alone", i, static_cast<unsigned long long>(w.prompt_tokens), w.prefill_ms,
+                          cold.stats.prefill_ms);
+            out(line + cache(w) + " cold " + cache(cold.stats));
+        }
+    }
+    out("prefix selftest: " + std::to_string(equal) + "/" + std::to_string(total) + " EQUAL, hits " + std::to_string(warm_hits));
+    return total != 0 && equal == total && warm_hits >= 2 * prompts.size();
+}
+
 // The decode stall: the longest gap between two consecutive tokens of one stream that overlaps a prefill call of
 // another request (ms; 0 when no gap overlaps a prefill).
 inline double max_prefill_stall_ms(const std::vector<SelftestStream>& streams, const std::vector<TraceEvent>& ev) {
