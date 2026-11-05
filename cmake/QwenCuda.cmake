@@ -41,6 +41,17 @@ add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
+# Serving front end of the node (OpenAI/Anthropic API, SSE, GGUF BPE tokenizer, Qwen chat template) for the RTX engine.
+add_library(strix_serve_win STATIC
+    src/serve/json_constraint.cpp src/serve/constraint_selection.cpp src/serve/bpe_tokenizer.cpp
+    src/serve/chat_template.cpp src/serve/deepseek_chat.cpp src/serve/engine.cpp src/serve/api.cpp src/serve/request_fields.cpp src/serve/health.cpp src/serve/http_server.cpp)
+target_include_directories(strix_serve_win PUBLIC include PRIVATE src/serve)
+target_link_libraries(strix_serve_win PUBLIC strix_qwen_handoff)
+add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
+target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
+if(MSVC)
+    target_compile_options(strix-cuda-qwen-serve PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 add_executable(qwen_quant_host_test tests/cuda/qwen_quant_host_test.cpp src/ggml_dequant.cpp src/iq4_nl.cpp src/gguf_reader.cpp)
 target_include_directories(qwen_quant_host_test PRIVATE include)
 add_executable(qwen_quant_device_test tests/cuda/qwen_quant_device_test.cu src/ggml_dequant.cpp src/iq4_nl.cpp)
