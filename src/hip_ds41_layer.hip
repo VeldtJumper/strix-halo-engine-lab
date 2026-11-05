@@ -1488,7 +1488,7 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     // Lean >= 2: the activation codes as a buffer (raw, stride 0, offsets in bytes) and each row's byte offset
     const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), (abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), static_cast<int>((abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU})), 0x31004000);
     [[maybe_unused]] unsigned aoff[RT];
 #pragma unroll
     for (unsigned rt = 0; rt < RT; ++rt) {
@@ -1498,7 +1498,7 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     // Lean >= 3: the weight tensor as a buffer and each output row's byte offset (K-offset included)
     const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), (wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), static_cast<int>((wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU})), 0x31004000);
     [[maybe_unused]] unsigned woff[OT];
 #pragma unroll
     for (unsigned t = 0; t < OT; ++t) {
