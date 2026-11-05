@@ -27,6 +27,7 @@ def _table(endpoints, guards):
 
 def render_md(r):
     rep = r["report"]
+    receipts = r.get("arm_model_receipt_sha256", {})
     lines = [f"# {r['option']}: {r['verdict']}", "",
              f"{'Qualification' if r['qualification'] else 'SEARCH split: not a qualification'}; "
              f"reference `{r['reference']}`, control `{r['control']}`"
@@ -35,7 +36,11 @@ def render_md(r):
              f"({r['parents_used_per_stratum']}), "
              f"{rep['positions'] if rep else 0} positions; one-sided level {r['level']:.5f} (alpha {r['alpha']}, k {r['k']}).",
              f"Plan `{r['plan_sha256'][:16]}` (frozen {r['plan_frozen_utc']}), manifest `{r['manifest_sha256'][:16]}`, "
-             f"binary {', '.join(b[:16] for b in r['binary_sha256'])}.", "",
+             f"binary {', '.join(b[:16] for b in r['binary_sha256'])}.",
+             *(["Model receipt sha256: " + "; ".join(
+                 f"`{name}` `{receipts.get(name, '-')}`" for name in dict.fromkeys(
+                     n for n in (r["reference"], r["control"], r["option"]) if n)) + "."]
+               if "arm_model_receipt_sha256" in r else []), "",
              f"Deciding margins: {r.get('tier', 'exact-class')}." + _statement(r.get("statement"))
              + (" Every endpoint is the mean of the stratum means (strata weigh equally)."
                 if r.get("stratum_weights") == "equal" else ""), ""]

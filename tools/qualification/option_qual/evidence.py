@@ -58,11 +58,51 @@ def event_record(rec):
             and isinstance(rec.get("error"), str))
 
 
+def has_model_overrides(arms):
+    return any("model" in spec or "model_receipt" in spec for spec in arms.values())
+
+
+def normalize_arm_receipts(meta, required, allow_legacy=True):
+    """Validate explicit provenance; only an absent legacy field may use the default."""
+    key = "arm_model_receipt_sha256"
+    if key not in meta:
+        if not allow_legacy:
+            raise ValueError("arm receipt provenance missing for model overrides")
+        value = {name: meta.get("model_receipt_sha256") for name in required}
+    else:
+        value = meta[key]
+    if not isinstance(value, dict) or any(
+            name not in value or not isinstance(value[name], str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", value[name]) is None for name in required):
+        raise ValueError("malformed arm_model_receipt_sha256 provenance: every required arm needs a 64-hex receipt hash")
+    return {name: value[name] for name in required}
+
+
+def arm_identity(identity, label):
+    """Run identity with the receipt of this arm (including reference repeats)."""
+    name = label.removesuffix("@repeat") if isinstance(label, str) else ""
+    receipts = identity.get("arm_model_receipt_sha256")
+    if "arm_model_receipt_sha256" in identity:
+        receipt = receipts.get(name) if isinstance(receipts, dict) else None
+    else:
+        receipt = identity.get("model_receipt_sha256")
+    return dict(identity, model_receipt_sha256=receipt)
+
+
 def run_ok(rec, identity):
     """A well-formed, successful, complete run of this identity."""
-    return (run_record(rec) and all(rec[k] == identity.get(k) for k in RUN_IDENTITY)
+    return (run_record(rec) and all(rec[k] == arm_identity(identity, rec["arm"]).get(k) for k in RUN_IDENTITY)
             and rec["complete"] is True and rec["rc"] == 0 and rec["timeout"] is False and rec["problem"] is None
             and rec["rows"] == rec["forced_steps"] and bool(rec["logits_sha256"]))
+
+
+def replay_provenance(rec):
+    """A capture identity bound to this run's validated logits bytes."""
+    cap = rec.get("replay_capture") if isinstance(rec, dict) else None
+    return (isinstance(cap, dict)
+            and all(_str(cap.get(k)) for k in ("capture_id", "collection_id", "label", "bin_sha256"))
+            and re.fullmatch(r"[0-9a-fA-F]{64}", cap["bin_sha256"]) is not None
+            and cap["bin_sha256"] == rec.get("logits_sha256"))
 
 
 CASE_IN_TEXT = re.compile(r'"case_id"\s*:\s*"([^"\\]+)"')
@@ -96,8 +136,9 @@ class Ledger:
     journal's prefix or identity is not honoured (``bad_resets``); it can never void later lines.
     """
 
-    def __init__(self, lines, resets, identity, raws=None):
+    def __init__(self, lines, resets, identity, raws=None, require_replay=False):
         self.identity = identity or {}
+        self.require_replay = require_replay
         self.lines = list(lines)
         raws = list(raws) if raws is not None else None
         self.resets, self.bad_resets = [], []
@@ -116,8 +157,11 @@ class Ledger:
             if not (run_record(line) or event_record(line)):
                 self.bad.append((pos, _case_of(line), "malformed journal line"))
                 continue
-            if any(line[k] != self.identity.get(k) for k in RUN_IDENTITY):
+            if any(line[k] != arm_identity(self.identity, line["arm"]).get(k) for k in RUN_IDENTITY):
                 self.bad.append((pos, line["case_id"], "journal line of another identity"))
+                continue
+            if require_replay and run_ok(line, self.identity) and not replay_provenance(line):
+                self.bad.append((pos, line["case_id"], "successful run lacks replay provenance; reimport into a new --out"))
                 continue
             rid = line["run_id"]
             if rid in first:
@@ -184,6 +228,13 @@ class Ledger:
                 ids.append(rec["run_id"])
         return ids
 
+    def witness_failed(self, case_id, label):
+        """The failed runs of this pair (see failed) whose engine run did not carry its arm's witness."""
+        failed = set(self.failed(case_id, label))
+        return [rec["run_id"] for _, rec in self.records if "event" not in rec and rec["run_id"] in failed
+                and (rec["case_id"], rec["arm"]) == (case_id, label)
+                and str(rec.get("problem") or "").startswith("witness:")]
+
     def post(self):
         """Post-processing time seen after an engine run (validation, hashing): wall minus execution."""
         return [rec["wall_seconds"] - rec["exec_seconds"] for _, rec in self.records
@@ -198,7 +249,8 @@ class Ledger:
         """The marker names the newest counting run of this pair, a valid complete run with this logits
         file, the continuation's counts and the same route; the marker carries this plan."""
         rec = self.by_id(mark.get("run_id"), counting_case=case_id)
-        return (rec is not None and run_ok(rec, self.identity) and mark.get("plan_sha256") == plan_sha
+        return (rec is not None and run_ok(rec, self.identity)
+                and (not self.require_replay or replay_provenance(rec)) and mark.get("plan_sha256") == plan_sha
                 and (rec["case_id"], rec["arm"], rec["logits_sha256"]) == (case_id, label, sha)
                 and (rec["rows"], rec["forced_steps"]) == (cont_tokens, cont_tokens)
                 and rec["route"] == mark.get("route") and self.newest(case_id, label) == rec["run_id"]

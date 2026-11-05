@@ -19,6 +19,7 @@ import json
 import math
 from pathlib import Path
 
+from .common import captured_text
 from .common import VERSION, atomic, canonical, sha
 from . import manifest as manifest_mod
 
@@ -76,6 +77,10 @@ TIER_STATEMENTS = {
     "exact-class-long": "rounding-sensitive regime; non-inferior to a rounding-equivalent control",
     "fast-parity-long": "rounding-sensitive regime; non-inferior to a rounding-equivalent control",
 }
+# A summary may attest this policy only after validated, complete replay evidence.
+REPLAY_POLICY = "verified-arm-model-replay-v1"
+# Only records issued after verification of the actual captured buffers authorize margins.
+VERIFICATION_POLICY = "single-capture-arm-model-replay-v1"
 RULE_METRICS = ("loss", "kl_rc", "kl_cr", "disagree", "dnll")
 DEFAULT_MARGINS = {**TIERS["exact-class"], **{e: m for e, m in TIERS["fast-parity"].items() if e != "E1"}}
 
@@ -106,7 +111,8 @@ def _tier(name, endpoints, control):
 
 def init(manifest_dir, split, reference, control, options, compositions, lengths, alpha=0.05,
          bootstrap=20000, seed=20261027, min_parents=None, repeat_cases=(), endpoints=None, family=None,
-         routes=None, tier="exact-class", secondary_tier=None, e7_control_clip=None, stratum_weights=None):
+         routes=None, tier="exact-class", secondary_tier=None, e7_control_clip=None, stratum_weights=None,
+         witness=None):
     """``family``: names of every option/composition of the release family when they are qualified in
     separate campaigns (separate binaries); the simultaneous level then uses the whole family.
     ``routes``: {arm: regular expression} for arms that intentionally take another route than the
@@ -158,6 +164,7 @@ def init(manifest_dir, split, reference, control, options, compositions, lengths
             "tier": tier, "endpoints": specs, "guards": guards,
             **({"secondary": secondary} if secondary else {}),
             **({"stratum_weights": stratum_weights} if stratum_weights else {}),
+            **({"witness": witness} if witness is not None else {}),
             "frozen": False}
     problem = check(plan)
     if problem:
@@ -204,7 +211,114 @@ def _spec_problem(e, spec):
     return None
 
 
+# Label semantics apply only at the paths owned by each document schema.
+_LABEL_MAPS = {
+    "summary": {"parents_per_stratum": None, "effective_config": None},
+    "source": {},
+    "plan": {"routes": None, "witness": "witness", "endpoints": None, "guards": None},
+    "margin_set": {"endpoints": None, "guards": None},
+    "result": {"parents_used_per_stratum": None, "endpoints": None, "guards": "guard"},
+    "secondary_result": {"endpoints": None, "guards": "guard"},
+    "report": {"by_stratum": None, "by_length": None},
+    "guard": {"stratum_points": None},
+}
+_SCHEMA_CHILDREN = {
+    "summary": {"control_report": "report"},
+    "source": {"search_summary": "summary"},
+    "plan": {"calibration_source": "source", "secondary": "margin_set"},
+    "result": {"report": "report", "secondary": "secondary_result"},
+}
+
+
+def has_model_overrides(value, schema="summary"):
+    """Inspect provenance fields using the caller's schema; unknown wrappers stay generic."""
+    def walk(value, state):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"model", "model_receipt", "arm_model_receipt_sha256"}:
+                    return True
+                if key in {"env", "argv"} or (state == "witness" and key == "stdout"):
+                    # Expected stdout is arbitrary result data, including nested objects.
+                    continue
+                maps = _LABEL_MAPS.get(state, {})
+                if key in maps:
+                    if isinstance(child, dict):
+                        if any(walk(v, maps[key]) for v in child.values()):
+                            return True
+                        continue
+                    # Malformed label maps have no label exemption.
+                if walk(child, _SCHEMA_CHILDREN.get(state, {}).get(key)):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(walk(v, None) for v in value)
+        return False
+    return walk(value, schema)
+
+
+def _replay_policy_problem(summary, schema="summary"):
+    if has_model_overrides(summary, schema) and summary.get("replay_policy") != REPLAY_POLICY:
+        return ("override-bearing SEARCH summary lacks the verified replay policy attestation; "
+                "regenerate from validated replay evidence")
+    return None
+
+
+def _verification_problem(source):
+    if not has_model_overrides(source, "source"):
+        return None
+    # Whole-plan rewriting and rehashing is outside this boundary: the frozen plan SHA is published
+    # before data collection. This record binds the verification performed during calibration.
+    v = source.get("replay_verification")
+    digest = lambda x: isinstance(x, str) and re.fullmatch(r"[0-9a-f]{64}", x) is not None
+    if not isinstance(v, dict) or v.get("policy") != VERIFICATION_POLICY or not digest(v.get("search_plan_sha256")):
+        return "override-bearing calibration source lacks well-formed replay_verification; recalibrate with evidence"
+    ledgers = v.get("runs_ledger_sha256")
+    if not isinstance(ledgers, dict) or not ledgers or not all(
+            isinstance(k, str) and k.endswith("/runs.jsonl") and not k.startswith("/")
+            and "\\" not in k and all(p not in {"", ".", ".."} for p in k.split("/")) and digest(h)
+            for k, h in ledgers.items()):
+        return "calibration source has malformed replay_verification runs ledger"
+    body = source.get("search_summary", source)
+    if body.get("plan_sha256") != v["search_plan_sha256"]:
+        return "calibration source replay_verification SEARCH plan does not match"
+    return None
+
+
+def _verify_replay(summary, evidence):
+    """Evidence is {manifest: directory, search_plan: path, runs: [directory, ...]}."""
+    from . import analyze
+    import os
+    if not isinstance(evidence, dict) or not all(evidence.get(k) for k in ("manifest", "search_plan", "runs")):
+        raise ValueError("override-bearing SEARCH calibration requires replay evidence (manifest, search_plan, runs)")
+    dirs = [Path(d).resolve() for d in evidence["runs"]]
+    if not dirs or len(set(dirs)) != len(dirs):
+        raise ValueError("replay evidence requires distinct run directories")
+    root = Path(os.path.commonpath([str(d.parent) for d in dirs]))
+    def ledgers():
+        return {d.relative_to(root).as_posix() + "/runs.jsonl": sha((d / "runs.jsonl").read_bytes()) for d in dirs}
+    before = ledgers()
+    _, plan_sha = load(evidence["search_plan"])
+    captured = {}
+    rebuilt = analyze.build_summary(*analyze.analyze(evidence["manifest"], evidence["search_plan"], dirs,
+                                                  _captured=captured))
+    consumed = {d.relative_to(root).as_posix() + "/runs.jsonl": captured["ledgers"][d] for d in dirs}
+    body = lambda s: {k: v for k, v in s.items() if k != "self_sha256"}
+    if canonical(body(rebuilt)) != canonical(body(summary)):
+        raise ValueError("SEARCH summary differs from current replay evidence analysis")
+    if rebuilt.get("replay_policy") != REPLAY_POLICY or rebuilt.get("plan_sha256") != plan_sha:
+        raise ValueError("SEARCH replay evidence is not verified")
+    after = ledgers()
+    _, after_plan_sha = load(evidence["search_plan"])
+    if (before != consumed or consumed != after or captured["plan_sha256"] != plan_sha
+            or after_plan_sha != plan_sha):
+        raise ValueError("SEARCH replay evidence changed during verification")
+    return {"policy": VERIFICATION_POLICY, "search_plan_sha256": plan_sha, "runs_ledger_sha256": consumed}
+
+
 def _legacy_source_problem(source):
+    problem = _replay_policy_problem(source, "source") or _verification_problem(source)
+    if problem:
+        return problem
     for key in ("binary_sha256", "model_receipt_sha256", "search_summary_sha256"):
         if not (isinstance(source.get(key), str) and source[key]):
             return f"calibration source lacks {key}"
@@ -245,6 +359,9 @@ def _source_problem(source, legacy=False):
         return "calibration source lacks its SEARCH summary"
     if sha(canonical(body)) != source["search_summary_sha256"]:
         return "calibration source: the SEARCH summary does not match its recorded SHA-256"
+    problem = _replay_policy_problem(body) or _verification_problem(source)
+    if problem:
+        return "calibration source: " + problem
     derived = {"binary_sha256": (body.get("binary_sha256") or [None])[0],
                "model_receipt_sha256": (body.get("model_receipt_sha256") or [None])[0],
                "reference_def": body.get("reference_def"), "control_def": body.get("control_def")}
@@ -298,7 +415,7 @@ def unresolved(plan):
     return None
 
 
-def calibrate(plan, search_summary):
+def calibrate(plan, search_summary, evidence=None):
     """Resolve rule margins from the control's SEARCH means (``summary.json`` of a SEARCH analysis)."""
     if plan.get("frozen"):
         raise ValueError("cannot calibrate a frozen plan")
@@ -307,6 +424,9 @@ def calibrate(plan, search_summary):
         raise ValueError(problem)
     if search_summary.get("split") != "search":
         raise ValueError("calibration must use SEARCH results")
+    problem = _replay_policy_problem(search_summary)
+    if problem:
+        raise ValueError(problem)
     means = search_summary.get("control_means")
     if not means:
         raise ValueError("SEARCH summary has no control means")
@@ -326,6 +446,7 @@ def calibrate(plan, search_summary):
     body = {k: v for k, v in search_summary.items() if k != "self_sha256"}
     if search_summary.get("self_sha256") != sha(canonical(body)):
         raise ValueError("SEARCH summary was modified after it was written")
+    verification = _verify_replay(search_summary, evidence) if has_model_overrides(search_summary) else None
     new = copy.deepcopy(plan)
     # The holdout must run the very reference and control (binary, model, arm definitions) the margins
     # were calibrated with; analysis enforces this binding.
@@ -335,6 +456,8 @@ def calibrate(plan, search_summary):
                                  "control_def": search_summary["control_def"],
                                  "search_summary_sha256": search_summary["self_sha256"],
                                  "search_summary": body}
+    if verification is not None:
+        new["calibration_source"]["replay_verification"] = verification
     for e, spec in [(e, s) for _, specs, _ in margin_sets(new) for e, s in specs.items()]:
         if "rule" in spec:
             r = spec["rule"]
@@ -346,6 +469,30 @@ def calibrate(plan, search_summary):
                                    search_summary.get("self_sha256"), "search_manifest_sha256":
                                    search_summary.get("manifest_sha256")}
     return new
+
+
+def _witness_problem(witness, names):
+    """Structure of a plan's per-arm run witness (see README, 'Run witness')."""
+    if not isinstance(witness, dict) or not witness:
+        return "witness must be a non-empty object {arm: spec}"
+    for arm, spec in witness.items():
+        if arm not in names:
+            return f"witness for unknown arm {arm!r}"
+        if not isinstance(spec, dict) or not spec or set(spec) - {"stdout", "stderr_forbid", "stderr_require"}:
+            return f"witness of {arm}: a non-empty object with stdout / stderr_forbid / stderr_require"
+        if "stdout" in spec and (not isinstance(spec["stdout"], dict) or not spec["stdout"]
+                                 or not all(isinstance(k, str) and k for k in spec["stdout"])):
+            return f"witness of {arm}: stdout must be a non-empty object of result keys"
+        for key in ("stderr_forbid", "stderr_require"):
+            if key in spec and (not isinstance(spec[key], list) or not spec[key]
+                                or not all(isinstance(x, str) and x for x in spec[key])):
+                return f"witness of {arm}: {key} must be a non-empty list of strings"
+        for pattern in spec.get("stderr_require", []):
+            try:
+                re.compile(pattern)
+            except (re.error, OverflowError, RecursionError, ValueError) as e:
+                return f"witness of {arm}: bad pattern {pattern!r}: {type(e).__name__}: {e}"
+    return None
 
 
 def check(plan):
@@ -372,6 +519,10 @@ def check(plan):
                 return f"guard {g}: multiplier {spec.get('max_stratum_point')!r} is not a positive finite number"
     if plan["min_parents_per_stratum"] < 2:
         return "at least two parents per stratum are needed for a bound"
+    if "witness" in plan:
+        problem = _witness_problem(plan["witness"], names)
+        if problem:
+            return problem
     if any(ENDPOINTS[e]["kind"] == "vs_control" for _, specs, _ in margin_sets(plan) for e in specs) \
             and not plan.get("control"):
         return "an endpoint needs a control arm"
@@ -423,7 +574,8 @@ def plan_sha(plan):
 
 
 def load(path):
-    plan = json.loads(Path(path).read_text())
+    # Preserve the canonical plan identity, derived solely from this one parsed buffer.
+    plan = json.loads(captured_text(Path(path).read_bytes(), encoding="utf-8"))
     return plan, plan_sha(plan)
 
 
@@ -475,17 +627,25 @@ def main(argv=None):
     i.add_argument("--repeat-cases", default="")
     i.add_argument("--family", default="", help="all options/compositions of the release family (comma list)")
     i.add_argument("--route", action="append", default=[], help="ARM=REGEX: expected route lines of an arm")
+    i.add_argument("--witness", default="", help="JSON file {arm: {stdout, stderr_forbid, stderr_require}}")
     i.add_argument("--out", required=True)
     c = sub.add_parser("calibrate")
     c.add_argument("plan")
     c.add_argument("--search-summary", required=True)
     c.add_argument("--out", required=True)
+    c.add_argument("--search-runs")
+    c.add_argument("--search-plan")
+    c.add_argument("--manifest")
     f = sub.add_parser("freeze")
     f.add_argument("plan")
     s = sub.add_parser("show")
     s.add_argument("plan")
     a = p.parse_args(argv)
     if a.cmd == "init":
+        witness = json.loads(Path(a.witness).read_text(encoding="utf-8")) if a.witness else None
+        if a.witness and witness is None:
+            # a given witness file is never read as "no witness"
+            raise ValueError(f"witness file {a.witness} holds null; a witness is an object {{arm: spec}}")
         comps = []
         for item in a.composition:
             name, _, members = item.partition("=")
@@ -495,12 +655,15 @@ def main(argv=None):
                     a.min_parents_per_stratum, [x for x in a.repeat_cases.split(",") if x],
                     [x for x in a.endpoints.split(",") if x] or None, [x for x in a.family.split(",") if x],
                     dict(r.split("=", 1) for r in a.route), a.tier, a.secondary_tier or None,
-                    a.e7_control_clip, a.stratum_weights or None)
+                    a.e7_control_clip, a.stratum_weights or None,
+                    witness)
         print(save(a.out, plan))
     elif a.cmd == "calibrate":
         plan, _ = load(a.plan)
         summary = json.loads(Path(a.search_summary).read_text())
-        print(save(a.out, calibrate(plan, summary)))
+        print(save(a.out, calibrate(plan, summary, {"manifest": a.manifest,
+                                                  "search_plan": a.search_plan,
+                                                  "runs": a.search_runs.split(",") if a.search_runs else None})))
     elif a.cmd == "freeze":
         plan, _ = load(a.plan)
         print(save(a.plan, freeze(plan)))

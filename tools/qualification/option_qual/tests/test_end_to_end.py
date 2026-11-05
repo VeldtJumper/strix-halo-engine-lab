@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,8 @@ g = args.index("--generate")
 ids = [int(x) for x in args[1:g]]
 n = int(args[g + 1])
 forced = [int(x) for x in open(os.environ["STRIX_BITCALC_FORCE_TOKENS"]).read().replace(",", " ").split()]
-if os.environ.get("FAKE_TRUNCATE"):
+if os.environ.get("FAKE_TRUNCATE") or (os.environ.get("FAKE_TRUNCATE_FILE")
+                                       and os.path.exists(os.environ["FAKE_TRUNCATE_FILE"])):
     n = n // 2
 if os.environ.get("FAKE_ONE_BYTE"):
     open(os.environ["STRIX_BITCALC_LOGITS_OUT"], "wb").write(b"x")
@@ -30,6 +32,8 @@ if os.environ.get("FAKE_ONE_BYTE"):
 if os.environ.get("FAKE_IGNORE_FORCE"):
     forced = []
 noise = float(os.environ.get("FAKE_NOISE", "0"))
+if open(args[0], "rb").read() == b"wrong historical model":
+    noise += 0.8 if os.path.basename(args[0]) == "REF.gguf" else 1.5
 if os.environ.get("FAKE_NOISE_FILE") and os.path.exists(os.environ["FAKE_NOISE_FILE"]):
     noise = float(open(os.environ["FAKE_NOISE_FILE"]).read())
 vocab = 256
@@ -60,7 +64,9 @@ sys.stderr.write("Qwen auto-prefill: automatic T8 context=%d; reason=test%s\n" %
 steps = n if os.environ.get("FAKE_CLAIM_FORCED") else min(n, len(forced))
 if os.environ.get("FAKE_FORCED_TEXT_FILE") and os.path.exists(os.environ["FAKE_FORCED_TEXT_FILE"]):
     steps = str(steps)
-print(json.dumps({"generated_tokens": emitted, "bitcalc_forced_steps": steps}))
+print(json.dumps({"generated_tokens": emitted, "bitcalc_forced_steps": steps,
+                  "lever": os.environ.get("FAKE_LEVER_ON") == "1" or bool(os.environ.get("FAKE_LEVER_FILE") and
+                           os.path.exists(os.environ["FAKE_LEVER_FILE"]))}))
 '''
 
 
@@ -72,7 +78,7 @@ class EndToEnd(unittest.TestCase):
         manifest.build(src, d / "m", FakeTokenizer(), [256, 512], cont=24, salt="e2e", search_per_stratum=2)
         (d / "fake.py").write_text(FAKE)
         (d / "model.gguf").write_bytes(b"model")
-        (d / "receipt").write_text("receipt")
+        (d / "receipt").write_text(common.file_sha(d / "model.gguf") + "  model.gguf")
         arms = {"REF": {}, "CTRL": {"env": {"FAKE_NOISE": "0.02"}}, "A": {"env": {"FAKE_NOISE": "0.005"}},
                 "B": {"env": {"FAKE_NOISE": "1.5"}}, "AB": {"env": {"FAKE_NOISE": "1.5"}}}
         (d / "arms.json").write_text(json.dumps({"arms": arms}))
@@ -98,6 +104,927 @@ class EndToEnd(unittest.TestCase):
                          "--binary", str(d / "fake.py"), "--model", str(d / "model.gguf"), "--model-receipt",
                          str(d / "receipt"), "--out", str(out), "--soft-seconds", "600", "--allow-fake-for-tests",
                          "--python-binary-for-tests", *extra])
+
+    def _capture_fixture(self, live, target, models):
+        """Package fake captures with producer provenance, independently of kit run metadata."""
+        import shutil
+        target.mkdir()
+        cases = {c["case_id"]: c for c in manifest.load(self.dir / "m")[0]["cases"]}
+        entries = []
+        for n, out in enumerate(sorted((live / "log").glob("*.stdout"))):
+            cid, label = out.name[:-len(".stdout")].rsplit(".", 1)
+            c = cases[cid]
+            result = run.parse_result(out.read_text())
+            result.update(case_id=cid, prompt_sha256=c["prompt_sha256"], cont_sha256=c["cont_sha256"])
+            (target / f"{cid}.{label}.json").write_text(json.dumps(result))
+            for folder, suffix in (("log", "stderr"), ("logits", "bin")):
+                shutil.copyfile(live / folder / f"{cid}.{label}.{suffix}", target / f"{cid}.{label}.{suffix}")
+            entries.append(dict(status="complete", capture_id=f"cap-{n}",
+                                collection_id="repeat" if label.endswith("@repeat") else "main",
+                                case_id=cid, label=label, binary_sha256=common.file_sha(self.dir / "fake.py"),
+                                model_sha256=models[label.removesuffix("@repeat")],
+                                prompt_sha256=c["prompt_sha256"], cont_sha256=c["cont_sha256"],
+                                **{suffix + "_sha256": common.file_sha(target / f"{cid}.{label}.{suffix}")
+                                   for suffix in ("json", "bin", "stderr")}))
+        (target / "runs.jsonl").write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    def test_per_arm_model_capture_and_receipts(self):
+        d = self.dir
+        p, live = self._plan("holdout"), d / "live"
+        self.assertEqual(self._run(p, live, ["--keep-logits"]), 0)
+        arms = json.loads((d / "arms.json").read_text())
+        models = {name: common.file_sha(d / "model.gguf") for name in arms["arms"]}
+        receipts = {name: common.file_sha(d / "receipt") for name in arms["arms"]}
+        for name in ("REF", "A"):
+            model, receipt = d / f"{name}.gguf", d / f"{name}.receipt"
+            model.write_bytes(name.encode())
+            receipt.write_text(common.file_sha(model) + "  " + model.name)
+            arms["arms"][name].update(model=str(model), model_receipt=str(receipt))
+            models[name], receipts[name] = common.file_sha(model), common.file_sha(receipt)
+        self.assertEqual(len(set(models.values())), 3)
+        (d / "arms.json").write_text(json.dumps(arms))
+        replay, out = d / "captures", d / "rep"
+        self._capture_fixture(live, replay, models)
+        self.assertEqual(self._run(p, out, ["--replay", str(replay)]), 0)
+        self.assertEqual(self._run(p, out, ["--replay", str(replay)]), 0)
+        ctx, results, ctrl, means = analyze.analyze(d / "m", p, [out])
+        self.assertEqual(ctx["global_problems"], [])
+        self.assertTrue(ctx["qualification"])
+        self.assertEqual(results["A"]["verdict"], "PASS", results["A"]["notes"])
+        self.assertEqual(results["B"]["verdict"], "FAIL")
+        for rec in common.read_journal(out / "runs.jsonl")[0]:
+            self.assertEqual(rec["model_receipt_sha256"], receipts[rec["arm"].removesuffix("@repeat")])
+        analyze.write(d / "receipts", ctx, results, ctrl, means)
+        js = json.loads((d / "receipts" / "A.receipt.json").read_text())
+        md = (d / "receipts" / "A.receipt.md").read_text()
+        self.assertEqual(js["arm_model_receipt_sha256"], receipts)
+        for name in ("REF", "CTRL", "A"):
+            self.assertIn(f"`{name}` `{receipts[name]}`", md)
+        meta_path = out / "run-meta.json"
+        original_meta = meta_path.read_text()
+        legacy_meta = [json.loads(line) for line in original_meta.splitlines()]
+        for meta in legacy_meta:
+            del meta["arm_model_receipt_sha256"]
+        meta_path.write_text("".join(json.dumps(meta) + "\n" for meta in legacy_meta))
+        invalid_ctx, invalid_results, _, _ = analyze.analyze(d / "m", p, [out])
+        self.assertEqual(invalid_results["A"]["verdict"], "INVALID")
+        self.assertTrue(any("provenance missing for model overrides" in x for x in invalid_ctx["global_problems"]))
+        self.assertEqual(self._run(p, out, ["--replay", str(replay)]), 1)
+        meta_path.write_text(original_meta)
+        # Every other model must be refused for every arm, including independent repeats.
+        args = run.parse_args(["--manifest", str(d / "m"), "--plan", str(p), "--arms", str(d / "arms.json"),
+                               "--binary", str(d / "fake.py"), "--model", str(d / "model.gguf"),
+                               "--model-receipt", str(d / "receipt"), "--out", str(out),
+                               "--replay", str(replay), "--allow-fake-for-tests"])
+        runner = run.Runner(args)
+        for label in [*models, "REF@repeat"]:
+            name = label.removesuffix("@repeat")
+            case = next(c for c in runner.cases if (c["case_id"], label) in runner.replay_entries)
+            entry = runner.replay_entries[(case["case_id"], label)][0]
+            for wrong in set(models.values()) - {models[name]}:
+                with self.subTest(label=label, wrong=wrong):
+                    entry["model_sha256"] = wrong
+                    rc, _, stderr, missing = runner.replay_run(case, label, name, d / "unused.bin", d / "unused.ids")
+                    self.assertEqual(rc, 3)
+                    self.assertIsNone(missing)
+                    self.assertIn(b"model_sha256 differs", stderr)
+            entry["model_sha256"] = models[name]
+
+    @staticmethod
+    def _historical_module(commit, name):
+        """Execute the recorded project implementation as an artifact compatibility oracle."""
+        import subprocess
+        import types
+        mod = types.ModuleType("tools.qualification.option_qual._golden_" + name)
+        mod.__package__ = "tools.qualification.option_qual"
+        mod.__file__ = str(Path(run.__file__).with_name(name + ".py"))
+        try:
+            source = subprocess.check_output(
+                ["git", "show", f"{commit}:tools/qualification/option_qual/{name}.py"],
+                cwd=Path(run.__file__).parent, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.CalledProcessError):
+            raise unittest.SkipTest(f"revision {commit} is not in this checkout (compatibility oracle unavailable)")
+        exec(compile(source, f"{commit}/{name}.py", "exec"), mod.__dict__)
+        return mod
+
+    def test_historical_direct_overrides_are_never_reused(self):
+        from unittest import mock
+        d = self.dir
+        p = self._plan("search", frozen=False)
+        original = json.loads((d / "arms.json").read_text())
+        old = self._historical_module("e2f0d9b95", "run")
+        empty = d / "empty-replay"
+        empty.mkdir()
+        (empty / "runs.jsonl").write_bytes(b"")
+        for kind in ("COMPLETE", "RAN", "REF-CTRL"):
+            with self.subTest(kind=kind):
+                arms = json.loads(json.dumps(original))
+                for name in (("REF", "CTRL") if kind == "REF-CTRL" else ("A",)):
+                    receipt = d / f"{name}.receipt"
+                    receipt.write_text(("c" if name == "REF" else "d") * 64 + "  other.gguf")
+                    arms["arms"][name].update(model=str(d / "model.gguf"), model_receipt=str(receipt))
+                (d / "arms.json").write_text(json.dumps(arms))
+                out = d / kind
+                with mock.patch.object(run, "Runner", old.Runner):
+                    self.assertEqual(self._run(p, out, ["--keep-logits"]), 0)
+                if kind == "RAN":
+                    mark_path = next((out / "done").glob("*.A"))
+                    mark = json.loads(mark_path.read_text())
+                    mark["status"] = "RAN"
+                    mark.pop("red_sha256")
+                    mark.pop("redj_sha256")
+                    mark_path.write_bytes(common.canonical(mark))
+                    for suffix in ("npz", "json"):
+                        (out / "red" / (mark_path.name + "." + suffix)).unlink()
+                ctx, res, _, means = analyze.analyze(d / "m", p, [out])
+                self.assertEqual(res["A"]["verdict"], "INVALID")
+                self.assertTrue(any("lacks replay provenance" in x for x in ctx["global_problems"]))
+                self.assertIsNone(means)
+                summary = analyze.write(d / (kind + "-receipts"), ctx, res, None, means)
+                self.assertNotIn("replay_policy", summary)
+                hp = plan.init(d / "m", "holdout", "REF", "CTRL", ["A"], [], [256, 512])
+                with self.assertRaises(ValueError):
+                    plan.calibrate(hp, summary)
+                before = {str(q.relative_to(out)): q.read_bytes() for q in out.rglob("*") if q.is_file()}
+                self.assertEqual(self._run(p, out, ["--replay", str(empty)]), 1)
+                self.assertEqual(before, {str(q.relative_to(out)): q.read_bytes()
+                                          for q in out.rglob("*") if q.is_file()})
+                # Losing metadata cannot turn historical direct evidence into replay evidence.
+                (out / "run-meta.json").unlink()
+                self.assertEqual(self._run(p, out, ["--replay", str(empty)]), 1)
+
+    def test_historical_search_summary_requires_replay_attestation(self):
+        from unittest import mock
+        d = self.dir
+        sp = self._plan("search", frozen=False)
+        original_arms = json.loads((d / "arms.json").read_text())
+        original_arms["arms"]["A"]["env"]["FAKE_NOISE"] = "0.1"
+        (d / "arms.json").write_text(json.dumps(original_arms))
+        search_live = d / "search-live"
+        self.assertEqual(self._run(sp, search_live, ["--keep-logits"]), 0)
+        hp_live = self._plan("holdout", name="capture-plan.json")
+        live = d / "holdout-live"
+        self.assertEqual(self._run(hp_live, live, ["--keep-logits"]), 0)
+        arms = json.loads((d / "arms.json").read_text())
+        for name in ("REF", "CTRL"):
+            model, receipt = d / f"{name}.gguf", d / f"{name}.receipt"
+            model.write_bytes(b"wrong historical model")
+            # The receipts identify the correct model; the old direct runner uses wrong bytes.
+            receipt.write_text(common.file_sha(d / "model.gguf") + "  " + model.name)
+            arms["arms"][name].update(model=str(model), model_receipt=str(receipt))
+        (d / "arms.json").write_text(json.dumps(arms))
+        old_run = self._historical_module("e2f0d9b95", "run")
+        old_analyze = self._historical_module("9344a7aea", "analyze")
+        old_plan = self._historical_module("9344a7aea", "plan")
+        out = d / "historical-search"
+        with mock.patch.object(run, "Runner", old_run.Runner):
+            self.assertEqual(self._run(sp, out, ["--keep-logits"]), 0)
+        ctx, res, ctrl, means = old_analyze.analyze(d / "m", sp, [out])
+        self.assertEqual(ctx["global_problems"], [])
+        summary = old_analyze.write(d / "historical-receipts", ctx, res, ctrl, means)
+        original = common.canonical(summary)
+        self.assertNotIn("replay_policy", summary)
+        hp = plan.init(d / "m", "holdout", "REF", "CTRL", ["A", "B"],
+                       [{"name": "AB", "members": ["A", "B"]}], [256, 512], bootstrap=500, min_parents=2)
+        # Isolate the model-dependent E2/E3 calibration regression from fixed NLL/top-1 gates.
+        hp["endpoints"] = {e: hp["endpoints"][e] for e in ("E2", "E3")}
+        hp["guards"] = {}
+        frozen = old_plan.freeze(old_plan.calibrate(hp, summary))
+        self.assertIsNone(old_plan.check(frozen))
+        with self.assertRaisesRegex(ValueError, "replay policy attestation"):
+            plan.calibrate(hp, summary)
+        self.assertIn("replay policy attestation", plan.check(frozen))
+        path = d / "historically-frozen.json"
+        plan.save(path, frozen)
+        self.assertEqual(self._run(path, d / "refused"), 1)
+        captures, replay = d / "holdout-captures", d / "historically-admitted"
+        self._capture_fixture(live, captures, {n: common.file_sha(d / "model.gguf") for n in arms["arms"]})
+        # Recreate a HOLDOUT admitted by the historical plan checker, with correct replay models.
+        with mock.patch.object(plan, "require_runnable", old_plan.require_runnable):
+            self.assertEqual(self._run(path, replay, ["--replay", str(captures)]), 0)
+        ctx, res, _, means = analyze.analyze(d / "m", path, [replay])
+        self.assertEqual(res["A"]["verdict"], "INVALID")
+        self.assertTrue(any("replay policy attestation" in p for p in ctx["global_problems"]))
+        self.assertIsNone(means)
+        self.assertTrue(all("replay policy attestation" in p for p in ctx["global_problems"]), ctx)
+        self.assertEqual(common.canonical(summary), original)
+        forged = dict(summary, replay_policy=plan.REPLAY_POLICY)
+        forged["self_sha256"] = common.sha(common.canonical({k: v for k, v in forged.items() if k != "self_sha256"}))
+        forged_plan = old_plan.calibrate(hp, forged)
+        self.assertIn("replay_verification", plan.check(forged_plan))
+        with self.assertRaisesRegex(ValueError, "replay_verification"):
+            plan.freeze(forged_plan)
+        search_captures = d / "search-captures"
+        self._capture_fixture(search_live, search_captures,
+                              {n: common.file_sha(d / "model.gguf") for n in arms["arms"]})
+        search_replay = d / "verified-search"
+        self.assertEqual(self._run(sp, search_replay, ["--replay", str(search_captures)]), 0)
+        ev = {"manifest": d / "m", "search_plan": sp, "runs": [search_replay]}
+        with self.assertRaisesRegex(ValueError, "differs from current replay evidence"):
+            plan.calibrate(hp, forged, ev)
+        forged_path = d / "forged-frozen.json"
+        plan.save(forged_path, old_plan.freeze(forged_plan))
+        self.assertEqual(self._run(forged_path, d / "forged-refused", ["--replay", str(captures)]), 1)
+        admitted = d / "forged-admitted"
+        with mock.patch.object(plan, "require_runnable", old_plan.require_runnable):
+            self.assertEqual(self._run(forged_path, admitted, ["--replay", str(captures)]), 0)
+        with mock.patch.object(old_analyze, "plan_mod", old_plan):
+            old_ctx, old_res, _, _ = old_analyze.analyze(d / "m", forged_path, [admitted])
+        self.assertEqual(old_ctx["global_problems"], [])
+        self.assertEqual(old_res["A"]["verdict"], "PASS")
+        before = {q.relative_to(admitted): q.read_bytes() for q in admitted.rglob("*") if q.is_file()}
+        self.assertEqual(self._run(forged_path, admitted, ["--replay", str(captures)]), 1)
+        self.assertEqual(before, {q.relative_to(admitted): q.read_bytes() for q in admitted.rglob("*") if q.is_file()})
+        invalid_ctx, invalid_res, _, _ = analyze.analyze(d / "m", forged_path, [admitted])
+        self.assertEqual(invalid_res["A"]["verdict"], "INVALID")
+        self.assertTrue(any("replay_verification" in p for p in invalid_ctx["global_problems"]))
+        verified = analyze.build_summary(*analyze.analyze(d / "m", sp, [search_replay]))
+        calibrated = plan.calibrate(hp, verified, ev)
+        self.assertGreater(forged_plan["endpoints"]["E2"]["fixed"], calibrated["endpoints"]["E2"]["fixed"])
+        self.assertGreater(forged_plan["endpoints"]["E3"]["fixed"], calibrated["endpoints"]["E3"]["fixed"])
+        # The same correct HOLDOUT captures fail with verified, model-faithful SEARCH margins.
+        plan.save(path, plan.freeze(calibrated))
+        verified_holdout = d / "verified-holdout"
+        self.assertEqual(self._run(path, verified_holdout, ["--replay", str(captures)]), 0)
+        ctx, res, _, _ = analyze.analyze(d / "m", path, [verified_holdout])
+        self.assertEqual(ctx["global_problems"], [])
+        self.assertEqual(res["A"]["verdict"], "FAIL")
+
+
+    def test_calibration_effective_reference_and_control_receipts(self):
+        d = self.dir
+        # Produce actual captures for both splits before enabling model overrides.
+        sp, slive = self._plan("search", frozen=False), d / "search-live"
+        hp, hlive = self._plan("holdout", name="uncalibrated.json"), d / "holdout-live"
+        self.assertEqual(self._run(sp, slive, ["--keep-logits"]), 0)
+        self.assertEqual(self._run(hp, hlive, ["--keep-logits"]), 0)
+        arms = json.loads((d / "arms.json").read_text())
+        models = {n: common.file_sha(d / "model.gguf") for n in arms["arms"]}
+        for name in ("REF", "CTRL"):
+            receipt = d / f"{name}.receipt"
+            receipt.write_bytes((d / "receipt").read_bytes())
+            arms["arms"][name].update(model=str(d / "model.gguf"), model_receipt=str(receipt))
+        (d / "arms.json").write_text(json.dumps(arms))
+        sr, hr = d / "search-captures", d / "holdout-captures"
+        self._capture_fixture(slive, sr, models)
+        self._capture_fixture(hlive, hr, models)
+        sout = d / "search-replay"
+        self.assertEqual(self._run(sp, sout, ["--replay", str(sr)]), 0)
+        ctx, res, ctrl, means = analyze.analyze(d / "m", sp, [sout])
+        self.assertEqual(ctx["global_problems"], [])
+        self.assertEqual(res["A"]["verdict"], "PASS")
+        self.assertIsNotNone(means)
+        summary = analyze.write(d / "search-receipts", ctx, res, ctrl, means)
+        self.assertEqual(summary["replay_policy"], plan.REPLAY_POLICY)
+        body = {k: v for k, v in summary.items() if k != "self_sha256"}
+        self.assertEqual(summary["self_sha256"], common.sha(common.canonical(body)))
+        self.assertNotIn("replay_policy", json.loads((d / "search-receipts" / "A.receipt.json").read_text()))
+        hp = plan.init(d / "m", "holdout", "REF", "CTRL", ["A", "B"],
+                       [{"name": "AB", "members": ["A", "B"]}], [256, 512], bootstrap=500, min_parents=2)
+        for policy in (None, "verified-arm-model-replay-v0", 1, {}):
+            with self.subTest(policy=policy):
+                bad = dict(summary, replay_policy=policy)
+                bad["self_sha256"] = common.sha(common.canonical({k: v for k, v in bad.items() if k != "self_sha256"}))
+                with self.assertRaisesRegex(ValueError, "replay policy attestation"):
+                    plan.calibrate(hp, bad)
+        # Preserve the emission boundary for all six labels, including the independent repeat.
+        snapshot = {q: q.read_bytes() for q in sout.rglob("*") if q.is_file()}
+        records = common.read_journal(sout / "runs.jsonl")[0]
+        cid = "en-00.L256"
+        def restore():
+            for q, data in snapshot.items():
+                q.write_bytes(data)
+        def check_withheld():
+            damaged = analyze.build_summary(*analyze.analyze(d / "m", sp, [sout]))
+            self.assertNotIn("replay_policy", damaged)
+            with self.assertRaises(ValueError):
+                plan.calibrate(hp, damaged, {"manifest": d / "m", "search_plan": sp, "runs": [sout]})
+        try:
+            for label in ("REF", "CTRL", "A", "B", "AB", "REF@repeat"):
+                for defect in ("missing", "partial", "FAILED", "INVALID", "record", "replay", "receipt"):
+                    with self.subTest(label=label, defect=defect):
+                        restore()
+                        marker = sout / "done" / f"{cid}.{label}"
+                        if defect == "missing":
+                            marker.unlink()
+                        elif defect == "partial":
+                            marker.write_bytes(b'{"status":')
+                        elif defect in ("FAILED", "INVALID"):
+                            mark = json.loads(marker.read_text())
+                            mark["status"] = defect
+                            marker.write_bytes(common.canonical(mark))
+                        else:
+                            edited = copy.deepcopy(records)
+                            rec = next(r for r in edited if r.get("case_id") == cid and r.get("arm") == label)
+                            if defect == "record":
+                                del rec["rows"]
+                            elif defect == "replay":
+                                del rec["replay_capture"]
+                            else:
+                                rec["model_receipt_sha256"] = "0" * 64
+                            (sout / "runs.jsonl").write_bytes(b"".join(common.canonical(r) + b"\n" for r in edited))
+                        check_withheld()
+            for defect in ("partial-ledger", "missing-meta", "repeat-capture", "repeat-collection", "nonfinite"):
+                with self.subTest(defect=defect):
+                    restore()
+                    if defect == "partial-ledger":
+                        with (sout / "runs.jsonl").open("ab") as f:
+                            f.write(b'{"case_id":')
+                    elif defect == "missing-meta":
+                        (sout / "run-meta.json").unlink()
+                    elif defect.startswith("repeat-"):
+                        edited = copy.deepcopy(records)
+                        ref = next(r for r in edited if r.get("case_id") == cid and r.get("arm") == "REF")
+                        rep = next(r for r in edited if r.get("case_id") == cid and r.get("arm") == "REF@repeat")
+                        key = "capture_id" if defect == "repeat-capture" else "collection_id"
+                        rep["replay_capture"][key] = ref["replay_capture"][key]
+                        (sout / "runs.jsonl").write_bytes(b"".join(common.canonical(r) + b"\n" for r in edited))
+                    else:
+                        red = sout / "red" / f"{cid}.A.npz"
+                        with np.load(red) as loaded:
+                            arrays = dict(loaded)
+                        arrays["nonfinite_c"][:] = 1
+                        np.savez(red, **arrays)
+                        marker = sout / "done" / f"{cid}.A"
+                        mark = json.loads(marker.read_text())
+                        mark["red_sha256"] = common.file_sha(red)
+                        marker.write_bytes(common.canonical(mark))
+                    check_withheld()
+        finally:
+            restore()
+        path = d / "calibrated.json"
+        ev = {"manifest": d / "m", "search_plan": sp, "runs": [sout]}
+        with self.assertRaisesRegex(ValueError, "requires replay evidence"):
+            plan.calibrate(hp, summary)
+        calibrated = plan.calibrate(hp, summary, ev)
+        verification = calibrated["calibration_source"]["replay_verification"]
+        self.assertEqual(verification, {"policy": plan.VERIFICATION_POLICY,
+                         "search_plan_sha256": plan.load(sp)[1],
+                         "runs_ledger_sha256": {"search-replay/runs.jsonl": common.file_sha(sout / "runs.jsonl")}})
+        # Migration objects are issued by the actual earlier verifier and analyzer.
+        from unittest import mock
+        old_plan = self._historical_module("ded24908b", "plan")
+        old_analyze = self._historical_module("ded24908b", "analyze")
+        old_analyze.plan_mod = old_plan
+        with mock.patch("tools.qualification.option_qual.analyze", old_analyze):
+            old_summary = old_analyze.build_summary(*old_analyze.analyze(d / "m", sp, [sout]))
+            old_calibrated = old_plan.calibrate(hp, old_summary, ev)
+        old_frozen = old_plan.freeze(old_calibrated)
+        self.assertEqual(old_calibrated["calibration_source"]["replay_verification"]["policy"], plan.REPLAY_POLICY)
+        migration_path, admitted = d / "migration.json", d / "migration-runs"
+        old_plan.save(migration_path, old_frozen)
+        with mock.patch.object(run, "plan_mod", old_plan):
+            self.assertEqual(self._run(migration_path, admitted, ["--replay", str(hr)]), 0)
+        retained = {q.relative_to(admitted): q.read_bytes() for q in admitted.rglob("*") if q.is_file()}
+        for historical in (old_calibrated, old_frozen):
+            with self.subTest(frozen=historical["frozen"]):
+                self.assertIn("replay_verification", plan.check(historical))
+                with self.assertRaises(ValueError):
+                    plan.freeze(historical)
+                source = historical["calibration_source"]
+                legacy = {k: v for k, v in source.items() if k != "search_summary"}
+                legacy["replay_policy"] = plan.REPLAY_POLICY
+                self.assertIn("replay_verification", plan._source_problem(legacy, legacy=True))
+                plan.save(migration_path, historical)
+                self.assertEqual(self._run(migration_path, d / "migration-fresh", ["--replay", str(hr)]), 1)
+                self.assertEqual(self._run(migration_path, admitted, ["--replay", str(hr)]), 1)
+                self.assertEqual(retained, {q.relative_to(admitted): q.read_bytes()
+                                            for q in admitted.rglob("*") if q.is_file()})
+                mc, mr, _, _ = analyze.analyze(d / "m", migration_path, [admitted])
+                self.assertEqual(mr["A"]["verdict"], "INVALID")
+                self.assertTrue(any("replay_verification" in p for p in mc["global_problems"]))
+        self.assertIsNone(plan.check(plan.calibrate(hp, old_summary, ev)))
+        # A lacks replay provenance; analysis sees valid B, then the file returns to A.
+        # Inject all three reads synchronously: before, RunDir's parse, after.
+        from unittest import mock
+        ledger_path = sout / "runs.jsonl"
+        ledger_b = ledger_path.read_bytes()
+        ledger_a = b"".join(common.canonical({k: v for k, v in r.items() if k != "replay_capture"}) + b"\n"
+                            for r in records)
+        original_read = Path.read_bytes
+        observed = []
+        def race_read(path):
+            if path == ledger_path:
+                data = (ledger_a, ledger_b, ledger_a)[len(observed)]
+                observed.append(data)
+                return data
+            return original_read(path)
+        with mock.patch.object(Path, "read_bytes", race_read):
+            with self.assertRaisesRegex(ValueError, "changed during verification"):
+                plan.calibrate(hp, summary, ev)
+        self.assertEqual(observed, [ledger_a, ledger_b, ledger_a])
+        whitespace_bytes = ledger_b + b" \n  "
+        with mock.patch.object(Path, "read_bytes", lambda p: whitespace_bytes if p == ledger_path else original_read(p)):
+            verified_whitespace = plan.calibrate(hp, summary, ev)["calibration_source"]["replay_verification"]
+        self.assertEqual(verified_whitespace["runs_ledger_sha256"],
+                         {"search-replay/runs.jsonl": common.sha(whitespace_bytes)})
+        # Keep every byte, including whitespace and an incomplete tail, in the parsed digest.
+        tail_bytes = ledger_b + b'  \n{"partial":'
+        with mock.patch.object(Path, "read_bytes", lambda p: tail_bytes if p == ledger_path else original_read(p)):
+            rd = analyze.RunDir(sout, plan.arms_needed(plan.load(sp)[0]))
+        self.assertEqual(rd.runs_bytes, tail_bytes)
+        self.assertTrue(any("incomplete record" in p for p in rd.problems))
+        unverified = copy.deepcopy(calibrated)
+        del unverified["calibration_source"]["replay_verification"]
+        with self.assertRaisesRegex(ValueError, "replay_verification"):
+            plan.freeze(unverified)
+        plan.save(path, plan.freeze(calibrated))
+        for changed in (None, "REF", "CTRL"):
+            with self.subTest(changed=changed):
+                if changed:
+                    (d / f"{changed}.receipt").write_bytes((d / "receipt").read_bytes() + b"\n")
+                out = d / f"calibrated-{changed}"
+                self.assertEqual(self._run(path, out, ["--replay", str(hr)]), 0)
+                context, results, _, means = analyze.analyze(d / "m", path, [out])
+                if changed:
+                    self.assertEqual(results["A"]["verdict"], "INVALID")
+                    self.assertTrue(any("calibrated SEARCH receipts" in x for x in context["global_problems"]))
+                    self.assertIsNone(means)
+                    (d / f"{changed}.receipt").write_bytes((d / "receipt").read_bytes())
+                else:
+                    self.assertEqual(context["global_problems"], [])
+                    self.assertEqual(results["A"]["verdict"], "PASS", results["A"]["notes"])
+                    self.assertTrue(context["qualification"])
+                    self.assertIsNotNone(means)
+
+    def test_no_override_artifacts_match_original_runner(self):
+        import datetime
+        import shutil
+        import types
+        from contextlib import ExitStack
+        from unittest import mock
+        d = self.dir
+        arms_path = d / "arms.json"
+        arms = json.loads(arms_path.read_text())
+        arms["arms"]["CTRL"]["env"]["NON_ASCII"] = "caf\u00e9"
+        arms_path.write_bytes(json.dumps(arms, ensure_ascii=False).encode("utf-8"))
+        p, live = self._plan("holdout"), d / "golden-live"
+        self.assertEqual(self._run(p, live, ["--keep-logits"]), 0)
+        captures = d / "golden-captures"
+        self._capture_fixture(live, captures, {n: common.file_sha(d / "model.gguf")
+                                             for n in ("REF", "CTRL", "A", "B", "AB")})
+        baseline_plan = self._historical_module("cd13ad369", "plan")
+        baseline_analyze = self._historical_module("cd13ad369", "analyze")
+        ss = baseline_analyze.write(d / "baseline-search-receipts",
+                                    *baseline_analyze.analyze(d / "m", p, [live]))
+        ss["split"] = "search"
+        ss["self_sha256"] = common.sha(common.canonical({k: v for k, v in ss.items() if k != "self_sha256"}))
+        hp = plan.init(d / "m", "holdout", "REF", "CTRL", ["A", "B"],
+                       [{"name": "AB", "members": ["A", "B"]}], [256, 512], bootstrap=500, min_parents=2,
+                       repeat_cases=["en-02.L256", "en-05.L256"])
+        baseline_plan.save(p, baseline_plan.freeze(baseline_plan.calibrate(hp, ss)))
+        baseline_run = self._historical_module("cd13ad369", "run")
+        baseline_analyze = self._historical_module("cd13ad369", "analyze")
+        baseline_evidence = self._historical_module("cd13ad369", "evidence")
+        baseline_receipt = self._historical_module("cd13ad369", "receipt")
+        baseline_run.evidence = baseline_analyze.evidence = baseline_evidence
+        baseline_analyze.render_md = baseline_receipt.render_md
+        baseline_analyze.render_summary_md = baseline_receipt.render_summary_md
+        class FixedDate(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 1, 1, tzinfo=tz)
+        for replay in (False, True):
+            expected = None
+            retained = None
+            for phase, rm, am in (("fresh", baseline_run, baseline_analyze), ("fresh", run, analyze),
+                                 ("resume", baseline_run, baseline_analyze), ("resume", run, analyze)):
+                if phase == "resume":
+                    for name, data in retained.items():
+                        q = d / name
+                        q.parent.mkdir(parents=True, exist_ok=True)
+                        q.write_bytes(data)
+                    if rm is baseline_run:
+                        expected = None
+                out, receipts = d / "golden-output", d / "golden-receipts"
+                with ExitStack() as stack:
+                    for mod in (rm, am):
+                        stack.enter_context(mock.patch.object(mod, "kit_commit", lambda: "fixed-commit"))
+                    stack.enter_context(mock.patch.object(rm.datetime, "datetime", FixedDate))
+                    stack.enter_context(mock.patch.object(rm.uuid, "uuid4", lambda: types.SimpleNamespace(hex="a" * 32)))
+                    runner_class = rm.Runner
+                    stack.enter_context(mock.patch.object(run, "Runner", lambda a: runner_class(a, now=lambda: 0.)))
+                    extra = ["--no-effective-config", "--keep-logits"]
+                    if replay:
+                        extra += ["--replay", str(captures)]
+                    self.assertEqual(self._run(p, out, extra), 0)
+                    ctx, res, ctrl, means = am.analyze(d / "m", p, [out])
+                    self.assertEqual(ctx["global_problems"], [])
+                    self.assertEqual(res["A"]["verdict"], "PASS")
+                    am.write(receipts, ctx, res, ctrl, means)
+                summary = json.loads((receipts / "summary.json").read_text())
+                self.assertFalse(plan.has_model_overrides(summary))
+                baseline_plan = self._historical_module("cd13ad369", "plan")
+                for split in ("search", "holdout"):
+                    pp = plan.init(d / "m", split, "REF", "CTRL", ["A", "B"],
+                                   [{"name": "AB", "members": ["A", "B"]}], [256, 512])
+                    self.assertFalse(plan.has_model_overrides(pp, "plan"))
+                    ss = dict(summary, split="search")
+                    ss["self_sha256"] = common.sha(common.canonical({k: v for k, v in ss.items() if k != "self_sha256"}))
+                    current = plan.freeze(plan.calibrate(pp, ss), now=FixedDate(2026, 1, 1))
+                    previous = baseline_plan.freeze(baseline_plan.calibrate(pp, ss), now=FixedDate(2026, 1, 1))
+                    self.assertFalse(plan.has_model_overrides(current, "plan"))
+                    self.assertFalse(plan.has_model_overrides(previous, "plan"))
+                    self.assertEqual(common.canonical(current), common.canonical(previous))
+                artifacts = {str(q.relative_to(d)): q.read_bytes()
+                             for root in (out, receipts) for q in root.rglob("*") if q.is_file()}
+                # Include every emitted artifact, especially both metadata journals and the repeat.
+                self.assertIn("golden-output/run-meta.json", {k.replace("\\", "/") for k in artifacts})
+                self.assertTrue(list((out / "done").glob("*.REF@repeat")))
+                if phase == "fresh" and rm is baseline_run:
+                    retained = artifacts
+                self.assertNotIn("replay_policy", json.loads((receipts / "summary.json").read_text()))
+                if expected is None:
+                    expected = artifacts
+                else:
+                    self.assertEqual(set(expected), set(artifacts))
+                    for name in expected:
+                        with self.subTest(replay=replay, phase=phase, artifact=name):
+                            self.assertEqual(expected[name], artifacts[name])
+                shutil.rmtree(out)
+                shutil.rmtree(receipts)
+
+    def test_reserved_labels_match_original_admission(self):
+        import datetime
+        d = self.dir
+        src = _sources(d / "named-src", strata=("model",), parents=6)
+        manifest.build(src, d / "named-m", FakeTokenizer(), [256], cont=24, salt="names", search_per_stratum=2)
+        # Use the normal runner helper with the named manifest.
+        import shutil
+        shutil.rmtree(d / "m")
+        shutil.copytree(d / "named-m", d / "m")
+        baseline = self._historical_module("cd13ad369", "plan")
+        for arm in ("model", "model_receipt"):
+            with self.subTest(arm=arm):
+                arms = {"REF": {}, "CTRL": {"env": {"FAKE_NOISE": "0.02"}}, arm: {}}
+                (d / "arms.json").write_text(json.dumps({"arms": arms}))
+                sp = plan.init(d / "m", "search", "REF", "CTRL", [arm], [], [256],
+                               bootstrap=100, min_parents=2, routes={arm: "Qwen"})
+                path = d / (arm + ".json")
+                plan.save(path, sp)
+                out = d / (arm + "-runs")
+                self.assertEqual(self._run(path, out), 0)
+                ctx, res, ctrl, means = analyze.analyze(d / "m", path, [out])
+                self.assertEqual(ctx["global_problems"], [])
+                self.assertIn("model", ctx["parents_per_stratum"])
+                self.assertIn("model", ctrl["by_stratum"])
+                self.assertIn(arm, ctx["effective_config"])
+                summary = analyze.build_summary(ctx, res, ctrl, means)
+                hp = plan.init(d / "m", "holdout", "REF", "CTRL", [arm], [], [256],
+                               bootstrap=100, min_parents=2, routes={arm: "Qwen"})
+                for deferred in (False, True):
+                    with self.subTest(deferred=deferred):
+                        ss = copy.deepcopy(summary)
+                        if deferred:
+                            ss["effective_config"][arm] = None
+                        ss["self_sha256"] = common.sha(common.canonical({k: v for k, v in ss.items()
+                                                                                       if k != "self_sha256"}))
+                        now = datetime.datetime(2026, 1, 1)
+                        current = plan.freeze(plan.calibrate(hp, ss), now=now)
+                        frozen = baseline.freeze(baseline.calibrate(hp, ss), now=now)
+                        self.assertEqual(common.canonical(current), common.canonical(frozen))
+                        for pp in (current, frozen):
+                            self.assertFalse(plan.has_model_overrides(pp, "plan"))
+                            self.assertIsNone(plan.check(pp))
+                            self.assertIsNone(plan.unresolved(pp))
+                            plan.require_runnable(pp, manifest.load(d / "m")[1])
+
+    def test_captured_reader_encoding_matches_original(self):
+        from tools.qualification.option_qual import reduce
+        old_run = self._historical_module("cd13ad369", "run")
+        old_analyze = self._historical_module("cd13ad369", "analyze")
+        old_plan = self._historical_module("cd13ad369", "plan")
+        old_reduce = self._historical_module("cd13ad369", "reduce")
+        d = self.dir / "encoding"
+        d.mkdir()
+        path = d / "arms.json"
+        stem = d / "reduction"
+        reduce.save(stem, {"x": np.array([1.])}, {})
+        document = '{"arms": {"A": {"env": {"VALUE": "caf\u00e9"}}}}\r\n'
+        def outcome(read):
+            try:
+                return ("accepted", read())
+            except (ValueError, UnicodeError) as exc:
+                return ("refused", type(exc).__name__)
+        buffers = [document.encode(enc) for enc in
+                   ("cp1252", "utf-8", "utf-8-sig", "utf-16", "utf-32")]
+        for data in buffers:
+            with self.subTest(data=data[:12]):
+                path.write_bytes(data)
+                meta = {k: "a" * 64 for k in old_analyze.IDENTITY}
+                meta["arms_sha256"] = common.sha(data)
+                (d / "run-meta.json").write_bytes(common.canonical(meta) + b"\n")
+                Path(str(stem) + ".json").write_bytes(data)
+                for previous, current in (
+                    (lambda: old_run.load_arms(path, ["A"]), lambda: run.load_arms(path, ["A"])),
+                    (lambda: old_analyze.RunDir(d).arms, lambda: analyze.RunDir(d, ["A"]).arms),
+                    (lambda: old_plan.load(path), lambda: plan.load(path)),
+                    (lambda: old_reduce.load(stem)[1], lambda: reduce.load(stem)[1]),
+                ):
+                    self.assertEqual(outcome(previous), outcome(current))
+                self.assertEqual(outcome(lambda: old_run.load_arms(path, ["A"])),
+                                 outcome(lambda: run.load_arms(path, ["A"], data=data)))
+
+    def test_label_maps_inspect_values_and_unknown_wrappers(self):
+        # Every actual label map inspects its values; unknown placements stay generic.
+        for schema, fields in plan._LABEL_MAPS.items():
+            for field in fields:
+                for label in ("model", "model_receipt", "arm_model_receipt_sha256"):
+                    with self.subTest(schema=schema, field=field, label=label):
+                        self.assertFalse(plan.has_model_overrides({field: {label: None}}, schema))
+                        self.assertTrue(plan.has_model_overrides(
+                            {field: {label: {"wrapper": [{"model": "x"}]}}}, schema))
+                        self.assertTrue(plan.has_model_overrides({"unknown": {field: {label: "x"}}}, schema))
+        self.assertTrue(plan.has_model_overrides({"by_stratum": {"model": "unverified.gguf"}}))
+        pp = plan.load(self._plan("holdout"))[0]
+        pp["witness"] = {"A": {"stdout": {"model": {"model_receipt": "expected data"}}}}
+        self.assertIsNone(plan.check(pp))
+        self.assertFalse(plan.has_model_overrides(pp, "plan"))
+        self.assertTrue(plan.has_model_overrides({"unknown": pp}, "plan"))
+
+    def test_reduction_hash_load_single_capture(self):
+        from unittest import mock
+        from tools.qualification.option_qual import reduce
+        d = self.dir
+        (d / "red").mkdir()
+        stem = d / "red" / "case.CTRL"
+        npz, js = Path(str(stem) + ".npz"), Path(str(stem) + ".json")
+        reduce.save(stem, {"overlap": np.array([1.0])}, {"rows": 1})
+        captured = {p: p.read_bytes() for p in (npz, js)}
+        original_read = Path.read_bytes
+        reads = []
+        def swap_read(path):
+            data = original_read(path)
+            if path in captured:
+                reads.append(path)
+                # Swap immediately after the verified bytes are read, before parsing.
+                path.write_bytes(b"invalid replacement")
+            return data
+        rd = object.__new__(analyze.RunDir)
+        rd.path = d
+        with mock.patch.object(Path, "read_bytes", swap_read):
+            arrays, info = rd.verified("case", "CTRL", common.sha(captured[npz]), common.sha(captured[js]))
+        self.assertEqual(reads, [npz, js])
+        np.testing.assert_array_equal(arrays["overlap"], [1.0])
+        self.assertEqual(info, {"rows": 1})
+        self.assertIsNone(rd.verified("case", "CTRL", common.sha(captured[npz]), common.sha(captured[js])))
+
+    def test_recursive_override_source_placements(self):
+        d = self.dir
+        sp = self._plan("search", frozen=False)
+        out = d / "search"
+        self.assertEqual(self._run(sp, out), 0)
+        summary = analyze.build_summary(*analyze.analyze(d / "m", sp, [out]))
+        hp = plan.init(d / "m", "holdout", "REF", "CTRL", ["A", "B"],
+                       [{"name": "AB", "members": ["A", "B"]}], [256, 512])
+        baseline_plan = self._historical_module("cd13ad369", "plan")
+        self.assertFalse(plan.has_model_overrides(summary))
+        self.assertEqual(common.canonical(plan.calibrate(hp, summary)),
+                         common.canonical(baseline_plan.calibrate(hp, summary)))
+        # Arms parsing and SEARCH-plan identity use their captured bytes even if the
+        # backing file changes immediately after the read. Public identity stays canonical.
+        from unittest import mock
+        inputs = {sp: sp.read_bytes(), out / "arms.json": (out / "arms.json").read_bytes()}
+        reads = []
+        original_read = Path.read_bytes
+        def swap_inputs(path):
+            data = original_read(path)
+            if path in inputs:
+                reads.append(path)
+                path.write_bytes(b"invalid replacement")
+            return data
+        try:
+            with mock.patch.object(Path, "read_bytes", swap_inputs):
+                rebuilt = analyze.build_summary(*analyze.analyze(d / "m", sp, [out]))
+            self.assertEqual(rebuilt, summary)
+            self.assertCountEqual(reads, list(inputs))
+        finally:
+            for path, data in inputs.items():
+                path.write_bytes(data)
+        placements = [
+            {"by_stratum": {"model": "unverified.gguf"}},
+            {"model": "x"}, {"model_receipt": "x"},
+            {"reference_def": {"wrapper": {"model": "x"}}},
+            {"control_def": {"wrapper": {"model_receipt": "x"}}},
+            {"wrapper": {"arm_model_receipt_sha256": {}}},
+            {"wrapper": [0, {"nested": [0, {"model": "x"}]}]},
+        ]
+        for placement in placements:
+            with self.subTest(placement=placement):
+                bad = copy.deepcopy(summary)
+                bad.update(placement)
+                bad["replay_policy"] = plan.REPLAY_POLICY
+                bad["self_sha256"] = common.sha(common.canonical({k: v for k, v in bad.items() if k != "self_sha256"}))
+                with self.assertRaisesRegex(ValueError, "requires replay evidence"):
+                    plan.calibrate(hp, bad)
+                source = baseline_plan.calibrate(hp, bad)["calibration_source"]
+                self.assertIn("replay_verification", plan._source_problem(source))
+                embedded = dict(hp, calibration_source=source)
+                self.assertIn("replay_verification", plan.check(embedded))
+                with self.assertRaisesRegex(ValueError, "replay_verification"):
+                    plan.freeze(embedded)
+                legacy = {k: v for k, v in source.items() if k != "search_summary"}
+                legacy.update(placement)
+                legacy["replay_policy"] = plan.REPLAY_POLICY
+                self.assertIn("replay_verification", plan._legacy_source_problem(legacy))
+                self.assertIn("replay_verification", plan._source_problem(legacy, legacy=True))
+                lp = dict(embedded, split="search", calibration_source=legacy)
+                del lp["tier"]
+                self.assertIn("replay_verification", plan.check(lp))
+                with self.assertRaisesRegex(ValueError, "replay_verification"):
+                    plan.freeze(lp)
+        payload = {"model": "model_receipt", "nested": [{"arm_model_receipt_sha256": "x"}]}
+        accepted = copy.deepcopy(summary)
+        accepted["reference_def"] = {"env": payload, "argv": [payload, "model"]}
+        accepted["self_sha256"] = common.sha(common.canonical({k: v for k, v in accepted.items() if k != "self_sha256"}))
+        self.assertFalse(plan.has_model_overrides(accepted))
+        calibrated = plan.calibrate(hp, accepted)
+        self.assertIsNone(plan._source_problem(calibrated["calibration_source"]))
+        self.assertIsNone(plan.check(plan.freeze(calibrated)))
+        legacy = {k: v for k, v in calibrated["calibration_source"].items() if k != "search_summary"}
+        self.assertIsNone(plan._legacy_source_problem(legacy))
+        # The old CLI remains sufficient and irrelevant evidence flags are never read.
+        summary_path, dest = d / "summary.json", d / "cli.json"
+        summary_path.write_bytes(common.canonical(summary))
+        for extra in ([], ["--search-runs", "missing", "--search-plan", "missing", "--manifest", "missing"]):
+            plan.main(["calibrate", str(self._plan("holdout", frozen=False, name="cli-plan.json")),
+                       "--search-summary", str(summary_path), "--out", str(dest), *extra])
+            self.assertNotIn("replay_verification", plan.load(dest)[0]["calibration_source"])
+
+    def test_direct_model_overrides_refused_at_start(self):
+        import contextlib, io
+        d = self.dir
+        p = self._plan("search")
+        original = json.loads((d / "arms.json").read_text())
+        for name in original["arms"]:
+            arms = json.loads(json.dumps(original))
+            arms["arms"][name].update(model=str(d / "model.gguf"), model_receipt=str(d / "missing.receipt"))
+            (d / "arms.json").write_text(json.dumps(arms))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(self._run(p, d / name), 1)
+            self.assertIn("per-arm model overrides require --replay", err.getvalue())
+            self.assertFalse((d / name / "runs.jsonl").exists())
+
+    def test_legacy_mixed_resume_and_malformed_maps(self):
+        import shutil
+        d = self.dir
+        p, live = self._plan("search"), d / "live"
+        self.assertEqual(self._run(p, live), 0)
+        original = (live / "run-meta.json").read_text()
+        # One untouched legacy-shaped directory and one resumed all-default directory,
+        # with disjoint cases and a common plan/arms/binary/default receipt.
+        legacy, resumed = d / "legacy", d / "resumed"
+        shutil.copytree(live, legacy)
+        shutil.copytree(live, resumed)
+        metas = [json.loads(line) for line in original.splitlines()]
+        for m in metas:
+            m.pop("arm_model_receipt_sha256", None)
+        (legacy / "run-meta.json").write_text("".join(json.dumps(m) + "\n" for m in metas))
+        explicit = dict(metas[0], arm_model_receipt_sha256={
+            n: common.file_sha(d / "receipt") for n in ("REF", "CTRL", "A", "B", "AB")})
+        (resumed / "run-meta.json").write_text(json.dumps(explicit) + "\n")
+        cases = sorted({r["case_id"] for r in common.read_journal(live / "runs.jsonl")[0]})
+        for directory, keep in ((legacy, set(cases[::2])), (resumed, set(cases[1::2]))):
+            records = [r for r in common.read_journal(directory / "runs.jsonl")[0] if r["case_id"] in keep]
+            (directory / "runs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+            for mark in (directory / "done").iterdir():
+                if mark.name.rsplit(".", 1)[0] not in keep:
+                    mark.unlink()
+        ctx, results, ctrl, means = analyze.analyze(d / "m", p, [legacy, resumed])
+        self.assertEqual(ctx["global_problems"], [])
+        self.assertEqual(results["A"]["verdict"], "PASS")
+        analyze.write(d / "receipts", ctx, results, ctrl, means)
+        self.assertNotIn("arm_model_receipt_sha256", json.loads((d / "receipts" / "A.receipt.json").read_text()))
+        self.assertNotIn("Model receipt sha256:", (d / "receipts" / "A.receipt.md").read_text())
+        # Default-only resume omits the map; explicit all-default maps remain accepted.
+        self.assertEqual(self._run(p, legacy, ["--cases", ",".join(cases[::2])]), 0)
+        self.assertEqual(analyze.analyze(d / "m", p, [legacy, resumed])[0]["global_problems"], [])
+        for bad in (None, {}, "oops", {"REF": "a" * 64},
+                    {n: None for n in ("REF", "CTRL", "A", "B", "AB")},
+                    {n: "z" * 64 for n in ("REF", "CTRL", "A", "B", "AB")}):
+            with self.subTest(bad=bad):
+                m = json.loads(original.splitlines()[0])
+                m["arm_model_receipt_sha256"] = bad
+                (live / "run-meta.json").write_text(json.dumps(m) + "\n")
+                ctx, results, _, _ = analyze.analyze(d / "m", p, [live])
+                self.assertEqual(results["A"]["verdict"], "INVALID")
+                self.assertTrue(any("arm_model_receipt_sha256 provenance" in x for x in ctx["global_problems"]))
+                self.assertEqual(self._run(p, live), 1)
+
+    def test_replay_of_a_many_case_engine_run(self):
+        """--replay takes each (case, arm) from an engine's output directory and gives the verdicts of a live run."""
+        import hashlib, shutil
+        p = self._plan("holdout")
+        live, R = self.dir / "live", self.dir / "replay-src"
+        self.assertEqual(self._run(p, live, ["--keep-logits"]), 0)
+        R.mkdir()
+        cases = {c["case_id"]: c for c in json.loads((self.dir / "m" / "manifest.json").read_text())["cases"]}
+
+        def fsha(path):
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        binary = fsha(self.dir / "fake.py")
+        model = (self.dir / "receipt").read_text().split()[0]
+        journal = []
+        for n, out in enumerate(sorted((live / "log").glob("*.stdout"))):
+            cid, lab = out.name[:-len(".stdout")].rsplit(".", 1)
+            res = json.loads([l for l in out.read_text().splitlines() if l.startswith("{")][-1])
+            c = cases[cid]
+            res.update(case_id=cid, prompt_sha256=c["prompt_sha256"], cont_sha256=c["cont_sha256"])
+            (R / f"{cid}.{lab}.json").write_text(json.dumps(res))
+            shutil.copyfile(live / "log" / f"{cid}.{lab}.stderr", R / f"{cid}.{lab}.stderr")
+            shutil.copyfile(live / "logits" / f"{cid}.{lab}.bin", R / f"{cid}.{lab}.bin")
+            journal.append(dict(status="complete", capture_id=f"cap-{n}",
+                                collection_id="col-repeat" if lab.endswith("@repeat") else "col-main",
+                                case_id=cid, label=lab, binary_sha256=binary, model_sha256=model,
+                                prompt_sha256=c["prompt_sha256"],
+                                cont_sha256=c["cont_sha256"], json_sha256=fsha(R / f"{cid}.{lab}.json"),
+                                bin_sha256=fsha(R / f"{cid}.{lab}.bin"), stderr_sha256=fsha(R / f"{cid}.{lab}.stderr")))
+        (R / "runs.jsonl").write_text("".join(json.dumps(e) + "\n" for e in journal))
+        rep = self.dir / "rep"
+        self.assertEqual(self._run(p, rep, ["--replay", str(R)]), 0)
+        _, want, _, _ = analyze.analyze(self.dir / "m", p, [live])
+        _, got, _, _ = analyze.analyze(self.dir / "m", p, [rep])
+        for opt in ("A", "B", "AB"):
+            self.assertEqual(got[opt]["verdict"], want[opt]["verdict"], (opt, got[opt]["notes"]))
+            self.assertEqual(json.dumps(got[opt].get("endpoints"), sort_keys=True, default=str),
+                             json.dumps(want[opt].get("endpoints"), sort_keys=True, default=str))
+        meta = json.loads((rep / "run-meta.json").read_text().splitlines()[0])
+        self.assertEqual(meta["replay_dir"], str(R.resolve()))
+        victim = sorted(R.glob("*.A.json"))[0]
+        vcase = victim.name[:-len(".A.json")]
+
+        def broken(name, mutate, extra=()):
+            src, out = self.dir / f"replay-{name}", self.dir / f"rep-{name}"
+            shutil.copytree(R, src)
+            mutate(src)
+            rc = self._run(p, out, ["--replay", str(src), *extra])
+            _, res, _, _ = analyze.analyze(self.dir / "m", p, [out]) if (out / "runs.jsonl").exists() else (0, None, 0, 0)
+            return rc, res
+        # a result that names another case is a failed attempt, never evidence
+        def other_case(src):
+            f = src / victim.name; r = json.loads(f.read_text()); r["case_id"] = "someone-else"; f.write_text(json.dumps(r))
+        rc, res = broken("case", other_case)
+        self.assertEqual(rc, 1); self.assertNotEqual(res["A"]["verdict"], "PASS")
+        # the option's logits replaced by the reference's: bytes differ from the committed entry
+        rc, res = broken("swap", lambda src: shutil.copyfile(src / f"{vcase}.REF.bin", src / f"{vcase}.A.bin"))
+        self.assertEqual(rc, 1); self.assertNotEqual(res["A"]["verdict"], "PASS")
+        # the repeat folded onto the reference capture is not an independent run
+        rc, res = broken("alias", lambda src: None, ["--replay-label", "REF@repeat=REF"])
+        self.assertEqual(rc, 1); self.assertNotEqual(res["A"]["verdict"], "PASS")
+        # a capture made by another binary
+        def other_binary(src):
+            lines = [json.loads(x) for x in (src / "runs.jsonl").read_text().splitlines()]
+            for e in lines:
+                if e["case_id"] == vcase and e["label"] == "A":
+                    e["binary_sha256"] = "0" * 64
+            (src / "runs.jsonl").write_text("".join(json.dumps(e) + "\n" for e in lines))
+        rc, res = broken("binary", other_binary)
+        self.assertEqual(rc, 1); self.assertNotEqual(res["A"]["verdict"], "PASS")
+        # a capture that names another model
+        def other_model(src):
+            lines = [json.loads(x) for x in (src / "runs.jsonl").read_text().splitlines()]
+            for e in lines:
+                if e["case_id"] == vcase and e["label"] == "A":
+                    e["model_sha256"] = "f" * 64
+            (src / "runs.jsonl").write_text("".join(json.dumps(e) + "\n" for e in lines))
+        rc, res = broken("model", other_model)
+        self.assertEqual(rc, 1); self.assertNotEqual(res["A"]["verdict"], "PASS")
+        # malformed producer model identities: missing, null, empty, not a string
+        for n, value in enumerate((None, "", 7, "MISSING")):
+            def bad_model(src, value=value):
+                lines = [json.loads(x) for x in (src / "runs.jsonl").read_text().splitlines()]
+                for e in lines:
+                    if e["case_id"] == vcase and e["label"] == "A":
+                        if value == "MISSING":
+                            del e["model_sha256"]
+                        else:
+                            e["model_sha256"] = value
+                (src / "runs.jsonl").write_text("".join(json.dumps(e) + "\n" for e in lines))
+            rc, res = broken(f"model{n}", bad_model)
+            self.assertEqual(rc, 1, value); self.assertNotEqual(res["A"]["verdict"], "PASS", value)
+        # a receipt that names no model: refused before any capture is imported
+        for n, text in enumerate(("", "   \n\t")):
+            receipt, out = self.dir / f"receipt-empty-{n}", self.dir / f"rep-empty-{n}"
+            receipt.write_text(text)
+            rc = run.main(["--manifest", str(self.dir / "m"), "--plan", str(p), "--arms", str(self.dir / "arms.json"),
+                           "--binary", str(self.dir / "fake.py"), "--model", str(self.dir / "model.gguf"),
+                           "--model-receipt", str(receipt), "--out", str(out), "--soft-seconds", "600",
+                           "--allow-fake-for-tests", "--python-binary-for-tests", "--replay", str(R)])
+            self.assertEqual(rc, 1)
+            self.assertFalse((out / "runs.jsonl").exists() and (out / "runs.jsonl").read_text().strip())
+        # no producer journal at all: refused before anything is imported
+        rc, _ = broken("nojournal", lambda src: (src / "runs.jsonl").unlink())
+        self.assertEqual(rc, 1)
+        # a pair without engine output is not run: resumable (exit 2), INCOMPLETE, never FAIL
+        R3, rep3 = self.dir / "replay-gap", self.dir / "rep3"
+        shutil.copytree(R, R3)
+        lines = [x for x in (R3 / "runs.jsonl").read_text().splitlines()
+                 if not (json.loads(x)["case_id"] == vcase and json.loads(x)["label"] == "A")]
+        (R3 / "runs.jsonl").write_text("".join(x + "\n" for x in lines))     # not committed yet
+        self.assertEqual(self._run(p, rep3, ["--replay", str(R3)]), 2)
+        _, gap, _, _ = analyze.analyze(self.dir / "m", p, [rep3])
+        self.assertEqual(gap["A"]["verdict"], "INCOMPLETE", gap["A"]["notes"])
 
     def test_holdout_verdicts(self):
         p = self._plan("holdout")
@@ -133,6 +1060,108 @@ class EndToEnd(unittest.TestCase):
         victim.unlink()
         _, results, _, _ = analyze.analyze(self.dir / "m", p, [out])
         self.assertEqual(results["A"]["verdict"], "INCOMPLETE")
+
+    def test_run_witness_misses_are_incomplete_never_fail(self):
+        d = self.dir
+        arms = {"REF": {}, "CTRL": {"env": {"FAKE_NOISE": "0.02"}},
+                "A": {"env": {"FAKE_NOISE": "0.005", "FAKE_LEVER_ON": "1"}},   # lever engaged
+                "B": {"env": {"FAKE_NOISE": "0.005"}},                         # lever silently declined
+                "AB": {"env": {"FAKE_NOISE": "1.5"}}}
+        (d / "arms-w.json").write_text(json.dumps({"arms": arms}))
+        witness = {"A": {"stdout": {"lever": True}, "stderr_require": ["reason=test"]},
+                   "B": {"stdout": {"lever": True}}, "REF": {"stdout": {"lever": False}}}
+        pl = plan.init(d / "m", "holdout", "REF", "CTRL", ["A", "B"], [{"name": "AB", "members": ["A", "B"]}],
+                       [256, 512], bootstrap=500, min_parents=2, repeat_cases=["en-02.L256", "en-05.L256"],
+                       witness=witness)
+        for e, m in (("E2", 0.01), ("E3", 0.01), ("E4", 0.05)):
+            pl["endpoints"][e] = {"fixed": m}
+        pl = plan.freeze(pl)
+        plan.save(d / "plan-w.json", pl)
+        out = d / "out-w"
+        argv = ["--manifest", str(d / "m"), "--plan", str(d / "plan-w.json"), "--arms", str(d / "arms-w.json"),
+                "--binary", str(d / "fake.py"), "--model", str(d / "model.gguf"), "--model-receipt",
+                str(d / "receipt"), "--out", str(out), "--soft-seconds", "600", "--allow-fake-for-tests",
+                "--python-binary-for-tests"]
+        self.assertEqual(run.main(argv), 1)          # B's runs fail their witness (a failed attempt each)
+        self.assertEqual(run.main(argv), 1)
+        recs = [json.loads(x) for x in (out / "runs.jsonl").read_text().splitlines() if '"event"' not in x]
+        b = [r for r in recs if r["arm"] == "B"]
+        self.assertTrue(b and all((r["problem"] or "").startswith("witness: result lever = false") for r in b), b[:1])
+        self.assertTrue(all(r["complete"] for r in recs if r["arm"] == "A"))
+        _, results, _, _ = analyze.analyze(d / "m", d / "plan-w.json", [out])
+        self.assertEqual(results["A"]["verdict"], "PASS", results["A"]["notes"])
+        self.assertEqual(results["B"]["verdict"], "INCOMPLETE", results["B"]["notes"])
+        self.assertTrue(any("witness" in n for n in results["B"]["notes"]))
+        # a lost terminal marker restored from the journal stays INCOMPLETE (classified from the run records)
+        for m in (out / "done").glob("*.B"):
+            m.unlink()
+        run.main(argv)
+        self.assertTrue(any("restored" in m.read_text() for m in (out / "done").glob("*.B")))
+        _, results, _, _ = analyze.analyze(d / "m", d / "plan-w.json", [out])
+        self.assertEqual(results["B"]["verdict"], "INCOMPLETE", results["B"]["notes"])
+        self.assertEqual(results["A"]["verdict"], "PASS", results["A"]["notes"])
+        # the primary reference's logs are checked too: replaced bytes (even still carrying the witness) are INVALID
+        r_case = next(x.name for x in (out / "done").glob("*.A"))[:-2]
+        ref_log = out / "log" / f"{r_case}.REF.stdout"
+        kept = ref_log.read_bytes()
+        ref_log.write_bytes(kept + b" ")
+        _, results, _, _ = analyze.analyze(d / "m", d / "plan-w.json", [out])
+        self.assertEqual(results["A"]["verdict"], "INVALID", results["A"]["notes"])
+        ref_log.write_bytes(kept)
+        # a kept candidate run whose logs were replaced is INVALID, not evidence - even if they show the witness
+        a_err = out / "log" / f"{r_case}.A.stderr"
+        a_err.write_bytes(a_err.read_bytes() + b"reason=test\n")
+        _, results, _, _ = analyze.analyze(d / "m", d / "plan-w.json", [out])
+        self.assertEqual(results["A"]["verdict"], "INVALID")
+
+    def test_witness_misses_never_count_toward_fail(self):
+        d = self.dir
+        lever, trunc = d / "lever-on", d / "truncate"
+        arms = {"REF": {}, "CTRL": {"env": {"FAKE_NOISE": "0.02"}},
+                "A": {"env": {"FAKE_NOISE": "0.005", "FAKE_LEVER_FILE": str(lever),
+                              "FAKE_TRUNCATE_FILE": str(trunc)}}}
+        (d / "arms-m.json").write_text(json.dumps({"arms": arms}))
+        pl = plan.init(d / "m", "holdout", "REF", "CTRL", ["A"], [], [256], bootstrap=500, min_parents=2,
+                       witness={"A": {"stdout": {"lever": True}}})
+        for e, m in (("E2", 0.01), ("E3", 0.01), ("E4", 0.05)):
+            pl["endpoints"][e] = {"fixed": m}
+        plan.save(d / "plan-m.json", plan.freeze(pl))
+        out = d / "out-m"
+        argv = ["--manifest", str(d / "m"), "--plan", str(d / "plan-m.json"), "--arms", str(d / "arms-m.json"),
+                "--binary", str(d / "fake.py"), "--model", str(d / "model.gguf"), "--model-receipt",
+                str(d / "receipt"), "--out", str(out), "--soft-seconds", "600", "--allow-fake-for-tests",
+                "--python-binary-for-tests"]
+        self.assertEqual(run.main(argv), 1)          # attempt 1 of every A run: witness miss
+        lever.write_text("1")
+        trunc.write_text("1")
+        self.assertEqual(run.main(argv), 1)          # attempt 2: an ordinary failure; the attempts are used up
+        recs = [json.loads(x) for x in (out / "runs.jsonl").read_text().splitlines() if '"event"' not in x]
+        probs = [r["problem"] or "" for r in recs if r["arm"] == "A"]
+        self.assertTrue(any(x.startswith("witness:") for x in probs) and any(x.startswith("forced") for x in probs))
+        _, results, _, _ = analyze.analyze(d / "m", d / "plan-m.json", [out])
+        self.assertEqual(results["A"]["verdict"], "INCOMPLETE", results["A"]["notes"])
+
+    def test_witness_plan_validation(self):
+        base = dict(split="holdout", reference="REF", control="CTRL", options=["A"], compositions=[],
+                    lengths=[256], bootstrap=500, min_parents=2)
+        bad = [{"Z": {"stdout": {"x": 1}}}, {"A": {}}, {"A": {"stdout": {}}}, {"A": {"stderr_forbid": ["", "x"]}},
+               {"A": {"stderr_require": ["(unclosed"]}}, {"A": {"other": 1}}, {}, [], False, 0,
+               {"A": {"stderr_require": ["a{4294967296}"]}}]
+        for w in bad:
+            with self.assertRaises(ValueError, msg=w):
+                plan.init(self.dir / "m", **base, witness=w)
+        self.assertNotIn("witness", plan.init(self.dir / "m", **base))     # legacy plans unchanged
+        # CLI: a given witness file is always validated (null included); omitting the flag gives no witness
+        cli = ["init", "--manifest", str(self.dir / "m"), "--split", "holdout", "--reference", "REF", "--control",
+               "CTRL", "--options", "A", "--lengths", "256", "--bootstrap", "500", "--min-parents-per-stratum", "2"]
+        for doc in ("null", "{}", "false"):
+            (self.dir / "w.json").write_text(doc)
+            with self.assertRaises(ValueError, msg=doc):
+                plan.main(cli + ["--witness", str(self.dir / "w.json"), "--out", str(self.dir / "pw.json")])
+            self.assertFalse((self.dir / "pw.json").exists())
+        plan.main(cli + ["--out", str(self.dir / "pn.json")])
+        self.assertNotIn("witness", json.loads((self.dir / "pn.json").read_text()))
+        self.assertIn("witness", plan.init(self.dir / "m", **base, witness={"A": {"stdout": {"lever": True}}}))
 
     def test_provenance_control_and_forcing_gates(self):
         p = self._plan("holdout")

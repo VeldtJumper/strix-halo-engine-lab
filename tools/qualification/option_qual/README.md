@@ -152,7 +152,16 @@ python3 -m tools.qualification.option_qual.plan freeze HOLDOUT_PLAN.json
 
 `ARMS.json` maps arm names to extra environment variables and arguments, for example
 `{"arms": {"REF": {"env": {}}, "OPT_A": {"env": {"OPTION_SWITCH": "1"}, "argv": []}}}`. The runner
-starts each arm from a clean environment (`PATH`, `HOME`, `LD_LIBRARY_PATH` only, every inherited
+accepts optional `"model": "OPTION.gguf"` and `"model_receipt": "OPTION.receipt"` paths together
+in each arm for `--replay` only; direct runs refuse any arm model override. Each replay capture,
+including the reference repeat, must name the model SHA-256 from that arm's receipt. Omit both to use
+`--model` and `--model-receipt`. The binary stays identical across arms; the manifest's tokenizer receipt
+remains tied to the run's `--model-receipt`. Run metadata, holdout ledgers and receipts record
+`arm_model_receipt_sha256` only when the arms file has overrides. Each run record binds its arm's
+receipt. The arms-file hash in run metadata covers these overrides; successful records in such directories require replay capture
+provenance, including independent reference and repeat captures. Historical direct captures must be
+reimported into a new output directory; adding `--replay` cannot validate old records. Plans do not
+freeze an arms-file hash. The runner starts each arm from a clean environment (`PATH`, `HOME`, `LD_LIBRARY_PATH` only, every inherited
 engine variable dropped) and sets the measurement hook variables itself. It is resumable: run it again
 in the next turn until it exits 0 (2 means the soft budget stopped it; 1 means a run failed: the other
 arms and cases still run, and a failing pair is retried up to `--max-attempts` times, then counts
@@ -183,6 +192,30 @@ invocation records which capture it relies on. Arm names contain no `.`, `/` or 
 least one gating endpoint. Logit files (about 1 MB per
 position) are deleted as soon as they are reduced; `--keep-logits` keeps them. `reduce.py` also works
 on a pair of teacher spools (`--format spool`).
+
+### Run witness
+
+An engine can decline a lever or fall back to another route at run time (for example when memory is short), and
+the run then produces another arm's numbers without any error. A plan can declare, per arm, what every run of that
+arm must show (`plan.py init --witness FILE`, frozen with the plan):
+
+```json
+{"OPT": {"stdout": {"lever_engaged": true, "storage_identity": "fp16-v1+lever"},
+         "stderr_forbid": ["declined", "insufficient-memory"],
+         "stderr_require": ["reason=qualified-prompt"]},
+ "REF": {"stdout": {"lever_engaged": false}}}
+```
+
+`stdout` keys are compared with the run's JSON result as serialized JSON values (`1`, `1.0`, `true` and `"1"`
+all differ); `stderr_forbid` texts must not and `stderr_require` patterns must occur in the run's stderr (decoded
+as UTF-8, no newline translation). A validated run that misses its witness is not evidence: it counts as a failed
+attempt (`witness: ...` in its run record) and is repeated up to `--max-attempts`. Witness misses never count
+toward FAIL: a pair is FAIL only when its ordinary failures alone reach the limit, otherwise it is INCOMPLETE; this
+is read from the run journal, so a marker restored after an interruption is classified the same way. Every run
+record binds the sha256 of its saved stdout/stderr logs; the analysis checks the witness of every kept run (the
+reference included, before any of its data is used) on exactly those bytes. A kept run whose logs are missing,
+changed or lack the witness, or whose record does not bind its logs (an older kit), is INVALID. Plans without a
+witness are unchanged.
 
 ## Receipts
 
