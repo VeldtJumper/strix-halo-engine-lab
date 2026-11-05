@@ -1126,6 +1126,17 @@ void lean_equal(int mode, unsigned rows, unsigned heads, unsigned nwin, std::uin
                         std::to_string(heads) + " windows " + std::to_string(nwin) + " p0 " + std::to_string(p0) + " ratio " + std::to_string(ratio) +
                         " a8 " + std::to_string(a8) + " swizzle " + std::to_string(swz) + " f16 " + std::to_string(f16));
         }
+        // lean 3 with the 6-wave register budget off (STRIX_DS41_ATTN_WAVE_CAP=0) and on: the same bytes
+        for (const int cap : {0, 1}) {
+            g::set_attention_wave_cap(cap);
+            g::set_attention_lean(3);
+            pw.clear();
+            pw.run();
+            expect(pw.bytes() == ref, "lean 3 wave cap " + std::to_string(cap) + " == previous form, mode " + std::to_string(mode) + " rows " +
+                   std::to_string(rows) + " heads " + std::to_string(heads) + " ratio " + std::to_string(ratio) + " swizzle " + std::to_string(swz) +
+                   " f16 " + std::to_string(f16));
+        }
+        g::set_attention_wave_cap(-1);
     }
     g::set_attention_lean(-1);
     g::set_attention_tile_f16(-1);

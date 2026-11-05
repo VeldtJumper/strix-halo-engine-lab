@@ -1281,6 +1281,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Attention wave cap for lean 3 chunk calls",
+    "flag_or_env": "STRIX_DS41_ATTN_WAVE_CAP",
+    "default": "on",
+    "exact": "Bitwise: the same source, one instantiation compiled with a 6-waves-per-SIMD occupancy hint; HIP attention device tests compare lean 3 with the cap on and off against the lean 0 bytes (output, A8 and ticket bytes, adversarial inputs); two-node serve logits digests and generated ids identical at 1,999 / 8,399 / 32,499 tokens, cap on vs off in both orders.",
+    "gain": "Prefill window bench (8-row windows, 640 keys, cap vs the same lean 3 uncapped): -12.6 % (32 heads, compressed keys) / -10.3 % (64 heads) per 8-row window, -11.3 % (64 heads, positions 1000), -13.8 % on 64-row windows. Two-node serve TTFT at 1,999 / 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order, mean of the two orders): 2.722 / 8.004 / 27.568 s with STRIX_DS41_ATTN_WAVE_CAP=0 vs 2.712 / 7.921 / 27.503 s default (-0.4 / -1.0 / -0.2 %; the arm order moved single runs by up to 1.5 % at 32K).",
+    "preconditions": "HIP chunk kernels at lean 3, four heads per wave, compressed keys (index selection) or 64 heads; segment launches cap only when every view qualifies.",
+    "off_switch": "STRIX_DS41_ATTN_WAVE_CAP=0",
+    "doc_anchor": "docs/optimizations.md#ds-attn-wave-cap"
+  },
+  {
+    "engine": "deepseek",
     "name": "Server warm-up and DSpark calibration",
     "flag_or_env": "STRIX_DS41_SERVE_WARM; STRIX_DS41_DSPARK_CALIB",
     "default": "auto",

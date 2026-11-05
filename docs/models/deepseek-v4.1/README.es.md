@@ -187,6 +187,11 @@ En `default`, los bloques de prefill denso de 896 filas o más ejecutan ahora la
 lanzamiento (`STRIX_DS41_PREFILL_O_B_ONE=0` restablece los dos lanzamientos; toda salida que no sea NaN es idéntica bit a bit).
 TTFT del servidor en el par, ambos órdenes de ejecución, mismos logits e ids generados: 8.4K 8.069 → 7.935 s (−1.7 %),
 32.5K 27.41 → 27.18 s (−0.8 %). La tabla anterior es previa a este cambio y no se volvió a medir con él.
+En `default`, el kernel de atención lean 3 por fragmentos se ejecuta ahora compilado para 6 waves por SIMD donde compensa
+(claves comprimidas o 64 cabezas; `STRIX_DS41_ATTN_WAVE_CAP=0` restablece el kernel sin límite; bytes de salida iguales).
+TTFT del servidor en el par, media de ambos órdenes, mismos logits e ids generados: 1,999 tokens 2.722 → 2.712 s
+(734 → 737 tok/s, −0.4 %), 8,399 tokens 8.004 → 7.921 s (1,049 → 1,060 tok/s, −1.0 %), 32,499 tokens 27.568 → 27.503 s
+(1,179 → 1,182 tok/s, −0.2 %). La tabla anterior tampoco se volvió a medir con este cambio.
 
 `--prefill-rows auto` se detiene ahora en piezas de 16384 filas: desde el cono del decodificador diferido, las piezas de
 32768 filas son más lentas en el par (8.01 / 28.30 / 39.94 s frente a 7.94 / 27.44 / 38.98 s con 8,399 / 32,499 / 44,699

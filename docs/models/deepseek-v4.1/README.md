@@ -183,6 +183,11 @@ In `default`, dense prefill chunks of 896 rows or more now run o_b's two K-halve
 (`STRIX_DS41_PREFILL_O_B_ONE=0` restores two launches; every non-NaN output bitwise equal). Server TTFT on the pair,
 both run orders, same logits and generated ids: 8.4K 8.069 → 7.935 s (−1.7 %), 32.5K 27.41 → 27.18 s (−0.8 %).
 The table above predates this change and was not re-measured with it.
+In `default`, the lean 3 chunk attention kernel now runs compiled for 6 waves per SIMD where it pays (compressed keys
+or 64 heads; `STRIX_DS41_ATTN_WAVE_CAP=0` restores the uncapped kernel; output bytes equal). Server TTFT on the pair,
+mean of both run orders, same logits and generated ids: 1,999 tokens 2.722 → 2.712 s (734 → 737 tok/s, −0.4 %),
+8,399 tokens 8.004 → 7.921 s (1,049 → 1,060 tok/s, −1.0 %), 32,499 tokens 27.568 → 27.503 s (1,179 → 1,182 tok/s, −0.2 %).
+The table above was not re-measured with this change either.
 
 `--prefill-rows auto` now stops at 16384-row pieces: since the deferred decoder cone, 32768-row pieces are slower on
 the pair (8.01 / 28.30 / 39.94 s vs 7.94 / 27.44 / 38.98 s at 8,399 / 32,499 / 44,699 tokens, same binary, one load per
