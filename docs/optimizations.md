@@ -2849,6 +2849,22 @@ Mode 5 evaluates two heads' probabilities in one packed exponential; mode 6 also
 - **Measured gain:** 8K TTFT in-process A/B/A vs mode 5: -1.6 / 0.0 / 0.0 % (not slower); producer fixture within noise at small row counts.
 - **Implementation / evidence:** [kernel](../src/minimax/attn/msa_fused.hip), [tests](../src/minimax/attn/msa_fused_tests.hip)
 
+<a id="mm-pf-msa-mode7"></a>
+
+### MSA prefill mode 7
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 7.
+
+Mode 6 writes per-chunk partials and combines them in a second launch; mode 7 runs the same producer and lets the last chunk block of each (row, group) take an atomic ticket and combine the partials itself, with the same expressions in the same ascending order, so the separate combine launch disappears.
+
+- **Preconditions:** Supported MSA prefill shapes (as mode 6).
+- **Automatic selection:** Resolver supplies 7 only when unset; explicit values win.
+- **Fallback notice:** As mode 6.
+- **Exactness evidence:** Exact: the fused MSA unit suite compares every partial, score, index and output byte of modes 0..7 (both PV paths, dense and sparse, scratch sizes, graph replay); prefill state and final rows identical on both ranks in a 6-vs-7 PAIR A/B.
+- **Off switch:** STRIX_MM_PF_MSA_REWORK=6 (previous default), =5, =3, =0 (original)
+- **Measured gain:** attend call -8.3 % at 28672 rows x 4096 keys (faster at every fixture shape); TTFT bracketed in-process A/B vs mode 6 8K -5.0 % (-0.78 s), 16K -3.0 % (-0.93 s); 32K fresh process 6/7/6 + 7/6/7 -2.4 % (-1.59 s), result hash identical on both ranks.
+- **Implementation / evidence:** [kernel](../src/minimax/attn/msa_fused.hip), [tests](../src/minimax/attn/msa_fused_tests.hip)
+
 <a id="mm-rank-pfx"></a>
 
 ### GPU-gated prefill exchange in the rank app

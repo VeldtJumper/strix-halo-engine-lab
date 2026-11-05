@@ -1875,6 +1875,17 @@
   },
   {
     "engine": "minimax",
+    "name": "MSA prefill mode 7",
+    "flag_or_env": "STRIX_MM_PF_MSA_REWORK",
+    "default": "7",
+    "exact": "Exact: every partial, score, index and output byte of modes 0..7 in the fused MSA suite; state and final rows identical on both ranks in a 6-vs-7 PAIR A/B.",
+    "gain": "attend call -8.3 % at 28672x4096; TTFT bracketed in-process A/B vs mode 6 8K -5.0 % (-0.78 s), 16K -3.0 % (-0.93 s); 32K fresh process 6/7/6 + 7/6/7 -2.4 % (-1.59 s), result hash identical on both ranks",
+    "preconditions": "Supported MSA prefill shapes.",
+    "off_switch": "STRIX_MM_PF_MSA_REWORK=6 (previous default), =5, =3, =0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-msa-mode7"
+  },
+  {
+    "engine": "minimax",
     "name": "GPU-gated prefill exchange in the rank app",
     "flag_or_env": "STRIX_MM_PFX",
     "default": "on",

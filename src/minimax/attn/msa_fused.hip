@@ -1254,7 +1254,7 @@ __global__ __launch_bounds__(256) void prefill_combine_kernel(PrefillView p) {
 }
 
 template <unsigned HPW, bool DENSE, class View = DecodeView, bool SEPARATE = false, bool STREAM = false, bool COMPACT = SEPARATE, bool PACKED = false,
-          bool CORRPACK = false>
+          bool CORRPACK = false, bool TAIL = !SEPARATE>
 __global__ __launch_bounds__(kGroup / HPW * 32) void attend4_kernel(View input, int select) {
     constexpr bool REPAIR = repaired_prefill<View>;
     static_assert(!PACKED || (HPW == 2 && REPAIR && SEPARATE && STREAM && COMPACT));
@@ -1575,7 +1575,7 @@ __global__ __launch_bounds__(kGroup / HPW * 32) void attend4_kernel(View input, 
         for (unsigned i = 0; i < kDimsPerLane; ++i) out[2 + lane * kDimsPerLane + i] = acc[h][i];
     }
     stamp(v.phase, 5);
-    if constexpr (!SEPARATE) {
+    if constexpr (TAIL) {  // the last chunk block of (row, group) combines; mode 7 keeps this on the SEPARATE producer
         __threadfence();
         __syncthreads();
         std::uint32_t* ticket = v.ticket + rg;
@@ -1942,6 +1942,16 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         }
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
+        if (p.msa_rework == 7) {
+            // Mode 6 producer with the ticket combine fused into the last chunk block of each (row, group):
+            // same partials, same combine expressions and ascending chunk order, no separate combine launch.
+            const RepairedPrefillView repaired{scheduled};
+            hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, true>),
+                               dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
+                               4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
+            check(hipGetLastError(), "minimax prefill fused partial producers");
+            return;
+        }
         if (p.msa_rework == 4) {
             const unsigned blocks = static_cast<unsigned>(block_count(p.pos0 + scheduled.rows));
             hipLaunchKernelGGL((prefill_r16_kernel<DENSE>), dim3(blocks, v.kv_heads, windows), dim3(1024),
@@ -2010,7 +2020,7 @@ template <bool DENSE> void launch_prefill_partials(const PrefillView& p, unsigne
         const unsigned blocks = static_cast<unsigned>(block_count(p.pos0 + p.rows));
         hipLaunchKernelGGL((prefill_r16_kernel<DENSE>), dim3(blocks, v.kv_heads, windows), dim3(1024),
                            4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, p);
-    } else if (p.msa_rework == 6) {
+    } else if (p.msa_rework == 6 || p.msa_rework == 7) {  // diagnostic: mode 7 = mode 6 producer (no tickets here)
         const RepairedPrefillView repaired{p};
         hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true>),
                            dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
@@ -2038,7 +2048,7 @@ namespace {
 void validate_prefill_diagnostic(const PrefillView& p) {
     const DecodeView& v = p.window;
     const unsigned windows = p.rows == 0 ? 0 : (p.rows - 1) / kMaxRows + 1;
-    if (p.msa_rework > 6 || windows == 0 || windows > 65535U || p.first_window != 0 ||
+    if (p.msa_rework > 7 || windows == 0 || windows > 65535U || p.first_window != 0 ||
         p.scratch_windows == 0 || windows > p.scratch_windows ||
         v.rows_per_seq != (p.rows < kMaxRows ? p.rows : kMaxRows) || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.max_blocks == 0 || v.max_blocks > kMaxBlocks ||
@@ -2122,7 +2132,7 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     const DecodeView& v = p.window;
-    if (p.msa_rework > 6 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
+    if (p.msa_rework > 7 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.idx_heads != 2 || v.shard_count != 1 || v.shard_rank != 0 ||
         v.max_blocks == 0 || v.max_blocks > kMaxBlocks || (attend_version(v) != 3 && attend_version(v) != 4) ||
