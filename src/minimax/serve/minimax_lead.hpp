@@ -537,6 +537,7 @@ private:
             for (auto id : t->job.stop_tokens) stops.push(sv::Json(std::uint64_t(id)));
             command.set("tokens", std::move(tokens)); command.set("stops", std::move(stops));
             command.set("count", sv::Json(std::uint64_t(t->job.max_tokens)));
+            command.set("defer_park", sv::Json(true));  // answered first, parked below before anything else runs
             const auto begin = Time::now();
             sv::GenerationStats stats; stats.prompt_tokens = t->job.prompt.size();
             auto publish = [&](std::span<const std::uint32_t> ids) {
@@ -555,6 +556,12 @@ private:
                 stats.finish = t->ticket->cancelled() ? "cancelled" : finish ? finish->as_string() :
                                ids.size() < t->job.max_tokens ? "stop" : "length";
                 queue_.finish(*t, stats);
+                // The reply is out; park the conversation (capture + receipts on both ranks) before the next admission
+                // can reuse the slot. A failed park only loses the stored state: the next turn is a miss.
+                auto park = sv::Json::object(); park.set("op", sv::Json("park_active")); park.set("id", sv::Json(t->job.session));
+                const auto parked = dispatch_session(park.dump());
+                if (const auto* park_error = parked.find("error"))
+                    std::fprintf(stderr, "session park after reply failed: %s\n", park_error->dump().c_str());
             }
             return true;
         }

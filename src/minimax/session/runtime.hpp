@@ -39,6 +39,8 @@ public:
   bool in_ram(const std::string& id) const { return cache_->in_ram(id); }
   bool on_disk(const std::string& id) const { return options_.disk_enabled && cache_->on_disk(id); }
   bool disk_enabled() const { return options_.disk_enabled; }
+  // A request's state is in the slot and not yet parked.
+  bool active() const { return active_; }
   std::vector<std::string> list() const { return cache_->list(); }
   Stats stats() const { return cache_->stats(); }
   std::string digest();

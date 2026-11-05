@@ -75,7 +75,8 @@ Runtime::Runtime(engine::Engine &e, dspark::DeviceDrafter *d,
   // can enter the peer channel. Do not add constructor collectives here.
   cache_ =
       std::make_unique<Cache>(std::move(compat), e.rank(), 2, options_.budget,
-                              options_.directory, exchange_, options_.max_parked, options_.disk_budget);
+                              options_.disk_enabled ? options_.directory : std::string{}, exchange_,
+                              options_.max_parked, options_.disk_budget);
   // Taps are scoped to named requests; construction leaves ordinary serving untouched.
 }
 bool Runtime::begin_request(const std::string& id, std::span<const std::uint32_t> prompt) {

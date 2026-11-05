@@ -3,7 +3,7 @@
 set -euo pipefail
 SESSION_PHASE=${1:-}
 case "$SESSION_PHASE" in
-  prepare|prewarm|save-off|restore-off|save-on|restore-on|auto-serve-off|old-rank|off-rank|explicit-on-rank|old-serve-off|off-serve-off|explicit-on-serve-off|old-serve-on|off-serve-on|explicit-on-serve-on|compare) ;;
+  prepare|prewarm|save-off|restore-off|save-on|restore-on|auto-serve-off|auto-serve-on|old-rank|off-rank|explicit-on-rank|old-serve-off|off-serve-off|explicit-on-serve-off|old-serve-on|off-serve-on|explicit-on-serve-on|off-serve-default|auto-serve-default|compare) ;;
   *) echo 'usage: session_cache_gate.sh PHASE (see docs/minimax/session-cache.md)'; exit 2 ;;
 esac
 export SESSION_PHASE
@@ -111,8 +111,11 @@ for rank in (0,1):
             raise SystemExit(f"FAIL rank {rank}: malformed hashing receipt: {line}")
         seconds,hits,misses=match.groups()
         hashes.append(dict(seconds=float(seconds),cache_hits=int(hits),cache_misses=int(misses)))
+    # Serving sessions run without the drafter by default (STRIX_MM_SESSION_DRAFT=1 restores it), so every serve arm
+    # has the target lookup only; the rank arms with --session-dspark also hash the drafter assets.
     expected={"off-A":1,"off-B":1,"on-A":2,"on-B":2,
-              "explicit-on-serve-off":1,"explicit-on-serve-on":2}.get(tag.removesuffix("-adaptive"),0)
+              "explicit-on-serve-off":1,"explicit-on-serve-on":1,
+              "auto-serve-off":1,"auto-serve-on":1,"auto-serve-default":1}.get(tag.removesuffix("-adaptive"),0)
     io=[float(x) for x in re.findall(r"(?:write_fsync_s|read_io_s) ([0-9.]+)",text)]
     (root/f"r{rank}/{tag}.timing.json").write_text(json.dumps(dict(
         rank=rank,hash_seconds=sum(x["seconds"] for x in hashes),hash_operations=len(hashes),
@@ -158,13 +161,10 @@ pair() {
 }
 check_session_receipts() {
   local tag=$1 kind=$2 rank
-  if [[ $kind == serve && $tag == explicit-on-* ]]; then
+  # The qualified serve route admits sessions automatically: no switch in the environment, runtime live on both ranks.
+  if [[ $kind == serve && ( $tag == explicit-on-* || $tag == auto-* ) ]]; then
     for rank in 0 1; do
       bounded grep -Fx 'session cache: on (runtime live)' "$OUT/r$rank/$tag.log" || { echo "FAIL runtime not live on rank $rank"; exit 1; }
-    done
-  elif [[ $tag == auto-* ]]; then
-    for rank in 0 1; do
-      bounded grep -E '^session cache: off \(route not yet GPU-qualified: .+\)$' "$OUT/r$rank/$tag.log" || exit 1
     done
   fi
 }
@@ -177,19 +177,38 @@ default_pair_arm() {
   local tag=$1 kind=$2 binary=$3 mode=$4 scheduler=$5
   local -a remote localcmd extra unset_env=() probe_env=() sched_env=()
   local -a engine_env=("${ENV_ARGS[@]}")
-  [[ $tag != explicit-on-serve-* ]] || probe_env=(MM_DEFAULT_REQUIRE_SESSION=1)
+  [[ $tag != explicit-on-serve-* && $tag != auto-serve-* ]] || probe_env=(MM_DEFAULT_REQUIRE_SESSION=1)
   if [[ $tag == auto-* ]]; then
     # Remove inherited switches so this is an actual automatic-admission check.
     unset_env=(-u STRIX_SESSION_CACHE -u STRIX_MM_BASELINE -u STRIX_BASELINE)
-    engine_env=()
+    local kept entry
+    local -a kept_env=()
+    for entry in "${engine_env[@]}"; do
+      kept=${entry%%=*}
+      [[ $kept == STRIX_SESSION_CACHE || $kept == STRIX_MM_BASELINE || $kept == STRIX_BASELINE ]] || kept_env+=("$entry")
+    done
+    engine_env=("${kept_env[@]}")
+  elif [[ $tag == old-* ]]; then
+    # The baseline runs as shipped (its own session default; it may already contain opt-in sessions).
+    unset_env=(-u STRIX_SESSION_CACHE)
   elif [[ $tag == off-* ]]; then engine_env+=(STRIX_SESSION_CACHE=0); else engine_env+=(STRIX_SESSION_CACHE=1); fi
   extra=(--slots 3 --capacity 512 --max-rows 256)
   if [[ $kind == serve && $mode == on ]]; then extra+=(--dspark "$DSPARK"); fi
+  # default = what a plain strix-minimax-serve resolves: DSpark mode, drafter discovery and geometry left to the defaults.
+  [[ $mode != default ]] || extra=()
   if [[ $kind == rank ]]; then
     localcmd=(env "${unset_env[@]}" "${engine_env[@]}" "${probe_env[@]}" "MM_DEFAULT_PROBE=$OUT/$tag" "$binary" "$MODEL" 0 usb4-auto "$OUT/r0" "${extra[@]}" --session "default:$OUT/D.u32:64")
     remote=(env "${unset_env[@]}" "${engine_env[@]}" "${probe_env[@]}" "MM_DEFAULT_PROBE=$OUT/$tag" "$binary" "$MODEL" 1 usb4-auto "$OUT/r1" "${extra[@]}" --session "default:$OUT/D.u32:64")
   else
-    local dspark=0; [[ $mode == on ]] && dspark=1
+    local -a dspark_env=("STRIX_MM_SERVE_DSPARK=0")
+    [[ $mode == on ]] && dspark_env=("STRIX_MM_SERVE_DSPARK=1")
+    if [[ $mode == default ]]; then
+      dspark_env=(); unset_env+=(-u STRIX_MM_SERVE_DSPARK)
+      local forwarded
+      local -a without_dspark=()
+      for forwarded in "${engine_env[@]}"; do [[ ${forwarded%%=*} == STRIX_MM_SERVE_DSPARK ]] || without_dspark+=("$forwarded"); done
+      engine_env=("${without_dspark[@]}")
+    fi
     if [[ $scheduler == off ]]; then sched_env=(STRIX_MM_SERVE_SCHED=off);
     else
       unset_env+=(-u STRIX_MM_SERVE_SCHED -u STRIX_MM_SERVE_SERVICE_MS -u STRIX_MM_SERVE_GAP_MS
@@ -204,8 +223,8 @@ default_pair_arm() {
       done
       engine_env=("${filtered[@]}")
     fi
-    localcmd=(env "${unset_env[@]}" "${engine_env[@]}" "${probe_env[@]}" "${sched_env[@]}" "STRIX_MM_SERVE_DSPARK=$dspark" "MM_DEFAULT_PROBE=$OUT/$tag" "MM_DEFAULT_PROMPT=$OUT/D.u32" "$binary" "$MODEL" --rank 0 --transport usb4-auto "${extra[@]}")
-    remote=(env "${unset_env[@]}" "${engine_env[@]}" "${probe_env[@]}" "${sched_env[@]}" "STRIX_MM_SERVE_DSPARK=$dspark" "MM_DEFAULT_PROBE=$OUT/$tag" "MM_DEFAULT_PROMPT=$OUT/D.u32" "$binary" "$MODEL" --rank 1 --transport usb4-auto "${extra[@]}")
+    localcmd=(env "${unset_env[@]}" "${engine_env[@]}" "${probe_env[@]}" "${sched_env[@]}" "${dspark_env[@]}" "MM_DEFAULT_PROBE=$OUT/$tag" "MM_DEFAULT_PROMPT=$OUT/D.u32" "$binary" "$MODEL" --rank 0 --transport usb4-auto "${extra[@]}")
+    remote=(env "${unset_env[@]}" "${engine_env[@]}" "${probe_env[@]}" "${sched_env[@]}" "${dspark_env[@]}" "MM_DEFAULT_PROBE=$OUT/$tag" "MM_DEFAULT_PROMPT=$OUT/D.u32" "$binary" "$MODEL" --rank 1 --transport usb4-auto "${extra[@]}")
   fi
   launch_pair "$tag"
   check_session_receipts "$tag" "$kind"
@@ -297,11 +316,11 @@ copy "$OUT/P.u32" "$OUT/S.u32" "$OUT/D.u32" "$NODE1:$OUT/" >/dev/null
   old-rank|off-rank|explicit-on-rank)
     binary="$DEFAULT_BIN"; [[ $SESSION_PHASE == old-* ]] && binary="$BASELINE_BIN"
     default_pair "$SESSION_PHASE" rank "$binary" off ;;
-  auto-serve-off|old-serve-*|off-serve-*|explicit-on-serve-*)
+  auto-serve-*|old-serve-*|off-serve-*|explicit-on-serve-*)
     binary="$DEFAULT_SERVE"; [[ $SESSION_PHASE == old-* ]] && binary="$BASELINE_SERVE"
     default_pair "$SESSION_PHASE" serve "$binary" "${SESSION_PHASE##*-}" ;;
   compare)
-    for phase in prewarm auto-serve-off save-off restore-off save-on restore-on old-rank off-rank explicit-on-rank old-serve-off off-serve-off explicit-on-serve-off old-serve-on off-serve-on explicit-on-serve-on; do
+    for phase in prewarm auto-serve-off auto-serve-on save-off restore-off save-on restore-on old-rank off-rank explicit-on-rank old-serve-off off-serve-off explicit-on-serve-off old-serve-on off-serve-on explicit-on-serve-on off-serve-default auto-serve-default; do
       [[ -s "$OUT/$phase.done" ]] || { echo "FAIL missing receipt $phase"; exit 2; }
     done
     for mode in off on; do
@@ -320,20 +339,38 @@ copy "$OUT/P.u32" "$OUT/S.u32" "$OUT/D.u32" "$NODE1:$OUT/" >/dev/null
         compare_default "old-serve-$mode$suffix" "off-serve-$mode$suffix" serve
         for rank in 0 1; do
           bounded cmp "$OUT/off-serve-$mode$suffix.r$rank.revision" "$OUT/explicit-on-serve-$mode$suffix.r$rank.revision"
-          if [[ $suffix == -adaptive ]]; then committed_state "off-serve-$mode$suffix" "explicit-on-serve-$mode$suffix" "$rank"
-          else for ext in u32 f32 state send receive; do bounded cmp "$OUT/off-serve-$mode$suffix.r$rank.$ext" "$OUT/explicit-on-serve-$mode$suffix.r$rank.$ext"; done; fi
+          for on in explicit-on auto; do
+            bounded cmp "$OUT/off-serve-$mode$suffix.r$rank.revision" "$OUT/$on-serve-$mode$suffix.r$rank.revision"
+            if [[ $suffix == -adaptive ]]; then committed_state "off-serve-$mode$suffix" "$on-serve-$mode$suffix" "$rank"
+            else for ext in u32 f32 state send receive; do bounded cmp "$OUT/off-serve-$mode$suffix.r$rank.$ext" "$OUT/$on-serve-$mode$suffix.r$rank.$ext"; done; fi
+          done
         done
-        for build in old off explicit-on; do
+        for build in old off explicit-on auto; do
           [[ $(bounded stat -c %s "$OUT/$build-serve-$mode$suffix.r0.emitted") == 256 ]]
           bounded cmp "$OUT/$build-serve-$mode$suffix.r0.send" "$OUT/$build-serve-$mode$suffix.r1.receive"
           bounded cmp "$OUT/$build-serve-$mode$suffix.r1.send" "$OUT/$build-serve-$mode$suffix.r0.receive"
         done
         bounded cmp "$OUT/old-serve-$mode$suffix.r0.emitted" "$OUT/off-serve-$mode$suffix.r0.emitted"
         bounded cmp "$OUT/off-serve-$mode$suffix.r0.emitted" "$OUT/explicit-on-serve-$mode$suffix.r0.emitted"
+        bounded cmp "$OUT/off-serve-$mode$suffix.r0.emitted" "$OUT/auto-serve-$mode$suffix.r0.emitted"
       done
+    done
+    # Production default serve path: automatic admission == OFF for unnamed requests.
+    for suffix in "" "-adaptive"; do
+      for rank in 0 1; do
+        bounded cmp "$OUT/off-serve-default$suffix.r$rank.revision" "$OUT/auto-serve-default$suffix.r$rank.revision"
+        if [[ $suffix == -adaptive ]]; then committed_state "off-serve-default$suffix" "auto-serve-default$suffix" "$rank"
+        else for ext in u32 f32 state send receive; do bounded cmp "$OUT/off-serve-default$suffix.r$rank.$ext" "$OUT/auto-serve-default$suffix.r$rank.$ext"; done; fi
+      done
+      for build in off auto; do
+        [[ $(bounded stat -c %s "$OUT/$build-serve-default$suffix.r0.emitted") == 256 ]]
+        bounded cmp "$OUT/$build-serve-default$suffix.r0.send" "$OUT/$build-serve-default$suffix.r1.receive"
+        bounded cmp "$OUT/$build-serve-default$suffix.r1.send" "$OUT/$build-serve-default$suffix.r0.receive"
+      done
+      bounded cmp "$OUT/off-serve-default$suffix.r0.emitted" "$OUT/auto-serve-default$suffix.r0.emitted"
     done
     compare_default old-rank off-rank rank
     for rank in 0 1; do bounded cmp "$OUT/off-rank.r$rank.revision" "$OUT/explicit-on-rank.r$rank.revision"; for ext in u32 f32 state; do bounded cmp "$OUT/off-rank.r$rank.$ext" "$OUT/explicit-on-rank.r$rank.$ext"; done; done
-    echo 'PASS A == L == B; OFF == baseline; unnamed explicit-on == OFF; automatic admission refused' | tee -a "$OUT/results.txt"
+    echo 'PASS A == L == B; OFF == baseline; unnamed explicit-on == OFF; automatic admission live == OFF' | tee -a "$OUT/results.txt"
     ;;
 esac

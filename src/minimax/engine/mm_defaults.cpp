@@ -270,7 +270,9 @@ SessionConfig session_policy(const Cli& cli, const Lookup& env, bool explicit_cl
     const auto mode = value("STRIX_SESSION_CACHE");
     c.route = cli.app + "/" + cli.transport + "/fixed-width-one-session-v1";
     // Add routes only after native execution, fidelity and complete-workload qualification.
-    static constexpr std::array<const char*, 0> gpu_qualified_session_routes{};
+    // serve/usb4-auto: tools/minimax/session_cache_gate.sh on both ranks (A == L == B, OFF == baseline, unnamed
+    // explicit and automatic ON == OFF with DSpark off/on and both scheduler arms).
+    static constexpr std::array<const char*, 1> gpu_qualified_session_routes{"serve/usb4-auto/fixed-width-one-session-v1"};
     const bool qualified = std::find(gpu_qualified_session_routes.begin(),
                                     gpu_qualified_session_routes.end(), c.route) != gpu_qualified_session_routes.end();
     if (env("STRIX_SESSION_MAX_PARKED")) c.max_parked = std::stoull(value("STRIX_SESSION_MAX_PARKED"));
@@ -287,7 +289,6 @@ SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t av
                              bool explicit_cli, const std::string& explicit_directory) {
     auto c = session_policy(cli, env, explicit_cli);
     auto value = [&](const char* key, const char* fallback) { const char* v = env(key); return std::string(v ? v : fallback); };
-    auto off = [&](const char* key) { auto v = value(key, "1"); return v == "0" || v == "off"; };
     if (available == UINT64_MAX) {
         available = 0;
 #ifdef _WIN32
@@ -300,7 +301,9 @@ SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t av
         }
 #endif
     }
-    c.ram_bytes = std::min<std::uint64_t>(8ULL << 30, available / 10);
+    // MemAvailable is read after the model load, so it is what remains for the host; a quarter admits the six-peak
+    // capture guard at the default 8256-token context on the two-node serve route (~31 GB available -> ~7.7 GB).
+    c.ram_bytes = std::min<std::uint64_t>(8ULL << 30, available / 4);
     if (env("STRIX_SESSION_RAM_BYTES")) c.ram_bytes = std::stoull(value("STRIX_SESSION_RAM_BYTES", "0"));
     auto xdg = value("XDG_CACHE_HOME", "");
     auto home = value("HOME", "");
@@ -315,7 +318,9 @@ SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t av
             c.reason = "budget/MemAvailable below one session capture peak";
     }
     c.enabled = c.reason.empty();
-    c.disk = c.enabled && (explicit_cli || !off("STRIX_SESSION_DISK"));
+    // Automatic serving parks in host RAM only; the shared disk tier is opt-in (no per-server ownership of a directory).
+    const auto disk = value("STRIX_SESSION_DISK", "0");
+    c.disk = c.enabled && (explicit_cli || disk == "1" || disk == "on");
     if (c.disk && explicit_directory.empty() && xdg.empty() && home.empty() && !env("STRIX_SESSION_DIR")) { c.disk = false; c.disk_reason = "home directory unavailable"; }
     if (c.disk) {
         std::error_code ec;

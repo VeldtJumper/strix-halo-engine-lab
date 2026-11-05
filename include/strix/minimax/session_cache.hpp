@@ -89,6 +89,8 @@ public:
       std::uint64_t payload_bytes); // evict LRU before reserving peak
   void admit(std::uint64_t payload_bytes)
       const;                // BEFORE allocating capture/restore buffers
+  void prepare_resume(const std::string &id,
+                      std::uint64_t payload_bytes); // evict other LRU entries before a RAM restore peak
   void capture(Checkpoint); // RAM checkpoint; LRU, no mutation when a single
                             // entry exceeds budget
   void checkpoint(
