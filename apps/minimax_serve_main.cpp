@@ -181,6 +181,9 @@ struct Runner {
 
     std::uint64_t local_id = 0, control_round = 0;
     std::uint32_t last_next = 0, contexts = 0;
+    // STRIX_MM_SERVE_DSPARK_STAGE=0 (or STRIX_MM_BASELINE=1 when unset) appends every cycle's rows at once (previous form).
+    const bool stage = std::getenv("STRIX_MM_SERVE_DSPARK_STAGE") != nullptr ? env_num("STRIX_MM_SERVE_DSPARK_STAGE", 1) != 0
+                                                                     : env_num("STRIX_MM_BASELINE", 0) != 1;
     void retire_contexts(std::uint32_t mask) {
         contexts &= ~mask;
         if (dd != nullptr) for (std::uint32_t s = 0; s < eng.slots(); ++s)
@@ -189,6 +192,7 @@ struct Runner {
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> prompt, bool context,
                        std::uint64_t id, std::uint64_t parent = 0, std::uint64_t generation = 0) {
         contexts = (contexts & ~(1U << slot)) | (context ? 1U << slot : 0U);
+        if (dd != nullptr) dd->drop_staged(slot);  // a new sequence: the previous one's staged rows are never read
         mm::Engine::PrefillTapSink sink;
         if (dd != nullptr && context)
             sink = [this](const float* taps, std::size_t n, std::uint32_t s, std::uint64_t pos0) { if ((contexts >> s) & 1U) dd->append(s, taps, n, pos0, nullptr); };
@@ -239,7 +243,9 @@ struct Runner {
         return out;
     }
     // One step; then each slot of `append` gets its committed rows appended (its anchor + the drafts the target accepted:
-    // the window's contiguous tap rows, before the next call overwrites them).
+    // the window's contiguous tap rows, before the next call overwrites them). The rows are staged and appended in one
+    // batch by the slot's next block pass or after 32 rows (measurement: with the gate mostly shut every 1-row append
+    // cost ~3 ms per cycle; batching changes only the drafter context's bits, the emitted tokens are target-greedy).
     std::vector<std::uint32_t> step(std::span<const mm::Row> rows, std::uint32_t append) {
         if ((append & ~contexts) != 0) throw std::runtime_error("step: retired drafter context");
         auto g = eng.step(rows);
@@ -252,7 +258,8 @@ struct Runner {
                     std::vector<std::uint32_t> d;
                     for (std::size_t i = i0 + 1; i < i1; ++i) d.push_back(rows[i].token);
                     const auto v = ds::verify_greedy(d, std::span<const std::uint32_t>(g.data() + i0, i1 - i0));
-                    dd->append(rows[i0].slot, taps + i0 * ds::taps * 6144, v.accepted + 1, rows[i0].pos, nullptr);
+                    if (stage) dd->append_deferred(rows[i0].slot, taps + i0 * ds::taps * 6144, v.accepted + 1, rows[i0].pos, nullptr);
+                    else dd->append(rows[i0].slot, taps + i0 * ds::taps * 6144, v.accepted + 1, rows[i0].pos, nullptr);
                 }
                 i0 = i1;
             }

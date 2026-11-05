@@ -2,7 +2,7 @@
 // changed/new selectors, update their allow-table and tests, then update hashes.
 {"CMakeLists.txt", 0xab23a52f2ed7ad6aULL},
 {"apps/minimax_rank_main.cpp", 0xab06fe0f932392b8ULL},
-{"apps/minimax_serve_main.cpp", 0xcce02f4d4f8d64a8ULL},
+{"apps/minimax_serve_main.cpp", 0xc588abe30c955277ULL},
 {"src/dspark_common/markov_cand_kernels.hpp", 0xf20c7f91a631cbc1ULL},
 {"src/minimax/attn/index_proj.hip", 0x8332b8f8830e98d8ULL},
 {"src/minimax/attn/index_proj.hpp", 0x47d7a6439fff1b5fULL},
@@ -88,6 +88,6 @@
 {"src/minimax/serve/minimax_dspark_policy.hpp", 0x5b88d9c4748f46a6ULL},
 {"src/minimax/model_assets.cpp", 0xe54fe5f2fb98cb0eULL},
 {"src/minimax/serve/minimax_session.hpp", 0xfa8a0e7e38bc77b0ULL},
-{"src/minimax/session/runtime.cpp", 0x0bfea6b56b36ad62ULL},
+{"src/minimax/session/runtime.cpp", 0xeeb3228f21d5e351ULL},
 {"src/minimax/session/runtime.hpp", 0x466e983c739745e5ULL},
 {"src/minimax/session/session_cache.cpp", 0x6cfeb3a46f3dd444ULL},
