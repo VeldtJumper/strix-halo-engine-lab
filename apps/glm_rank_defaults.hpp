@@ -106,6 +106,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: pipelined prefill exchanges through the coherent staging views; pair ABBA -0.8 % 1K / -0.9 % 8K TTFT, logits bitwise"},
         {"pf-hc-fuse", "STRIX_GLM_PF_HC_FUSE", "1", "0", false, true,
          "Measurement: mHC expand + next-site norm fused (F not materialised), logits bitwise; pair ABBA x2 -1.1 % 1K / -1.3 % 8K TTFT"},
+        {"pf-mixnorm", "STRIX_GLM_PF_MIXNORM", "1", "0", false, true,
+         "Measurement: mHC mix collapse + RMSNorm in one kernel (same operation order), logits bitwise on the pair at 1K / 8K / 32K; 8K TTFT 15.07 -> 14.95 s, 32K 63.23 -> 62.23 s (=0 restores the two-kernel path)"},
     };
     return items;
 }

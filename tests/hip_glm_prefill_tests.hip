@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <random>
@@ -923,6 +924,141 @@ void test_hc_rows_v2(const std::string& cases, std::mt19937& g) {
     hok(hipGetLastError(), "mHC zero rows");
 }
 
+// Strict bitwise comparison of every output, guard and flag. The one allowance: with distinct NaN payloads fed into the
+// shared R6 (stress 2), which payload propagates may differ; NaN positions and all other bits must still match.
+void test_hc_mixnorm(std::mt19937& g) {
+    constexpr unsigned n = kHc * kHidden;
+    constexpr std::size_t guard = 17;
+    const std::uint32_t specials[] = {0x7FC12345U, 0xFFC54321U, 0x7FA00001U, 0x7F800000U, 0xFF800000U,
+                                      0x7F7FFFFFU, 0xFF7FFFFFU, 0x00000000U, 0x80000000U, 0x00000001U};
+    auto special = [&](unsigned i) {
+        float f = 0.0F;
+        const auto u = specials[i % (sizeof(specials) / sizeof(specials[0]))];
+        std::memcpy(&f, &u, sizeof(f));
+        return f;
+    };
+    hipStream_t s = nullptr;
+    hok(hipStreamCreateWithFlags(&s, hipStreamNonBlocking), "mixnorm stream");
+    for (unsigned R : {1U, 15U, 16U, 17U, 255U, 4096U}) {
+        for (unsigned stress = 0; stress < 3; ++stress) {
+            const std::size_t nf = static_cast<std::size_t>(R) * n, nz = static_cast<std::size_t>(R) * kHcMix;
+            const std::size_t nx = static_cast<std::size_t>(R) * kHidden;
+            auto X = rnd(nf, g, 1.0F), z = rnd(nz, g, 1.0F);
+            auto base = rnd(kHcMix, g, 1.0F), scale = rnd(3, g, 1.0F);
+            auto weight = rnd_half(kHidden, g, 1.0F, true);
+            if (stress == 1) {
+                // Specials throughout all four collapse operands, including pairs of distinct NaN payloads.
+                for (unsigned r = 0; r < R; ++r)
+                    for (unsigned j = 0; j < kHc; ++j)
+                        for (unsigned i = 0; i < 32; ++i)
+                            X[static_cast<std::size_t>(r) * n + j * kHidden + i * 127] = special(r + j + i);
+                const std::uint16_t ws[] = {0x7FC1U, 0xFFC5U, 0x7F80U, 0xFF80U, 0x7F7FU, 0x8000U, 0x0001U};
+                std::copy(std::begin(ws), std::end(ws), weight.begin());
+            } else if (stress == 2) {
+                for (std::size_t i = 0; i < nz; i += 7) z[i] = special(static_cast<unsigned>(i));
+                for (unsigned i = 0; i < kHcMix; ++i) base[i] = special(i);
+                for (unsigned i = 0; i < 3; ++i) scale[i] = special(i + 3);
+            }
+            float *dX = up(X), *dz = up(z), *db = up(base), *ds = up(scale);
+            auto* dw = up(weight);
+            auto* dw_next = up(rnd_half(kHidden, g, 1.0F, true));
+            float* fn = up(rnd(static_cast<std::size_t>(kHcMix) * n, g, 0.01F));
+            float *fa = poison<float>(nf + guard), *fb = poison<float>(nf + guard);
+            float *za = poison<float>(nz + guard), *zb = poison<float>(nz + guard);
+            float* xc = poison<float>(nx + guard);
+            float* rr = poison<float>(R + guard);
+            hok(hipDeviceSynchronize(), "mixnorm setup");  // poison memsets run on the null stream; s is non-blocking
+            P::hc_norm_factor_rows(dX, rr, R, s);
+            for (unsigned mode = 0; mode < 3; ++mode) {  // isolated tail, full v2, already-normalized v2
+                if (const char* v = std::getenv("STRIX_GLM_PF_HC"); mode == 2 && v && std::string(v) == "1") continue;
+                float *ma[2], *mb[2], *ya[2], *yb[2];
+                unsigned *fla[2], *flb[2];
+                std::vector<unsigned> flags(R + guard, 0xA5A5A5A5U);
+                for (unsigned r = 0; r < R; ++r) flags[r] = r % 2 ? 0x40U : 0U;
+                for (unsigned call = 0; call < 2; ++call) {
+                    ma[call] = poison<float>(nz + guard); mb[call] = poison<float>(nz + guard);
+                    ya[call] = poison<float>(nx + guard); yb[call] = poison<float>(nx + guard);
+                    fla[call] = up(flags); flb[call] = up(flags);
+                }
+                hok(hipDeviceSynchronize(), "mixnorm mode setup");
+                // Two calls per path queued without a host sync; workspaces reused, outputs kept separately.
+                for (unsigned fused = 0; fused < 2; ++fused) {
+                    for (unsigned call = 0; call < 2; ++call) {
+                        float* m = fused ? mb[call] : ma[call];
+                        float* y = fused ? yb[call] : ya[call];
+                        float* f = fused ? fb : fa;
+                        float* zz = fused ? zb : za;
+                        const auto* w = call == 0 ? dw : dw_next;
+                        if (fused) {
+                            if (mode == 0) P::hc_mix_norm_rows(dX, dz, db, ds, m, w, y, R, s);
+                            else if (mode == 1) P::hc_pre_rows_v2(dX, fn, db, ds, f, zz, m, w, y, R, s);
+                            else P::hc_pre_rows_normed(dX, fn, db, ds, rr, zz, m, w, y, R, s);
+                        } else {
+                            if (mode == 0) P::hc_mix_rows_v2(dX, dz, db, ds, m, xc, R, s);
+                            else if (mode == 1) P::hc_pre_rows_v2(dX, fn, db, ds, f, zz, m, xc, R, s);
+                            else P::hc_pre_rows_normed(dX, fn, db, ds, rr, zz, m, xc, R, s);
+                            D::rmsnorm(xc, w, D::WType::BF16, kHidden, kEps, y, R, s);
+                        }
+                        // Neither pre-site tail sets a flag. Exercise the unchanged downstream C1 consumer,
+                        // including per-row OR semantics, using the now-dead F workspace for expanded output.
+                        D::hc_expand(dX, m, y, f, fused ? flb[call] : fla[call], R, s, 1);
+                    }
+                }
+                hok(hipStreamSynchronize(s), "mixnorm queued calls");
+                bool same = true;
+                auto compare = [&](const float* a, const float* b, std::size_t count, const char* name) {
+                    const auto ha = down(a, count + guard), hb = down(b, count + guard);
+                    bool eq = true;
+                    if (stress == 0)
+                        for (std::size_t i = 0; i < count; ++i) eq &= is_finite(ha[i]) && is_finite(hb[i]);
+                    for (std::size_t i = count; i < count + guard; ++i) {
+                        std::uint32_t ua = 0, ub = 0;
+                        std::memcpy(&ua, &ha[i], sizeof(ua)); std::memcpy(&ub, &hb[i], sizeof(ub));
+                        eq &= ua == 0xFFFFFFFFU && ub == 0xFFFFFFFFU;
+                    }
+                    // Payload differences are counted apart: only stress 2 (distinct NaN payloads in z, base and scale meeting
+                    // inside the shared R6) may differ, and only NaN against NaN at the same element. Everything else is bitwise.
+                    std::size_t nan_only = 0, other = 0, first = count;
+                    for (std::size_t i = 0; i < count; ++i) {
+                        std::uint32_t ua = 0, ub = 0;
+                        std::memcpy(&ua, &ha[i], sizeof(ua)); std::memcpy(&ub, &hb[i], sizeof(ub));
+                        if (ua == ub) continue;
+                        if (first == count) first = i;
+                        ((ua & 0x7FFFFFFFU) > 0x7F800000U && (ub & 0x7FFFFFFFU) > 0x7F800000U ? nan_only : other) += 1;
+                    }
+                    eq &= other == 0 && (nan_only == 0 || stress == 2);
+                    if (!eq || nan_only != 0) {
+                        std::uint32_t fa = 0, fb = 0;
+                        if (first < count) { std::memcpy(&fa, &ha[first], 4); std::memcpy(&fb, &hb[first], 4); }
+                        std::printf("%s mixnorm %s R=%u mode=%u stress=%u diff nan-payload-only %zu other %zu first %zu %08x/%08x\n",
+                                    eq ? "NOTE" : "FAIL", name, R, mode, stress, nan_only, other, first, fa, fb);
+                    }
+                    same &= eq;
+                };
+                for (unsigned call = 0; call < 2; ++call) {
+                    compare(ma[call], mb[call], nz, "mix");
+                    compare(ya[call], yb[call], nx, "xn");
+                    const auto a = down(fla[call], R + guard), b = down(flb[call], R + guard);
+                    same &= a == b;
+                    for (std::size_t i = R; i < R + guard; ++i) same &= a[i] == flags[i] && b[i] == flags[i];
+                    for (unsigned r = 0; r < R; ++r) same &= a[r] == (stress == 0 ? flags[r] : flags[r] | 1U);
+                }
+                compare(fa, fb, nf, "expanded output");
+                if (mode != 0) compare(za, zb, nz, "z");
+                check(same, "mHC mixnorm strict bytes/guards/flags, two queued calls, rows=" + std::to_string(R) +
+                            " mode=" + std::to_string(mode) + " stress=" + std::to_string(stress));
+            }
+            free_all();
+        }
+    }
+    P::hc_pre_rows_v2(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, s);
+    P::hc_pre_rows_normed(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, s);
+    P::hc_mix_rows_v2(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, s);
+    P::hc_mix_norm_rows(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, s);
+    hok(hipGetLastError(), "mixnorm zero rows");
+    hok(hipStreamDestroy(s), "mixnorm stream destroy");
+}
+
 void test_dsa(const std::string& cases, std::mt19937& g) {
     CaseDir c(cases + "/mla_l3_r0", {{"kv_b_proj", "u16", static_cast<std::size_t>(64) * 2 * kMlaDim * kKvLora}, {"indexer.wk", "u16", kIdxDim * kHidden},
                                      {"indexer.index_kpool_compress_gate", "u16", kIdxDim * kHidden}, {"indexer.weights_proj", "u16", kIdxHeads * kHidden},
@@ -1315,6 +1451,11 @@ int main(int argc, char** argv) {
         std::printf("checks: %d failures: %d\n", checks, failures);
         return failures ? 1 : 0;
     }
+    if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "mixnorm") {
+        test_hc_mixnorm(g);  // fixture-free; bitwise except stress-2 NaN payloads
+        std::printf("checks: %d failures: %d\n", checks, failures);
+        return failures ? 1 : 0;
+    }
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "hcfuse") {
         test_hc_expand_norm(g);  // fixture-free
         std::printf("checks: %d failures: %d\n", checks, failures);
@@ -1324,6 +1465,7 @@ int main(int argc, char** argv) {
     test_dense_rows_v2(g, bench_dense);
     test_hc_rows(argv[1], g);
     test_hc_rows_v2(argv[1], g);
+    test_hc_mixnorm(g);
     test_hc_expand_norm(g);
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "hc") g_only_hc = true;
     if (!g_only_hc) {
