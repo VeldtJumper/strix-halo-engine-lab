@@ -1952,6 +1952,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill exchange chunk size 4 MiB",
+    "flag_or_env": "STRIX_MM_PFX_CHUNK",
+    "default": "4194304",
+    "exact": "Pair prefill 1K / 4K / 8K with chunks 1 / 16 / 4 / 1 MiB in fresh processes: prefill state and final-row digests identical in every arm on both ranks (same bytes, same order).",
+    "gain": "Pair prefill TTFT 1 MiB / 4 MiB: 1,024 tokens 2.469 / 2.423 s (414.8 / 422.6 tok/s, -1.9 %), 4,096 tokens 9.168 / 9.025 s (446.8 / 453.9 tok/s, -1.5 %), 8,192 tokens unchanged (about 590 tok/s)",
+    "preconditions": "Pair MiniMax prefill; both ranks use the same chunk size.",
+    "off_switch": "STRIX_MM_PFX_CHUNK=1048576",
+    "doc_anchor": "docs/optimizations.md#mm-pfx-chunk"
+  },
+  {
+    "engine": "minimax",
     "name": "MSA prefill index query tiles",
     "flag_or_env": "STRIX_MM_PF_IDX_TILE",
     "default": "1",

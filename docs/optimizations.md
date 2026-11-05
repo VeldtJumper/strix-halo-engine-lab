@@ -2967,6 +2967,21 @@ On sparse decode calls of four rows or more at 16K positions or more, one select
 - **Measured gain:** Same-binary bench, index + attend per layer and rank, v3 / select once: 32K N8 455.3 / 436.0 and 453.2 / 433.5, 32K N4 241.5 / 237.1, 32K verify windows of 8 / 4 rows 220.4 / 206.4 and 141.0 / 136.0, 128K N8 1304.7 / 1286.2 us
 - **Implementation / evidence:** [resolver](../src/minimax/engine/mm_defaults.cpp), [MSA tests](../src/minimax/attn/msa_fused_tests.hip)
 
+<a id="mm-pfx-chunk"></a>
+
+### Prefill exchange chunk size 4 MiB
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PFX_CHUNK` (bytes, multiple of 64 in [64 KiB, 64 MiB], both ranks the same). **Default:** 4 MiB (was 1 MiB).
+
+The pair prefill exchange sends each message as a run of synchronous transport calls of one chunk each. At 1 MiB per call the exposed exchange wait at 4K implies about 35 Gb/s per direction; 4 MiB calls reach about 37. The chunk size only changes how the same bytes are cut into calls: same order, same CRC trailer per chunk, same received bytes.
+
+- **Preconditions:** Pair (two-rank) MiniMax prefill; both ranks run the same default or the same explicit value (the handshake checks it).
+- **Fallback notice:** 16 MiB measured no better than 4 MiB (1,024 tokens 2.465 s = 415.4 tok/s, 4,096 tokens 9.112 s = 449.5 tok/s, 8,192 tokens 13.900 s = 589.3 tok/s); at 8K the exchange is already hidden behind compute, so the chunk size does not change TTFT.
+- **Exactness evidence:** Pair prefill at 1K / 4K / 8K with chunks 1 / 16 / 4 / 1 MiB in fresh processes: prefill state and final-row digests identical in every arm on both ranks.
+- **Off switch:** STRIX_MM_PFX_CHUNK=1048576
+- **Measured gain:** TTFT 1,024 tokens 2.469 -> 2.423 s (414.8 -> 422.6 tok/s, -1.9 %), 4,096 tokens 9.168 -> 9.025 s (446.8 -> 453.9 tok/s, -1.5 %), 8,192 tokens 13.817 / 13.874 -> 13.874 s (592.9 / 590.5 -> 590.5 tok/s, unchanged)
+- **Implementation / evidence:** [exchange options](../src/minimax/pfx/pf_exchange.hpp), [exchange tests](../tests/hip_mm_pfx_tests.hip)
+
 <a id="mm-pf-idx-tile"></a>
 
 ### MSA prefill index query tiles

@@ -46,7 +46,7 @@
 {"src/minimax/pfx/pf_crc.cpp", 0xefbe65eb2a3ec54dULL},
 {"src/minimax/pfx/pf_crc.hpp", 0xa9ad32c18b11abe1ULL},
 {"src/minimax/pfx/pf_exchange.hip", 0x0f439e3953f617a8ULL},
-{"src/minimax/pfx/pf_exchange.hpp", 0xcf7b0d4e1269e34aULL},
+{"src/minimax/pfx/pf_exchange.hpp", 0x05f29dd5f4694476ULL},
 {"src/minimax/rtxpf/cuda/.gitignore", 0xd062357af638be02ULL},
 {"src/minimax/rtxpf/cuda/build_prefill.bat", 0x1706631ad7c167bbULL},
 {"src/minimax/rtxpf/cuda/build_tests.bat", 0x638a46cb48aebdadULL},
