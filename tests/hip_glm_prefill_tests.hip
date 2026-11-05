@@ -42,10 +42,10 @@ namespace P = strix::glm::pf;
 
 namespace {
 // Explicit MLA {scores, o-bar, gemm} versions gated bitwise against the 3/5/1 reference (intermediates, decode outputs).
-constexpr unsigned kMlaPairs = 13;
+constexpr unsigned kMlaPairs = 15;
 constexpr unsigned kMlaPair[kMlaPairs][3] = {{4, 5, 1}, {3, 6, 1}, {4, 6, 1}, {5, 5, 1}, {4, 7, 1}, {5, 7, 1},
                                              {5, 7, 2}, {4, 5, 2}, {4, 6, 2}, {6, 7, 2}, {6, 5, 1}, {7, 7, 2},
-                                             {7, 5, 1}};
+                                             {7, 5, 1}, {7, 7, 3}, {4, 6, 3}};
 
 int failures = 0, checks = 0;
 void check(bool ok, const std::string& what) {
@@ -1195,13 +1195,64 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                     }
                 }
                 // Byte comparisons deliberately include NaN payloads and the output guard regions.
-                check(same, "MLA explicit scores/obar/gemm (9 combinations incl. 5/7/2, 4/6/2) == 3/5/1 bitwise intermediates/output/guards H=" + std::to_string(H) +
+                check(same, "MLA explicit scores/obar/gemm (incl. 7/7/3, 4/6/3) == 3/5/1 bitwise intermediates/output/guards H=" + std::to_string(H) +
                       (ieee ? " NaN/+Inf/-Inf latent" : " signed-zero/subnormal latent") + ", n=1..2051 tile boundaries");
             }
         }
         free_all();
     }
-    P::mla_attention_rows_versions({}, nullptr, nullptr, nullptr, nullptr, 32, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 4, 6);
+    {  // GEMM v3 vs v2 directly: one full 128-row tile plus a tail, every column tile, both head counts.
+        constexpr unsigned C = 129, cap = 64, nt = 17, guard = 17;
+        for (unsigned H : {32U, 64U}) {
+            SlotBufs slot(cap);
+            const auto lat = rnd_half(static_cast<std::size_t>(cap) * kKvLora, g, 0.25F, true);
+            hok(hipMemcpy(slot.s.latent, lat.data(), lat.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice), "MLA seed");
+            std::vector<std::uint32_t> tokens(static_cast<std::size_t>(C) * P::kMaxTokens);
+            for (unsigned r = 0; r < C; ++r)
+                for (unsigned j = 0; j < nt; ++j) tokens[static_cast<std::size_t>(r) * P::kMaxTokens + j] = (r + 3 * j) % cap;
+            auto* tk = up(tokens);
+            auto* nn = up(std::vector<std::uint32_t>(C, nt));
+            auto* kv = up(std::vector<std::uint16_t>(fx.kvb.data(), fx.kvb.data() + static_cast<std::size_t>(H) * 2 * kMlaDim * kKvLora));
+            auto qm = rnd(static_cast<std::size_t>(C) * H * kMlaDim, g, 0.25F);
+            for (unsigned r : {0U, 127U, 128U})
+                for (unsigned h = 0; h < H; ++h) {
+                    const std::size_t base = (static_cast<std::size_t>(r) * H + h) * kMlaDim;
+                    qm[base] = 0.0F;
+                    qm[base + 15] = -0.0F;
+                    const std::uint32_t sub = h & 1U ? 0x80000001U : 0x00000001U;
+                    std::memcpy(&qm[base + 16], &sub, sizeof(sub));
+                }
+            auto* q = up(qm);
+            const std::size_t nq = static_cast<std::size_t>(C) * H * kKvLora;
+            const std::size_t ne = static_cast<std::size_t>(C) * H * P::kEStride, no = static_cast<std::size_t>(C) * H * kMlaDim;
+            float *qt[2], *ep[2], *ob[2], *out[2];
+            for (unsigned v = 0; v < 2; ++v) {  // separate poisoned buffers prevent a missed v3 store inheriting v2's result
+                qt[v] = poison<float>(nq + guard);
+                ep[v] = poison<float>(ne + guard);
+                ob[v] = poison<float>(nq + guard);
+                out[v] = poison<float>(no + guard);
+                P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, qt[v], ep[v], ob[v], out[v], C, nullptr, 7, 7, v + 2);
+            }
+            bool same = true;
+            auto compare = [&](const float* a, const float* b, std::size_t count) {
+                const auto x = down(a, count + guard), y = down(b, count + guard);
+                same &= bits_eq(x, y);
+                for (std::size_t j = count; j < x.size(); ++j) {
+                    std::uint32_t u, v;
+                    std::memcpy(&u, &x[j], sizeof(u));
+                    std::memcpy(&v, &y[j], sizeof(v));
+                    same &= u == 0xFFFFFFFFU && v == 0xFFFFFFFFU;
+                }
+            };
+            compare(qt[0], qt[1], nq);
+            compare(ep[0], ep[1], ne);
+            compare(ob[0], ob[1], nq);
+            compare(out[0], out[1], no);
+            check(same, "MLA 7/7/3 == 7/7/2 bitwise intermediates/output/guards, C=129 H=" + std::to_string(H));
+            free_all();
+        }
+    }
+    P::mla_attention_rows_versions({}, nullptr, nullptr, nullptr, nullptr, 32, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 4, 6, 3);
     hok(hipGetLastError(), "MLA zero rows");
 }
 

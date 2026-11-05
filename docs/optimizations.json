@@ -2251,12 +2251,23 @@
     "engine": "glm",
     "name": "Prefill MLA absorb / output GEMM v2",
     "flag_or_env": "STRIX_GLM_PF_MLA_GEMM",
-    "default": "2",
+    "default": "3 (v3); 2 selects v2",
     "exact": "Absorbed queries and outputs bitwise equal to v1 and the decode kernel on the prefill gate.",
     "gain": "absorb 6.1 -> 4.6, output 4.1 -> 3.3 us/row per DSA layer",
     "preconditions": "Exact chunked prefill.",
     "off_switch": "STRIX_GLM_PF_MLA_GEMM=1",
     "doc_anchor": "docs/optimizations.md#glm-pf-mla-gemm-v2"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill MLA absorb / output GEMM v3",
+    "flag_or_env": "STRIX_GLM_PF_MLA_GEMM",
+    "default": "3",
+    "exact": "Bitwise: every arm on both ranks of the pair equals the public exact anchors at 8K and 32K (prefill logits and state).",
+    "gain": "Two-node pair, alternating arms: MLA GEMM time per rank 0.715 -> 0.425 s at 8K (-41 %), 2.853 -> 1.628 s at 32K (-43 %); TTFT 8,192 tokens 15.34 -> 15.05 s (534 -> 544 tok/s, -1.9 %), 32,768 tokens 62.36 -> 60.91 s (525 -> 538 tok/s, -2.3 %)",
+    "preconditions": "Exact chunked prefill (the legacy MLA pair keeps its own kernels).",
+    "off_switch": "STRIX_GLM_PF_MLA_GEMM=2 (v2) or 1 (legacy tiled GEMM); --baseline selects v2",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-gemm-v3"
   },
   {
     "engine": "glm",

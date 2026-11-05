@@ -3492,18 +3492,36 @@ is widened to f32 once per block.
 
 ### Prefill MLA absorb / output GEMM v2
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_MLA_GEMM`. **Default:** 2.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_MLA_GEMM`. **Default:** 3 ([v3](#glm-pf-mla-gemm-v3)); 2 selects v2.
 
 The MLA query absorption and output projection GEMMs keep every output's chain (k ascending from +0) with a 128-row x
 64-column tile, A staged transposed and the F16 weight widened to f32 once per tile, 8 x 4 outputs per thread.
 
 - **Preconditions:** Exact chunked prefill (the legacy MLA pair keeps its own kernels).
-- **Automatic selection:** Unset resolves to 2; the engine default provides it; the resolver reports it. Explicit values win.
+- **Automatic selection:** Unset resolves to 3 (v3, same bits); `--baseline` and STRIX_GLM_PF_MLA_GEMM=2 select v2. Explicit values win.
 - **Fallback notice:** None.
 - **Exactness evidence:** Absorbed queries and outputs bitwise equal to v1 and to the decode kernel on the prefill gate.
 - **Off switch:** STRIX_GLM_PF_MLA_GEMM=1
 - **Measured gain:** absorb 6.1 -> 4.6 and output 4.1 -> 3.3 us/row per DSA layer (32 heads per rank)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+
+<a id="glm-pf-mla-gemm-v3"></a>
+
+### Prefill MLA absorb / output GEMM v3
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_MLA_GEMM`. **Default:** 3.
+
+The MLA absorb and output GEMMs run as 128-row x 128-column VALU tiles (8 x 8 outputs per thread) with the column
+tile fastest in the grid, so the CTAs that share one A tile run back to back and read it from L2. Every output keeps
+the v2 chain (k ascending from +0, fmaf), so the result has the same bits as v2.
+
+- **Preconditions:** Exact chunked prefill (the legacy MLA pair keeps its own kernels).
+- **Automatic selection:** Unset resolves to 3; the engine default provides it; the resolver reports it. Explicit values win; values other than 1, 2 and 3 are rejected.
+- **Fallback notice:** None.
+- **Exactness evidence:** Bitwise: every arm on both ranks of the pair equals the public exact anchors at 8K and 32K (prefill logits and state).
+- **Off switch:** STRIX_GLM_PF_MLA_GEMM=2 (v2) or 1 (legacy tiled GEMM); --baseline selects v2
+- **Measured gain:** Two-node pair, alternating arms: MLA GEMM time per rank 0.715 -> 0.425 s at 8K (-41 %), 2.853 -> 1.628 s at 32K (-43 %); TTFT 8,192 tokens 15.34 -> 15.05 s (534 -> 544 tok/s, -1.9 %), 32,768 tokens 62.36 -> 60.91 s (525 -> 538 tok/s, -2.3 %)
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
 <a id="glm-pf-dense-rows-v2"></a>
 
