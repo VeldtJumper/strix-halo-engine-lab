@@ -494,13 +494,13 @@ struct Engine::Impl {
     bool pf_dense_o = true;  // STRIX_MM_PF_DENSE_O (default ON): prefill o_proj on the v4 core for full 4096-row pieces; =0 library
     bool pf_dense_qkv = true;  // STRIX_MM_PF_DENSE_QKV (default ON): prefill q/k/v in one v4-core call from 1024 rows (same bits as strix_gemm); =0 library
     unsigned pf_idx_rows = 32;
-    unsigned pf_msa_rework = 6;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 6 (= 5 with the tile corrections in the packed exp lanes, exact); =5 / =3 previous defaults, =0 original
+    unsigned pf_msa_rework = 7;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 7 (= 6 with the combine fused into the last chunk block, exact); =6 / =5 / =3 previous defaults, =0 original
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
     std::uint32_t *pf_idx = nullptr, *pf_cnt = nullptr, *pf_ticket = nullptr;
     void set_prefill_msa_rework(unsigned mode) {
-        if (mode > 6) throw std::invalid_argument("prefill MSA rework must be 0, 1, 2, 3, 4, 5 or 6");
+        if (mode > 7) throw std::invalid_argument("prefill MSA rework must be 0, 1, 2, 3, 4, 5, 6 or 7");
         pf_msa_rework = mode;
     }
     bool pf_attend4 = true;  // STRIX_MM_PF_ATTEND4 (default ON, exact measurement): prefill windows use v4, two heads per wave
@@ -645,9 +645,9 @@ struct Engine::Impl {
         attn_prefill_fused = apf == nullptr || std::string(apf) != "off";  // ON by default (measurement: bitwise, TTFT -5.5 %); =off
         if (const char* rework = std::getenv("STRIX_MM_PF_MSA_REWORK")) {
             const std::string mode = rework;
-            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4" && mode != "5" && mode != "6")
-                throw std::invalid_argument("STRIX_MM_PF_MSA_REWORK must be 0, 1, 2, 3, 4, 5 or 6");
-            set_prefill_msa_rework(mode == "6" ? 6U : mode == "5" ? 5U : mode == "4" ? 4U : mode == "3" ? 3U : mode == "2" ? 2U : mode == "1" ? 1U : 0U);
+            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4" && mode != "5" && mode != "6" && mode != "7")
+                throw std::invalid_argument("STRIX_MM_PF_MSA_REWORK must be 0, 1, 2, 3, 4, 5, 6 or 7");
+            set_prefill_msa_rework(mode == "7" ? 7U : mode == "6" ? 6U : mode == "5" ? 5U : mode == "4" ? 4U : mode == "3" ? 3U : mode == "2" ? 2U : mode == "1" ? 1U : 0U);
         }
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);

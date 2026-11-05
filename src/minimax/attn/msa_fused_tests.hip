@@ -778,7 +778,7 @@ void prefill_batch_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, 
             std::vector<float> score_ref, partial_ref, batch_output_ref;
             std::vector<std::uint32_t> idx_ref, count_ref;
             for (unsigned query_rows : {0U, 16U, 32U, 64U}) {
-                for (unsigned rework : {0U, 1U, 2U, 3U, 4U, 5U, 6U}) {
+                for (unsigned rework : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U}) {
                     reset();
                     auto v = prefill_view(p, pos0, std::min(n, 16U), ver, ver == 4 ? 2U : 0U);
                     v.scores = scores;
@@ -842,7 +842,7 @@ void prefill_batch_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, 
                                                                : std::vector<unsigned>{1U, scratch_windows};
     for (unsigned cap : producer_caps) for (unsigned pvf : {0U, 1U}) {
         const std::size_t batch_rows = std::size_t{cap} * 16;
-        float producer_ms[7] = {}, complete_ms[7] = {};
+        float producer_ms[8] = {}, complete_ms[8] = {};
         float selection_ms = 0.0F;
         std::uint64_t partial_count = 0;
         for (unsigned r0 = 0; r0 < n; r0 += cap * 16) {
@@ -852,7 +852,7 @@ void prefill_batch_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, 
             std::vector<float> score_ref, partial_ref, output_ref;
             std::vector<std::uint32_t> ids_ref, counts_ref;
             std::vector<std::uint16_t> k_ref, v_ref, ik_ref;
-            for (unsigned mode : {0U, 1U, 2U, 3U, 4U, 5U, 6U}) {
+            for (unsigned mode : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U}) {
                 hip_ok(hipMemset(scores, 0xa5, batch_rows * 2 * p.max_blocks * sizeof(float)), "producer scores sentinel");
                 hip_ok(hipMemset(partial, 0xa5, batch_rows * 32 * msa::kMaxChunks * 130 * sizeof(float)), "producer partial sentinel");
                 hip_ok(hipMemset(idx, 0xa5, batch_rows * 2 * msa::kTopK * sizeof(std::uint32_t)), "producer ids sentinel");
@@ -905,8 +905,8 @@ void prefill_batch_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, 
                     1e6 * producer_ms[4] / static_cast<double>(partial_count),
                     1e6 * producer_ms[5] / static_cast<double>(partial_count),
                     1e6 * producer_ms[6] / static_cast<double>(partial_count));
-        std::printf("prefill complete pos0=%u n=%u scratch=%u pv_full=%u modes 0/1/2/3/4/5/6 %.3f/%.3f/%.3f/%.3f/%.3f/%.3f/%.3f ms; shared-selection scheduling %.3f ms (R16 membership included in producers)\n",
-                    pos0, n, cap, pvf, complete_ms[0], complete_ms[1], complete_ms[2], complete_ms[3], complete_ms[4], complete_ms[5], complete_ms[6], selection_ms);
+        std::printf("prefill complete pos0=%u n=%u scratch=%u pv_full=%u modes 0/1/2/3/4/5/6/7 %.3f/%.3f/%.3f/%.3f/%.3f/%.3f/%.3f/%.3f ms; shared-selection scheduling %.3f ms (R16 membership included in producers)\n",
+                    pos0, n, cap, pvf, complete_ms[0], complete_ms[1], complete_ms[2], complete_ms[3], complete_ms[4], complete_ms[5], complete_ms[6], complete_ms[7], selection_ms);
     }
     // Index gates also run in quick mode. Compare default, Q32 and real Q64 in
     // each reused scratch batch, including causal holes and unused tail rows.
@@ -987,13 +987,13 @@ void prefill_batch_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, 
     catch (const std::invalid_argument&) { rejected = true; }
     check(rejected, "batched prefill rejects unsupported index rows");
     invalid.index_rows = 32;
-    invalid.msa_rework = 7;
+    invalid.msa_rework = 8;
     rejected = false;
     try { mf::enqueue_prefill(invalid, nullptr); }
     catch (const std::invalid_argument&) { rejected = true; }
     check(rejected, "batched prefill rejects unsupported rework mode");
     auto invalid_producer = mf::PrefillView{prefill_view(p, pos0, std::min(n, 16U), 4, 2),
-                                          std::min(n, 16U), pos0, 1, 0, false, 32, 7};
+                                          std::min(n, 16U), pos0, 1, 0, false, 32, 8};
     rejected = false;
     try { mf::enqueue_prefill_partials(invalid_producer, nullptr); }
     catch (const std::invalid_argument&) { rejected = true; }

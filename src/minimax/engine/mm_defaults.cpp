@@ -98,7 +98,7 @@ constexpr Item kItems[] = {
     {"pf_attend4", "STRIX_MM_PF_ATTEND4", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_router_batch", "STRIX_MM_PF_ROUTER_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_mtfit", "STRIX_MMX_PREFILL_MTFIT", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
-    {"pf_msa_rework", "STRIX_MM_PF_MSA_REWORK", "6", "0", "Prefill attention measurement: exact; mode 6 (tile corrections in the packed exp lanes) vs 5 8K in-process -1.6/0/0 %, mode 3 8K B/A 0.963 / 0.957 / 0.972"},
+    {"pf_msa_rework", "STRIX_MM_PF_MSA_REWORK", "7", "0", "Prefill attention measurement: exact; mode 7 (combine fused into the last chunk block) vs 6 attend -8.3 %/call at 28672:4096, TTFT bracketed in-process A/B vs mode 6 8K -5.0 % (-0.78 s), 16K -3.0 % (-0.93 s); 32K fresh process 6/7/6 + 7/6/7 -2.4 % (-1.59 s), result hash identical on both ranks; mode 6 (tile corrections in the packed exp lanes) vs 5 8K in-process -1.6/0/0 %, mode 3 8K B/A 0.963 / 0.957 / 0.972"},
     {"pf_idx_tile", "STRIX_MM_PF_IDX_TILE", "1", "0",
      "Prefill index measurement: exact (state/final rows identical), index scoring 8K -6.7 %, 32K -6.4 %; TTFT 8K -1.9 %, 32K -0.6 %, 1K neutral"},
     {"pf_idx_rows", "STRIX_MM_PF_IDX_ROWS", "64", "32",

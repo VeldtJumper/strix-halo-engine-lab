@@ -200,7 +200,7 @@ public:
     [[nodiscard]] bool prefill_index_tile() const;
     void set_prefill_msa_batch(bool on);  // STRIX_MM_PF_MSA_BATCH, default off; prefill only
     [[nodiscard]] bool prefill_msa_batch() const;
-    void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0..6; prefill only, default 6
+    void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0..7; prefill only, default 7
     [[nodiscard]] unsigned prefill_msa_rework() const;
     void set_prefill_attend4(bool on);  // STRIX_MM_PF_ATTEND4, default off; prefill only
     [[nodiscard]] bool prefill_attend4() const;

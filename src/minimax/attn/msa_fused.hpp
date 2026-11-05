@@ -95,7 +95,7 @@ struct PrefillView {
     std::uint32_t first_window = 0;  // internal launch range, must be zero on entry
     bool index_tile = false;
     std::uint32_t index_rows = 32;  // 16/32/64; 64 reuses 32 KiB LDS across four 16-query subtiles
-    std::uint32_t msa_rework = 0;  // 0 = original; 1 = shared selection/HPW2/separate combine; 2 = 16-key K/V tiles; 3 = direct sparse mapping + visible tiles; 4 = R16 shared K/V tiles; 5 = mode 3 with packed probabilities; 6 = mode 5 with the tile corrections in the packed exp lanes
+    std::uint32_t msa_rework = 0;  // 0 = original; 1 = shared selection/HPW2/separate combine; 2 = 16-key K/V tiles; 3 = direct sparse mapping + visible tiles; 4 = R16 shared K/V tiles; 5 = mode 3 with packed probabilities; 6 = mode 5 with the tile corrections in the packed exp lanes; 7 = mode 6 with the combine fused into the last chunk block (ticket)
 };
 using PrefillStageMarker = void (*)(void* user, const char* category, bool before);
 void enqueue_prefill(const PrefillView& v, hipStream_t stream,
