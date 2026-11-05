@@ -1600,6 +1600,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Conversation sessions",
+    "flag_or_env": "--session-cache, STRIX_SESSION_CACHE",
+    "default": "on (two-node serve route)",
+    "exact": "20-phase two-node gate, all pass: restored == live == fresh token ids and state digests; off == baseline; unnamed requests with sessions on == off; automatic admission == off. 21 paired turns, sessions vs off: ids identical every turn.",
+    "gain": "Two nodes, turn 2 of a 6,989-token conversation (6,989-token prompt): whole reply wall time 16.16 / 15.20 s -> 5.16 / 3.84 s (3-4x); the plain run prefills the prompt in 13.46 / 12.51 s (519 / 559 tok/s), the session run restores all 6,989 tokens and prefills none. Turn-2 text identical, turn 1 unchanged; 21 paired turns: no resolved slowdown in any cell.",
+    "preconditions": "The qualified two-node route; the request carries a `session` id; no constrained output (refused with a 400 naming `session`). Named requests decode without the DSpark drafter by default (grouped prefill, same ids); STRIX_MM_SESSION_DRAFT=1 restores it.",
+    "off_switch": "--session-cache off; STRIX_SESSION_CACHE=0; --baseline / STRIX_BASELINE=1",
+    "doc_anchor": "docs/optimizations.md#mm-sessions"
+  },
+  {
+    "engine": "minimax",
     "name": "o_proj warm during decode attention",
     "flag_or_env": "STRIX_MM_XB_WARM_O",
     "default": "8",

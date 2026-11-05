@@ -124,9 +124,15 @@ sv::Json session_execute(Engine& eng, Runtime& rt,
             const auto n = static_cast<unsigned>(std::min<std::uint64_t>(static_cast<std::uint64_t>(req.find("count")->as_int()), room));
             const auto generated = rt.generate(n, {}, stops, publish);
             for (const auto token : generated) ids.push(sv::Json(std::uint64_t(token)));
-            rt.park(id);
+            // defer_park: the caller answers the request first and then sends park_active before anything else runs.
+            const auto* defer = req.find("defer_park");
+            if (!(defer && defer->is_bool() && defer->as_bool())) rt.park(id);
             reply.set("token_ids", std::move(ids)); reply.set("hit", sv::Json(hit));
             reply.set("finish", sv::Json(session_finish(generated, n, stops)));
+        } else if (op == "park_active") {
+            // Parks the session a deferred generate left active (no restore: its state is still in the slot).
+            if (!rt.active()) throw sv::SessionApiError(409, "session_incompatible", "no active session to park");
+            rt.park(id);
         } else if (op == "checkpoint" || op == "ram_checkpoint") {
             // Finished requests are parked; resume before checkpointing their committed state.
             rt.restore_auto(id);

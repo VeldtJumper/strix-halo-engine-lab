@@ -2488,6 +2488,27 @@ request drafts its window from the match where the expected tokens per second of
 - **Measured gain:** Two-node serve, one load, lookup switched per request batch: copy-heavy rewrite (C1, DSpark off) 23.65 / 23.44 -> 26.01 / 25.69 tok/s (+9.8 %); agent edit / agent JSON / prose at C1 and four concurrent requests equal within noise (DSpark keeps drafting where it is admitted; no lookup window at C4 on these prompts).
 - **Counters:** `/admin/sched` counters lookup_windows, lookup_drafted, lookup_accepted, lookup_s.
 
+<a id="mm-sessions"></a>
+
+### Conversation sessions
+
+**Engine:** `minimax`. **Control:** `--session-cache, STRIX_SESSION_CACHE`. **Default:** on (two-node serve route).
+
+A request that names a `session` parks its state in host RAM right after the reply; the next turn of that session
+resumes from it and prefills only the new tokens. The route table qualifies `serve/usb4-auto/fixed-width-one-session-v1`;
+any other route declines by name and runs as with sessions off. RAM is bounded at min(8 GiB, 25 % of MemAvailable after
+the model load), at most 8 parked sessions; a full cache evicts other entries to resume one, and a resume that cannot fit
+alone is refused before anything is evicted. Unnamed requests are unchanged. The disk tier is opt-in
+(`--session-disk on` / `STRIX_SESSION_DISK=1`).
+
+- **Preconditions:** The qualified two-node route; the request carries a `session` id; no constrained output (refused with a 400 naming `session`). Named requests decode without the DSpark drafter by default (grouped prefill, same ids); STRIX_MM_SESSION_DRAFT=1 restores it.
+- **Automatic selection:** On for named requests on the qualified route; other routes decline by name. Explicit values win.
+- **Fallback notice:** A declined route or a refused resume runs as with sessions off.
+- **Exactness evidence:** 20-phase two-node gate, all pass: restored == live == fresh token ids and state digests; off == baseline; unnamed requests with sessions on == off; automatic admission == off. 21 paired turns, sessions vs off: ids identical every turn.
+- **Off switch:** --session-cache off; STRIX_SESSION_CACHE=0; --baseline / STRIX_BASELINE=1
+- **Measured gain:** Two nodes, turn 2 of a 6,989-token conversation (6,989-token prompt): whole reply wall time 16.16 / 15.20 s -> 5.16 / 3.84 s (3-4x); the plain run prefills the prompt in 13.46 / 12.51 s (519 / 559 tok/s), the session run restores all 6,989 tokens and prefills none. Turn-2 text identical, turn 1 unchanged; 21 paired turns: no resolved slowdown in any cell.
+- **Implementation / evidence:** [session cache](minimax/session-cache.md), [serve](../apps/minimax_serve_main.cpp), [session store](../src/minimax/session/session_cache.cpp)
+
 <a id="mm-serve-dspark"></a>
 
 ### DSpark automatic admission

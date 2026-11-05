@@ -362,14 +362,22 @@ int main() {
         s.submit(800, 2, 2000, 3);
         s.submit(1000, 3, 10, 2, "conversation");
         ms::SessionService service;
-        unsigned calls = 0;
+        unsigned calls = 0, parks = 0;
         service.execute = [&](const std::string& body, const ms::SessionService::Publish& publish) {
+            if (sv::parse_json(body).find("op")->as_string() == "park_active") {
+                // The reply was published before the park: the ticket is finished with its final count.
+                check(calls == 1 && s.tickets.at(3)->stats().generated_tokens == 2, "named request is answered before its park");
+                check(sv::parse_json(body).find("id")->as_string() == "conversation", "park names the same session");
+                ++parks;
+                return sv::Json::object();
+            }
             check(!s.engine.prefill_open(), "session runs without active or parked prefill");
             check(s.tickets.at(1)->stats().generated_tokens == 100 && s.tickets.at(2)->stats().generated_tokens == 3,
                   "named request waits for ordinary decoders");
             const auto command = sv::parse_json(body);
             check(command.find("id")->as_string() == "conversation" && command.find("count")->as_int() == 2,
                   "named request command retains session and generation count");
+            check(command.find("defer_park") && command.find("defer_park")->as_bool(), "named request defers its park to after the reply");
             const std::array<std::uint32_t, 2> ids{201, 202};
             check(publish(ids), "session callback accepts complete tokens");
             auto reply = sv::Json::object(), tokens = sv::Json::array();
@@ -379,8 +387,8 @@ int main() {
             return reply;
         };
         const auto r = s.run(40000, &service);
-        check(calls == 1 && count(r, ms::Command::session) == 1 && count(r, ms::Command::nest) == 0,
-              "named request dispatches once at idle and cannot nest");
+        check(calls == 1 && parks == 1 && count(r, ms::Command::session) == 2 && count(r, ms::Command::nest) == 0,
+              "named request dispatches once at idle (then its park) and cannot nest");
         const auto stats = s.tickets.at(3)->stats();
         check(stats.generated_tokens == 2 && stats.cached_tokens == 10 && stats.finish == "length",
               "named request completion publishes cache hit and complete token count");
@@ -392,7 +400,8 @@ int main() {
         Scenario s(ms::Sched::interleave);
         s.submit(0, 1, 10, 4, "conversation");
         ms::SessionService service;
-        service.execute = [&](const std::string&, const ms::SessionService::Publish& publish) {
+        service.execute = [&](const std::string& body, const ms::SessionService::Publish& publish) {
+            if (sv::parse_json(body).find("op")->as_string() == "park_active") return sv::Json::object();
             const std::array<std::uint32_t, 1> ids{201};
             (void)publish(ids);
             auto reply = sv::Json::object(), tokens = sv::Json::array();

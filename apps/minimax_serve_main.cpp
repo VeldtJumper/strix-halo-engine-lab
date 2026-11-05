@@ -63,6 +63,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -913,7 +914,13 @@ int main(int argc, char** argv) {
             session_options.disk_enabled = session_config.disk;
             const bool session_on = session_config.enabled;
 
-            if (!session_cli) session_options.draft = drafter != nullptr;
+            // Named sessions decode without the drafter by default: its taps force the ungrouped prefill (a 6.9K-token
+            // first turn took 22 s instead of 13 s) and fixed-width-one drafting gave no decode gain there; output ids
+            // are the same either way (target greedy). STRIX_MM_SESSION_DRAFT=1 keeps the drafter for named sessions.
+            if (!session_cli) {
+                const char* draft_env = std::getenv("STRIX_MM_SESSION_DRAFT");
+                session_options.draft = drafter != nullptr && draft_env != nullptr && std::string_view(draft_env) == "1";
+            }
             session_runtime = strix::minimax::session::admit_runtime_pair(
                 {session_on, session_explicit, session_config.reason}, eng.rank(),
                 [&](const strix::minimax::session::StartupVote& vote) { return strix::minimax::session::exchange_startup(eng, vote); }, [&] {

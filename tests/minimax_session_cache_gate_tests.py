@@ -29,8 +29,10 @@ with tempfile.TemporaryDirectory(prefix='mm-timing-') as temp:
         assert not (root/'off-A.done').exists()
         receipt=json.loads((root/f'r{rank}/off-A.timing.json').read_text())
         assert receipt['cache_hits']==7 and receipt['cache_misses']==1
+    # Serving sessions run without the drafter by default: one (target) lookup on every serve arm.
     for tag,count in [('off-A',1),('off-B',1),('on-A',2),('on-B',2),
-                      ('explicit-on-serve-off',1),('explicit-on-serve-on',2)]:
+                      ('explicit-on-serve-off',1),('explicit-on-serve-on',1),
+                      ('auto-serve-on',1),('auto-serve-default-adaptive',1)]:
         assert parse(tag,['\n'.join([warm]*count)]*2).returncode == 0
         assert parse(tag,['']*2).returncode != 0, 'missing compatibility receipt passed'
         assert parse(tag,[warm.replace(' cache_misses 0','')]*2).returncode != 0
@@ -55,10 +57,11 @@ with tempfile.TemporaryDirectory(prefix='mm-receipts-') as temp:
         for rank in (0,1):
             lines=[live,live]; lines[rank]='READY'
             assert check_receipts(tag, lines)!=0, 'missing live rank falsely passed'
-    assert check_receipts('auto-serve-off', [off,off])==0
-    for rank in (0,1):
-        lines=[off,off]; lines[rank]=live
-        assert check_receipts('auto-serve-off', lines)!=0, 'automatic qualification falsely passed'
+    for tag in ('auto-serve-off','auto-serve-on'):
+        assert check_receipts(tag, [live,live])==0
+        for rank in (0,1):
+            lines=[live,live]; lines[rank]=off
+            assert check_receipts(tag, lines)!=0, 'automatic admission refusal falsely passed'
 with tempfile.TemporaryDirectory(prefix='mm-gate-') as temp:
     root=pathlib.Path(temp)
     def command(script,*args):

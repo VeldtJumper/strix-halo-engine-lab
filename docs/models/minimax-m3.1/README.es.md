@@ -26,6 +26,14 @@ se quedan en simple. Véase [admisión y cualificación](../../engine/serving/ds
 Una petición de sesión con nombre que no cabe en el contexto devuelve HTTP 400 `context_length_exceeded` (la
 sesión sigue aparcada); la generación se detiene al final del contexto con el motivo de fin `length`. Véase
 [caché de sesiones](../../minimax/session-cache.md).
+Las sesiones de conversación están activadas por defecto en la ruta de servicio de dos nodos: una petición con id
+de `session` aparca su estado en la RAM del host justo después de la respuesta y se reanuda desde él en el turno
+siguiente (turno 2 de una conversación de 6,989 tokens, prompt de 6,989 tokens restaurado entero: respuesta completa
+3.84–5.16 s en lugar de 15.20–16.16 s, de los que el prefill simple son 12.51–13.46 s, 519–559 tok/s; salida idéntica). Presupuesto min(8 GiB, 25 % de la memoria libre tras cargar el modelo),
+como máximo 8 sesiones aparcadas; el nivel de disco es opcional (`--session-disk on` / `STRIX_SESSION_DISK=1`).
+Se desactiva con `--session-cache off` / `STRIX_SESSION_CACHE=0` o con los interruptores de baseline. Las
+peticiones con nombre decodifican sin el drafter DSpark (mantiene el prefill agrupado; los ids son los mismos);
+`STRIX_MM_SESSION_DRAFT=1` lo restablece.
 
 <a id="how-fast"></a>
 

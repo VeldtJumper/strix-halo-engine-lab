@@ -252,7 +252,7 @@ void test_session_inspection() {
 }
 void test_session_defaults() {
     md::Cli cli; cli.app = "serve";
-    for (const EnvMap& off : {EnvMap{}, EnvMap{{"STRIX_SESSION_CACHE", "0"}},
+    for (const EnvMap& off : {EnvMap{{"STRIX_SESSION_CACHE", "0"}},
                              EnvMap{{"STRIX_SESSION_CACHE", "off"}}, EnvMap{{"STRIX_MM_BASELINE", "1"}},
                              EnvMap{{"STRIX_BASELINE", "1"}, {"STRIX_SESSION_CACHE", "1"}}}) {
         const auto policy = md::session_policy(cli, [&](const char* key) -> const char* {
@@ -264,10 +264,27 @@ void test_session_defaults() {
         });
         check(!policy.enabled && policy.ram_bytes == 0 && policy.directory.empty(), "OFF startup uses pure policy");
     }
+    {
+        md::Cli rank; rank.app = "rank";
+        const auto policy = md::session_policy(rank, lookup(EnvMap{}));
+        check(!policy.enabled && policy.reason == "route not yet GPU-qualified: rank/usb4-auto/fixed-width-one-session-v1" &&
+              policy.ram_bytes == 0 && policy.directory.empty(), "unqualified rank route stays off with pure policy");
+    }
     EnvMap env{{"STRIX_SESSION_DISK","0"},{"HOME","/test-home"}};
     auto c = md::session_config(cli, lookup(env), 100ULL << 30);
-    check(!c.enabled && c.reason == "route not yet GPU-qualified: " + c.route &&
-          c.ram_bytes == (8ULL << 30) && c.max_parked == 8 && !c.disk, "unqualified default declines");
+    check(c.enabled && c.reason.empty() && c.route == "serve/usb4-auto/fixed-width-one-session-v1" &&
+          c.ram_bytes == (8ULL << 30) && c.max_parked == 8 && !c.disk, "qualified serve route admits by default");
+    {
+        md::Cli tcp = cli; tcp.transport = "tcp-listen:9000";
+        const auto other = md::session_config(tcp, lookup(env), 100ULL << 30);
+        check(!other.enabled && other.reason == "route not yet GPU-qualified: serve/tcp-listen:9000/fixed-width-one-session-v1",
+              "unqualified transport declines");
+    }
+    {
+        EnvMap no_disk_switch{{"HOME", "/test-home"}};
+        const auto automatic = md::session_config(cli, lookup(no_disk_switch), 100ULL << 30);
+        check(automatic.enabled && !automatic.disk, "automatic serving parks in RAM only unless the disk tier is requested");
+    }
     env["STRIX_SESSION_CACHE"] = "1";
     check(md::session_config(cli,lookup(env),100ULL<<30).enabled, "explicit qualification gate opt-in");
     env.erase("STRIX_SESSION_CACHE");
@@ -284,9 +301,15 @@ void test_session_defaults() {
     check(!c.enabled && !c.reason.empty(), "120K refuses default budget cleanly");
     cli.capacity = 8256;
     check(!md::session_config(cli,lookup(env),2ULL<<30).enabled, "MemAvailable guard");
+    {
+        // Two-node serve node after the model load: ~31 GB available admits the default 8256-token context.
+        md::Cli production; production.app = "serve";
+        const auto node = md::session_config(production, lookup(env), 31ULL << 30);
+        check(node.enabled && node.ram_bytes == (31ULL << 30) / 4, "default context fits a quarter of post-load MemAvailable");
+    }
     env["STRIX_SESSION_RAM_BYTES"] = "7000000000"; env["STRIX_SESSION_MAX_PARKED"] = "3";
     c = md::session_config(cli,lookup(env),100ULL<<30);
-    check(!c.enabled && c.ram_bytes == 7000000000 && c.max_parked == 3, "budget overrides");
+    check(c.enabled && c.ram_bytes == 7000000000 && c.max_parked == 3, "budget overrides");
     const auto directory = std::filesystem::current_path() / "minimax-explicit-defaults-fixture";
     check(!std::filesystem::exists(directory), "explicit test directory fresh");
     env["STRIX_SESSION_CACHE"] = "0";

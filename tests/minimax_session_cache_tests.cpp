@@ -60,6 +60,16 @@ Checkpoint sample(unsigned rank = 0, unsigned world = 1) {
       {"pending.logits", false, Bytes((rank == 0 ? 100096 : 99968) * 4, 0)});
   return c;
 }
+// The same shape with `positions` state rows: large enough that the 1 MiB capture margin is small next to the payload.
+Checkpoint sized_sample(const std::string &id, std::uint64_t positions) {
+  auto c = sample();
+  c.id = id;
+  c.history.assign(positions, 3);
+  c.frontier.consumed = c.frontier.accepted = positions;
+  c.sections = split_state(Bytes(positions * 76800, 0), positions);
+  c.sections.push_back({"pending.logits", false, Bytes(100096 * 4, 0)});
+  return c;
+}
 struct Pair {
   std::barrier<> sync{2};
   std::array<Bytes, 2> messages;
@@ -283,6 +293,23 @@ int main() {
     lru.capture(e);
     refuses([&] { lru.resume("B", false); });
     check(lru.stats().evictions == 1, "peak-aware LRU");
+    {
+      // Saturated cache: the second capture fits (budget >= 6P + E), but resuming the first with both parked needs
+      // 8E > budget; only the other entry may go (budget >= 7E).
+      const auto big_a = sized_sample("A", 100), big_b = sized_sample("B", 100);
+      std::uint64_t big_payload = 1048576;
+      for (const auto &sec : big_a.sections)
+        big_payload += sec.bytes.size();
+      const std::uint64_t entry = encode(big_a).size();
+      const std::uint64_t budget = std::max(6 * big_payload + entry, 7 * entry) + 4096;
+      check(budget < 8 * entry, "saturated-resume fixture is tight enough");
+      Cache full(big_a.compat, 0, 1, budget, dir / "full", self);
+      full.capture(big_a);
+      full.capture(big_b);
+      check(full.in_ram("A") && full.in_ram("B") && full.stats().evictions == 0, "both entries parked");
+      check(state_digest(full.resume("A", false)) == state_digest(big_a) && !full.in_ram("B") &&
+                full.stats().evictions == 1, "full cache resumes by evicting another entry, never the target");
+    }
     Cache tiny(c.compat, 0, 1, 1, dir / "tiny", self);
     refuses([&] { tiny.capture(c); });
     check(tiny.stats().bytes == 0, "oversized admission");

@@ -289,8 +289,10 @@ std::string shared(const Checkpoint &c) {
   return sha(w.b);
 }
 } // namespace
+// Same digest as sha256_bytes; the CPU's SHA extensions when present (state payloads are hundreds of MB, hashed
+// several times per save and resume).
 std::string sha(std::span<const std::uint8_t> b) {
-  return model_content_identity_hex(sha256_bytes(std::as_bytes(b)));
+  return model_content_identity_hex(sha256_bytes_fast(std::as_bytes(b)));
 }
 void validate_id(const std::string &s) {
   require(!s.empty() && s.size() <= 128 &&
@@ -739,6 +741,23 @@ void Cache::prepare_capture(std::uint64_t payload) {
     ++evictions_;
   }
 }
+// A full cache must still restore its own entries: evict other parked sessions (LRU) until the restore peak fits,
+// never the one being resumed.
+void Cache::prepare_resume(const std::string &id, std::uint64_t payload) {
+  const auto available = available_memory();
+  // Refuse before evicting anything when even the target alone cannot be restored.
+  const auto target = entries_.find(id);
+  require(target != entries_.end() && memory_admitted(target->second.bytes.size(), payload, budget_, available),
+          "host budget/capture peak/MemAvailable admission refused");
+  while (!memory_admitted(stats().bytes, payload, budget_, available)) {
+    auto victim = entries_.end();
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+      if (it->first != id && (victim == entries_.end() || it->second.touched < victim->second.touched)) victim = it;
+    require(victim != entries_.end(), "host budget/capture peak/MemAvailable admission refused");
+    entries_.erase(victim);
+    ++evictions_;
+  }
+}
 void Cache::admit(std::uint64_t payload) const {
   require(memory_admitted(stats().bytes, payload, budget_, available_memory()),
           "host budget/capture peak/MemAvailable admission refused");
@@ -918,7 +937,8 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
     if (!disk) {
       auto it = entries_.find(id);
       require(it != entries_.end(), "session_not_found: RAM miss");
-      admit(it->second.bytes.size());
+      prepare_resume(id, it->second.bytes.size());
+      it = entries_.find(id);
       c = decode(it->second.bytes, compat_, rank_, world_, budget_);
       it->second.touched = ++clock_;
     } else {
@@ -1052,10 +1072,11 @@ void Cache::erase_locked(const std::string &id) {
   validate_id(id);
   bool ok = true;
   try {
-    std::filesystem::remove(manifest(directory_, id));
     entries_.erase(id); // rank payloads are immutable; remove only this
                         // session's local files
-    if (std::filesystem::exists(directory_))
+    // RAM-only caches have no directory; never resolve paths against the working directory.
+    if (!directory_.empty()) std::filesystem::remove(manifest(directory_, id));
+    if (!directory_.empty() && std::filesystem::exists(directory_))
       for (const auto &e : std::filesystem::directory_iterator(directory_))
         if (e.is_regular_file()) {
           auto name = e.path().filename().string();
