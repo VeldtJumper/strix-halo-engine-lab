@@ -86,5 +86,8 @@ void enqueue_merge(const Rows&, std::uint32_t rows, cudaStream_t);
 void enqueue_commit(const Rows&, std::uint32_t rows, std::uint32_t* record, cudaStream_t);
 void enqueue(const Rows&, std::uint32_t rows, std::uint32_t clear_words, const Weights&, const amdmath::Tables&,
              std::uint32_t* record, cudaStream_t);
+// True when the expert types are not the A8 profile's (gate Q4_K/Q5_K with down Q5_1/Q8_0): enqueue() then runs the native
+// FAST path (any cuda_qwen_quant.cuh type; needs Rows::intermediates for the FP32 h values).
+[[nodiscard]] bool native_types(const Weights&);
 
 }  // namespace strix::cuda::qwen_moe

@@ -64,6 +64,7 @@ struct PleTailArgs {
     const std::uint16_t* input; std::uint32_t input_stride;    // BF16 wide residual [rows][10240] (the query)
     std::uint16_t* output; std::uint32_t output_stride;        // BF16 [rows][10240]; may equal input
     std::uint16_t* conv_state;                             // BF16 [10240][9], read then rewritten
+    std::uint16_t* const* conv_state_slot;                 // non-null: conv_state is read from this device word instead
     const float* norm_key; const float* norm_query; const float* norm_conv;   // F32 [10240]
     const float* conv;                                     // F32 [10240][4]
     float* gates;                                          // FP32 [rows][4] scratch
@@ -71,6 +72,10 @@ struct PleTailArgs {
     float epsilon;                                         // rms_norm_epsilon (1e-6)
 };
 void launch_ple_tail(const PleTailArgs& args, const amdmath::Tables& tables, cudaStream_t stream);
+// PLE conv history after the first `keep` rows of a tail call: `before` = the history before it, keys = that call's
+// normalized keys (the tail rewrites PleTailArgs::keys in place).
+void launch_ple_conv_rollback(const std::uint16_t* before, const float* keys, std::uint32_t key_stride, std::uint32_t keep,
+    std::uint16_t* conv_state, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------------------------------------------
 // MTP predictor cache rows over the prompt (HIP: HipMtpRuntime::prime_hidden_rows, src/hip_mtp_runtime.hip:584-613, with

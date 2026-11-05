@@ -21,9 +21,11 @@
 //   so d*sc and dm*mn are exact in FP32, and sc*r (< 2^23), mn*s (< 2^18) are exact too: both sides are the exact product
 //   d*sc*r rounded once (same for zero signs, infinities and NaN). Every other operation is HIP's, in HIP's order.
 #include "strix/cuda_qwen_moe.hpp"
+#include "strix/cuda_qwen_quant.cuh"
 
 #include <cuda_fp16.h>
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -567,6 +569,343 @@ __global__ __launch_bounds__(kDownThreads) void down_kernel(const std::uint8_t* 
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Decode shapes (rows <= 8, so a tile holds <= 8 assignments of one expert). Same per-element chains as project_kernel /
+// down_kernel; the exact integer group dots come from dp4a over lane groups (integer adds, order-free).
+// STRIX_QRTX_DECODE_KERNELS=0 keeps the tiled kernels (reference seam).
+bool decode_rows_enabled() {
+    static const bool on = [] { const char* e = std::getenv("STRIX_QRTX_DECODE_KERNELS"); return !(e && e[0] == '0'); }();
+    return on;
+}
+constexpr unsigned kRowsMax = 8U;
+
+// gate/up: block = (tile, 32 outputs), warp w = output w, gate and up chains in the same loop (their loads overlap). Lane L: pair p = L / 8, group of the
+// pair G = (L / 4) % 2 (group j = 2p + G), elements 8 (L % 4) .. + 7 of group j. Per K block b: u = D_j * float(dot),
+// v = DM_j * S, t = u - v, x = E * t; pair = x(G=0) + x(G=1); acc[p] += pair (p = this lane's pair); then
+// (acc0 + acc1) + (acc2 + acc3). Then the SwiGLU + down activation quantizer of project_kernel per assignment.
+template <bool Q5K>
+__global__ __launch_bounds__(1024) void project_rows_kernel(const std::uint8_t* gate, const std::uint8_t* up, Rows v,
+                                                           amdmath::Tables tables) {
+    using L = ProjLayout<Q5K>;
+    const Csr& csr = v.csr;
+    if ((csr.summary[0] & ~projection_nonfinite) || blockIdx.x >= *csr.tile_count) return;
+    const unsigned tile_begin = csr.tile_begins[blockIdx.x], total = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
+    // a tile holds <= 8 assignments when every route of a row is distinct; any more run in further chunks of 8
+    for (unsigned base = 0; base < total; base += kRowsMax) {
+    const unsigned begin = tile_begin + base, count = min(total - base, kRowsMax);
+    __syncthreads();  // the previous chunk finished with the shared buffers
+    const unsigned expert = csr.tile_experts[blockIdx.x], out0 = blockIdx.y * 32U;
+    __shared__ __align__(16) std::uint32_t A[kRowsMax][hidden / 4U];
+    __shared__ float E[kRowsMax][hidden / 32U], S[kRowsMax][hidden / 32U];
+    __shared__ float GU[2][kRowsMax][32];
+    __shared__ unsigned row_of[kRowsMax], slot_of[kRowsMax];
+    const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5;
+    if (t < kRowsMax) {
+        const unsigned a = t < count ? t : 0U;
+        row_of[t] = csr.rows[begin + a]; slot_of[t] = csr.slots[begin + a];
+    }
+    __syncthreads();
+    for (unsigned i = t; i < count * (hidden / 4U); i += 1024U) {
+        const unsigned a = i / (hidden / 4U), w = i % (hidden / 4U);
+        A[a][w] = reinterpret_cast<const std::uint32_t*>(at(v.codes, row_of[a]))[w];
+    }
+    for (unsigned i = t; i < count * (hidden / 32U); i += 1024U) {
+        const unsigned a = i / (hidden / 32U), g = i % (hidden / 32U);
+        E[a][g] = at(v.deltas, row_of[a])[g];
+        S[a][g] = static_cast<float>(at(v.sums, row_of[a])[g]);
+    }
+    __syncthreads();
+    const unsigned p = lane >> 3, G = (lane >> 2) & 1U, sub = lane & 3U, j = 2U * p + G;
+    constexpr unsigned blocks = hidden / 256U;
+    const unsigned o = out0 + warp;
+    const std::uint8_t* wrow[2] = {gate + (static_cast<std::uint64_t>(expert) * ffn + o) * blocks * L::WB,
+                                   up + (static_cast<std::uint64_t>(expert) * ffn + o) * blocks * L::WB};
+    float acc[2][kRowsMax];
+#pragma unroll
+    for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+        for (unsigned a = 0; a < kRowsMax; ++a) acc[m][a] = 0.0F;
+#pragma unroll 2
+    for (unsigned b = 0; b < blocks; ++b) {
+        uint4 h[2];
+        unsigned q0[2], q1[2], qh0[2] = {0U, 0U}, qh1[2] = {0U, 0U};
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m) {
+            const std::uint8_t* blk = wrow[m] + b * L::WB;
+            h[m] = *reinterpret_cast<const uint4*>(blk);
+            const unsigned* qs = reinterpret_cast<const unsigned*>(blk + L::QS + 32U * p + 8U * sub);
+            q0[m] = qs[0]; q1[m] = qs[1];
+            if constexpr (Q5K) {
+                const unsigned* qh = reinterpret_cast<const unsigned*>(blk + 16U + 8U * sub);
+                qh0[m] = qh[0]; qh1[m] = qh[1];
+            }
+        }
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m) {
+            const float D = __fmul_rn(half_bits(h[m].x & 65535U), static_cast<float>(factor(h[m], j, false)));
+            const float DM = __fmul_rn(half_bits(h[m].x >> 16U), static_cast<float>(factor(h[m], j, true)));
+            unsigned w0 = G ? (q0[m] >> 4U) & 0x0f0f0f0fU : q0[m] & 0x0f0f0f0fU;
+            unsigned w1 = G ? (q1[m] >> 4U) & 0x0f0f0f0fU : q1[m] & 0x0f0f0f0fU;
+            if constexpr (Q5K) {
+                w0 |= ((qh0[m] >> j) & 0x01010101U) << 4U;
+                w1 |= ((qh1[m] >> j) & 0x01010101U) << 4U;
+            }
+#pragma unroll
+            for (unsigned a = 0; a < kRowsMax; ++a) {
+                if (a >= count) break;
+                const unsigned* x = &A[a][(256U * b + 32U * j + 8U * sub) / 4U];
+                int dot = __dp4a(static_cast<int>(w0), static_cast<int>(x[0]), 0);
+                dot = __dp4a(static_cast<int>(w1), static_cast<int>(x[1]), dot);
+                dot += __shfl_xor_sync(0xffffffffU, dot, 1);
+                dot += __shfl_xor_sync(0xffffffffU, dot, 2);
+                const float u = __fmul_rn(D, static_cast<float>(dot));
+                const float vv = __fmul_rn(DM, S[a][8U * b + j]);
+                const float tt = __fsub_rn(u, vv);
+                const float xx = __fmul_rn(E[a][8U * b + j], tt);
+                const float other = __shfl_xor_sync(0xffffffffU, xx, 4);
+                const float pair = G ? __fadd_rn(other, xx) : __fadd_rn(xx, other);
+                acc[m][a] = __fadd_rn(acc[m][a], pair);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+        for (unsigned a = 0; a < kRowsMax; ++a) {
+            if (a >= count) break;
+            const float c0 = __shfl_sync(0xffffffffU, acc[m][a], 0), c1 = __shfl_sync(0xffffffffU, acc[m][a], 8);
+            const float c2 = __shfl_sync(0xffffffffU, acc[m][a], 16), c3 = __shfl_sync(0xffffffffU, acc[m][a], 24);
+            if (lane == 0U) GU[m][a][warp] = __fadd_rn(__fadd_rn(c0, c1), __fadd_rn(c2, c3));
+        }
+    __syncthreads();
+    // down_activation_quantize per (assignment, 32-output group), as project_kernel's epilogue
+    const bool write_intermediates = v.intermediates.base != nullptr;
+    for (unsigned a = warp; a < count; a += 32U) {
+        const unsigned r = row_of[a], slot = slot_of[a];
+        const unsigned feature = out0 + lane, at_slot = slot * 2U * ffn + feature;
+        const float gv = GU[0][a][lane], uv = GU[1][a][lane];
+        const float ex = amdmath::amd_expf(tables, -gv);
+        const float hv = __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0F, ex)), uv);
+        float* output = write_intermediates ? at(v.intermediates, r) : nullptr;
+        if (output) output[at_slot + ffn] = canon(uv);
+        const unsigned bad = __ballot_sync(0xffffffffU, !finite(gv) || !finite(uv) || !finite(hv));
+        if (bad != 0U) {
+            if (output) output[at_slot] = canon(gv);
+            if (lane == 0) { atomicOr(at(v.status, r), projection_nonfinite); atomicOr(csr.summary, projection_nonfinite); }
+            continue;
+        }
+        float x = fabsf(hv);
+        for (int sh = 16; sh != 0; sh /= 2) x = fmaxf(x, __shfl_xor_sync(0xffffffffU, x, sh));
+        const bool tiny = x > 0.0F && x < 0x1p-119F;
+        const float delta = x == 0.0F || tiny ? 1.0F : __fdiv_rn(x, 127.0F);
+        const float rounded = tiny ? 0.0F : rintf(__fdiv_rn(hv, delta));
+        const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
+        int sum = code;
+        for (int sh = 16; sh != 0; sh /= 2) sum += __shfl_xor_sync(0xffffffffU, sum, sh);
+        if (output) output[at_slot] = hv;
+        at(v.down_codes, r)[slot * ffn + feature] = static_cast<std::int8_t>(code);
+        if (lane == 0) { at(v.down_deltas, r)[slot * (ffn / 32U) + feature / 32U] = delta; at(v.down_sums, r)[slot * (ffn / 32U) + feature / 32U] = sum; }
+    }
+    }
+}
+
+// down: block = (tile, 8 hidden outputs), warp = one output. Lane L: chain j = L / 8, elements 4 (L % 8) .. + 3 of
+// group g = 4c + j, chunks c ascending: first = d * float(dot), Q5_1: combined = first + m * S, contribution = E *
+// combined, acc_j += contribution; then (acc0 + acc1) + (acc2 + acc3) into rawdots.
+template <bool Q51>
+__global__ __launch_bounds__(256) void down_rows_kernel(const std::uint8_t* weights, Rows v) {
+    using L = DownLayout<Q51>;
+    const Csr& csr = v.csr;
+    if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
+    const unsigned tile_begin = csr.tile_begins[blockIdx.x], total = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
+    // a tile holds <= 8 assignments when every route of a row is distinct; any more run in further chunks of 8
+    for (unsigned base = 0; base < total; base += kRowsMax) {
+    const unsigned begin = tile_begin + base, count = min(total - base, kRowsMax);
+    __syncthreads();  // the previous chunk finished with the shared buffers
+    const unsigned expert = csr.tile_experts[blockIdx.x];
+    constexpr unsigned groups = ffn / 32U;
+    __shared__ __align__(16) std::uint32_t A[kRowsMax][ffn / 4U];
+    __shared__ float E[kRowsMax][groups], S[kRowsMax][groups];
+    __shared__ unsigned row_of[kRowsMax], slot_of[kRowsMax];
+    const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5;
+    if (t < kRowsMax) {
+        const unsigned a = t < count ? t : 0U;
+        row_of[t] = csr.rows[begin + a]; slot_of[t] = csr.slots[begin + a];
+    }
+    __syncthreads();
+    for (unsigned i = t; i < count * (ffn / 4U); i += 256U) {
+        const unsigned a = i / (ffn / 4U), w = i % (ffn / 4U);
+        A[a][w] = reinterpret_cast<const std::uint32_t*>(at(v.down_codes, row_of[a]) + slot_of[a] * ffn)[w];
+    }
+    for (unsigned i = t; i < count * groups; i += 256U) {
+        const unsigned a = i / groups, g = i % groups;
+        E[a][g] = at(v.down_deltas, row_of[a])[slot_of[a] * groups + g];
+        S[a][g] = static_cast<float>(at(v.down_sums, row_of[a])[slot_of[a] * groups + g]);
+    }
+    __syncthreads();
+    const unsigned o = blockIdx.y * 8U + warp, j = lane >> 3, sub = lane & 7U;
+    const std::uint8_t* wrow = weights + (static_cast<std::uint64_t>(expert) * hidden + o) * groups * L::WB;
+    float acc[kRowsMax];
+#pragma unroll
+    for (unsigned a = 0; a < kRowsMax; ++a) acc[a] = 0.0F;
+#pragma unroll
+    for (unsigned c = 0; c < groups / 4U; ++c) {
+        const unsigned g = 4U * c + j;
+        const std::uint8_t* blk = wrow + g * L::WB;
+        const unsigned short* hw = reinterpret_cast<const unsigned short*>(blk);
+        const float d = half_bits(hw[0]);
+        unsigned word;
+        float mm = 0.0F;
+        if constexpr (Q51) {
+            mm = half_bits(hw[1]);
+            const unsigned qh = *reinterpret_cast<const unsigned*>(blk + 4U);
+            const unsigned qs = *reinterpret_cast<const unsigned*>(blk + 8U + 4U * (sub & 3U));
+            const unsigned hb = (qh >> (4U * sub)) & 15U;
+            word = (sub < 4U ? qs & 0x0f0f0f0fU : (qs >> 4U) & 0x0f0f0f0fU) | ((hb * 0x00204081U) & 0x01010101U) << 4U;
+        } else {
+            word = static_cast<unsigned>(hw[1U + 2U * sub]) | (static_cast<unsigned>(hw[2U + 2U * sub]) << 16U);
+        }
+#pragma unroll
+        for (unsigned a = 0; a < kRowsMax; ++a) {
+            if (a >= count) break;
+            int dot = __dp4a(static_cast<int>(word), static_cast<int>(A[a][8U * g + sub]), 0);
+            dot += __shfl_xor_sync(0xffffffffU, dot, 1);
+            dot += __shfl_xor_sync(0xffffffffU, dot, 2);
+            dot += __shfl_xor_sync(0xffffffffU, dot, 4);
+            const float first = __fmul_rn(d, static_cast<float>(dot));
+            float combined = first;
+            if constexpr (Q51) combined = __fadd_rn(first, __fmul_rn(mm, S[a][g]));
+            acc[a] = __fadd_rn(acc[a], __fmul_rn(E[a][g], combined));
+        }
+    }
+#pragma unroll
+    for (unsigned a = 0; a < kRowsMax; ++a) {
+        if (a >= count) break;
+        const float c0 = __shfl_sync(0xffffffffU, acc[a], 0), c1 = __shfl_sync(0xffffffffU, acc[a], 8);
+        const float c2 = __shfl_sync(0xffffffffU, acc[a], 16), c3 = __shfl_sync(0xffffffffU, acc[a], 24);
+        if (lane == 0U) at(v.rawdots, row_of[a])[slot_of[a] * hidden + o] = __fadd_rn(__fadd_rn(c0, c1), __fadd_rn(c2, c3));
+    }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Native expert types (the GSQ-RCO IQ file: gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS, down IQ4_NL / Q2_0; also any other
+// cuda_qwen_quant.cuh type). FAST arithmetic, not a node profile: FP32 activations (BF16 input rows, FP32 h), weights
+// decoded per 32-value group with the shared decoders (bitwise the host reference values), FP32 dots, SwiGLU with expf. A warp owns
+// one output; each lane decodes its groups once per chunk of up to 8 assignments and applies them to every assignment.
+constexpr unsigned kNativeChunk = 8U;
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (unsigned d = 16U; d; d >>= 1U) v += __shfl_xor_sync(0xffffffffU, v, d);
+    return v;
+}
+// grid (tiles, ffn / 32), 1024 threads: warp w = output 32 * blockIdx.y + w, gate and up. Writes h = silu(g) * u into
+// intermediates[row][slot * 2 * ffn + o].
+__global__ __launch_bounds__(1024) void native_project_kernel(const std::uint8_t* gate, const std::uint8_t* up, std::uint32_t type,
+                                                              Rows v) {
+    const Csr& csr = v.csr;
+    if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
+    const unsigned tile_begin = csr.tile_begins[blockIdx.x], total = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
+    const unsigned expert = csr.tile_experts[blockIdx.x];
+    __shared__ std::uint16_t X[kNativeChunk][hidden];  // BF16 input rows
+    __shared__ unsigned row_of[kNativeChunk], slot_of[kNativeChunk];
+    const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, o = blockIdx.y * 32U + warp;
+    const std::uint64_t row_bytes = static_cast<std::uint64_t>(hidden) / quant::geometry(type).block_elements * quant::geometry(type).block_bytes;
+    const std::uint8_t* wg = gate + (static_cast<std::uint64_t>(expert) * ffn + o) * row_bytes;
+    const std::uint8_t* wu = up + (static_cast<std::uint64_t>(expert) * ffn + o) * row_bytes;
+    for (unsigned base = 0; base < total; base += kNativeChunk) {
+        const unsigned count = min(total - base, kNativeChunk);
+        __syncthreads();
+        if (t < kNativeChunk) {
+            const unsigned a = t < count ? t : 0U;
+            row_of[t] = csr.rows[tile_begin + base + a]; slot_of[t] = csr.slots[tile_begin + base + a];
+        }
+        __syncthreads();
+        for (unsigned i = t; i < count * hidden; i += 1024U) {
+            const unsigned a = i / hidden, f = i % hidden;
+            X[a][f] = at(v.input, row_of[a])[f];
+        }
+        __syncthreads();
+        float g[kNativeChunk], u[kNativeChunk];
+#pragma unroll
+        for (unsigned a = 0; a < kNativeChunk; ++a) { g[a] = 0.0F; u[a] = 0.0F; }
+        for (unsigned grp = lane; grp < hidden / 32U; grp += 32U) {
+            float wv[32];
+#pragma unroll
+            for (unsigned m = 0; m < 2U; ++m) {
+                quant::decode_row_group(type, m ? wu : wg, grp, wv);
+#pragma unroll
+                for (unsigned a = 0; a < kNativeChunk; ++a) {
+                    if (a >= count) break;
+                    const std::uint16_t* x = &X[a][32U * grp];
+                    float sacc = 0.0F;
+#pragma unroll
+                    for (unsigned j = 0; j < 32U; ++j) sacc = __fmaf_rn(wv[j], __uint_as_float(static_cast<unsigned>(x[j]) << 16U), sacc);
+                    if (m) u[a] += sacc; else g[a] += sacc;
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned a = 0; a < kNativeChunk; ++a) {
+            if (a >= count) break;
+            const float gv = warp_sum(g[a]), uv = warp_sum(u[a]);
+            if (lane == 0U) {
+                const float h = gv / (1.0F + expf(-gv)) * uv;
+                at(v.intermediates, row_of[a])[slot_of[a] * 2U * ffn + o] = h;
+                if (!isfinite(h)) { atomicOr(at(v.status, row_of[a]), projection_nonfinite); atomicOr(csr.summary, projection_nonfinite); }
+            }
+        }
+    }
+}
+// grid (tiles, hidden / 32), 1024 threads: warp w = hidden output 32 * blockIdx.y + w; lanes 0..19 own the 20 groups of
+// 640. Writes rawdots[row][slot * hidden + o].
+__global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* down, std::uint32_t type, Rows v) {
+    const Csr& csr = v.csr;
+    if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
+    const unsigned tile_begin = csr.tile_begins[blockIdx.x], total = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
+    const unsigned expert = csr.tile_experts[blockIdx.x];
+    __shared__ float H[kNativeChunk][ffn];
+    __shared__ unsigned row_of[kNativeChunk], slot_of[kNativeChunk];
+    const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, o = blockIdx.y * 32U + warp;
+    const std::uint64_t row_bytes = static_cast<std::uint64_t>(ffn) / quant::geometry(type).block_elements * quant::geometry(type).block_bytes;
+    const std::uint8_t* w = down + (static_cast<std::uint64_t>(expert) * hidden + o) * row_bytes;
+    for (unsigned base = 0; base < total; base += kNativeChunk) {
+        const unsigned count = min(total - base, kNativeChunk);
+        __syncthreads();
+        if (t < kNativeChunk) {
+            const unsigned a = t < count ? t : 0U;
+            row_of[t] = csr.rows[tile_begin + base + a]; slot_of[t] = csr.slots[tile_begin + base + a];
+        }
+        __syncthreads();
+        for (unsigned i = t; i < count * ffn; i += 1024U) {
+            const unsigned a = i / ffn, f = i % ffn;
+            H[a][f] = at(v.intermediates, row_of[a])[slot_of[a] * 2U * ffn + f];
+        }
+        __syncthreads();
+        float acc[kNativeChunk];
+#pragma unroll
+        for (unsigned a = 0; a < kNativeChunk; ++a) acc[a] = 0.0F;
+        if (lane < ffn / 32U) {
+            float wv[32];
+            quant::decode_row_group(type, w, lane, wv);
+#pragma unroll
+            for (unsigned a = 0; a < kNativeChunk; ++a) {
+                if (a >= count) break;
+                float sacc = 0.0F;
+#pragma unroll
+                for (unsigned j = 0; j < 32U; ++j) sacc = __fmaf_rn(wv[j], H[a][32U * lane + j], sacc);
+                acc[a] = sacc;
+            }
+        }
+#pragma unroll
+        for (unsigned a = 0; a < kNativeChunk; ++a) {
+            if (a >= count) break;
+            const float d = warp_sum(acc[a]);
+            if (lane == 0U) at(v.rawdots, row_of[a])[slot_of[a] * hidden + o] = d;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // merge / commit (hip_moe_experts_launcher.hip:2660-2708).
 __global__ __launch_bounds__(256) void merge_kernel(Rows v) {
     const unsigned row = blockIdx.y;
@@ -634,6 +973,14 @@ void enqueue_csr(const Rows& v, std::uint32_t rows, cudaStream_t s) {
     check(cudaGetLastError(), "MoE CSR");
 }
 void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s) {
+    if (rows <= kRowsMax && decode_rows_enabled()) {
+        const dim3 grid(csr_sizes(rows).max_tiles, ffn / 32U);
+        if (w.gate_type == type_q5_k) project_rows_kernel<true><<<grid, 1024, 0, s>>>(w.gate, w.up, v, tables);
+        else if (w.gate_type == type_q4_k) project_rows_kernel<false><<<grid, 1024, 0, s>>>(w.gate, w.up, v, tables);
+        else throw std::invalid_argument("MoE gate type");
+        check(cudaGetLastError(), "MoE gate/up rows");
+        return;
+    }
     const dim3 grid(csr_sizes(rows).max_tiles, ffn / kProjOuts);
     if (w.gate_type == type_q5_k) {
         static bool once = (set_smem(project_kernel<true>, ProjLayout<true>::total), true); (void)once;
@@ -645,6 +992,14 @@ void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const 
     check(cudaGetLastError(), "MoE gate/up");
 }
 void enqueue_down(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s) {
+    if (rows <= kRowsMax && decode_rows_enabled()) {
+        const dim3 grid(csr_sizes(rows).max_tiles, hidden / 8U);
+        if (w.down_type == type_q5_1) down_rows_kernel<true><<<grid, 256, 0, s>>>(w.down, v);
+        else if (w.down_type == type_q8_0) down_rows_kernel<false><<<grid, 256, 0, s>>>(w.down, v);
+        else throw std::invalid_argument("MoE down type");
+        check(cudaGetLastError(), "MoE down rows");
+        return;
+    }
     const dim3 grid(csr_sizes(rows).max_tiles, hidden / kDownOuts);
     if (w.down_type == type_q5_1) {
         static bool once = (set_smem(down_kernel<true>, DownLayout<true>::total), true); (void)once;
@@ -663,10 +1018,29 @@ void enqueue_commit(const Rows& v, std::uint32_t rows, std::uint32_t* record, cu
     commit_kernel<<<dim3((hidden + 255U) / 256U, rows), 256, 0, s>>>(v, rows, record);
     check(cudaGetLastError(), "MoE commit");
 }
+bool native_types(const Weights& w) {
+    const bool a8_gate = w.gate_type == type_q4_k || w.gate_type == type_q5_k;
+    const bool a8_down = w.down_type == type_q5_1 || w.down_type == type_q8_0;
+    return !(a8_gate && a8_down);
+}
+
 void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
              std::uint32_t* record, cudaStream_t s) {
     enqueue_prologue(v, rows, clear_words, s);
     enqueue_csr(v, rows, s);
+    if (native_types(w)) {
+        if (!v.intermediates.base) throw std::invalid_argument("MoE native expert types need Rows::intermediates");
+        if (quant::geometry(w.gate_type).block_elements == 0 || quant::geometry(w.down_type).block_elements == 0)
+            throw std::invalid_argument("MoE expert type without a decoder");
+        const unsigned tiles = csr_sizes(rows).max_tiles;
+        native_project_kernel<<<dim3(tiles, ffn / 32U), 1024, 0, s>>>(w.gate, w.up, w.gate_type, v);
+        check(cudaGetLastError(), "MoE native gate/up");
+        native_down_kernel<<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
+        check(cudaGetLastError(), "MoE native down");
+        enqueue_merge(v, rows, s);
+        enqueue_commit(v, rows, record, s);
+        return;
+    }
     enqueue_project(v, rows, w, tables, s);
     enqueue_down(v, rows, w, s);
     enqueue_merge(v, rows, s);
