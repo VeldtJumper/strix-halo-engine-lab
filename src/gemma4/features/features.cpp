@@ -77,7 +77,7 @@ Identity freeze(const ModelManifest& model, std::string tokenizer_hash) {
     return i;
 }
 Identity backend_identity(const engine::Backend& backend) {
-    return identity_json(required(backend.identity(),"feature_identity"));
+    return identity_json(required(backend.identity(),"feature_exporter_identity"));
 }
 Json Result::json(bool data) const {
     Json j(Json::Object{{"identity",identity.json()},{"stream_handle",stream_handle},{"prefix_frontier",frontier},
@@ -141,9 +141,10 @@ Result Exporter::export_features(const Request& r) {
     if (r.prefix) {
         temporary.admitted = r.retain_prefix ? c.max_positions : std::uint32_t(base+longest);
         temporary.state = backend_.create_stream(temporary.admitted);
-        // Exact many-row chunks when the backend has them (same committed
-        // bytes); chunk_rows < 8 keeps explicit small passes.
-        const auto many = r.chunk_rows == 8 ? backend_.prefill_chunk_rows() : 0;
+        // Many-row chunks only when the backend's prompt rows equal its decode
+        // rows (prefill-exact, same committed bytes): a v1/v2/a8 prompt route
+        // would change the frozen identity. chunk_rows < 8 keeps explicit small passes.
+        const auto many = r.chunk_rows == 8 && backend_.prefill_matches_decode() ? backend_.prefill_chunk_rows() : 0;
         for (std::size_t p = 0; p < r.prefix->size();) {
             if (many && r.prefix->size()-p > 8) {
                 const auto n = std::min<std::size_t>(r.prefix->size()-p,many-p%many);
@@ -198,9 +199,10 @@ Result Exporter::export_features(const Request& r, engine::StreamState& prefix) 
             return row;
         };
         out.options.resize(b.option_close_positions.size());
-        // One exact many-row pass over the whole branch: hidden rows from the
-        // same final norm, code logits from the same head and softcap.
-        const auto many = r.chunk_rows == 8 ? backend_.prefill_chunk_rows() : 0;
+        // One exact many-row pass over the whole branch (only when prompt rows
+        // equal decode rows): hidden rows from the same final norm, code logits
+        // from the same head and softcap.
+        const auto many = r.chunk_rows == 8 && backend_.prefill_matches_decode() ? backend_.prefill_chunk_rows() : 0;
         if (many && b.tokens.size() > 8 && b.tokens.size() <= many) {
             tx.reset(); tx = prefix.begin();
             const auto rows = backend_.prefill_rows(*tx,b.tokens,true,false);

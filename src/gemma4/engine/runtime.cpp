@@ -235,7 +235,7 @@ Runtime::Runtime(const Options& o) {
     }
     metadata.set("profile",strix::serve::parse_json_unique(o.profile.json()));
     metadata.set("qualification",o.profile.qualification());
-    metadata.set("feature_identity",features::freeze(manifest,
+    metadata.set("feature_exporter_identity",features::freeze(manifest,
         o.tokenizer.empty() ? std::string{} : metadata.find("tokenizer_hash")->as_string()).json());
     backend = std::make_unique<MetadataBackend>(std::move(backend),std::move(metadata));
 }

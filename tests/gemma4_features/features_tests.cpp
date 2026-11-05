@@ -4,6 +4,7 @@
 #include <bit>
 #include <limits>
 #include <iostream>
+#include <map>
 #include <thread>
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -93,10 +94,57 @@ public:
     MetadataBackend(e::Backend& b, f::Identity i) : backend(b), frozen(std::move(i)) {}
     std::unique_ptr<e::StreamState> create_stream() override { return backend.create_stream(); }
     const g::ModelConfig& config() const override { return backend.config(); }
-    Json identity() const override { auto j = backend.identity(); j.set("feature_identity",frozen.json()); return j; }
+    Json identity() const override { auto j = backend.identity(); j.set("feature_exporter_identity",frozen.json()); return j; }
     g::ForwardResult forward_rows(std::span<const g::RowPlan> rows) override { return backend.forward_rows(rows); }
     e::Backend& backend; f::Identity frozen;
 };
+// A backend with a many-row prefill (emulated with exact forward_rows passes) whose prefill_matches_decode is
+// `matches`: the exporter may take its many-row path only when prompt rows equal decode rows (prefill-exact);
+// a v1/v2/a8 prompt route (matches = false) must never reach the exported features.
+class ManyRowBackend final : public e::Backend {
+public:
+    ManyRowBackend(e::Backend& b, bool m) : backend(b), matches(m) {}
+    std::unique_ptr<e::StreamState> create_stream() override { return backend.create_stream(); }
+    std::unique_ptr<e::StreamState> create_stream(std::uint32_t admitted) override { return backend.create_stream(admitted); }
+    const g::ModelConfig& config() const override { return backend.config(); }
+    Json identity() const override { return backend.identity(); }
+    g::ForwardResult forward_rows(std::span<const g::RowPlan> rows) override { return backend.forward_rows(rows); }
+    std::size_t prefill_chunk_rows() const override { return 16; }
+    bool prefill_matches_decode() const override { return matches; }
+    e::PrefillRows prefill_rows(g::KvTxn& tx, std::span<const std::uint32_t> tokens, bool hidden, bool) override {
+        ++calls; e::PrefillRows out; const auto width = backend.config().hidden; tx.reserve_rows(tokens.size());
+        for (std::size_t p = 0; p < tokens.size(); p += 8) {
+            std::vector<g::RowPlan> rows;
+            for (std::size_t k = 0; k < std::min<std::size_t>(8,tokens.size()-p); ++k)
+                rows.push_back({0,0,tx.frontier()+p+k,tokens[p+k],&tx,k,true,true});
+            const auto pass = backend.forward_rows(rows);
+            for (std::size_t k = 0; k < rows.size(); ++k) {
+                const auto first = pass.hidden.begin()+std::ptrdiff_t(k*width);
+                std::vector<float> h(first,first+std::ptrdiff_t(width));
+                const auto logits = pass.logits.begin()+std::ptrdiff_t(k*pass.vocab);
+                heads[std::string(reinterpret_cast<const char*>(h.data()),h.size()*sizeof(float))].assign(logits,logits+pass.vocab);
+                if (hidden) out.hidden.insert(out.hidden.end(),h.begin(),h.end());
+            }
+        }
+        return out;
+    }
+    bool head_logits(std::span<const float> hidden, std::vector<float>& logits) override {
+        const auto it = heads.find(std::string(reinterpret_cast<const char*>(hidden.data()),hidden.size_bytes()));
+        if (it == heads.end()) return false;
+        logits = it->second; return true;
+    }
+    e::Backend& backend; bool matches; unsigned calls = 0; std::map<std::string,std::vector<float>> heads;
+};
+void many_row_gate(e::Backend& host, const f::Identity& identity) {
+    const auto request = feature_fixture::request(identity);
+    const auto expected = f::Exporter(host,identity).export_features(request);
+    ManyRowBackend other(host,false), exact(host,true);
+    equal(expected,f::Exporter(other,identity).export_features(request));
+    CHECK(other.calls == 0);
+    equal(expected,f::Exporter(exact,identity).export_features(request));
+    CHECK(exact.calls > 0);
+    std::cout << "PASS many-row feature rows only when prefill matches decode\n";
+}
 class Writer final : public strix::serve::HttpResponseWriter {
 public:
     int status = 0; std::string body;
@@ -175,7 +223,7 @@ int main(int argc, char** argv) {
     try {
         const auto model = feature_fixture::model(); const feature_fixture::Tables tables;
         e::HostBackend host(model,tables.view(),1); const auto identity = f::freeze(model);
-        gates(host,identity);
+        gates(host,identity); many_row_gate(host,identity);
         if (argc > 2 && std::string(argv[1]) == "--tokenizer") http(host,identity,argv[2]);
         if (argc > 1 && std::string(argv[1]) == "--device") {
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND

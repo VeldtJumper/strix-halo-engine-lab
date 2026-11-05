@@ -363,7 +363,7 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                     {"prefill",*config.find("prefill_identity")},{"sampling","splitmix64-cdf-v1"},{"thinking_budget","checked-two-job-continuation"},
                     {"tools",true},{"reasoning_content",true},{"queue",batched ? "continuous batching; up to "+std::to_string(slots)+" chat jobs decode together" :
                         std::string("FIFO; one chat job at a time")},
-                    {"features",backend.identity().find("feature_identity") ? *backend.identity().find("feature_identity") : Json()},
+                    {"feature_exporter_identity",backend.identity().find("feature_exporter_identity") ? *backend.identity().find("feature_exporter_identity") : Json()},
                     {"dflash",config},
                     {"unsupported",Json(Json::Array{"response_format","logprobs","stop","penalties","forced tool_choice"})}}).dump()); return;
             }

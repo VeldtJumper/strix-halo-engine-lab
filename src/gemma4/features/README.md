@@ -121,7 +121,11 @@ handles across JSONL lines. Completed output archives are otherwise not replaced
 
 `POST /v1/gemma4/features` on `strix-gemma4-serve` accepts the same request and
 returns features and receipt inline. `GET /v1/capabilities` exposes its frozen
-feature identity. HTTP feature calls serialize backend execution with ordinary
+identity as `feature_exporter_identity`: the route of this endpoint, which always
+runs prefill-exact rows. The served chat prompt route is the top-level `prefill`
+(and `dflash.prefill_route`), which may differ. Earlier builds named this
+capabilities entry `features`; clients reading that key must read
+`feature_exporter_identity` instead. HTTP feature calls serialize backend execution with ordinary
 chat generation. Handles are process-local opaque references, not credentials;
 the service's deployment access control applies to this endpoint too.
 
