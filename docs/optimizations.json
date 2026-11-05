@@ -2572,7 +2572,7 @@
     "flag_or_env": "--prefix-cache; STRIX_QRTX_PREFIX_CACHE; --prefix-cache-host-mb; --prefix-cache-vram-mb; --prefix-cache-block; --prefix-cache-stride",
     "default": "ON",
     "exact": "qwen_prefix_cache_e2e 16/16: state digests, 64 ids and logit hashes of fresh == checkpoint-continue == restored into another session == changed suffix == changed boundary token, sync and overlapped prefill; HTTP on vs off outputs identical 8/8.",
-    "gain": "Pending the on/off window (20 alternating pairs); follow-up agent turns report 48,128-49,664 restored tokens in cached_tokens.",
+    "gain": "No throughput figure published yet; follow-up agent turns report 48,128-49,664 restored tokens in cached_tokens.",
     "preconditions": "strix-cuda-qwen-serve; token ids sharing at least one 256-token block with an earlier prompt in the same process and compatibility key.",
     "off_switch": "--prefix-cache off; STRIX_QRTX_PREFIX_CACHE=0",
     "doc_anchor": "docs/optimizations.md#qwen-rtx-prefix-cache"
