@@ -548,22 +548,43 @@ void DevicePrefill::use_canonical_kernel(bool enabled) {
 }
 ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned> input, bool all_logits, bool logits, bool hidden,
                                    bool taps, bool views) {
+    const PrefillSegment one{&transaction, input};
+    return std::move(pass({&one, 1}, all_logits, logits, hidden, taps, views).front());
+}
+std::vector<ChunkResult> DevicePrefill::forward_batch(std::span<const PrefillSegment> segments, bool hidden, bool taps, bool views) {
+    return pass(segments, false, false, hidden, taps, views);
+}
+std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> segments, bool all_logits, bool logits, bool hidden,
+                                             bool taps, bool views) {
     using Clock = std::chrono::steady_clock;
     const auto entered = Clock::now();
     auto launched_at = entered, synced_at = entered;
     auto& b = *impl_; const auto& w = b.w; const auto& c = w.config;
-    auto* tx = dynamic_cast<gpu::DeviceStream::Impl::Txn*>(&transaction);
-    const auto n = unsigned(input.size());
-    if (!tx || tx->published || tx->failed || tx->evaluated || tx->rows || tx->stream->poisoned || !gpu::same_config(tx->stream->config, c))
-        throw std::invalid_argument("invalid prefill transaction");
-    if (!n || input.size() > chunk_rows || tx->start > tx->stream->admitted || input.size() > tx->stream->admitted - tx->start ||
-        tx->start > b.table_positions || input.size() > b.table_positions - tx->start)
-        throw std::invalid_argument("prefill row or position bounds");
-    for (const auto t : input) if (t >= c.vocab) throw std::invalid_argument("prefill token out of range");
+    // Segment s owns rows [first, first + rows) of the pass; its attention uses its own stride.
+    struct Part { gpu::DeviceStream::Impl::Txn* tx; unsigned first, rows, stride; };
+    std::vector<Part> parts;
+    std::vector<unsigned> input;
+    unsigned n = 0;
+    if (segments.empty() || ((all_logits || logits) && segments.size() != 1)) throw std::invalid_argument("prefill pass segments");
+    for (const auto& s : segments) {
+        auto* tx = dynamic_cast<gpu::DeviceStream::Impl::Txn*>(s.transaction);
+        const auto rows = unsigned(s.tokens.size());
+        if (!tx || tx->published || tx->failed || tx->evaluated || tx->rows || tx->stream->poisoned || !gpu::same_config(tx->stream->config, c))
+            throw std::invalid_argument("invalid prefill transaction");
+        if (!rows || s.tokens.size() > chunk_rows || tx->start > tx->stream->admitted || s.tokens.size() > tx->stream->admitted - tx->start ||
+            tx->start > b.table_positions || s.tokens.size() > b.table_positions - tx->start)
+            throw std::invalid_argument("prefill row or position bounds");
+        for (const auto t : s.tokens) if (t >= c.vocab) throw std::invalid_argument("prefill token out of range");
+        for (const auto& p : parts) if (p.tx->stream == tx->stream) throw std::invalid_argument("prefill pass repeats a stream");
+        parts.push_back({tx, n, rows, unsigned(((tx->start + rows + 63U) / 64U) * 64U)});
+        input.insert(input.end(), s.tokens.begin(), s.tokens.end());
+        n += rows;
+    }
+    if (n > chunk_rows) throw std::invalid_argument("prefill row or position bounds");
     // Announced before any device work: no graph capture starts on another thread until this pass returns.
     const gpu::PrefillInFlight in_flight;
     // KV_QUEUE: the commit publishes this pass's rows on the queue that wrote them.
-    if (tx->stream->writer_queue) tx->stream->queue = b.queue;
+    for (const auto& p : parts) if (p.tx->stream->writer_queue) p.tx->stream->queue = b.queue;
     ChunkResult result; result.rows = n; result.vocab = c.vocab; result.tap_width = 5 * c.hidden;
     // PINNED_TAPS: unconsumed taps are never copied; consumed taps and hidden
     // rows land in pinned memory through asynchronous copies. Off: as before.
@@ -577,10 +598,13 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
     bool taps_checked = false;
     try {
         b.queue_io = queue_io_enabled(); b.staged = 0;
-        tx->rows = n;
-        for (unsigned l = 0; l < c.layers; ++l) {
-            const auto bytes = std::size_t(n) * tx->stream->cache[l].width * sizeof(float);
-            if (bytes > tx->overlay[l].k.size()) { tx->overlay[l].k.resize(bytes); tx->overlay[l].v.resize(bytes); }
+        for (const auto& p : parts) {
+            auto* tx = p.tx;
+            tx->rows = p.rows;
+            for (unsigned l = 0; l < c.layers; ++l) {
+                const auto bytes = std::size_t(p.rows) * tx->stream->cache[l].width * sizeof(float);
+                if (bytes > tx->overlay[l].k.size()) { tx->overlay[l].k.resize(bytes); tx->overlay[l].v.resize(bytes); }
+            }
         }
         b.ranges.clear(); b.range_aliases.clear(); b.clear(b.maximum); b.clear(b.failure);
         // Pinned copies only the rows this chunk writes; a model with fewer
@@ -596,11 +620,13 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             if (want_taps) Impl::host_rows(b.pinned_taps, b.pinned_taps_floats, std::size_t(b.rows_capacity) * result.tap_width);
             if (hidden) Impl::host_rows(b.pinned_hidden, b.pinned_hidden_floats, std::size_t(b.rows_capacity) * c.hidden);
         }
-        b.put(b.tokens, input.data(), input.size_bytes());
+        b.put(b.tokens, input.data(), input.size() * sizeof(unsigned));
         std::vector<std::uint64_t> positions(n);
-        for (unsigned r = 0; r < n; ++r) positions[r] = tx->start + r;
+        for (const auto& p : parts) for (unsigned r = 0; r < p.rows; ++r) positions[p.first + r] = p.tx->start + r;
         b.put(b.positions, positions.data(), positions.size() * sizeof(std::uint64_t));
-        const auto stride = unsigned(((tx->start + n + 63U) / 64U) * 64U);
+        // Buffer capacity covers the widest segment; each segment's kernels take its own stride.
+        unsigned stride = 0;
+        for (const auto& p : parts) stride = std::max(stride, p.stride);
         if (stride > b.stride) {
             // Capacity only: every kernel takes this pass's stride; QUEUE_IO doubles the capacity.
             const auto capacity = b.queue_io ? std::max(stride, 2 * b.stride) : stride, capacity_chunks = capacity / 64;
@@ -664,10 +690,11 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
             auto& reads = all_reads;
             std::vector<gpu::KvWrite> writes(std::size_t(c.layers) * n);
             for (unsigned l = 0; l < c.layers; ++l)
-                for (unsigned r = 0; r < n; ++r) {
-                    reads[std::size_t(l) * n + r] = tx->read(c.layer[l].producer, tx->start + r);
-                    writes[std::size_t(l) * n + r] = {tx->overlay[l].k.as<float>(), tx->overlay[l].v.as<float>(), r};
-                }
+                for (const auto& p : parts)
+                    for (unsigned r = 0; r < p.rows; ++r) {
+                        reads[std::size_t(l) * n + p.first + r] = p.tx->read(c.layer[l].producer, p.tx->start + r);
+                        writes[std::size_t(l) * n + p.first + r] = {p.tx->overlay[l].k.as<float>(), p.tx->overlay[l].v.as<float>(), r};
+                    }
             if (b.reads.size() < reads.size() * sizeof(gpu::KvRead)) b.reads.resize(reads.size() * sizeof(gpu::KvRead));
             if (b.writes.size() < writes.size() * sizeof(gpu::KvWrite)) b.writes.resize(writes.size() * sizeof(gpu::KvWrite));
             b.put(b.reads, reads.data(), reads.size() * sizeof(gpu::KvRead));
@@ -705,23 +732,31 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
                 else kv();
             }
             b.timing(b.stats.attention_ms, [&] {
+            // One attention call per segment, with that segment's rows, KV reads and stride (as forward() alone).
+            for (const auto& p : parts) {
+            const auto rows = p.rows;
+            auto* q = b.q.as<float>() + std::size_t(p.first) * c.heads * d;
+            auto* att = b.att.as<float>() + std::size_t(p.first) * c.heads * d;
+            const auto* reads = layer_reads + p.first;
             if (b.stats.attention == AttentionMode::wmma) {
+                // Packs are reused across layers only within a one-segment pass: segments share the pack buffers.
                 auto& owner = packed_producer[global ? 1 : 0];
-                const bool pack = !b.stats.attention_packed || owner != a.producer || !pack_reuse_enabled();
+                const bool pack = !b.stats.attention_packed || owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;
                 owner = a.producer;
-                prefill::attention(b.q.as<float>(), layer_reads, n, c.heads, d, b.att.as<float>(), b.failure.as<unsigned>(), b.queue,
+                prefill::attention(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue,
                                     b.stats.attention_packed ? (global ? b.global_halves : b.attention_halves).data() : nullptr,
-                                    stride, global ? stride : std::min(stride, c.window + n - 1), pack);
+                                    p.stride, global ? p.stride : std::min(p.stride, c.window + rows - 1), pack);
             } else if (!b.stats.canonical_kernel ||
-                       !canonical_attention(b.q.as<float>(), std::span<const gpu::KvRead>(all_reads).subspan(std::size_t(l) * n, n), c.heads, d, b.att.as<float>(), b.failure.as<unsigned>(), b.queue,
+                       !canonical_attention(q, std::span<const gpu::KvRead>(all_reads).subspan(std::size_t(l) * n + p.first, rows), c.heads, d, att, b.failure.as<unsigned>(), b.queue,
                                             {b.canonical_scores.as<float>(), b.canonical_scores.size() / sizeof(float),
                                              b.canonical_denominators.as<float>(), b.canonical_packed.as<float>(),
                                              b.canonical_packed.size() / sizeof(float)})) {
-            for (unsigned r = 0; r < n; r += 8) {
-                const auto count = std::min(8U, n - r);
-                gpu::attention(b.q.as<float>() + std::size_t(r) * c.heads * d, layer_reads + r, count, c.heads, d,
-                               stride, b.scores.as<float>(), b.maxima.as<float>(), b.partials.as<float>(),
-                               b.att.as<float>() + std::size_t(r) * c.heads * d, b.failure.as<unsigned>(), b.queue);
+            for (unsigned r = 0; r < rows; r += 8) {
+                const auto count = std::min(8U, rows - r);
+                gpu::attention(q + std::size_t(r) * c.heads * d, reads + r, count, c.heads, d,
+                               p.stride, b.scores.as<float>(), b.maxima.as<float>(), b.partials.as<float>(),
+                               att + std::size_t(r) * c.heads * d, b.failure.as<unsigned>(), b.queue);
+            }
             }
             }
             });
@@ -821,16 +856,31 @@ ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned>
         if (all_logits) { result.all_logits.resize(std::size_t(n) * c.vocab); b.get(result.all_logits.data(), b.logits, result.all_logits.size() * sizeof(float)); }
         if (hidden && pinned) result.pinned_hidden = {b.pinned_hidden, std::size_t(n) * c.hidden};
         else if (hidden) { result.hidden.resize(std::size_t(n) * c.hidden); b.get(result.hidden.data(), b.x, result.hidden.size() * sizeof(float)); }
-        tx->evaluated = true;
+        for (const auto& p : parts) p.tx->evaluated = true;
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
         result.host_ms = ms(launched_at - entered) + ms(Clock::now() - synced_at);
     } catch (...) {
         (void)hipStreamSynchronize(b.queue);
         if (b.copy_queue) (void)hipStreamSynchronize(b.copy_queue);
         if (b.side_queue) (void)hipStreamSynchronize(b.side_queue);
-        tx->failed = true; throw;
+        for (const auto& p : parts) p.tx->failed = true;
+        throw;
     }
-    return result;
+    if (parts.size() == 1) return {std::move(result)};
+    // Each segment gets its own rows of the pass (taps, hidden; views stay views). Host time is the pass's.
+    std::vector<ChunkResult> out(parts.size());
+    for (std::size_t s = 0; s < parts.size(); ++s) {
+        const auto& p = parts[s];
+        auto& r = out[s];
+        r.rows = p.rows; r.vocab = result.vocab; r.tap_width = result.tap_width; r.levers = result.levers; r.host_ms = result.host_ms;
+        const auto t0 = std::size_t(p.first) * result.tap_width, tn = std::size_t(p.rows) * result.tap_width;
+        const auto h0 = std::size_t(p.first) * c.hidden, hn = std::size_t(p.rows) * c.hidden;
+        if (!result.pinned_taps.empty()) r.pinned_taps = result.pinned_taps.subspan(t0, tn);
+        if (!result.taps.empty()) r.taps.assign(result.taps.begin() + std::ptrdiff_t(t0), result.taps.begin() + std::ptrdiff_t(t0 + tn));
+        if (!result.pinned_hidden.empty()) r.pinned_hidden = result.pinned_hidden.subspan(h0, hn);
+        if (!result.hidden.empty()) r.hidden.assign(result.hidden.begin() + std::ptrdiff_t(h0), result.hidden.begin() + std::ptrdiff_t(h0 + hn));
+    }
+    return out;
 }
 namespace {
 bool defer_head_enabled() {

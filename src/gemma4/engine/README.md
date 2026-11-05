@@ -108,7 +108,14 @@ batcher thread owns the backend for chat jobs: it admits up to
 `Coordinator`, steps them together (one target pass per step, prompt chunks of
 at most `STRIX_G4_SERVE_PREFILL_PER_STEP` requests per step, default 1,
 round-robin) and retires each on stop, length, cancellation or its thinking
-budget continuation. Each request's ids equal the same request served alone:
+budget continuation. Prompt chunks of several requests that fit in one 512-row
+pass share a single prefill call (one weight pass for all of them), on the
+prefill routes with a batched byte record (prefill-exact on non-EXL3 packs and
+g4-wmma-pf-v1); where prefill and decode arithmetic differ, only chunks of more
+than eight rows join. Each stream's rows, digests and logits equal its call
+alone. `STRIX_G4_PREFILL_BATCH=0` keeps one call per request; receipts carry
+`prefill_batched_calls` and the backend identity `prefill_batch`.
+Each request's ids equal the same request served alone:
 rows of different streams never mix, and selection and sampling draws are per
 request. Socket threads write their own SSE deltas, so a slow client never
 stalls the batch. `STRIX_G4_SERVE_BATCH=0` restores one chat job at a time.

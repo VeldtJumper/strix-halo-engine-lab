@@ -211,6 +211,7 @@ void device_tests() {
 }
 #endif
 void prefill_taps_tests();
+void prefill_batch_tests();
 void decode_export_tests();
 void capture_guard_tests();
 void host_tests(bool off) {
@@ -370,7 +371,7 @@ void host_tests(bool off) {
     e::Coordinator cancelled(backend); const auto cancelled_slot = cancelled.submit(r); const auto before_cancel = backend.calls;
     cancelled.cancel(cancelled_slot); cancelled.run(); CHECK(backend.calls == before_cancel);
     CHECK(cancelled.result(cancelled_slot).status == e::Status::cancelled);
-    if (!off) { prefill_taps_tests(); decode_export_tests(); capture_guard_tests(); }
+    if (!off) { prefill_taps_tests(); prefill_batch_tests(); decode_export_tests(); capture_guard_tests(); }
     std::cout << "host: C1..C8, shared calls, unequal prompts, cancellation/reuse, DFlash windows/seeds/stops, sampling, costs and prompt taps passed\n";
 }
 
@@ -385,7 +386,9 @@ public:
     g4::ForwardResult forward_rows(std::span<const g4::RowPlan> rows) override { return host.forward_rows(rows); }
     const g4::ModelConfig& config() const override { return host.config(); }
     Json identity() const override { return host.identity(); }
-    std::size_t prefill_chunk_rows() const override { return 8; }
+    std::size_t prefill_chunk_rows() const override { return chunk; }
+    bool prefill_matches_decode() const override { return matches; }
+    bool prefill_batch_supported() const override { return supported; }
     e::PrefillRows prefill_rows(g4::KvTxn& tx, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
         requested.push_back(taps);
         std::vector<g4::RowPlan> rows;
@@ -398,9 +401,26 @@ public:
         if (taps) { held = std::move(pass.taps); out.tap_view = held; }
         return out;
     }
+    // Batched calls as the device backend makes them: one result per stream, views valid until the next call.
+    std::vector<e::PrefillRows> prefill_rows_batch(std::span<const e::PrefillItem> items, bool hidden, bool taps) override {
+        ++batch_calls; batch_width = std::max(batch_width,items.size());
+        std::size_t total = 0;
+        for (const auto& item : items) total += item.tokens.size();
+        CHECK(total <= chunk && items.size() > 1);
+        held_batch.clear(); held_batch.reserve(items.size());
+        std::vector<e::PrefillRows> out;
+        for (const auto& item : items) {
+            out.push_back(prefill_rows(*item.transaction,item.tokens,hidden,taps));
+            if (!out.back().tap_view.empty()) { held_batch.push_back(held); out.back().tap_view = held_batch.back(); }
+        }
+        return out;
+    }
     e::HostBackend host;
     std::vector<bool> requested;
     std::vector<float> held;
+    std::vector<std::vector<float>> held_batch;
+    std::size_t chunk = 8, batch_calls = 0, batch_width = 0;
+    bool matches = false, supported = true;
 };
 struct StageLog { std::vector<float> taps, hidden; std::vector<std::uint64_t> positions; std::size_t empty_taps = 0; };
 // Session shapes of the three drafter families: DFlash consumes taps through
@@ -442,6 +462,40 @@ void set_env(const char* name, const char* value) {
 #else
     if (value) (void)setenv(name, value, 1); else (void)unsetenv(name);
 #endif
+}
+// PREFILL_BATCH: streams with prompt chunks pending share one prefill call; every stream's ids, frontier and state
+// digest equal the stream alone. Two short prompts decode while three long ones prefill 4-row chunks (the row budget),
+// so two chunks share an 8-row call. A route whose prefill differs from decode joins only chunks of more than
+// 8 rows (here: never, the host admits 8-row passes; the device test covers longer chunks).
+void prefill_batch_tests() {
+    const auto model = tiny(); const Tables tables;
+    PrefillBackend backend(model,tables.view());
+    const auto run = [&](std::size_t chunk, bool matches, std::size_t limit) {
+        backend.chunk = chunk; backend.matches = matches; backend.batch_calls = backend.batch_width = 0;
+        e::Coordinator c(backend); c.set_prefill_limit(limit); c.set_prefill_budget(4);
+        std::vector<e::Request> requests{request(5),request(6)};
+        for (unsigned s = 0; s < 3; ++s) requests.push_back(request(30+s*5));
+        std::vector<e::Result> gold;
+        for (std::size_t s = 0; s < requests.size(); ++s) { gold.push_back(serial(backend,requests[s])); CHECK(c.submit(requests[s]) == s); }
+        c.run();
+        std::uint64_t batched = 0;
+        for (std::size_t s = 0; s < requests.size(); ++s) {
+            check_equal(c.result(s),gold[s]);
+            batched += c.result(s).prefill_batched_calls;
+            if (c.result(s).prefill_batched_calls) CHECK(c.receipt(s).find("prefill_batch_streams")->as_int() >= 2);
+        }
+        CHECK((backend.batch_calls > 0) == (batched > 0));
+        return backend.batch_calls;
+    };
+    const auto* off = std::getenv("STRIX_G4_PREFILL_BATCH");
+    const bool batching = !off || std::string(off) != "0";  // off: the same outputs, one call per stream
+    CHECK((run(8,true,1) > 0) == batching); CHECK(!batching || backend.batch_width >= 2);
+    CHECK((run(8,true,0) > 0) == batching);
+    CHECK(run(8,false,1) == 0);   // <= 8-row chunks on such a route never share a call
+    backend.supported = false;    // a route without a batched byte record: one call per stream
+    CHECK(run(8,true,1) == 0);
+    backend.supported = true;
+    std::cout << "host: batched prompt prefill (shared calls, exact and other-arithmetic routes) passed\n";
 }
 void prefill_taps_tests() {
     const auto model = tiny(); const Tables tables;

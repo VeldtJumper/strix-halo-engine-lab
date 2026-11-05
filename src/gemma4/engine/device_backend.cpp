@@ -110,7 +110,15 @@ public:
         if (prefill_ && prefill_->stats().linears != linears)
             throw std::logic_error("prefill linears differ from the declared prefill_matches_decode");
         metadata_.set("prefill_matches_decode",prefill_matches_decode_);
+        // Batched passes have byte records on two routes only: prefill-exact on non-EXL3 packs and g4-wmma-pf-v1.
+        // Every other route (a8, v2, EXL3 wmma or exact core order, any later identity) keeps one call per stream.
+        const bool exl3_pack = bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1;
+        prefill_batch_ = prefill_ && !exl3_pack && !exl3_wmma &&
+                         (wmma_route ? route == "v1" : linears == prefill::Linears::exact);
+        metadata_.set("prefill_batch",prefill_batch_);
+        if (prefill_ && !prefill_batch_) std::cerr << "gemma4 prefill batching off on this route (one call per stream)\n";
     }
+    bool prefill_batch_supported() const override { return prefill_batch_; }
     std::size_t prefill_chunk_rows() const override { return prefill_ ? prefill::chunk_rows : 0; }
     // With the exact decode attention: exact many-row prefill matches non-a8 decode; a8 prefill matches g4-a8-v1 decode.
     // EXL3 keeps its own core order; WMMA prefill never matches decode rows.
@@ -121,6 +129,19 @@ public:
         PrefillRows out;
         out.taps = std::move(chunk.taps); out.hidden = std::move(chunk.hidden); out.tap_width = chunk.tap_width;
         out.tap_view = chunk.pinned_taps; out.hidden_view = chunk.pinned_hidden; out.levers = chunk.levers; out.host_ms = chunk.host_ms;
+        return out;
+    }
+    std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, bool hidden, bool taps) override {
+        if (!prefill_) throw std::logic_error("many-row prefill is off");
+        std::vector<prefill::PrefillSegment> segments;
+        for (const auto& item : items) segments.push_back({item.transaction,item.tokens});
+        auto chunks = prefill_->forward_batch(segments,hidden,taps,true);
+        std::vector<PrefillRows> out(chunks.size());
+        for (std::size_t i = 0; i < chunks.size(); ++i) {
+            auto& chunk = chunks[i]; auto& o = out[i];
+            o.taps = std::move(chunk.taps); o.hidden = std::move(chunk.hidden); o.tap_width = chunk.tap_width;
+            o.tap_view = chunk.pinned_taps; o.hidden_view = chunk.pinned_hidden; o.levers = chunk.levers; o.host_ms = chunk.host_ms;
+        }
         return out;
     }
     bool head_logits(std::span<const float> hidden, std::vector<float>& logits) override {
@@ -181,7 +202,7 @@ private:
     strix::serve::Json metadata_;
     std::unique_ptr<gpu::DeviceTarget> target_;
     std::unique_ptr<prefill::DevicePrefill> prefill_;
-    bool prefill_matches_decode_ = false;
+    bool prefill_matches_decode_ = false, prefill_batch_ = false;
     gpu::Buffer head_input_, head_output_, head_failure_, head_scratch_;
 };
 struct DraftAssets {

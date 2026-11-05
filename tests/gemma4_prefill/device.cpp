@@ -5,6 +5,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <tuple>
 
 using namespace strix::gemma4;
 namespace pf = strix::gemma4::prefill;
@@ -237,6 +238,62 @@ void pinned_views_tests() {
     CHECK(plain.digest() == views.digest() && plain.digest() == untapped.digest());
     std::puts("prefill pinned views PASS");
 }
+// PREFILL_BATCH: one stream's 40-row chunk first in a batched pass or after another stream's 37 / 127 / 128 rows
+// (inside and across a 128-row tile) has the taps, hidden rows and committed KV of that chunk alone, as has the other
+// stream; on the WMMA route and the exact canonical route, with vectors and with pinned views.
+void batch_tests() {
+    const auto model = fixture::tiny(6);
+    fixture::Tables tables;
+    const auto weights = bind_host_weights(model);
+    const auto vec = [](std::span<const float> v) { return std::vector<float>(v.begin(), v.end()); };
+    const auto tokens = [&](unsigned n, unsigned seed) {
+        std::vector<unsigned> t(n);
+        for (unsigned r = 0; r < n; ++r) t[r] = (r * seed + 1) % model.config.vocab;
+        return t;
+    };
+    const auto prefix_mine = tokens(23, 5), prefix_other = tokens(70, 3), chunk_mine = tokens(40, 7);
+    for (const bool exact : {false, true}) {
+        pf::DevicePrefill target(weights, tables.view(), pf::Residency::host, false,
+                                 exact ? pf::AttentionMode::canonical : pf::attention_mode(), exact ? pf::Linears::exact : pf::Linears::wmma);
+        // A chunk alone: prefix committed by run(), then one uncommitted forward and its commit.
+        const auto alone = [&](const std::vector<unsigned>& prefix, const std::vector<unsigned>& chunk) {
+            gpu::DeviceStream stream(model.config, 1024);
+            (void)target.run(stream, prefix);
+            auto tx = stream.begin();
+            const auto out = target.forward(*tx, chunk, false, false, true, true, false);
+            auto taps = vec(out.tap_rows()), hidden = vec(out.hidden_rows());
+            tx->commit(unsigned(chunk.size()));
+            return std::tuple(std::move(taps), std::move(hidden), stream.digest());
+        };
+        const auto [mine_taps, mine_hidden, mine_digest] = alone(prefix_mine, chunk_mine);
+        for (const unsigned offset : {0U, 37U, 127U, 128U})
+            for (const bool views : {false, true}) {
+                const auto chunk_other = tokens(offset ? offset : 29, 11);
+                const auto [other_taps, other_hidden, other_digest] = alone(prefix_other, chunk_other);
+                gpu::DeviceStream mine(model.config, 1024), other(model.config, 1024);
+                (void)target.run(mine, prefix_mine); (void)target.run(other, prefix_other);
+                auto tm = mine.begin(); auto to = other.begin();
+                std::vector<pf::PrefillSegment> segments;
+                if (offset) segments = {{to.get(), chunk_other}, {tm.get(), chunk_mine}};
+                else segments = {{tm.get(), chunk_mine}, {to.get(), chunk_other}};
+                const auto out = target.forward_batch(segments, true, true, views);
+                CHECK(out.size() == 2);
+                const auto& m = out[offset ? 1 : 0]; const auto& o = out[offset ? 0 : 1];
+                CHECK(m.rows == chunk_mine.size() && o.rows == chunk_other.size());
+                bytes(vec(m.tap_rows()), mine_taps); bytes(vec(m.hidden_rows()), mine_hidden);
+                bytes(vec(o.tap_rows()), other_taps); bytes(vec(o.hidden_rows()), other_hidden);
+                tm->commit(unsigned(chunk_mine.size())); to->commit(unsigned(chunk_other.size()));
+                CHECK(mine.digest() == mine_digest); CHECK(other.digest() == other_digest);
+            }
+        // Refused: one stream twice, more than chunk_rows rows in total.
+        gpu::DeviceStream a(model.config, 1024), b(model.config, 1024);
+        auto ta = a.begin(), tb = b.begin();
+        const auto big = tokens(pf::chunk_rows - 39, 13);
+        refuses([&] { const std::vector<pf::PrefillSegment> s{{ta.get(), chunk_mine}, {ta.get(), chunk_mine}}; (void)target.forward_batch(s); });
+        refuses([&] { const std::vector<pf::PrefillSegment> s{{ta.get(), big}, {tb.get(), chunk_mine}}; (void)target.forward_batch(s); });
+    }
+    std::puts("prefill batched segments (offsets 0/37/127/128, WMMA and exact routes, vectors and views) PASS");
+}
 void alias_tests() {
     const auto model = fixture::tiny(42);
     fixture::Tables tables;
@@ -420,5 +477,5 @@ void v2_case(WeightFormat format, unsigned width, unsigned rows, unsigned output
     bytes(actual, pf::emulate_linear_v2(host_weights, x, rows, precision == pf::LinearPrecision::hilo_k128));
 }
 } // namespace
-int main() try { conversion_tests(); layout_tests(); tile_tests(); v2_tests(); v2_pair_tests(); pinned_absent_taps_tests(); split_tests(); pinned_views_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
+int main() try { conversion_tests(); layout_tests(); tile_tests(); v2_tests(); v2_pair_tests(); pinned_absent_taps_tests(); split_tests(); pinned_views_tests(); batch_tests(); alias_tests(); c4_tests(); context_callback_tests(); overflow_test(); return 0; }
 catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

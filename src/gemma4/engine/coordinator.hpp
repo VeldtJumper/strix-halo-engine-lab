@@ -49,6 +49,11 @@ struct PrefillRows {
     [[nodiscard]] std::span<const float> tap_rows() const { return tap_view.empty() ? std::span<const float>(taps) : tap_view; }
     [[nodiscard]] std::span<const float> hidden_rows() const { return hidden_view.empty() ? std::span<const float>(hidden) : hidden_view; }
 };
+// One stream's prompt chunk in a batched prefill call.
+struct PrefillItem {
+    KvTxn* transaction = nullptr;
+    std::span<const std::uint32_t> tokens;
+};
 class Backend : public Target {
 public:
     // Optional exact many-row prefill (prefill-exact). prefill_rows evaluates
@@ -64,6 +69,14 @@ public:
     virtual PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) {
         (void)transaction; (void)tokens; (void)hidden; (void)taps;
         throw std::logic_error("backend has no many-row prefill");
+    }
+    // Whether this backend's prefill route has a byte record for batched passes; false keeps one call per stream.
+    virtual bool prefill_batch_supported() const { return false; }
+    // Several streams' fresh transactions in one many-row pass, at most prefill_chunk_rows() rows in total: one
+    // PrefillRows per item, each equal to prefill_rows on that item alone. Empty = unsupported (one call per stream).
+    virtual std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, bool hidden, bool taps) {
+        (void)items; (void)hidden; (void)taps;
+        return {};
     }
     // Capped logits of one final-norm hidden row, equal to forward_rows' logits
     // for that row. false = unsupported.
@@ -220,6 +233,8 @@ struct Result {
     // coordinator's work around each call (checks, drafter staging, commit).
     std::uint64_t prefill_calls = 0;
     double prefill_host_ms = 0;
+    // PREFILL_BATCH: this request's chunks that shared a prefill call with other streams, and the widest such call.
+    std::uint64_t prefill_batched_calls = 0, prefill_batch_streams = 0;
 };
 const char* status_name(Status status);
 

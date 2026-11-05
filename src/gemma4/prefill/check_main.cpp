@@ -95,6 +95,7 @@ struct Args {
     unsigned gate_chunk = 512, ref_rows = 1; // --gate-chunk N (prefill chunk), --ref-rows N (decode rows per pass; 0 = 1 and 8)
     std::optional<g4::profile::Name> product; // --profile default|fast|quality
     bool allow_pending = false;               // --allow-pending (benchmarking only)
+    std::vector<unsigned> beside;             // --batch-beside L: batched prefill beside a second L-token stream
 };
 Args arguments(int argc, char** argv) {
     Args a;
@@ -127,6 +128,7 @@ Args arguments(int argc, char** argv) {
         else if (key == "--continuation") a.continuation = number(value);
         else if (key == "--gate-chunk") a.gate_chunk = number(value);
         else if (key == "--ref-rows") a.ref_rows = number(value);
+        else if (key == "--batch-beside") a.beside.push_back(number(value));
         else if (key == "--linears") {
             if (value != "exact" && value != "wmma" && value != "a8") throw std::invalid_argument("--linears expects exact, wmma or a8");
             a.linears = value == "exact" ? pf::Linears::exact : value == "a8" ? pf::Linears::a8 : pf::Linears::wmma;
@@ -139,6 +141,7 @@ Args arguments(int argc, char** argv) {
         throw std::invalid_argument("HF embedding boundary must be unspecified, ordinary-fp32 or bf16-boundary");
     if (a.draft_model.empty() != a.draft_rope.empty()) throw std::invalid_argument("DFlash gate needs model and rotary assets");
     if ((a.c4 || !a.draft_model.empty()) && !a.continuation) a.continuation = 32;
+    if (!a.beside.empty() && !a.continuation) a.continuation = 64;
     if ((a.after_benchmark_checks || a.profile_comparison) && a.lengths.empty())
         throw std::invalid_argument("benchmark checks/profile comparison require explicit lengths");
     if (a.profile_comparison && a.profile) throw std::invalid_argument("profile comparison requires uninstrumented benchmark runs");
@@ -164,6 +167,61 @@ g4::ForwardResult decode(gpu::DeviceTarget& target, gpu::DeviceStream& stream, s
     auto tx = stream.begin(); std::vector<g4::RowPlan> rows;
     for (unsigned i = 0; i < tokens.size(); ++i) rows.push_back({0, 1, tx->frontier() + i, tokens[i], tx.get(), i, true});
     auto out = target.forward_rows(rows); tx->commit(tokens.size()); return out;
+}
+// --batch-beside: the prompt's chunks share forward_batch passes with a second stream's chunks under the coordinator's
+// rule (both fit one pass; where prefill differs from decode, both are > 8 rows). Each stream's committed digest, the
+// prompt's last logits and both streams' greedy continuations must equal the stream alone.
+void batch_beside(pf::DevicePrefill& prefill, gpu::DeviceTarget& decoder, const g4::ModelConfig& config, std::span<const unsigned> mine,
+                  std::span<const unsigned> other, unsigned continuation, bool exact) {
+    gpu::DeviceStream mine_alone(config, unsigned(mine.size()) + continuation), other_alone(config, unsigned(other.size()) + continuation);
+    const auto solo_mine = prefill.run(mine_alone, mine), solo_other = prefill.run(other_alone, other);
+    gpu::DeviceStream mine_batched(config, unsigned(mine.size()) + continuation), other_batched(config, unsigned(other.size()) + continuation);
+    const auto pm = pf::plan(0, mine.size()), po = pf::plan(0, other.size());
+    const auto piece = [](std::span<const unsigned> t, const pf::Chunk& c) { return t.subspan(std::size_t(c.position), c.rows); };
+    std::vector<float> mine_last;
+    std::size_t batched = 0, i = 0, j = 0;
+    // The other stream's next chunk waits for the next prompt chunk it can share a pass with; when the prompt is done
+    // (or nothing fits), chunks run alone, each stream in its own chunk order.
+    while (i < pm.size() || j < po.size()) {
+        const bool join = i < pm.size() && j < po.size() && pm[i].rows + po[j].rows <= pf::chunk_rows &&
+                          (exact || (pm[i].rows > 8 && po[j].rows > 8));
+        if (join) {
+            // Mine goes last: the pass's last row (kept for last_logits) is the prompt's.
+            auto to = other_batched.begin(); auto tm = mine_batched.begin();
+            const std::vector<pf::PrefillSegment> segments{{to.get(), piece(other, po[j])}, {tm.get(), piece(mine, pm[i])}};
+            (void)prefill.forward_batch(segments);
+            to->commit(po[j].rows); tm->commit(pm[i].rows); ++batched;
+            if (i + 1 == pm.size()) mine_last = prefill.last_logits();
+            ++i; ++j;
+        } else if (i < pm.size()) {
+            auto tx = mine_batched.begin();
+            auto out = prefill.forward(*tx, piece(mine, pm[i]), false, i + 1 == pm.size());
+            tx->commit(pm[i].rows);
+            if (i + 1 == pm.size()) mine_last = std::move(out.last_logits);
+            ++i;
+        } else {
+            auto tx = other_batched.begin(); (void)prefill.forward(*tx, piece(other, po[j]), false, false); tx->commit(po[j].rows); ++j;
+        }
+    }
+    equal(mine_last, solo_mine.last_logits);
+    if (mine_batched.digest() != mine_alone.digest() || other_batched.digest() != other_alone.digest())
+        throw std::runtime_error("batched prefill committed-state mismatch");
+    // Greedy continuations from the same logits: every token, logit row and final state equal.
+    const auto follow = [&](gpu::DeviceStream& a, gpu::DeviceStream& b, std::vector<float> logits) {
+        for (unsigned r = 0; r < continuation; ++r) {
+            const auto token = greedy(logits);
+            const auto x = decode(decoder, a, {&token, 1}), y = decode(decoder, b, {&token, 1});
+            equal(x.logits, y.logits); logits = x.logits;
+        }
+        if (a.digest() != b.digest()) throw std::runtime_error("batched prefill continuation state mismatch");
+    };
+    follow(mine_alone, mine_batched, solo_mine.last_logits);
+    follow(other_alone, other_batched, solo_other.last_logits);
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const float x : mine_last) { h ^= g4::bit_cast<std::uint32_t>(x); h *= 1099511628211ULL; }
+    std::cout << "{\"gate\":\"batched-prefill-beside\",\"prefill_rows\":" << mine.size() << ",\"beside_rows\":" << other.size()
+              << ",\"batched_passes\":" << batched << ",\"continuation\":" << continuation << ",\"committed_digest\":\"" << mine_batched.digest()
+              << "\",\"last_logits_fnv\":\"" << std::hex << h << std::dec << "\",\"verdict\":\"EXACT\"}\n";
 }
 void metric(const char* gate, const pf::Fidelity& m, bool same_weight = false, bool quantized = false) {
     const bool bands = same_weight ? m.same_weight_bands_pass()
@@ -385,7 +443,7 @@ int main(int argc, char** argv) try {
     // --linears a8 compares against the decode target running g4-a8-v1 (eight-row passes).
     gpu::DeviceOptions decoder_options;
     if (args.linears == pf::Linears::a8) decoder_options.identity = g4::a8::arithmetic_id;
-    if (args.same_weight || args.continuation || args.c4 || args.exact_ab || args.a8_gate || !args.draft_model.empty())
+    if (args.same_weight || args.continuation || args.c4 || args.exact_ab || args.a8_gate || !args.draft_model.empty() || !args.beside.empty())
         decoder = std::make_unique<gpu::DeviceTarget>(weights, tables.view, decoder_options);
     std::unique_ptr<pf::DevicePrefill> profiled, canonical_profile;
     if (args.profile_comparison) {
@@ -469,6 +527,12 @@ int main(int argc, char** argv) try {
                 for (const float x : result.last_logits) { h ^= g4::bit_cast<std::uint32_t>(x); h *= 1099511628211ULL; }
                 std::cout << "{\"prefill_rows\":" << count << ",\"committed_digest\":\"" << stream->digest()
                           << "\",\"last_logits_fnv\":\"" << std::hex << h << std::dec << "\"}\n";
+            }
+            for (const auto beside : args.beside) {
+                // The second stream reads the fixture from another offset, so its rows differ from the prompt's.
+                std::vector<unsigned> other(beside);
+                for (unsigned i = 0; i < beside; ++i) other[i] = unsigned(ids[(i + 7U) % ids.size()]);
+                batch_beside(prefill, *decoder, model.config, tokens, other, args.continuation, args.linears == pf::Linears::exact);
             }
             if (args.profile_comparison && length && length >= 2048) {
                 profile_attention(*canonical_profile, model.config, tokens, "canonical");

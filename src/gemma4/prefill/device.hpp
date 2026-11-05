@@ -146,6 +146,11 @@ struct Stats {
     std::string linear_policy; // canonical spec text of the active LinearPolicy
 };
 enum class Residency { host, device };
+// One stream's prompt rows in a batched prefill pass.
+struct PrefillSegment {
+    KvTxn* transaction = nullptr;
+    std::span<const std::uint32_t> tokens;
+};
 class DevicePrefill {
   public:
     // Host residency uploads packed weights once. Device residency borrows immutable
@@ -170,6 +175,14 @@ class DevicePrefill {
     // or views=false, taps and hidden are vectors as before.
     ChunkResult forward(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool all_logits = false, bool logits = true,
                         bool hidden = false, bool taps = true, bool views = false);
+    // Several fresh transactions in one pass without logits, at most chunk_rows rows in total: the linears and
+    // epilogues run once over the segments' concatenated rows, while KV reads/writes and attention stay per segment.
+    // A many-row linear's output row reads only its own input row, so each segment's KV, taps and hidden rows equal
+    // forward() on that segment alone (the WMMA route also needs the same kernel choice: every segment > 8 rows).
+    // One result per segment, in order; views point into this object's pinned rows until the next pass. A failure
+    // fails every transaction of the pass.
+    std::vector<ChunkResult> forward_batch(std::span<const PrefillSegment> segments, bool hidden = false, bool taps = true,
+                                           bool views = false);
     [[nodiscard]] std::vector<float> last_logits();
     // Development only: per-op precision of the WMMA linears (see LinearPolicy).
     void set_linear_policy(const LinearPolicy& policy);
@@ -189,6 +202,8 @@ class DevicePrefill {
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::vector<ChunkResult> pass(std::span<const PrefillSegment> segments, bool all_logits, bool logits, bool hidden, bool taps,
+                                  bool views);
 };
 
 // Scheduler input fragments are buffered until a canonical chunk is complete.

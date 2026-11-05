@@ -19,6 +19,8 @@ using Clock = std::chrono::steady_clock;
 using Json = strix::serve::Json;
 double elapsed(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Clock::now()-start).count(); }
 bool env_on(const char* name) { const auto* v = std::getenv(name); return !v || std::string(v) != "0"; }
+// PREFILL_BATCH (STRIX_G4_PREFILL_BATCH=0 off): streams with prompt chunks pending share one prefill call per step.
+bool prefill_batch_enabled() { static const bool on = env_on("STRIX_G4_PREFILL_BATCH"); return on; }
 void require(bool ok, const char* message) { if (!ok) throw std::invalid_argument(message); }
 void add(dflash::Acceptance& a, const dflash::Acceptance& b) {
     a.cycles += b.cycles; a.attempted += b.attempted; a.eligible += b.eligible;
@@ -354,30 +356,78 @@ bool Coordinator::step() {
         std::vector<bool> prefilled(slots_.size(), false);
         std::size_t rowed = live; // streams left for this step's forward_rows pass
         if (const auto chunk = backend_.prefill_chunk_rows()) {
-            // With a prefill limit, at most that many streams prefill a chunk this step, round-robin from the
-            // cursor; the others sit this step out (scheduling only: rows and their order per stream are unchanged).
-            std::size_t chunks = 0, cursor = prefill_cursor_, decoding = 0;
+            // With a prefill limit, at most that many prefill calls run this step, round-robin from the cursor; the
+            // other prompt streams sit this step out (scheduling only: rows and their order per stream are unchanged).
+            // PREFILL_BATCH: streams whose chunks fit join one call (one weight pass for all of them); without it each
+            // stream's chunk is its own call.
+            struct Chunk { std::size_t slot = 0; std::unique_ptr<KvTxn> tx; std::uint64_t position = 0; std::size_t rows = 0; };
+            std::vector<std::vector<Chunk>> calls;
+            std::size_t cursor = prefill_cursor_, decoding = 0;
             for (const auto& p : slots_)
                 if (p->out.status == Status::running && p->prompt_processed+1 >= p->request.prompt.size()) ++decoding;
+            const bool batching = prefill_batch_enabled() && backend_.prefill_batch_supported();
+            // A pass's rows share the linears; where prefill and decode arithmetic differ, a segment of <= 8 rows
+            // would take another kernel than alone, so only longer segments share a call there.
+            const auto joinable = [&](std::size_t n) { return backend_.prefill_matches_decode() || n > 8; };
             for (std::size_t j = 0; j < slots_.size(); ++j) {
                 const auto i = (prefill_cursor_+j)%slots_.size();
                 auto& s = *slots_[i];
                 if (s.out.status != Status::running || s.prompt_processed+1+8 >= s.request.prompt.size()) continue;
                 s.out.peak_streams = std::max(s.out.peak_streams,live);
-                if (prefill_limit_ && chunks == prefill_limit_) { prefilled[i] = true; --rowed; continue; }
-                ++chunks; cursor = i+1;
-                const auto begin = Clock::now();
-                auto tx = s.state->begin();
-                const auto position = tx->frontier();
+                const std::uint64_t position = s.state->frontier();
                 auto n = std::min<std::size_t>(s.request.prompt.size()-1-s.prompt_processed, chunk-position%chunk);
                 // While other streams decode, a shorter chunk bounds their wait. Only when prefill rows equal decode
                 // rows: otherwise where a chunk ends decides which prompt rows a decode pass writes (a short tail goes
                 // through forward_rows), so chunk ends stay those of the stream alone.
                 if (prefill_budget_ && decoding && backend_.prefill_matches_decode()) n = std::min(n,prefill_budget_);
+                std::size_t used = 0;
+                if (!calls.empty()) for (const auto& c : calls.back()) used += c.rows;
+                const bool join = batching && !calls.empty() && joinable(n) && joinable(calls.back().front().rows) && used+n <= chunk;
+                if (!join && prefill_limit_ && calls.size() == prefill_limit_) { prefilled[i] = true; --rowed; continue; }
+                if (!join) calls.emplace_back();
+                auto tx = s.state->begin();
+                require(tx->frontier() == position, "prefill transaction frontier");
+                calls.back().push_back({i,std::move(tx),position,n});
+                cursor = i+1;
+            }
+            for (auto& call : calls) {
+                const auto begin = Clock::now();
+                std::vector<PrefillRows> results;
+                bool any_hidden = false, any_taps = false;
+                for (const auto& c : call) {
+                    const auto& s = *slots_[c.slot];
+                    any_hidden |= s.draft && s.draft->wants_hidden(); any_taps |= s.draft && s.draft->wants_taps();
+                }
+                const auto call_start = Clock::now();
+                if (call.size() > 1) {
+                    std::vector<PrefillItem> items;
+                    for (const auto& c : call) {
+                        const auto& s = *slots_[c.slot];
+                        items.push_back({c.tx.get(),{s.request.prompt.data()+s.prompt_processed,c.rows}});
+                    }
+                    results = backend_.prefill_rows_batch(items,any_hidden,any_taps);
+                    if (results.empty())  // unsupported: the same chunks, one call each
+                        for (const auto& c : call) {
+                            const auto& s = *slots_[c.slot];
+                            results.push_back(backend_.prefill_rows(*c.tx,{s.request.prompt.data()+s.prompt_processed,c.rows},
+                                s.draft && s.draft->wants_hidden(),s.draft && s.draft->wants_taps()));
+                        }
+                    require(results.size() == call.size(), "backend batched prefill returned another segment count");
+                } else {
+                    const auto& s = *slots_[call.front().slot];
+                    results.push_back(backend_.prefill_rows(*call.front().tx,{s.request.prompt.data()+s.prompt_processed,call.front().rows},
+                        s.draft && s.draft->wants_hidden(),s.draft && s.draft->wants_taps()));
+                }
+                const auto call_ms = elapsed(call_start);
+                for (std::size_t k = 0; k < call.size(); ++k) {
+                auto& c = call[k];
+                const auto i = c.slot;
+                auto& s = *slots_[i];
+                auto tx = std::move(c.tx);
+                const auto position = c.position;
+                const auto n = c.rows;
                 const bool hidden = s.draft && s.draft->wants_hidden(), taps = s.draft && s.draft->wants_taps();
-                const auto call = Clock::now();
-                const auto rows = backend_.prefill_rows(*tx,{s.request.prompt.data()+s.prompt_processed,n},hidden,taps);
-                const auto call_ms = elapsed(call);
+                const auto& rows = results[k];
                 const auto width = std::size_t(backend_.config().hidden);
                 const auto tap_rows = rows.tap_rows(), hidden_rows = rows.hidden_rows();
                 // Taps nobody consumes may be omitted. Returned taps are scanned
@@ -388,6 +438,7 @@ bool Coordinator::step() {
                     for (const auto x : tap_rows) require(std::isfinite(x), "nonfinite backend taps");
                 for (const auto& lever : prefill::lever_names) if (rows.levers & lever.bit) ++s.out.prefill_levers[lever.name];
                 if (rows.levers & prefill::lever_pinned_taps) s.out.prefill_taps = tap_rows.empty() ? "skipped (no consumer)" : "pinned-async";
+                if (call.size() > 1) { ++s.out.prefill_batched_calls; s.out.prefill_batch_streams = std::max<std::uint64_t>(s.out.prefill_batch_streams,call.size()); }
                 std::size_t staged = 0;
                 const auto stage = [&] {
                     const auto first = staged, count = std::min<std::size_t>(8,n-first);
@@ -424,6 +475,7 @@ bool Coordinator::step() {
                 ++s.out.prefill_calls; s.out.prefill_host_ms += elapsed(begin)-call_ms+rows.host_ms;
                 prefilled[i] = true;
                 --rowed;
+                }
             }
             if (prefill_limit_) prefill_cursor_ = cursor%slots_.size();
             if (!rowed) return true;
@@ -678,6 +730,9 @@ Json Coordinator::receipt(std::size_t slot) const {
     timings.set("prefill_ms",r.prefill_ms); timings.set("decode_ms",r.decode_ms); timings.set("draft_ms",r.draft_ms); timings.set("context_ms",r.context_ms);
     timings.set("verify_ms",r.verify_ms); timings.set("commit_ms",r.commit_ms);
     if (r.prefill_calls) timings.set("prefill_host_ms",r.prefill_host_ms);
+    if (r.prefill_batched_calls) {
+        j.set("prefill_batched_calls",r.prefill_batched_calls); j.set("prefill_batch_streams",r.prefill_batch_streams);
+    }
     timings.set("session_setup_ms",r.setup_ms);
     timings.set("state_hash_scope","completion/cancellation or explicit receipt; outside decode_ms");
     j.set("timings",timings);
