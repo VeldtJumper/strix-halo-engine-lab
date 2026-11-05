@@ -28,6 +28,8 @@ mismo `MODEL_DIR/tokenizer.json` que carga el servidor) en la línea de comandos
 8192 filas si ambos ranks las admiten; en caso contrario, 4096. Véanse el [resolutor](../../../apps/glm_rank_defaults.hpp),
 las [familias de modelos](../model-families.md) y la [cualificación/rendimiento](../../performance.md).
 
+Interruptores MLA del prefill: `STRIX_GLM_PF_SCORES=6` y `STRIX_GLM_PF_OBAR=5` restauran etapas anteriores; `STRIX_GLM_PF_MLA_GEMM=2` restaura la GEMM v2 (`=1`, la heredada); la v3, predeterminada, conserva las cadenas FMA con k ascendente (logits y estado del par idénticos bit a bit a la v2 con 8K y 32K; tiempo de la GEMM MLA un 41-43 % menor, TTFT con 8K −1.9 % y con 32K −2.3 %).
+
 <a id="glm-serve"></a>
 
 ## Servicio: el par

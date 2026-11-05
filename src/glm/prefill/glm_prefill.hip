@@ -863,7 +863,7 @@ __global__ __launch_bounds__(256) void mla_out_rows_kernel(const float* ob, cons
     o[(static_cast<std::size_t>(r) * heads + h) * kMlaDim + d] = acc;
 }
 
-// ---------------------------------------------------------------- MLA v2 (default): same per-output expressions, other
+// ---------------------------------------------------------------- MLA v2: same per-output expressions, other
 // placement. The absorb and output chains become tiled VALU GEMMs over rows (kv_b read once per 64 rows instead of per
 // row); scores read q-tilde transposed with vector LDS loads; o-bar stages the row's latent tile once in LDS and runs the
 // lds_tree<256> pairing as 3 LDS levels (128, 64, 32) + 5 shuffle levels (16 .. 1) inside wave 0.
@@ -1004,6 +1004,101 @@ __global__ __launch_bounds__(256) void mla_gemm_rows_v2_kernel(const float* A, c
         if (r < C)
             *reinterpret_cast<float4*>(Y + (static_cast<std::size_t>(r) * heads + h) * NC + c0 + tc * 4) =
                 float4{acc[i][0], acc[i][1], acc[i][2], acc[i][3]};
+    }
+}
+
+// GEMM v3: 128 rows x 128 columns, thread = 8 x 8 outputs, K step 16. The v2 chain is unchanged: each output starts
+// at +0 and consumes fmaf(A, W, acc) for every k ascending (no partial sums). Four ds_load_b128 feed 64 FMAs instead
+// of v2's three for 32; diagonal row/column pairs permit explicit VOPD without same-bank sources. Columns are two
+// contiguous quads 64 apart, avoiding the LDS bank conflicts of eight-contiguous-column thread tiles; stores remain
+// coalesced float4. A is read NC/128 times instead of NC/64. W is still converted once per 128-row tile: keeping a
+// whole head x 64-column W in f32 LDS would alone cost 64 / 128 KiB (absorb / out), leaving too little occupancy.
+// A single 16.5 KiB LDS stage plus next-stage register prefetch targets <=128 VGPRs (64 accumulators, 16 operands,
+// 12 prefetched words, address/conversion temporaries), to admit at least two 256-thread CTAs per SIMD pair. Full
+// LDS double buffering would use 33 KiB and prevent two CTAs in a 64 KiB budget. Measured on the pair: bitwise equal
+// to v2 (prefill logits and state at 8K and 32K), MLA GEMM time per rank -41 % at 8K and -43 % at 32K.
+// Grid: x = column tile (fastest), y = row tile, z = head, so the NC / 128 CTAs that share one A tile run back to back
+// and read it from L2 (with rows fastest, a head's whole A slice, C x 1 KiB at a 32 KiB row stride, was streamed once
+// per column tile: absorb per row went 2.3 -> 4.1 us from C 2048 to 4096). Placement only: same per-output chains.
+constexpr unsigned kG3R = 128, kG3C = 128, kG3K = 16, kG3Pad = 132;
+#include "glm/prefill/glm_pf_mla_gemm_vopd.inc"
+template <bool kOut>
+__global__ __launch_bounds__(256) void mla_gemm_rows_v3_kernel(const float* A, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* Y) {
+    constexpr unsigned K = kOut ? kKvLora : kMlaDim, NC = kOut ? kMlaDim : kKvLora;
+    __shared__ alignas(16) float as[kG3K][kG3Pad];
+    __shared__ alignas(16) float ws[kG3K][kG3Pad];
+    const unsigned r0 = blockIdx.y * kG3R, c0 = blockIdx.x * kG3C, h = blockIdx.z, tid = threadIdx.x, tr = tid / 16, tc = tid % 16;
+    float4 ar[2];
+    uint4 wr;
+    auto load = [&](unsigned k0) {
+#pragma unroll
+        for (unsigned i = 0; i < 2; ++i) {  // A tile [128 rows][16 k], coalesced quads
+            const unsigned x = tid + 256 * i, rr = x / 4, q = x % 4, r = r0 + rr;
+            ar[i] = r < C ? *reinterpret_cast<const float4*>(A + (static_cast<std::size_t>(r) * heads + h) * K + k0 + 4 * q)
+                          : float4{0.0F, 0.0F, 0.0F, 0.0F};
+        }
+        std::size_t at;
+        if (kOut) {
+            const unsigned cc = tid / 2, k8 = tid % 2;
+            at = static_cast<std::size_t>(h * 2 * kMlaDim + kMlaDim + c0 + cc) * kKvLora + k0 + 8 * k8;
+        } else {
+            const unsigned kk = tid / 16, c8 = tid % 16;
+            at = static_cast<std::size_t>(h * 2 * kMlaDim + k0 + kk) * kKvLora + c0 + 8 * c8;
+        }
+        wr = *reinterpret_cast<const uint4*>(kv_b + at);
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned x = tid + 256 * i, rr = x / 4, q = x % 4;
+            as[4 * q + 0][rr] = ar[i].x;
+            as[4 * q + 1][rr] = ar[i].y;
+            as[4 * q + 2][rr] = ar[i].z;
+            as[4 * q + 3][rr] = ar[i].w;
+        }
+        const std::uint32_t wv[4] = {wr.x, wr.y, wr.z, wr.w};
+        float f[8];
+#pragma unroll
+        for (unsigned ii = 0; ii < 8; ++ii) f[ii] = f16_to_float(static_cast<std::uint16_t>(wv[ii / 2] >> (16 * (ii % 2))));
+        if (kOut) {
+            const unsigned cc = tid / 2, k8 = tid % 2;
+#pragma unroll
+            for (unsigned ii = 0; ii < 8; ++ii) ws[8 * k8 + ii][cc] = f[ii];
+        } else {
+            const unsigned kk = tid / 16, c8 = tid % 16;
+            *reinterpret_cast<float4*>(&ws[kk][8 * c8]) = float4{f[0], f[1], f[2], f[3]};
+            *reinterpret_cast<float4*>(&ws[kk][8 * c8 + 4]) = float4{f[4], f[5], f[6], f[7]};
+        }
+    };
+    float acc[64];
+#pragma unroll
+    for (unsigned i = 0; i < 64; ++i) acc[i] = 0.0F;
+    load(0);
+    for (unsigned k0 = 0; k0 < K; k0 += kG3K) {
+        __syncthreads();  // every lane consumed the previous stage before it can be overwritten
+        store();
+        __syncthreads();
+        if (k0 + kG3K < K) load(k0 + kG3K);
+#pragma unroll 2
+        for (unsigned kk = 0; kk < kG3K; ++kk) {
+            const float4 a0 = *reinterpret_cast<const float4*>(&as[kk][tr * 8]), a1 = *reinterpret_cast<const float4*>(&as[kk][tr * 8 + 4]);
+            const float4 w0 = *reinterpret_cast<const float4*>(&ws[kk][tc * 4]), w1 = *reinterpret_cast<const float4*>(&ws[kk][64 + tc * 4]);
+            const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            mla_gemm_vopd_rows<0>(acc, av, wv);
+            mla_gemm_vopd_rows<1>(acc, av, wv);
+            mla_gemm_vopd_rows<2>(acc, av, wv);
+            mla_gemm_vopd_rows<3>(acc, av, wv);
+        }
+    }
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+        const unsigned r = r0 + tr * 8 + i;
+        if (r < C) {
+            float* dst = Y + (static_cast<std::size_t>(r) * heads + h) * NC + c0 + tc * 4;
+            *reinterpret_cast<float4*>(dst) = float4{acc[8 * i], acc[8 * i + 1], acc[8 * i + 2], acc[8 * i + 3]};
+            *reinterpret_cast<float4*>(dst + 64) = float4{acc[8 * i + 4], acc[8 * i + 5], acc[8 * i + 6], acc[8 * i + 7]};
+        }
     }
 }
 
@@ -2316,10 +2411,12 @@ unsigned obar_version() {  // default 7 (heads 32; heads 64 runs v2); STRIX_GLM_
     }();
     return v;
 }
-unsigned mla_gemm_version() {  // default v2 absorb / out GEMM (same bits, -20..-25 % per call); STRIX_GLM_PF_MLA_GEMM=1: v1
+unsigned mla_gemm_version() {  // default v3 absorb / out GEMM; STRIX_GLM_PF_MLA_GEMM=2: v2, =1: v1
     static const unsigned v = [] {
         const char* e = std::getenv("STRIX_GLM_PF_MLA_GEMM");
-        return e && std::string(e) == "1" ? 1U : 2U;
+        if (e && std::string(e) == "1") return 1U;
+        if (e && std::string(e) == "2") return 2U;
+        return 3U;
     }();
     return v;
 }
@@ -2592,7 +2689,7 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
                         hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
     if (C == 0) return;
     if (heads != 32 && heads != 64) throw std::runtime_error("glm pf mla_attention_rows: heads must be 32 or 64");
-    if (gemm_v != 1 && gemm_v != 2) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
+    if (gemm_v != 1 && gemm_v != 2 && gemm_v != 3) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
     if ((scores_v != 1 && scores_v != 2 && scores_v != 3 && scores_v != 4 && scores_v != 5 && scores_v != 6 && scores_v != 7) ||
         (obar_v != 1 && obar_v != 2 && obar_v != 4 && obar_v != 5 && obar_v != 6 && obar_v != 7) ||
         ((scores_v == 1) != (obar_v == 1)))
@@ -2606,7 +2703,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         if (heads == 32) mla_scores_rows_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
         else mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
     } else {
-        if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         mla_mark(1, s);
         if (scores_v == 2) {
@@ -2646,7 +2744,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         else if (obv == 4) mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         else mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         mla_mark(4, s);
-        if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
     }
     ok(hipGetLastError(), "glm pf mla obar/out");
