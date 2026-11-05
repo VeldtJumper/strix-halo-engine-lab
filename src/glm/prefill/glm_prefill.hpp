@@ -98,6 +98,19 @@ void hc_pre_rows_v1(const float* X, const float* fn, const float* base, const fl
 void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix, float* xc,
                     unsigned rows, hipStream_t s);
 
+// STRIX_GLM_PF_MIXNORM (cached, default 1; only 0/1 accepted): fuse the v2 collapse + BF16 RMS tail.
+// The overloads write mix and xn, never xc; the original entry points remain explicit unfused controls.
+bool hc_mix_norm_enabled();
+void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix,
+                    const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s);
+void hc_pre_rows_normed(const float* X, const float* fn, const float* base, const float* scale, const float* rr, float* z, float* mix,
+                        const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s);
+// Explicit tail hooks for bitwise gates with independently supplied z (no chain or environment dispatch).
+void hc_mix_rows_v2(const float* X, const float* z, const float* base, const float* scale, float* mix, float* xc,
+                    unsigned rows, hipStream_t s);
+void hc_mix_norm_rows(const float* X, const float* z, const float* base, const float* scale, float* mix,
+                      const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s);
+
 inline constexpr unsigned kMaxTokens = kIdxTopk + kKpool - 1;  // 2051
 // Rounds of 256 lanes covering a list (9 x 256 >= 2051) and the stride of the per-(row, head) score / probability
 // buffer e: kObRounds * 256 = 2304 >= kMaxTokens, so o-bar v5's lane-major p layout fits in place.

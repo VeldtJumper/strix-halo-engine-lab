@@ -111,11 +111,15 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 32);  // + pf-dense-rows-v2
+    CHECK(rd::env_items().size() == 33);  // + pf-dense-rows-v2, pf-mixnorm
     CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "2");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_DENSE_ROWS").value == "1");
     for (const char* v : {"1", "2"})
         CHECK(resolve({}, {{"STRIX_GLM_PF_DENSE_ROWS", v}}).env.at("STRIX_GLM_PF_DENSE_ROWS").source == "explicit");
+    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_MIXNORM").value == "1");
+    CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_MIXNORM").value == "0");
+    for (const char* v : {"0", "1"})
+        CHECK(resolve({}, {{"STRIX_GLM_PF_MIXNORM", v}}).env.at("STRIX_GLM_PF_MIXNORM").source == "explicit");
     CHECK(resolve(cat(kDeploy, kDecodeWork), {}).env.at("STRIX_GLM_SPEC_XCH").value == "xfer");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_SPEC_XCH").value == "comm");
     CHECK(resolve({}, {{"STRIX_GLM_SPEC_XCH", "comm"}}).env.at("STRIX_GLM_SPEC_XCH").source == "explicit");
@@ -344,6 +348,7 @@ void test_scan_and_print() {
     CHECK(s.find("effective identity=r1b (default)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_DIST_CRC_PARALLEL=1 (default, item hp-crc-parallel)\n") != std::string::npos);
     CHECK(s.find("effective env STRIX_GLM_PF_DENSE_ROWS=2 (default, item pf-dense-rows-v2)\n") != std::string::npos);
+    CHECK(s.find("effective env STRIX_GLM_PF_MIXNORM=1 (default, item pf-mixnorm)\n") != std::string::npos);
 }
 
 void test_max_rows_memory() {

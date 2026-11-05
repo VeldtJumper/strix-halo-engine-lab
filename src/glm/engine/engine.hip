@@ -1246,6 +1246,7 @@ struct Engine::Impl {
         Half b{A, R - A, X + static_cast<std::size_t>(A) * kHc * kHidden,
                X2 + static_cast<std::size_t>(A) * kHc * kHidden};
         const bool hc_fuse = glm::pf::hc_expand_norm_enabled();
+        const bool mixnorm = glm::pf::hc_mix_norm_enabled();
         CommExchange* async_xch = nullptr;
         if (const char* v = std::getenv("STRIX_DIST_ASYNC_START"); v && std::string(v) == "1")
             async_xch = dynamic_cast<CommExchange*>(xch.get());
@@ -1261,12 +1262,19 @@ struct Engine::Impl {
         auto partial = [&](const Half& h) { return part + static_cast<std::size_t>(h.offset) * kHidden; };
         auto pre = [&](Half& h, const HcSite& site, const std::uint16_t* norm) {
             const std::size_t q = h.offset;
-            if (h.normed) glm::pf::hc_pre_rows_normed(h.x, site.fn, site.base, site.scale, hrr + q,
-                                                      hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
-            else glm::pf::hc_pre_rows(h.x, site.fn, site.base, site.scale, F + q * kHc * kHidden,
-                                      hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
+            if (mixnorm) {
+                if (h.normed) glm::pf::hc_pre_rows_normed(h.x, site.fn, site.base, site.scale, hrr + q,
+                                                          hz + q * kHcMix, mix + q * kHcMix, norm, xn + q * kHidden, h.count, stream);
+                else glm::pf::hc_pre_rows_v2(h.x, site.fn, site.base, site.scale, F + q * kHc * kHidden,
+                                             hz + q * kHcMix, mix + q * kHcMix, norm, xn + q * kHidden, h.count, stream);
+            } else {
+                if (h.normed) glm::pf::hc_pre_rows_normed(h.x, site.fn, site.base, site.scale, hrr + q,
+                                                          hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
+                else glm::pf::hc_pre_rows(h.x, site.fn, site.base, site.scale, F + q * kHc * kHidden,
+                                          hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
+                D::rmsnorm(xc + q * kHidden, norm, D::WType::BF16, kHidden, kEps, xn + q * kHidden, h.count, stream);
+            }
             h.normed = false;
-            D::rmsnorm(xc + q * kHidden, norm, D::WType::BF16, kHidden, kEps, xn + q * kHidden, h.count, stream);
             mark(segHc);
         };
         auto attention = [&](Half& h, LayerW& w) {
@@ -1413,12 +1421,15 @@ struct Engine::Impl {
         const CallCtx c{&lib, rows, slot_d, pos_d, flag, stream, !pfc, sp};
         unsigned* const c1 = sp ? sp->row_flag : flag;  // C1 per row in spec mode
         const unsigned c1_stride = sp ? 1U : 0U;
+        const bool mixnorm = pfc && glm::pf::hc_mix_norm_enabled();
         for (unsigned li = 0; li < n_layers; ++li) {
             LayerW& w = layers[li];
             cur_layer = li;
             if (!pfc && r1b && strix::glm::r1b::hc_norm_enabled()) {
                 strix::glm::r1b::hc_pre_norm(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, mix, xc,
                                           w.in_norm, xn, R, stream);
+            } else if (mixnorm) {
+                glm::pf::hc_pre_rows_v2(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, hz, mix, w.in_norm, xn, R, stream);
             } else {
                 if (pfc) glm::pf::hc_pre_rows(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, hz, mix, xc, R, stream);
                 else hc_pre(X, w.hc_attn.fn, w.hc_attn.base, w.hc_attn.scale, F, mix, xc, R);
@@ -1438,6 +1449,8 @@ struct Engine::Impl {
             if (!pfc && r1b && strix::glm::r1b::hc_norm_enabled()) {
                 strix::glm::r1b::hc_pre_norm(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, mix, xc,
                                           w.post_norm, xn, R, stream);
+            } else if (mixnorm) {
+                glm::pf::hc_pre_rows_v2(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, hz, mix, w.post_norm, xn, R, stream);
             } else {
                 if (pfc) glm::pf::hc_pre_rows(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, hz, mix, xc, R, stream);
                 else hc_pre(X, w.hc_ffn.fn, w.hc_ffn.base, w.hc_ffn.scale, F, mix, xc, R);

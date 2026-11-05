@@ -3604,6 +3604,25 @@ the chain's 24 outputs over three CTAs (same bits).
 - **Measured gain:** Two-node pair TTFT, ABBA x2: 1K -1.1 %, 8K -1.3 %
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
+<a id="glm-pf-mixnorm"></a>
+
+### Prefill mHC mix collapse + norm in one kernel
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_MIXNORM`. **Default:** 1.
+
+At every v2 hyper-connection site of the exact prefill, the collapse of the 4-copy stream and the BF16 RMSNorm that
+follows run in one kernel with one block per row: the collapsed row stays in registers and is normalized with the
+same lane mapping, reduction tree and rounding as the separate norm kernel, so the collapsed row is never written or
+read back. Covers the plain sites and the sites already fed by the fused expand + norm.
+
+- **Preconditions:** Exact chunked prefill with the v2 hyper-connection sites (the default); `STRIX_GLM_PF_HC=1` keeps the two kernels.
+- **Automatic selection:** Unset resolves to 1; the engine default provides it; the resolver reports it. Explicit values win; values other than 0 and 1 are rejected.
+- **Fallback notice:** None.
+- **Exactness evidence:** Device gate bitwise against the two-kernel path over 1 to 4096 rows and special values (only propagated NaN payloads may differ, positions equal); pair logits bitwise equal the anchors at 1K, 8K and 32K.
+- **Off switch:** STRIX_GLM_PF_MIXNORM=0, or --baseline
+- **Measured gain:** Two-node pair TTFT, alternating arms: 8,192 tokens 15.07 -> 14.95 s (544 -> 548 tok/s, -0.8 %), 32,768 tokens 63.23 -> 62.23 s (518 -> 527 tok/s, -1.6 %)
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+
 <a id="glm-pf-staged"></a>
 
 ### Staged prefill exchange

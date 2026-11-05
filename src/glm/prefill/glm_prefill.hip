@@ -2241,6 +2241,37 @@ __global__ __launch_bounds__(256) void hc_mix_rows_v2_kernel(const float* X, con
     }
 }
 
+// One row per CTA: the collapse is rounded exactly as the materialized xc, then retained for RMS's second pass.
+// Keep the 256-lane mapping, ascending fmaf chain and LDS tree of dev::rmsnorm(kHidden), including special values.
+__global__ __launch_bounds__(256) void hc_mix_norm_rows_kernel(const float* X, const float* zg, const float* base,
+                                                              const float* scale, float* mix, const std::uint16_t* norm,
+                                                              float* xn, unsigned rows) {
+    static_assert(kHidden == 4096 && norm_lanes(kHidden) == 256);
+    __shared__ float m[kHcMix], s[256];
+    const unsigned r = blockIdx.x, l = threadIdx.x;
+    if (r >= rows) return;  // uniform: no partial CTA participates in a tree
+    if (l == 0) hc_mix_r6(zg + static_cast<std::size_t>(r) * kHcMix, base, scale, m);
+    __syncthreads();
+    if (l < kHcMix) mix[static_cast<std::size_t>(r) * kHcMix + l] = m[l];
+    const float* Xr = X + static_cast<std::size_t>(r) * kHc * kHidden;
+    float x[kHidden / 256];
+    float a = 0.0F;
+#pragma unroll
+    for (unsigned j = 0; j < kHidden / 256; ++j) {
+        const unsigned d = l + j * 256;
+        x[j] = ((m[0] * Xr[d] + m[1] * Xr[kHidden + d]) + m[2] * Xr[2 * kHidden + d]) + m[3] * Xr[3 * kHidden + d];
+        a = __builtin_fmaf(x[j], x[j], a);
+    }
+    const float ss = lds_tree<256>(s, a);
+    const float rr = inv_sqrt(ss / static_cast<float>(kHidden) + kEps);
+    float* yr = xn + static_cast<std::size_t>(r) * kHidden;
+#pragma unroll
+    for (unsigned j = 0; j < kHidden / 256; ++j) {
+        const unsigned d = l + j * 256;
+        yr[d] = norm ? (x[j] * rr) * bf16_to_float(norm[d]) : x[j] * rr;
+    }
+}
+
 unsigned hc_version() {  // default v2 (measurement: PF-K 30/0 + synthetic 6-layer engine gate PASS, 2.72 -> 1.75 us/row/site); STRIX_GLM_PF_HC=1: v1
     static const unsigned v = [] {
         const char* e = std::getenv("STRIX_GLM_PF_HC");
@@ -2455,6 +2486,44 @@ void hc_pre_rows(const float* X, const float* fn, const float* base, const float
     else hc_pre_rows_v1(X, fn, base, scale, F, z, mix, xc, rows, s);
 }
 
+bool hc_mix_norm_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRIX_GLM_PF_MIXNORM");
+        if (e == nullptr || *e == '\0') return true;
+        const std::string v(e);
+        if (v != "0" && v != "1") throw std::invalid_argument("STRIX_GLM_PF_MIXNORM must be 0 or 1");
+        return v == "1";
+    }();
+    return on && hc_version() == 2;
+}
+
+void hc_mix_rows_v2(const float* X, const float* z, const float* base, const float* scale, float* mix, float* xc,
+                    unsigned rows, hipStream_t s) {
+    if (rows == 0) return;
+    hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
+    ok(hipGetLastError(), "glm pf hc_mix_rows v2 tail");
+}
+
+void hc_mix_norm_rows(const float* X, const float* z, const float* base, const float* scale, float* mix,
+                      const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
+    if (rows == 0) return;
+    hc_mix_norm_rows_kernel<<<rows, 256, 0, s>>>(X, z, base, scale, mix, norm, xn, rows);
+    ok(hipGetLastError(), "glm pf hc_mix_norm_rows");
+}
+
+void hc_pre_rows_v2(const float* X, const float* fn, const float* base, const float* scale, float* F, float* z, float* mix,
+                    const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
+    if (rows == 0) return;
+    hc_norm_rows_kernel<<<rows, 256, 0, s>>>(X, F);
+    ok(hipGetLastError(), "glm pf hc_norm_rows v2 mixnorm");
+    const unsigned t = hc_rows_tile();
+    if (t == 64) hc_chain_launch<64, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
+    else if (t == 16) hc_chain_launch<16, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
+    else hc_chain_launch<32, false>(F, fn, z, rows, nullptr, hc_cols8(), s);
+    ok(hipGetLastError(), "glm pf hc_chain_rows v2 mixnorm");
+    hc_mix_norm_rows(X, z, base, scale, mix, norm, xn, rows, s);
+}
+
 namespace {
 unsigned hc_fuse_mode() {
     static const unsigned m = [] {
@@ -2495,6 +2564,18 @@ void hc_pre_rows_normed(const float* X, const float* fn, const float* base, cons
     ok(hipGetLastError(), "glm pf hc_chain_rows normed");
     hc_mix_rows_v2_kernel<<<(rows + kHcMixRows - 1) / kHcMixRows, 256, 0, s>>>(X, z, base, scale, mix, xc, rows);
     ok(hipGetLastError(), "glm pf hc_mix_rows normed");
+}
+
+void hc_pre_rows_normed(const float* X, const float* fn, const float* base, const float* scale, const float* rr, float* z, float* mix,
+                        const std::uint16_t* norm, float* xn, unsigned rows, hipStream_t s) {
+    if (rows == 0) return;
+    if (hc_version() != 2) throw std::logic_error("glm pf hc_pre_rows_normed: v2 sites only");
+    const unsigned t = hc_rows_tile();
+    if (t == 64) hc_chain_launch<64, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    else if (t == 16) hc_chain_launch<16, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    else hc_chain_launch<32, true>(X, fn, z, rows, rr, hc_cols8(), s);
+    ok(hipGetLastError(), "glm pf hc_chain_rows normed mixnorm");
+    hc_mix_norm_rows(X, z, base, scale, mix, norm, xn, rows, s);
 }
 
 namespace {
