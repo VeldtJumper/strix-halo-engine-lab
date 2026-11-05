@@ -280,6 +280,7 @@ bool run_failure(const std::string& name, int nth, const std::string& expect0, c
             px::Options o;
             o.rank = rank;
             o.capacity = b;
+            o.chunk = std::size_t{1} << 20;  // call indices below (header 0, chunks 1..4, trailer 5) assume 1 MiB chunks
             o.stream = s;
             o.tx_uncached = uncached;
             o.timeout = std::chrono::milliseconds(10000);
