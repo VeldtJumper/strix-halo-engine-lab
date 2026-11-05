@@ -1,5 +1,7 @@
 #include "gemma4/engine/profile.hpp"
+#include "gemma4/exl3/format.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -129,8 +131,22 @@ void drafter_convention() {
 }
 
 void product_table() {
+    for (const auto& [route, identity] : {std::pair<std::string_view, std::string_view>{"g4-wmma-pf-v1", "g4-wmma-pf-v1"},
+            {"g4-wmma-pf-v2", "g4-wmma-pf-v2"}, {"g4-exl3-wmma-pf-v1", "g4-exl3-wmma-pf-v1"},
+            {"a8-many-row", "prefill-a8"}, {"many-row", "prefill-exact"}, {"rows8", "prefill-exact"},
+            {"", "prefill-exact"}, {"unknown", "prefill-exact"}})
+        check(pr::prefill_identity_for_route(route) == identity, "served identity for route: " + std::string(route));
     // Rule: exact levers in all three profiles, bit-changing values only in FAST, pack values only in QUALITY.
+    // Exception: prefill_route, whose DEFAULT column carries the Q4_K_M-gated v2 route under its own receipt
+    // (the DEFAULT contract: prefill v2 + decode g4-v1, qualified against the DEFAULT bars); FAST runs a8.
     for (const auto& lever : pr::levers()) {
+        if (lever.name == "prefill_route") {
+            check(lever.value[0] == "default" && lever.value[1] == "a8" && lever.value[2] == lever.builtin &&
+                  lever.builtin == "exact", "prefill_route: default Q4_K_M-gated v2, fast a8, quality exact");
+            check(lever.column_target[0] == "g4-wmma-pf-v2" && lever.column_target[1].empty() &&
+                  lever.target == "g4-a8-v1", "prefill_route targets: default g4-wmma-pf-v2, fast g4-a8-v1");
+            continue;
+        }
         check(!lever.name.empty() && !lever.source.empty(), "lever has name and source");
         check(!lever.env.empty() || !lever.option.empty(), std::string(lever.name) + " has a switch");
         if (lever.kind == pr::Kind::bit_changing)
@@ -153,7 +169,69 @@ void product_table() {
     check(status(r, "decode_identity") == pr::Status::builtin && value(r, "decode_identity") == "g4-v1", "default g4-v1");
     check(status(r, "draft") == pr::Status::absent && r.drafter() == "absent", "default drafter absent without weights");
     check(status(r, "draft_mode") == pr::Status::builtin, "drafter auto admission");
-    check(status(r, "prefill_route") == pr::Status::builtin && value(r, "prefill_route") == "exact", "default exact prefill");
+    // Served prefill identity of a resolution on a Q4_K_M GGUF pack: the env value the profile exports (or the
+    // builtin when nothing is exported), the pack gate, the decode check, then the device's route metadata.
+    const auto served_q4km = [](const pr::Resolution& res) {
+        // prefill_route may return a view of its argument: keep the values alive.
+        const std::string requested(value(res, "prefill_route")), decode(value(res, "decode_identity"));
+        const auto route = pr::prefill_route_for_decode(pr::prefill_route(requested, pr::gguf_file_type_q4_k_m, false),
+            decode).route;
+        return pr::prefill_identity_for_route(route == "v2" ? strix::gemma4::prefill::v2_identity :
+            route == "v1" ? strix::gemma4::prefill::identity : route == "a8" ? "a8-many-row" : "many-row");
+    };
+    // DEFAULT prefill value: the Q4_K_M-gated route "default" = g4-wmma-pf-v2 on a MOSTLY_Q4_K_M GGUF, prefill-exact
+    // on every other pack; "fast" stays the v1 spelling under the same gate.
+    check(pr::prefill_route("default", 15, false) == "v2" && pr::prefill_route("default", 14, false) == "exact" &&
+          pr::prefill_route("default", 7, false) == "exact" && pr::prefill_route("default", 1, false) == "exact" &&
+          pr::prefill_route("default", -1, false) == "exact" && pr::prefill_route("default", 15, true) == "exact",
+          "default route: v2 on Q4_K_M, exact on Q4_K_S/Q8_0/F16/BF16 and EXL3 packs");
+    check(pr::prefill_route("fast", 15, false) == "v1" && pr::prefill_route("fast", -1, false) == "exact",
+          "=fast keeps v1 on Q4_K_M");
+    // DEFAULT prefill follows its own receipt: pending -> prefill-exact runs and the receipt names the pending
+    // g4-wmma-pf-v2 target; named -> the Q4_K_M-gated v2 route.
+    const bool default_prefill_ready = [] {
+        for (const auto& lever : pr::levers()) if (lever.name == "prefill_route") return lever.ready[0];
+        return false;
+    }();
+    if (default_prefill_ready) {
+        check(status(r, "prefill_route") == pr::Status::set && value(r, "prefill_route") == "default" &&
+              r.qualification() == "qualified", "default runs the qualified Q4_K_M-gated prefill");
+        check(served_q4km(r) == "g4-wmma-pf-v2", "qualified default serves g4-wmma-pf-v2 on Q4_K_M");
+    } else {
+        check(status(r, "prefill_route") == pr::Status::pending && value(r, "prefill_route") == "exact" &&
+              r.qualification() == "qualified", "default prefill pending: prefill-exact runs");
+        check(r.find("prefill_route")->target == "g4-wmma-pf-v2", "pending default names its v2 target");
+        const auto notices = r.notices();
+        check(std::find(notices.begin(), notices.end(),
+                        "profile default: prefill_route pending g4-wmma-pf-v2 (exact runs)") != notices.end(),
+              "pending default notice: pending g4-wmma-pf-v2 (exact runs)");
+        check(r.json().find("{\"lever\":\"prefill_route\",\"target\":\"g4-wmma-pf-v2\",\"runs\":\"exact\"}") !=
+              std::string::npos, "pending default receipt lists the v2 target");
+        check(served_q4km(r) == "prefill-exact", "pending default serves prefill-exact on Q4_K_M");
+    }
+    check(value(r, "prefill_route") != "fast", "the default receipt never names its prefill route fast");
+    {
+        // The filled state: --allow-pending runs the pending default column, which is that same route.
+        pr::Inputs pend = in(); pend.allow_pending = true;
+        const auto f = pr::resolve(pr::Name::standard, pr::App::engine, pend);
+        check(value(f, "prefill_route") == "default" && f.active("prefill_route") && served_q4km(f) == "g4-wmma-pf-v2",
+              "filled default runs the Q4_K_M-gated v2 route and reports g4-wmma-pf-v2");
+        // OFF: STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact under default (also over --allow-pending).
+        for (const bool allow : {false, true}) {
+            pr::Inputs o = in({}, {}, lookup({{"STRIX_G4_PREFILL_IDENTITY", "exact"}})); o.allow_pending = allow;
+            const auto off = pr::resolve(pr::Name::standard, pr::App::engine, o);
+            check(status(off, "prefill_route") == pr::Status::explicit_env && value(off, "prefill_route") == "exact" &&
+                  served_q4km(off) == "prefill-exact", "default OFF: =exact runs and reports prefill-exact");
+        }
+        // =v1 stays selectable under default.
+        const auto v1 = pr::resolve(pr::Name::standard, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_PREFILL_IDENTITY", "v1"}})));
+        check(status(v1, "prefill_route") == pr::Status::explicit_env && value(v1, "prefill_route") == "v1" &&
+              served_q4km(v1) == "g4-wmma-pf-v1", "default =v1 runs and reports g4-wmma-pf-v1");
+        // An explicit =default runs the v2 route (the default column is runnable in this build).
+        const auto d = pr::resolve(pr::Name::standard, pr::App::engine, in({}, {}, lookup({{"STRIX_G4_PREFILL_IDENTITY", "default"}})));
+        check(status(d, "prefill_route") == pr::Status::explicit_env && served_q4km(d) == "g4-wmma-pf-v2",
+              "explicit =default runs and reports g4-wmma-pf-v2");
+    }
     r = pr::resolve(pr::Name::standard, pr::App::engine, in({}, {{"draft", "/m/drafter-mtp"}}));
     check(status(r, "draft") == pr::Status::set && r.drafter() == "on (/m/drafter-mtp)", "default discovers the drafter");
     r = pr::resolve(pr::Name::standard, pr::App::engine, in({}, {{"draft", "/m/drafter-mtp"}}, lookup({{"STRIX_G4_DRAFT", "0"}})));
@@ -301,10 +379,10 @@ void product_table() {
     check(status(r, "prefill_route") == pr::Status::explicit_env && value(r, "prefill_route") == "exact", "explicit exact prefill");
     refuses([] { (void)pr::resolve(pr::Name::fast, pr::App::prefill_bench, in({}, {}, lookup({{"STRIX_G4_PREFILL", "exact"}}))); },
             "not in this build", "explicit exact route in the WMMA-only bench refused");
-    // DEFAULT engine: prefill-exact, qualified, nothing pending for prefill.
+    // DEFAULT engine: qualified either way; prefill-exact while its receipt is pending.
     r = pr::resolve(pr::Name::standard, pr::App::engine, in());
-    check(!r.active("prefill_route") && value(r, "prefill_route") == "exact" && r.qualification() == "qualified" &&
-          status(r, "prefill_route") == pr::Status::builtin, "default engine prefill-exact, qualified");
+    check(r.qualification() == "qualified" && (default_prefill_ready ? value(r, "prefill_route") == "default" :
+          (!r.active("prefill_route") && value(r, "prefill_route") == "exact")), "default engine prefill, qualified");
 
     // QUALITY: needs the EXL3 arm (never discovered); EXL3 identity auto-selected.
     refuses([] { (void)pr::resolve(pr::Name::quality, pr::App::engine, in()); }, "--exl3-arm", "quality needs arm");

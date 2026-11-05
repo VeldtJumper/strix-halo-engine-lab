@@ -85,8 +85,8 @@ conditions, repetition counts, exactness evidence and off switches.
 | **Nemotron 3.5 Bolt E4B** | 1 node | `default`, English chat, 256 tokens: C1 shipped (MTP drafter + prompt lookup) / C1 plain / C4 / C8 | **91.9** / 55.8 / 169.8 / 237.9 tok/s | prompt lookup on an agent code-edit prompt: 48.0 → 115.6 tok/s without a drafter, **149.1** shipped; chat decode unchanged within noise | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 node | `fast` (int8 activations, qualified), same columns | **99.5** / 54.0 / 206.5 / **340.6** tok/s | exact prefill 2K 458 → 538 tok/s; decode unchanged within noise | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 node | `quality` (EXL3 M4 pack), same columns; top-1 agreement with BF16 | **96.4** / 50.2 / 184.8 / 303.0 tok/s; **92.94 %** (Q4_K_M 87.0 %) | C1 shipped 83.8 → 96.4; plain C1 / C4 / C8 44.4 / 153.1 / 258.3 → 50.2 / 184.8 / 303.0 | `f32aab24` |
-| Nemotron 3.5 Bolt E4B | 1 node | Selectable prompt prefill route `g4-wmma-pf-v1` (`STRIX_G4_PREFILL_IDENTITY=v1`; FP16 WMMA linears on the prompt bulk, the last <= 8 prompt tokens and the anchor on the decode arithmetic; not exact), 2K / 4K / 8K | **2,359 / 2,249 / 1,957** tok/s | exact prefill 526 / 509 / 481, `g4-wmma-pf-v2` (`=v2`) 1,537 / 1,478 / 1,349 in the same session; `default` and `quality` keep exact prefill, `fast` runs `a8` prefill | current |
-| Nemotron 3.5 Bolt E4B | 1 node | Exact prefill, 2K / 8K / 32K: `default` and `quality` | **535 / 509 / 397** and **815 / 746 / 533 tok/s** | 466 / 429 / 358 and 769 / 701 / 520 tok/s before the fused gate/up tile, linear tiles, 24-bit and shared Q6_K decode, EXL3 LDS pairs | `f32aab24` |
+| Nemotron 3.5 Bolt E4B | 1 node | Selectable prompt prefill route `g4-wmma-pf-v1` (`STRIX_G4_PREFILL_IDENTITY=v1`, receipt `0b98d054`; FP16 WMMA linears on the prompt bulk, the last <= 8 prompt tokens and the anchor on the decode arithmetic; not exact), 2K / 4K / 8K | **2,359 / 2,249 / 1,957** tok/s | exact prefill 526 / 509 / 481 in the same session; `default` prefill identity `g4-wmma-pf-v2` on Q4_K_M (pending qualification; until then the exact prefill runs; `STRIX_G4_PREFILL_IDENTITY=exact` keeps it); `quality` keeps exact prefill, `fast` runs `a8` prefill | current |
+| Nemotron 3.5 Bolt E4B | 1 node | Exact prefill, 2K / 8K / 32K: `default` with `STRIX_G4_PREFILL_IDENTITY=exact`, and `quality` | **535 / 509 / 397** and **815 / 746 / 533 tok/s** | 466 / 429 / 358 and 769 / 701 / 520 tok/s before the fused gate/up tile, linear tiles, 24-bit and shared Q6_K decode, EXL3 LDS pairs | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 node | HTTP server, `default`, 8 clients, mixed prompts (chat, code, one ~1.3K-token document), prefix cache off, 128 tokens: aggregate / TTFT p50 | **76.1 tok/s / 0.6 s** | one request at a time: 66.9 tok/s / 13.8 s | `f32aab24` |
 | **MiniMax H3** | 2 nodes over USB4 | Text to video + audio, 1344x768, 124 frames (5.17 s) + stereo audio, seed 42: 6-step LoRA, sparse attention tau 0.75, fast VAE | **405.5 s** (DiT 300.2 s, video VAE 42.4 s) | dense reference 8 steps: ~16 min on 1 node, ~8 min on the pair | h3 block `9d9d523b` |
 | llama.cpp `74a4fb00`, same machine, same Q4_K_M | 1 node | Reference: C1 plain / C4 / C8; prefill 2K / 8K / 32K; server at 8 clients | 55.5 / 193.3 / 279.9 tok/s; 2,062 / 1,881 / 1,376 tok/s; 227.1 tok/s | measured in the same session as the Nemotron rows | `74a4fb00` |
@@ -150,11 +150,18 @@ never run silently. Every subcommand: [docs/pair-setup.md](docs/pair-setup.md).
 ## Profiles: `default`, `fast`, `quality`
 
 Qwen (CLI, `--http-serve` and the MTP runner), every DeepSeek pair app and Nemotron take `--profile default|fast|quality`;
-run the same profile on both ranks of a pair. `default` is the exact production configuration and sets nothing. An
+run the same profile on both ranks of a pair. `default` is the exact production configuration and sets nothing (Nemotron: see below). An
 explicit option or environment variable always wins over the profile, including explicit off.
 `--print-effective-config` (standalone RTX: `--print-config`) shows the selected profile and the state of every option
 before any device work. `--allow-pending` runs pending options whose code is in the build, for benchmarking only,
 stamped `unqualified`.
+
+Nemotron `default` declares decode `g4-v1` (exact at every batch size) with prompt prefill `g4-wmma-pf-v2` on Q4_K_M
+GGUF packs (not exact). Its qualification against the `default` bars on a fresh held-out set is pending: until the
+receipt is named, `default` runs exact prefill and the receipt lists `pending g4-wmma-pf-v2 (exact runs)`. Other pack
+types keep exact prefill. `STRIX_G4_PREFILL_IDENTITY=exact` is the off switch (exact prefill, bit-exact with the serial
+path); `=v1` selects `g4-wmma-pf-v1`, qualified against the same bars (receipt `0b98d054`). Prompt prefill at 2K / 8K
+(Q4_K_M, tok/s): exact 526 / 481, `g4-wmma-pf-v1` 2,359 / 1,957.
 
 | Engine | `fast` | `quality` |
 |---|---|---|

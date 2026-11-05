@@ -360,7 +360,7 @@ struct Api::Impl final : strix::serve::GenerationEngine {
             if (req.method == "GET" && req.path == "/v1/capabilities") {
                 const auto config = effective_config(backend,defaults,bool(drafts));
                 writer.send(200,"application/json",Json(Json::Object{{"model",model},{"identity",*config.find("decode_identity")},
-                    {"prefill","prefill-exact"},{"sampling","splitmix64-cdf-v1"},{"thinking_budget","checked-two-job-continuation"},
+                    {"prefill",*config.find("prefill_identity")},{"sampling","splitmix64-cdf-v1"},{"thinking_budget","checked-two-job-continuation"},
                     {"tools",true},{"reasoning_content",true},{"queue",batched ? "continuous batching; up to "+std::to_string(slots)+" chat jobs decode together" :
                         std::string("FIFO; one chat job at a time")},
                     {"features",backend.identity().find("feature_identity") ? *backend.identity().find("feature_identity") : Json()},

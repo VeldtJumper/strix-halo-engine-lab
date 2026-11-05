@@ -69,9 +69,10 @@ public:
         const bool exl3_wmma = many_row && exl3_route && std::string(exl3_route) == "wmma" &&
                                bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1;
         // Non-EXL3 packs: STRIX_G4_PREFILL_IDENTITY=v1|v2 runs a WMMA prefill identity with canonical
-        // attention: g4-wmma-pf-v1 (FP16 operands) or g4-wmma-pf-v2 (the declared hilo policy); "fast"
-        // (the fast profile's value) runs v1 on Q4_K_M packs, the pack its qualification covers, and
-        // prefill-exact on others; exact (or unset) keeps prefill-exact. A8 requires g4-a8-v1 decode.
+        // attention: g4-wmma-pf-v1 (FP16 operands) or g4-wmma-pf-v2 (the declared hilo policy); "default"
+        // (the default profile's value, once its receipt is named) runs v2 on Q4_K_M packs, the pack its
+        // qualification covers, and prefill-exact on others; "fast" runs v1 under the same pack gate; exact
+        // (or unset) keeps prefill-exact. A8 requires g4-a8-v1 decode.
         const auto* selected = std::getenv("STRIX_G4_IDENTITY");
         const std::string decode_identity{selected && *selected ? selected : arithmetic_id};
         // A FAST decode attention (STRIX_G4_DECODE_ATTN) changes decode rows: no prefill route equals them then

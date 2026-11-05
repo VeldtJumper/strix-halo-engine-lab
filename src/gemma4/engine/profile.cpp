@@ -1,4 +1,5 @@
 #include "profile.hpp"
+#include "gemma4/exl3/format.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -17,6 +18,12 @@ constexpr unsigned engine = unsigned(App::engine), decode_bench = unsigned(App::
 // are byte-identical to g4-a8-v1 decode rows (byte receipt 4e914dcf: KV and per-row logits on 56/56 teacher-v2 parents;
 // served ids equal to decode-fed rows at C1/C4). Empty = pending: fast runs prefill-exact.
 constexpr std::string_view fast_a8_prefill_receipt = "g4-a8-v1 9ba0cf53 + a8 prefill byte receipt 4e914dcf";
+// Held-out qualification receipt of the DEFAULT contract (prompt prefill g4-wmma-pf-v2 + decode g4-v1) against
+// the DEFAULT bars, on the Q4_K_M pack. The default column runs the Q4_K_M-gated route (value "default"): v2 on
+// MOSTLY_Q4_K_M GGUF packs, prefill-exact on others. Empty = pending: prefill-exact runs under default and the
+// receipt lists "pending g4-wmma-pf-v2 (exact runs)". (g4-wmma-pf-v1 + g4-v1 passed the same bars, receipt
+// 0b98d054; =v1 selects it.)
+constexpr std::string_view default_prefill_receipt = "";
 // Profile columns: default, fast, quality. One row per lever; an owner merge (or a passed gate) flips its
 // own `runnable` / `ready` column (and, if its switch name differs, `env`) on its own row.
 constexpr Lever table[] = {
@@ -84,18 +91,25 @@ constexpr Lever table[] = {
      .required = {false, false, false}, .ready = {false, false, true}, .runnable = {false, false, true},
      .kind = Kind::pack, .apps = engine,
      .source = "auto-select per pack and --streams: M4/M6 g4-exl3-v3 always, M5 v3 at >= 8 streams, else v1"},
-    // Prompt prefill route. DEFAULT and QUALITY run prefill-exact. STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact
-    // (the OFF switch under fast); =v1 / =v2 select a WMMA route explicitly.
+    // Prompt prefill route. DEFAULT runs g4-wmma-pf-v2 (WMMA linears under the declared v2 policy, canonical attention)
+    // on Q4_K_M packs under default_prefill_receipt (the DEFAULT contract, v2 + g4-v1 decode; empty = pending: exact
+    // runs and the receipt names the pending g4-wmma-pf-v2 target); other packs run prefill-exact. QUALITY runs
+    // prefill-exact. STRIX_G4_PREFILL_IDENTITY=exact keeps prefill-exact (the OFF switch under default and fast);
+    // =v1 / =v2 select a WMMA route explicitly.
     // =a8 (only with STRIX_G4_IDENTITY=g4-a8-v1): g4-a8-v1 linears on 512-row chunks; prompt rows equal the a8
     // decode of the same rows; otherwise prefill-exact runs. FAST runs a8: it is byte-identical to the g4-a8-v1 decode
     // rows that fast_a8_prefill_receipt qualified (not bitwise vs exact prefill).
-    {.name = "prefill_route", .env = "STRIX_G4_PREFILL_IDENTITY", .value = {"exact", "a8", "exact"}, .builtin = "exact",
-     .required = {false, true, false}, .ready = {true, !fast_a8_prefill_receipt.empty(), true}, .runnable = {true, true, true},
-     .kind = Kind::bit_changing, .apps = engine, .target = "g4-a8-v1",
-     .source = "fast: a8 prompt prefill (g4-a8-v1 linears on 512-row chunks, canonical attention; prompt rows equal the "
-               "a8 decode of the same rows, so the g4-a8-v1 receipt covers it; not bitwise vs exact prefill); default and "
-               "quality run prefill-exact as many-row chunks (STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes); "
-               "=v1 / =v2 select g4-wmma-pf-v1 / -v2; =fast runs v1 on Q4_K_M packs once fast_prefill_receipt is named"},
+    {.name = "prefill_route", .env = "STRIX_G4_PREFILL_IDENTITY", .value = {"default", "a8", "exact"}, .builtin = "exact",
+     .required = {false, true, false}, .ready = {!default_prefill_receipt.empty(), !fast_a8_prefill_receipt.empty(), true},
+     .runnable = {true, true, true},
+     .kind = Kind::bit_changing, .apps = engine, .target = "g4-a8-v1", .column_target = {"g4-wmma-pf-v2", "", ""},
+     .source = "default: g4-wmma-pf-v2 (WMMA linears under the declared v2 policy, canonical attention) on Q4_K_M "
+               "packs under the DEFAULT contract held-out receipt (prefill-exact while it is pending), prefill-exact "
+               "on other packs; "
+               "fast: a8 prompt prefill (g4-a8-v1 linears on 512-row chunks, canonical attention; prompt rows equal the "
+               "a8 decode of the same rows, so the g4-a8-v1 receipt covers it; not bitwise vs exact prefill); quality "
+               "runs prefill-exact as many-row chunks (STRIX_G4_PREFILL_EXACT_MANYROW=0 = eight-row passes); "
+               "=v1 / =v2 select g4-wmma-pf-v1 / -v2 (v1: DEFAULT receipt 0b98d054); =fast runs v1 on Q4_K_M packs"},
     // EXL3 packs: the pack's held-out bands were measured on g4-exl3-wmma-pf-v1 prompts (panel WMMA linears,
     // canonical attention); QUALITY targets that identity once its receipt lands, exact runs until then.
     {.name = "exl3_prefill", .env = "STRIX_G4_EXL3_PREFILL", .value = {"", "", "wmma"}, .builtin = "exact",
@@ -312,7 +326,8 @@ Resolution resolve(Name profile, App app, const Inputs& inputs, std::span<const 
             } else {
                 // Never refuse for a pending row: it is not applied, the builtin keeps running, the
                 // receipt lists the declared target and apply() prints one stderr line.
-                entry.target = std::string(lever.target.empty() ? wanted : lever.target);
+                const auto target = lever.column_target[column].empty() ? lever.target : lever.column_target[column];
+                entry.target = std::string(target.empty() ? wanted : target);
                 entry.value = std::string(lever.builtin);
                 entry.status = Status::pending;
             }
@@ -349,11 +364,18 @@ std::vector<std::string> Resolution::notices() const {
 
 std::string_view prefill_route(std::string_view requested, std::int32_t gguf_file_type, bool exl3_pack) {
     if (requested.empty() || requested == "exact") return "exact";
-    if (requested != "v1" && requested != "v2" && requested != "a8" && requested != "fast")
-        throw std::invalid_argument("STRIX_G4_PREFILL_IDENTITY must be exact, v1, v2, a8 or fast");
+    if (requested != "v1" && requested != "v2" && requested != "a8" && requested != "default" && requested != "fast")
+        throw std::invalid_argument("STRIX_G4_PREFILL_IDENTITY must be exact, v1, v2, a8, default or fast");
     if (exl3_pack) return "exact"; // EXL3 packs: STRIX_G4_EXL3_PREFILL selects their route
+    if (requested == "default") return gguf_file_type == gguf_file_type_q4_k_m ? "v2" : "exact";
     if (requested == "fast") return gguf_file_type == gguf_file_type_q4_k_m ? "v1" : "exact";
     return requested;
+}
+std::string_view prefill_identity_for_route(std::string_view route) {
+    if (route == prefill::identity) return prefill::identity;
+    if (route == prefill::v2_identity) return prefill::v2_identity;
+    if (route == exl3::prefill_identity) return exl3::prefill_identity;
+    return route == "a8-many-row" ? "prefill-a8" : "prefill-exact";
 }
 PrefillRouteChoice prefill_route_for_decode(std::string_view route, std::string_view decode_identity) {
     if (decode_identity.empty()) decode_identity = "g4-v1";

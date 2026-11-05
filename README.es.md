@@ -88,8 +88,8 @@ filas con sus condiciones, número de repeticiones, evidencia de exactitud e int
 | **Nemotron 3.5 Bolt E4B** | 1 nodo | `default`, chat en inglés, 256 tokens: C1 publicado (drafter MTP + prompt lookup) / C1 simple / C4 / C8 | **91.9** / 55.8 / 169.8 / 237.9 tok/s | prompt lookup en un prompt de agente que edita código: 48.0 → 115.6 tok/s sin drafter, **149.1** en la configuración publicada; decode de chat sin cambios dentro del ruido | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 nodo | `fast` (activaciones int8, cualificado), mismas columnas | **99.5** / 54.0 / 206.5 / **340.6** tok/s | prefill exacto 2K 458 → 538 tok/s; decode sin cambios dentro del ruido | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 nodo | `quality` (paquete EXL3 M4), mismas columnas; coincidencia top-1 con BF16 | **96.4** / 50.2 / 184.8 / 303.0 tok/s; **92.94 %** (Q4_K_M 87.0 %) | C1 publicado 83.8 → 96.4; C1 / C4 / C8 simple 44.4 / 153.1 / 258.3 → 50.2 / 184.8 / 303.0 | `f32aab24` |
-| Nemotron 3.5 Bolt E4B | 1 nodo | Ruta de prefill de prompts seleccionable `g4-wmma-pf-v1` (`STRIX_G4_PREFILL_IDENTITY=v1`; lineales WMMA FP16 en el grueso del prompt, los últimos <= 8 tokens del prompt y el ancla con la aritmética del decode; no exacto), 2K / 4K / 8K | **2,359 / 2,249 / 1,957** tok/s | prefill exacto 526 / 509 / 481, `g4-wmma-pf-v2` (`=v2`) 1,537 / 1,478 / 1,349 en la misma sesión; `default` y `quality` mantienen el prefill exacto, `fast` usa el prefill `a8` | actual |
-| Nemotron 3.5 Bolt E4B | 1 nodo | Prefill exacto, 2K / 8K / 32K: `default` y `quality` | **535 / 509 / 397** y **815 / 746 / 533 tok/s** | 466 / 429 / 358 y 769 / 701 / 520 tok/s antes del tile fusionado gate/up, los tiles lineales, la decodificación de 24 bits y la de Q6_K compartida, y los pares LDS de EXL3 | `f32aab24` |
+| Nemotron 3.5 Bolt E4B | 1 nodo | Ruta de prefill de prompts seleccionable `g4-wmma-pf-v1` (`STRIX_G4_PREFILL_IDENTITY=v1`, recibo `0b98d054`; lineales WMMA FP16 en el grueso del prompt, los últimos <= 8 tokens del prompt y el ancla con la aritmética del decode; no exacto), 2K / 4K / 8K | **2,359 / 2,249 / 1,957** tok/s | prefill exacto 526 / 509 / 481 en la misma sesión; identidad de prefill de `default` `g4-wmma-pf-v2` en Q4_K_M (cualificación pendiente; hasta entonces se ejecuta el prefill exacto; `STRIX_G4_PREFILL_IDENTITY=exact` lo mantiene); `quality` mantiene el prefill exacto, `fast` usa el prefill `a8` | actual |
+| Nemotron 3.5 Bolt E4B | 1 nodo | Prefill exacto, 2K / 8K / 32K: `default` con `STRIX_G4_PREFILL_IDENTITY=exact`, y `quality` | **535 / 509 / 397** y **815 / 746 / 533 tok/s** | 466 / 429 / 358 y 769 / 701 / 520 tok/s antes del tile fusionado gate/up, los tiles lineales, la decodificación de 24 bits y la de Q6_K compartida, y los pares LDS de EXL3 | `f32aab24` |
 | Nemotron 3.5 Bolt E4B | 1 nodo | Servidor HTTP, `default`, 8 clientes, prompts mixtos (chat, código, un documento de ~1.3K tokens), caché de prefijos desactivada, 128 tokens: agregado / TTFT p50 | **76.1 tok/s / 0.6 s** | una petición cada vez: 66.9 tok/s / 13.8 s | `f32aab24` |
 | **MiniMax H3** | 2 nodos sobre USB4 | Texto a vídeo + audio, 1344x768, 124 fotogramas (5.17 s) + audio estéreo, semilla 42: LoRA de 6 pasos, atención dispersa tau 0.75, VAE rápido | **405.5 s** (DiT 300.2 s, VAE de vídeo 42.4 s) | referencia densa de 8 pasos: ~16 min en 1 nodo, ~8 min en el par | h3 block `9d9d523b` |
 | llama.cpp `74a4fb00`, misma máquina, mismo Q4_K_M | 1 nodo | Referencia: C1 simple / C4 / C8; prefill 2K / 8K / 32K; servidor con 8 clientes | 55.5 / 193.3 / 279.9 tok/s; 2,062 / 1,881 / 1,376 tok/s; 227.1 tok/s | medido en la misma sesión que las filas de Nemotron | `74a4fb00` |
@@ -154,10 +154,18 @@ requieren root se imprimen; nunca se ejecutan sin avisar. Todos los subcomandos:
 
 Qwen (CLI, `--http-serve` y el runner MTP), todas las aplicaciones del par DeepSeek y Nemotron aceptan
 `--profile default|fast|quality`; ejecute el mismo perfil en ambos ranks de un par. `default` es la configuración exacta
-de producción y no establece nada. Una opción explícita o una variable de entorno siempre prevalece sobre el perfil,
+de producción y no establece nada (Nemotron: ver más abajo). Una opción explícita o una variable de entorno siempre prevalece sobre el perfil,
 incluida la desactivación explícita. `--print-effective-config` (RTX independiente: `--print-config`) muestra el perfil
 seleccionado y el estado de cada opción antes de cualquier trabajo en el dispositivo. `--allow-pending` ejecuta las
 opciones pendientes cuyo código está en la compilación, solo para benchmarks, marcadas `unqualified`.
+
+El `default` de Nemotron declara el decode `g4-v1` (exacto con cualquier tamaño de batch) con prefill de prompts
+`g4-wmma-pf-v2` en paquetes GGUF Q4_K_M (no exacto). Su cualificación contra los umbrales de `default` sobre un conjunto
+held-out nuevo está pendiente: hasta que se nombre el recibo, `default` usa el prefill exacto y el recibo lista
+`pending g4-wmma-pf-v2 (exact runs)`. Los demás tipos de paquete mantienen el prefill exacto.
+`STRIX_G4_PREFILL_IDENTITY=exact` es el interruptor de desactivación (prefill exacto, idéntico bit a bit a la ruta
+serial); `=v1` selecciona `g4-wmma-pf-v1`, cualificado contra los mismos umbrales (recibo `0b98d054`). Prefill de prompts
+con 2K / 8K (Q4_K_M, tok/s): exacto 526 / 481, `g4-wmma-pf-v1` 2,359 / 1,957.
 
 | Motor | `fast` | `quality` |
 |---|---|---|

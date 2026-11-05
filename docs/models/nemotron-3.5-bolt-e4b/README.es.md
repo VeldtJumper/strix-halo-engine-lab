@@ -23,7 +23,7 @@ declarado y una línea de stderr lo indica. Un perfil solo rechaza por un asset 
 
 | Perfil | Decode | Prefill | Garantía |
 |---|---|---|---|
-| `default` | `g4-v1` (activaciones FP32, pesos Q4_K_M) + drafter MTP en C1 | `prefill-exact` | Exacto: los bytes de salida son iguales a la ruta serial declarada para cualquier tamaño de batch (C4 == C1) y con el drafter activado o desactivado |
+| `default` | `g4-v1` (activaciones FP32, pesos Q4_K_M) + drafter MTP en C1 | Declarado: `g4-wmma-pf-v2` en paquetes GGUF Q4_K_M (otros tipos de paquete: `prefill-exact`); cualificación contra los umbrales de `default` pendiente, hasta entonces se ejecuta `prefill-exact` y el recibo lista `pending g4-wmma-pf-v2 (exact runs)`. `STRIX_G4_PREFILL_IDENTITY=exact` mantiene el prefill exacto | El decode sigue siendo exacto: los bytes de salida son iguales a la ruta serial declarada para cualquier tamaño de batch (C4 == C1) y con el drafter activado o desactivado; el prefill de prompts `g4-wmma-pf-v2` solo se ejecuta en `default` cuando se nombra su recibo contra los umbrales de `default` (no es idéntico bit a bit al prefill exacto) |
 | `fast` | `g4-a8-v1` (activaciones int8, cualificado) + drafter MTP; atención de decode en profundidad `g4-dattn-f2` (copias int8 de la KV de las capas globales): cualificación pendiente, hasta entonces se ejecuta la atención exacta | prefill de prompts `a8`: lineales `g4-a8-v1` en bloques de 512 filas; las filas del prompt son iguales al decode a8 de las mismas filas, así que la cualificación de `g4-a8-v1` las cubre (no es idéntico bit a bit al prefill exacto; `STRIX_G4_PREFILL_IDENTITY=exact` restaura el prefill exacto) | Perfil con nombre, cualificado contra bandas de fidelidad congeladas |
 | `quality` | Paquete EXL3 (`--exl3-arm DIR`), identidad elegida una vez por paquete y sesión (`g4-exl3-v1`/`v3`) | `prefill-exact` | Exacto dentro de su identidad EXL3; mayor fidelidad que Q4_K_M con un tamaño similar |
 
@@ -87,7 +87,7 @@ compilación del motor, y cada valor de llama.cpp se midió en el mismo turno qu
 
 | Perfil | C1 publicado ([drafter MTP](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) + prompt lookup) | C1, sin draft | C4 | C8 | Prefill 512 / 2K / 8K |
 |---|---:|---:|---:|---:|---:|
-| `default` (exacto, `g4-v1`) | **91.9** | 55.8 | 169.8 | 237.9 | 532 / 535 / 509 |
+| `default` (`g4-v1`) | **91.9** | 55.8 | 169.8 | 237.9 | 532 / 535 / 509 exacto¹ |
 | `fast` (`g4-a8-v1`, cualificado) | **99.5** | 54.0 | 206.5 | 340.6 | 551 / 538 / 509 exacto; prefill `a8`: ver abajo |
 | `quality` ([paquete EXL3 M4](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3), `g4-exl3-v3`) | **96.4** | 50.2 | 184.8 | 303.0 | 794 / 815 / 746 |
 | llama.cpp `74a4fb00`, mismo Q4_K_M | — | 55.5 | 193.3 | 279.9 | 2,077 / 2,062 / 1,881 |
@@ -95,7 +95,9 @@ compilación del motor, y cada valor de llama.cpp se midió en el mismo turno qu
 C1 publicado es la configuración que se obtiene por defecto: el drafter MTP encontrado en `MODEL_DIR/drafter-mtp/` más
 prompt lookup, medido en tres rondas intercaladas frente a la ejecución sin draft, con los ids de los tokens y el
 estado confirmado iguales en todas las rondas. C1 sin draft, C4 y C8 son decode simple (sin draft). Las celdas de prefill
-de estas tablas son prefill exacto en todos los perfiles; las rutas seleccionables `g4-wmma-pf-v1` / `g4-wmma-pf-v2` están abajo.
+son prefill exacto salvo donde se marca. ¹ Identidad de prefill de `default` `g4-wmma-pf-v2` en Q4_K_M (cualificación pendiente;
+hasta entonces se ejecuta el prefill exacto, el medido aquí; `STRIX_G4_PREFILL_IDENTITY=exact` lo mantiene). El
+prefill por identidad está en la tabla de prefill WMMA de abajo.
 
 Frente a la tabla publicada anteriormente (misma máquina): C1 publicado de `quality` 83.8 -> **96.4** tok/s,
 decode simple 44.4 / 153.1 / 258.3 -> **50.2 / 184.8 / 303.0** (C1 / C4 / C8); prefill exacto con 2K tokens
@@ -173,7 +175,8 @@ a 0.41-0.42 s y el percentil 99 de 0.44 / 1.08 s a 0.17 / 0.20 s (4 / 8 clientes
 cambian. `fast` (las filas del prompt `a8` son iguales a sus filas de decode) acorta los fragmentos igual; con
 `STRIX_G4_PREFILL_IDENTITY=exact` en `fast` (procesamiento exacto del prompt junto al decode con activaciones int8) los
 fragmentos mantienen su tamaño completo, porque dónde termina un fragmento decide qué filas del prompt escribe una
-pasada de decode.
+pasada de decode. Una ruta WMMA del prompt (`g4-wmma-pf-v2` en `default` una vez cualificada, o `=v1` / `=v2`) también
+mantiene los fragmentos completos; `default` con prefill exacto los acorta.
 
 El servidor también guarda el estado confirmado al final de cada prompt y de cada petición terminada, y lo reutiliza
 cuando un prompt posterior empieza exactamente con esos tokens, normalmente el siguiente turno de una conversación, que
@@ -181,8 +184,9 @@ vuelve a enviar la conversación hasta ese punto: solo se procesan las filas nue
 turno 2 (`default`, seis conversaciones en paralelo): documento de 4K tokens **0.20 s** frente a 12.59 s sin caché,
 documento de 1K tokens **0.19 s** frente a 3.48 s, chat 0.39-0.51 s frente a 1.31-1.66 s; los ids de tokens de ambos
 turnos son iguales a los obtenidos sin caché. Hasta 16 estados dentro de 4 GB (`STRIX_G4_SERVE_PREFIX_MB`);
-`STRIX_G4_SERVE_PREFIX=0` la desactiva. `fast` reutiliza cualquier estado, como `default` (sus filas de prompt `a8`
-son iguales a sus filas de decode); con `STRIX_G4_PREFILL_IDENTITY=exact` en `fast` solo se reutilizan estados en un
+`STRIX_G4_SERVE_PREFIX=0` la desactiva. `fast` reutiliza cualquier estado, como `default` con prefill exacto (sus filas
+de prompt `a8` son iguales a sus filas de decode); con `STRIX_G4_PREFILL_IDENTITY=exact` en `fast`, o con una ruta WMMA
+del prompt (`g4-wmma-pf-v2` en `default` una vez cualificada, o `=v1` / `=v2`), solo se reutilizan estados en un
 límite de 512 filas escritos por el procesamiento del prompt, nunca una respuesta. Dos conversaciones distintas que comparten un documento largo pero divergen
 después todavía no lo comparten.
 
@@ -267,6 +271,17 @@ El prefill exacto usa aritmética FP32 sin contracción, así que los ids de tok
 las longitudes; `quality` usa el prefill exacto de muchas filas de EXL3. `STRIX_G4_PREFILL_EXACT_MANYROW=0` restaura
 las pasadas de ocho filas con los mismos bytes.
 
+Prefill de prompts en `default`: la identidad declarada es `g4-wmma-pf-v2` en paquetes GGUF Q4_K_M (los demás tipos de
+paquete mantienen el prefill exacto). El contrato `default` (prefill de prompts `g4-wmma-pf-v2` + decode `g4-v1`) tiene
+pendiente la cualificación contra los umbrales de `default` sobre un conjunto held-out nuevo; hasta que se nombre su
+recibo, `default` usa el prefill exacto, el recibo lista `pending g4-wmma-pf-v2 (exact runs)` y una línea de stderr lo
+indica. `STRIX_G4_PREFILL_IDENTITY=exact` es el interruptor de desactivación: prefill exacto, idéntico bit a bit a la
+ruta serial, en cualquier momento. `=v1` selecciona `g4-wmma-pf-v1`, cuyo contrato con el decode `g4-v1` superó los
+mismos umbrales (fidelidad del prefill con teacher forcing hasta ~8.4K tokens en 8 idiomas dentro de sus bandas;
+Global-MMLU, 2,000 ítems pareados en cada uno de 8 idiomas: cota superior de la pérdida de acierto 0.15-0.32 puntos por
+idioma, umbral 0.5; recibo `0b98d054`). Prefill por identidad (Q4_K_M, tok/s con 2K / 4K / 8K, sesión intercalada de
+abajo): exacto 526 / 509 / 481, `g4-wmma-pf-v1` 2,359 / 2,249 / 1,957.
+
 Prefill de prompts de `fast`: `a8` (`STRIX_G4_PREFILL_IDENTITY=a8`, válido solo con el decode `g4-a8-v1`; con otra
 identidad de decode se ejecuta el prefill exacto y una línea en stderr lo indica). El prompt se procesa en bloques de
 512 filas con los mismos lineales `g4-a8-v1` que el decode (IU8 WMMA en bloques largos, los kernels del decode hasta 8
@@ -286,19 +301,19 @@ los dos órdenes de ejecución, decode `g4-a8-v1`:
 A través del motor (prompt de 8K tokens, un proceso nuevo cada uno, el mismo binario): exacto 16.19 s, **`a8` 5.13 s**,
 v1 + flash 2.97 s.
 
-Otras rutas de prefill de prompts seleccionables (paquetes no EXL3; `default` y `quality` mantienen el prefill exacto
-salvo que se elija una): `STRIX_G4_PREFILL_IDENTITY=v1` usa `g4-wmma-pf-v1`: los lineales usan los GEMM WMMA del prefill con
+Otras rutas de prefill de prompts seleccionables (paquetes no EXL3; `quality` mantiene el prefill exacto salvo que se
+elija una): `STRIX_G4_PREFILL_IDENTITY=v1` usa `g4-wmma-pf-v1`: los lineales usan los GEMM WMMA del prefill con
 operandos FP16 sobre paneles de pesos decodificados una vez al cargar; la atención sigue siendo canónica; el decode no
-cambia. `=v2` usa `g4-wmma-pf-v2` (activaciones divididas hi/lo). Ambas rutas procesan el grueso del prompt: los
+cambia. `=v2` usa `g4-wmma-pf-v2` (activaciones divididas hi/lo), el prefill de prompts declarado de `default`. Ambas rutas procesan el grueso del prompt: los
 últimos <= 8 tokens del prompt y el ancla (la posición final del prompt, cuyos logits eligen el primer token) usan la
 aritmética del decode (`g4-v1` en `default`), como las filas de decode. Ambas cambian los logits, así que no son exactas.
 Prefill de prompts v1 para `fast`: cualificación del par prefill v1 + decode a8 pendiente; `fast` usa el prefill `a8` hasta entonces. Q4_K_M, un nodo, tok/s de prefill, ejecuciones intercaladas en una sesión:
 
-| Prompt | exacto | `g4-wmma-pf-v1` (`=v1`) | `g4-wmma-pf-v2` (`=v2`) |
-|---|---:|---:|---:|
-| 2K | 526 | **2,359** | 1,537 |
-| 4K | 509 | **2,249** | 1,478 |
-| 8K | 481 | **1,957** | 1,349 |
+| Prompt | exacto (`=exact`) | `g4-wmma-pf-v1` (`=v1`) |
+|---|---:|---:|
+| 2K | 526 | 2,359 |
+| 4K | 509 | 2,249 |
+| 8K | 481 | 1,957 |
 
 Las rutas mantienen la atención canónica, idéntica en bytes a la atención de decodificación. Su rejilla de scores recorre primero las teselas de filas en grupos de 8 y sus valores D512 se calculan en bloques de 512 hilos que comparten una tesela de probabilidades en LDS: atención 8K 1,333 → 1,265 ms (−5.3 %), 32K 16.83 → 15.91 s (−5.5 %), mismos bytes; se apaga con `STRIX_G4_PREFILL_CANON_WIDE=0 STRIX_G4_PREFILL_CANON_GROUP=0` (`STRIX_G4_PREFILL_CANON_ROWS_MAJOR=0` vuelve a recorrer primero las teselas de claves).
 

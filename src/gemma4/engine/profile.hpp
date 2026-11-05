@@ -11,7 +11,7 @@
 #include <vector>
 
 // Product profiles: one name selects every lever's switch.
-//   default  exact g4-v1 decode, MTP drafter (auto), exact prefill
+//   default  exact g4-v1 decode, MTP drafter (auto), Q4_K_M-gated v2 prefill once qualified
 //   fast     named bit-changing identities (int8 activations, WMMA prefill) + drafter, once qualified
 //   quality  EXL3 pack route + drafter
 // Each lever is one table row (profile.cpp). A profile column that is not qualified yet
@@ -43,6 +43,7 @@ struct Lever {
     bool asset = false;                    // the value is a path the app supplies (option or discovery)
     bool builtin_unqualified = false;      // the build's fallback is itself unqualified: a pending column refuses
     std::string_view target{};             // declared target of a pending column (receipt, stderr); empty: the value
+    std::array<std::string_view, 3> column_target{}; // per-column target; empty: `target`
     std::string_view off{};                // value of `env` (or the option) that switches the lever off;
                                            // such an env is only read, never exported
     std::string_view source{};             // owner commit/branch and, when pending, what it waits for
@@ -95,16 +96,19 @@ struct Inputs {
 // (never asset or off-switch levers). Call before anything reads (and caches) those switches.
 void apply(const Resolution& resolution);
 
-// Prompt prefill route for STRIX_G4_PREFILL_IDENTITY (exact|v1|v2|a8|fast) and the pack: "fast" (the fast
-// profile's value) runs g4-wmma-pf-v1 only on a GGUF pack whose general.file_type is 15 (MOSTLY_Q4_K_M), the
-// pack type its held-out qualification covers, and prefill-exact on any other pack (Q4_K_S, BF16, ...); EXL3
-// packs keep their own route. Returns "exact", "v1", "v2" or "a8"; throws on an unknown value.
+// Prompt prefill route for STRIX_G4_PREFILL_IDENTITY (exact|v1|v2|a8|default|fast) and the pack: "default" (the
+// default profile's value) runs g4-wmma-pf-v2 only on a GGUF pack whose general.file_type is 15 (MOSTLY_Q4_K_M),
+// the pack type its held-out qualification covers, and prefill-exact on any other pack (Q4_K_S, BF16, ...);
+// "fast" runs g4-wmma-pf-v1 under the same pack gate (the fast profile itself runs "a8"); EXL3 packs keep their
+// own route. Returns "exact", "v1", "v2" or "a8"; throws on an unknown value.
 inline constexpr std::int32_t gguf_file_type_q4_k_m = 15;
 [[nodiscard]] std::string_view prefill_route(std::string_view requested, std::int32_t gguf_file_type, bool exl3_pack);
 struct PrefillRouteChoice { std::string_view route; std::string notice; };
 // A8 prefill requires g4-a8-v1 decode; empty decode identity means g4-v1. (Under a FAST decode attention such as
 // g4-dattn-f2 the route still runs, but its prompt rows no longer equal the decode rows: prefill_matches_decode is false.)
 [[nodiscard]] PrefillRouteChoice prefill_route_for_decode(std::string_view route, std::string_view decode_identity);
+// Served prefill identity from backend route metadata; absent or unknown routes retain the exact fallback.
+[[nodiscard]] std::string_view prefill_identity_for_route(std::string_view route);
 
 // Argument helper for apps whose legacy bare `--profile` means kernel profiling:
 // `--profile default|fast|quality` consumes the value and returns true; a bare

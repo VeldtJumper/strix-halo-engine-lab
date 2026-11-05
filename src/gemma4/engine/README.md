@@ -1,6 +1,13 @@
 # Gemma 4 generation coordinator
 
-This host/device product path executes `g4-v1` with `prefill-exact`.
+This host/device product path executes decode `g4-v1`. Prompt prefill identity
+is reported from the backend prefill route as `prefill_identity` in effective
+config and `/v1/capabilities`: `g4-wmma-pf-v2` under `default` on Q4_K_M GGUF
+packs once its `default` receipt is named (until then `default` runs exact prefill
+and the receipt lists `pending g4-wmma-pf-v2 (exact runs)`), `g4-wmma-pf-v1` with
+`STRIX_G4_PREFILL_IDENTITY=v1`, `prefill-exact` for the exact many-row or eight-row
+routes (other packs, `quality`, or `STRIX_G4_PREFILL_IDENTITY=exact`), and
+`prefill-a8` for `a8-many-row`.
 Broader complete-workload qualification remains separate. Model, table, tokenizer and
 drafter hashes appear in runtime receipts; private prompts and receipts do not
 belong in the repository.
@@ -15,12 +22,12 @@ streams allocate only that global KV capacity. Existing backends may use the
 default overload, which delegates to their fresh-state factory.
 
 A backend may also offer exact many-row prefill (`prefill_chunk_rows`,
-`prefill_rows`). The device backend does so for non-EXL3 routes with
-`prefill::DevicePrefill(..., AttentionMode::canonical, Linears::exact)`: a stream
-with more than eight prompt rows left prefills one chunk (ending on a multiple of
-512 positions) on its own, and the drafter receives the same rows in groups of
-at most eight. Committed KV, taps and hidden rows equal the eight-row
-`forward_rows` passes, so the identity stays `prefill-exact`.
+`prefill_rows`). The device backend's exact route uses canonical attention and
+exact linears: a stream with more than eight prompt rows left prefills one chunk
+(ending on a multiple of 512 positions) on its own, and the drafter receives the
+same rows in groups of at most eight. Committed KV, taps and hidden rows equal
+the eight-row
+`forward_rows` passes, so this exact route reports `prefill-exact`.
 `STRIX_G4_PREFILL_EXACT_MANYROW=0` (recorded in `off_switches`, with
 `prefill_route` in the backend identity) restores the eight-row passes.
 
