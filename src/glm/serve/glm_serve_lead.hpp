@@ -81,6 +81,7 @@ private:
 struct LeadConfig {
     std::uint32_t slots = 8;
     std::uint64_t capacity = 8192;
+    std::uint64_t prefix_cache_bytes = 0, prefix_identity = 0;
     bool batch = true;               // false: serial admission (one request at a time)
     double heartbeat_seconds = 1.0;  // idle: one heartbeat round per interval keeps rank 1 and the link alive
     std::vector<std::uint32_t> stops = default_stop_ids();
@@ -138,6 +139,7 @@ struct TraceEvent {
 
 struct LeadStats {
     std::uint64_t steps = 0, rows = 0, prefills = 0, prefill_tokens = 0, prefill_chunks = 0, gap_steps = 0, rounds = 0, heartbeats = 0;
+    std::uint64_t prefix_hits = 0, prefix_misses = 0, prefix_stores = 0, prefix_evictions = 0, prefix_bytes = 0;
     std::uint64_t finished = 0, active = 0;
     std::uint64_t rows_hist[kMaxRows + 1]{};  // steps by row count
     double step_seconds = 0, prefill_seconds = 0;
@@ -155,6 +157,8 @@ struct LeadStats {
 template<class Eng>
 void follow(Eng& eng, Channel& ch, const Hello& hello, std::uint32_t slots, std::uint64_t capacity) {
     ch.hello(hello);
+    std::optional<PrefixCache> cache;
+    if (hello.prefix_cache_bytes) cache.emplace(hello.prefix_cache_bytes);
     for (;;) {
         Control reply;
         reply.cmd = static_cast<std::uint32_t>(Cmd::reply);
@@ -167,7 +171,7 @@ void follow(Eng& eng, Channel& ch, const Hello& hello, std::uint32_t slots, std:
         const Control c = ch.exchange(reply);
         if (static_cast<Cmd>(c.cmd) == Cmd::shutdown) return;
         std::vector<std::uint32_t> prompt;
-        (void)replay(eng, ch, c, prompt, false, slots, capacity);
+        (void)replay(eng, ch, c, prompt, false, slots, capacity, cache ? &*cache : nullptr);
     }
 }
 
@@ -178,6 +182,7 @@ public:
     Lead(Eng& eng, Channel& ch, strix::serve::GenerationQueue& queue, LeadConfig cfg, std::atomic<bool>& stop)
         : eng_(eng), ch_(ch), queue_(queue), cfg_(std::move(cfg)), stop_(stop), table_(cfg_.slots), active_(cfg_.slots),
           mtp_on_(cfg_.mtp), chunk_(cfg_.prefill_chunk), g2_on_(cfg_.g2 && cfg_.mtp), calib_(cfg_.slots) {
+        if (cfg_.prefix_cache_bytes) prefix_cache_.emplace(cfg_.prefix_cache_bytes);
         for (unsigned n = 0; n <= kMaxRows; ++n)
             for (unsigned r = 0; r <= kMaxRows; ++r) cost_[n][r] = 30.0 + 11.0 * r + 2.5 * n;  // ms, measured EMA from here
     }
@@ -215,6 +220,11 @@ public:
     void set_mtp(bool on) { mtp_on_.store(on && cfg_.mtp); }
     // Batched self-speculation on/off (LeadConfig::g2; any thread; takes effect at the next cycle).
     void set_g2(bool on) { g2_on_.store(on && cfg_.g2 && cfg_.mtp); }
+    // Selftest driver: clear on the engine thread before admitting its next request.
+    void clear_prefix_cache() {
+        prefix_clear_.store(true);
+        while (prefix_clear_.load() && !stop_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     // RTX route for prompts admitted from now on (any thread; the gate's own-prefill arm turns it off).
     void set_route(bool on) { route_on_.store(on); }
     // Import gate digests (LeadConfig::state_digest): per request (key = its ticket), rank 0's then rank 1's words.
@@ -247,7 +257,8 @@ private:
         std::uint64_t pos = 0;
         std::vector<std::uint32_t> stops;
         Clock::time_point t_admit, t_first;
-        double prefill_ms = 0;
+        double prefill_ms = 0, restore_ms = 0;
+        std::uint64_t hit_tokens = 0;
         std::optional<double> first_token_ms;
         bool mtp_ok = false;  // prefilled with the MTP bootstrap
         std::uint64_t imported = 0;  // prompt tokens restored from the RTX state (GenerationStats::imported_tokens)
@@ -269,6 +280,13 @@ private:
         auto last_round = Clock::now();
         for (;;) {
             if (stop_.load()) return;
+            if (prefix_clear_.exchange(false) && cfg_.prefix_cache_bytes) {
+                Control c;
+                c.cmd = static_cast<std::uint32_t>(Cmd::prefix_clear);
+                (void)control_round(c);
+                std::lock_guard<std::mutex> l(m_);
+                stats_.prefix_bytes = 0;
+            }
             // cancellations between steps
             for (std::uint32_t s = 0; s < cfg_.slots; ++s)
                 if (active_[s] && active_[s]->job.ticket->cancelled()) finish(s, "cancelled");
@@ -365,7 +383,32 @@ private:
         p.a.mtp_ok = mtp_on_.load();
         p.chunk = p.a.mtp_ok && !cfg_.prefill_chunk_mtp ? 0U : chunk_.load();
         p.a.job.ticket->report_progress({strix::serve::GenerationPhase::prefill, 0, 0, n});
-        if (cfg_.rtx_prefill && route_on_.load() && !imp_ && n >= 2 && n >= cfg_.import_min_tokens) {
+        // Preserve the optional FAST import route's identity selection; native snapshots never replace an eligible import.
+        const bool import_route = cfg_.rtx_prefill && route_on_.load() && !imp_ && n >= 2 && n >= cfg_.import_min_tokens;
+        if (cfg_.prefix_cache_bytes) {
+            if (const auto* e = import_route ? nullptr : prefix_cache_->find(p.a.job.job.prompt, p.a.mtp_ok, cfg_.prefix_identity)) {
+                // Close C1 before restoring any device state; restored requests bootstrap fresh host control.
+                Control c;
+                c.cmd = static_cast<std::uint32_t>(Cmd::prefix_restore);
+                c.pslot = p.slot;
+                c.ppos = e->frontier;
+                c.prefix_id = e->id;
+                c.prefix_identity = cfg_.prefix_identity;
+                c.pflags = p.a.mtp_ok ? kPrefillMtp : 0U;
+                pf_ = std::move(p);  // a failed paired restore must finish this ticket through fail_all too
+                if (mtp_slot_ >= 0) leave();
+                const auto t0 = Clock::now();
+                (void)engine_round(c);
+                pf_->done = c.ppos;
+                pf_->a.hit_tokens = c.ppos;
+                pf_->a.restore_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                { std::lock_guard<std::mutex> l(m_); ++stats_.prefix_hits; }
+                return;
+            }
+            std::lock_guard<std::mutex> l(m_);
+            ++stats_.prefix_misses;
+        }
+        if (import_route) {
             // RTX route: both ranks start receiving (off their decode path); poll_import() asks the RTX once both
             // listen, then commits or falls back to the chunked prefill. Not an engine command: seeds stay valid.
             p.import_id = next_import_id_++;
@@ -447,11 +490,13 @@ private:
             p.a.job.ticket->report_progress({strix::serve::GenerationPhase::prefill, p.done, 0, n});
             return;
         }
+        if (cfg_.prefix_cache_bytes) store_prefix(p, out.at(0));
+        const auto ready = cfg_.prefix_cache_bytes ? Clock::now() : t1;
         const std::uint32_t slot = p.slot;
         Active a = std::move(p.a);
         pf_.reset();
-        a.prefill_ms = std::chrono::duration<double, std::milli>(t1 - a.t_admit).count();
-        a.t_first = t1;
+        a.prefill_ms = std::chrono::duration<double, std::milli>(ready - a.t_admit).count();
+        a.t_first = ready;
         a.pos = n;
         calib_[slot] = spec::Calibration{};  // a new request: fresh acceptance statistics
         const void* key = a.job.ticket.get();
@@ -462,6 +507,41 @@ private:
         emit(slot, out.at(0));
         trace(key, TraceEvent::first);  // after its first token: the steady window counts decode tokens only
         if (mtp_ok) seed_slot_ = static_cast<int>(slot);
+    }
+
+    void store_prefix(Prefilling& p, std::uint32_t y0) {
+        Control c;
+        c.cmd = static_cast<std::uint32_t>(Cmd::prefix_prepare);
+        c.pslot = p.slot;
+        c.ppos = p.a.job.job.prompt.size();
+        c.prefix_id = next_prefix_id_++;
+        c.prefix_identity = cfg_.prefix_identity;
+        c.pflags = p.a.mtp_ok ? kPrefillMtp : 0U;
+        auto key = p.a.job.job.prompt;
+        if (p.a.mtp_ok) key.push_back(y0);  // key length differs from the restore frontier
+        c.plen = static_cast<std::uint32_t>(key.size());
+        const auto vote = control_round(c, &key);
+        if (vote.at(0)) {
+            while (const auto id = prefix_cache_->replacement_id()) {
+                Control ev;
+                ev.cmd = static_cast<std::uint32_t>(Cmd::prefix_evict);
+                ev.prefix_id = id;
+                (void)control_round(ev);  // replace an equal key only after both new snapshots succeeded
+            }
+            while (prefix_cache_->bytes() > prefix_cache_->budget() - prefix_cache_->pending_bytes()) {
+                Control ev;
+                ev.cmd = static_cast<std::uint32_t>(Cmd::prefix_evict);
+                ev.prefix_id = prefix_cache_->oldest();
+                (void)control_round(ev);  // rank 0 chooses each victim; rank 1 only replays it
+            }
+        }
+        c.cmd = static_cast<std::uint32_t>(Cmd::prefix_commit);
+        c.prefix_ok = vote.at(0);
+        (void)control_round(c);  // both prepared, or both discard; never invalidate the final prefill seed
+        std::lock_guard<std::mutex> l(m_);
+        stats_.prefix_stores = prefix_cache_->stores;
+        stats_.prefix_evictions = prefix_cache_->evictions;
+        stats_.prefix_bytes = prefix_cache_->bytes();
     }
 
     // Import gate: both ranks digest the slot's state at frontier n (no engine change: seeds stay valid); the decode
@@ -544,6 +624,11 @@ private:
         st.decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - a.t_first).count();
         st.first_token_ms = a.first_token_ms;
         st.imported_tokens = a.imported;
+        if (cfg_.prefix_cache_bytes) {
+            st.engine_extra.emplace_back("prefix_cache", "{\"hit_tokens\":" + std::to_string(a.hit_tokens) +
+                ",\"prefill_tokens\":" + std::to_string(st.prompt_tokens - a.imported - a.hit_tokens) +
+                ",\"restore_ms\":" + std::to_string(a.restore_ms) + "}");
+        }
         if (!a.route.empty()) st.engine_extra.emplace_back("prefill_route", a.route);
         queue_.finish(a.job, std::move(st), error);
         active_[s].reset();
@@ -562,10 +647,12 @@ private:
     }
     // A control round without an engine command (import_expect, heartbeat): seeds and last rows stay valid.
     std::vector<std::uint32_t> control_round(Control& c, std::vector<std::uint32_t>* prompt = nullptr) {
+        const auto before = ch_.round();
         note_peer(ch_.exchange(c));
-        count_round();
         std::vector<std::uint32_t> none;
-        return replay(eng_, ch_, c, prompt ? *prompt : none, true, cfg_.slots, cfg_.capacity);
+        auto out = replay(eng_, ch_, c, prompt ? *prompt : none, true, cfg_.slots, cfg_.capacity, prefix_cache_ ? &*prefix_cache_ : nullptr);
+        { std::lock_guard<std::mutex> l(m_); stats_.rounds += ch_.round() - before; }
+        return out;
     }
     // The follower's import status from its last reply block (one round behind; every round updates it).
     void note_peer(const Control& r) {
@@ -990,6 +1077,9 @@ private:
     std::vector<WireRow> last_rows_;  // rows of the last engine command when it was a step
     mutable std::mutex m_;
     LeadStats stats_;
+    std::optional<PrefixCache> prefix_cache_;
+    std::uint64_t next_prefix_id_ = 1;
+    std::atomic<bool> prefix_clear_{false};
 };
 
 }  // namespace strix::glm::serve

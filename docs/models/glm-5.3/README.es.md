@@ -48,6 +48,20 @@ otras peticiones decodifican (`--prefill-chunk 0` = prompts enteros). `--serial`
 `--api-key-file F` exige una clave bearer. `--selftest N` en el rank 0 (sin HTTP) ejecuta N prompts integrados juntos
 y cada uno por separado e informa EXACT/FAIL con tok/s por nivel de concurrencia.
 
+`--prefix-cache-gib G` fija la LRU de snapshots de prompts en RAM en G GiB por rango
+(4 por defecto; `--prefix-cache-gib 0` la desactiva; ambos rangos deben usar el mismo presupuesto). Solo se guarda si ambos rangos
+confirman su snapshot y cada uno tiene al menos 16 GiB de MemAvailable; sin lectura de memoria o si
+el snapshot supera el presupuesto, se rechaza el guardado. Un acierto restaura la clave de prefijo
+estricto más larga y procesa el sufijo con el planificador de chunks habitual. Con MTP, la clave
+incluye el primer token greedy de salida y se restaura en la frontera del prompt original.
+El contrato exige restauración exacta del tronco y tokens emitidos iguales; las filas MTP conservan
+la regla existente de chunks. Con la caché activa, `strix.prefix_cache` informa de `hit_tokens`,
+`prefill_tokens` y `restore_ms`. `--selftest N --selftest-prefix` compara
+conversaciones de dos turnos con repeticiones tras vaciar la caché y exige aciertos;
+`--selftest-prefix-long L` usa primeros turnos de unos L tokens e imprime el tiempo de admisión a listo
+del turno 2 desde la caché y en frío. Los demás selftests también restauran prompts repetidos desde la
+caché; use `--prefix-cache-gib 0` para cifras sin caché.
+
 ## Ejecución: una RTX PRO 6000
 
 Solo Windows, opcional (opt-in): compile con `pwsh src/glm/rtxpf/producer/build.ps1` contra una exportación del código
@@ -111,8 +125,9 @@ del margen de admisión y del valor final con su origen. Véase el [catálogo](.
 | Indicador del paso comprobado con la cabeza (predeterminado) | decode C1 `--mtp 0` y lote R8, ABBA con proceso nuevo | **−0.2 %** C1, R8 dentro del ruido | tokens y R8 iguales a la referencia en ambos rangos; `STRIX_GLM_STEP_FLAG=0` restaura la sincronización de host a mitad de paso |
 | Último decode, todo predeterminado (#332 `ec76191f2`) | decode C1 `--mtp 0` y lote R8, dos ejecuciones | **39.00–39.03 ms/token** (25.6 tok/s, 57 % del techo de 44.7 tok/s); R8 **112.14–112.31 ms/paso** (71.3 tok/s agregados, calculado) | 24/24 exacto en ambos rangos |
 | Último prefill exacto por chunks, todo predeterminado (#300 `32ec66bd3`) | prompts de benchmark de 1K / 8K / 32K, chunks de 8192 filas | TTFT **2.83 / 15.15 / 61.96 s** (541 / 529 tok/s con 8K / 32K); tiles del resto MoE 8K 15.35 → 15.15 s (−1.3 %, pares alternos), 32K −1.2 % en ambos órdenes de ejecución (62.58 → 61.96 s, −1.0 %, en uno; −1.4 % en el otro) | logits bit a bit en ambos rangos |
-| Servido, `strix-glm5-serve --selftest 8` (predeterminados) | Flujos concurrentes C1 / C2 / C4 / C6 / C8, régimen estable (todos los flujos en decode); 8 prompts de chat cortos integrados con la plantilla de chat de GLM, 22–59 tokens de prompt (media ~33), hasta 128 tokens greedy cada uno, arranque con barrera, caché desactivada, el servidor no tiene caché de prompts | **C1 40.0 / C2 53.0 (G2 desactivado 37.8) / C4 59.9 (53.6) / C6 62.5 (62.4) / C8 69.5 (69.4) tok/s agregados**; por flujo 40.1 / 26.5 / 15.0 / 10.4 / 8.7; C1 sin MTP 25.30; CLI del motor `--batch` R8 69–71 | RESULT EXACT: los tokens de cada flujo son iguales a los del mismo prompt ejecutado solo (referencia C=1 simple) en todos los niveles, con G2 activado y desactivado |
+| Servido, `strix-glm5-serve --selftest 8` (predeterminados) | Flujos concurrentes C1 / C2 / C4 / C6 / C8, régimen estable (todos los flujos en decode); 8 prompts de chat cortos integrados con la plantilla de chat de GLM, 22–59 tokens de prompt (media ~33), hasta 128 tokens greedy cada uno, arranque con barrera, caché de prefijos desactivada | **C1 40.0 / C2 53.0 (G2 desactivado 37.8) / C4 59.9 (53.6) / C6 62.5 (62.4) / C8 69.5 (69.4) tok/s agregados**; por flujo 40.1 / 26.5 / 15.0 / 10.4 / 8.7; C1 sin MTP 25.30; CLI del motor `--batch` R8 69–71 | RESULT EXACT: los tokens de cada flujo son iguales a los del mismo prompt ejecutado solo (referencia C=1 simple) en todos los niveles, con G2 activado y desactivado |
 | Servido, prefill por chunks con prioridad al decode (`--prefill-chunk 512`, predeterminado) | 4 prompts de ~1,830 tokens que llegan cada 16 rondas de decode a 4 flujos en curso, 128 tokens generados cada uno, caché desactivada | Mayor parada del decode **6.65 → 2.67 s (−60 %)** frente a `--prefill-chunk 0`; una petición sola se procesa entera | exacto |
+| Caché de prefijos de prompt en el servidor (predeterminada, 4 GiB por rango) | Conversaciones de dos turnos, primer turno de ~4,100 tokens, el turno 2 añade 53 tokens; solo y en lote, frente a la misma petición tras vaciar la caché | Admisión a listo del turno 2 **8.57–8.98 s → 0.82–0.89 s (~10x)** para el prompt de 4,120 tokens (459–481 → 4,629–5,024 tok/s); restauración 9–11 ms; 4,067 de 4,120 tokens del prompt restaurados | tokens iguales a la repetición con la caché vacía (8/8; 16/16 con prompts cortos) en ambos rangos |
 | Prefill por fragmentos exacto, MLA scores v7 (sobre los predeterminados de PR #279) | prompts de benchmark de 8K / 32K, fragmentos de 8192 filas | kernel de scores del rango 0 **2.60 → 2.27 s** a 32K (−12 %) y **0.533 → 0.485 s** a 8K (−9 %); TTFT no más lento: 32K 65.68 → 65.54 s (−0.2 %, media de ambos órdenes: 65.574 → 65.524 con el nuevo primero, 65.778 → 65.549 con el anterior primero), 8K 16.23 → 16.12 s (−0.6 %, 4 brazos) | logits bit a bit iguales a v6 en ambos rangos; mismo binario, v6 con `STRIX_GLM_PF_SCORES=6`; el rango 0 corrió bajo el trazador de kernels; el cambio de TTFT está dentro de la dispersión de ~1 s entre ejecuciones a 32K |
 | Concordancia R1b con teacher forcing | 32 prompts, 256 posiciones cada uno; chat, código, JSON, matemáticas, razonamiento, traducción | **8,126/8,192 = 99.19 %** top-1; KL media **~1.8e-3 nats** | `4dad4c19`; las ejecuciones libres divergen en **28/32** prompts entre 19 y 227 tokens |
 

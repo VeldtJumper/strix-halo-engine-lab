@@ -20,6 +20,11 @@
 //   rank 0: --selftest N [--selftest-tokens M] [--selftest-long L (multi-chunk prompt tokens, default 2048; 0 = skip the
 //           interleave levels)] [--selftest-skip-basic (only the long-prompt reference and the staggered arms)]: no HTTP; N built-in prompts at once, then each alone (C=1), then the
 //           first C together (C = 2, 4, 8): EXACT/FAIL per level with aggregate and per-stream tok/s; exit 0 EXACT, 3 FAIL
+//   --prefix-cache-gib G: per-rank host LRU GiB (default 4, 0 = off); both ranks must agree.
+//     Exact trunk restore and emitted tokens; MTP rows retain the existing chunk scheduling rule.
+//     MTP snapshots use prompt + first greedy token as key, restoring at the prompt frontier.
+//   --selftest-prefix: with --selftest N and cache ON, compare two-turn streams against cleared-cache replays
+//           (--selftest-prefix-long L: first turns of ~L tokens, with warm vs cold timing lines).
 //   --mtp-cycles N (verify cycles per control round on the C1 MTP path, default 1), --mtp-k K / --mtp-adaptive 0|1 /
 //   --mtp-spec 0|1 as strix-glm5-rank; STRIX_GLM_SERVE_MTP=0 disables the C1 MTP path (plain decode at every C).
 //   Batched self-speculation (G2, with MTP on): every decoding slot's window (anchor + adaptive drafts) in ONE multi-slot
@@ -206,6 +211,7 @@ struct EngineOps {
     // batched self-speculation: per slot drafter state; its drafter rows live in Engine::mtp_hidden(slot) row hp_row
     std::vector<gs::SlotSpec> spec;
     std::vector<unsigned> hp_row;
+    std::uint32_t prefix_restored = 0, prefix_bootstrap_pending = 0;
 
     void plain_call() {
         if (dec) throw std::logic_error("engine call while an MTP decoder is open");
@@ -213,8 +219,22 @@ struct EngineOps {
     }
     void reset(std::uint32_t slot) {
         plain_call();
+        prefix_restored &= ~(1U << slot);
+        prefix_bootstrap_pending &= ~(1U << slot);
         eng.reset(slot);
         spec.at(slot) = {};
+    }
+    std::vector<std::uint8_t> state_bytes_upto(std::uint32_t slot, std::uint64_t p) {
+        return eng.state_bytes_upto(slot, p);
+    }
+    void restore_state(std::uint32_t slot, const std::vector<std::uint8_t>& bytes, std::uint64_t p) {
+        // reset() above has cleared SlotSpec and the old seed. pos0 > 0 does not reset bootstrap control.
+        control.calibration = sp::Calibration{};
+        control.cycle = control.step = 0;
+        hp_row.at(slot) = 0;
+        prefix_restored |= 1U << slot;
+        prefix_bootstrap_pending |= 1U << slot;
+        eng.restore_state(slot, bytes, p);
     }
     std::uint32_t prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         plain_call();
@@ -316,13 +336,33 @@ struct EngineOps {
     // greedy token instead of the next prompt token (drafts only; output exactness never depends on the drafter).
     std::uint32_t prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0, bool last) {
         plain_call();
+        if ((prefix_bootstrap_pending >> slot) & 1U) {
+            // Admission may have decoded other slots since restore: reset at this request's first suffix call too.
+            control.calibration = sp::Calibration{};
+            control.cycle = control.step = 0;
+            spec.at(slot) = {};
+            hp_row.at(slot) = 0;
+            prefix_bootstrap_pending &= ~(1U << slot);
+        }
         if (pos0 == 0 && last) {
             seed = sp::bootstrap(eng, slot, tokens, bootstrap, control);
             seed_slot = slot;
             seed_slot_spec(slot, *seed);
             return seed->y0;
         }
-        if (bootstrap != sp::BootstrapPolicy::Chunked) throw std::logic_error("chunked MTP prefill needs the exact chunked prefill path");
+        if (bootstrap != sp::BootstrapPolicy::Chunked) {
+            if (((prefix_restored >> slot) & 1U) == 0) throw std::logic_error("chunked MTP prefill needs the exact chunked prefill path");
+            // Reference bootstrap indexes the complete prompt at pos0; only its suffix is read.
+            std::vector<std::uint32_t> prompt(static_cast<std::size_t>(pos0), 0);
+            prompt.insert(prompt.end(), tokens.begin(), tokens.end());
+            const auto sd = sp::bootstrap(eng, slot, prompt, bootstrap, control, pos0);
+            if (last) {
+                seed = sd;
+                seed_slot = slot;
+                seed_slot_spec(slot, sd);
+            }
+            return sd.y0;
+        }
         if (pos0 == 0) {  // a new prompt: as sp::bootstrap
             control.calibration = sp::Calibration{};
             control.cycle = control.step = 0;
@@ -681,7 +721,7 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
-                                 "[--host H] [--port P] [--selftest N [--selftest-tokens M]] "
+                                 "[--host H] [--port P] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
                                  "[--import-listen IP:PORT --import-key FILE --import-model-sha HEX (operator attestation of the producer's "
                                  "model, compared with its hand-off header, not computed from the loaded tensors)]\n", argv[0]);
             return 2;
@@ -692,7 +732,9 @@ int main(int argc, char** argv) {
         opt.slots = 8;
         std::string transport_spec, host = "127.0.0.1", model_id = "glm-5.3-flash", api_key_file;
         unsigned port = 8080, selftest = 0, selftest_tokens = 128, heartbeat_ms = 1000, mtp_cycles = 1, prefill_chunk = 512;
-        unsigned selftest_long = 2048;
+        std::uint64_t prefix_cache_bytes = 4ULL << 30;  // default 4 GiB per rank; --prefix-cache-gib 0 = off
+        bool selftest_prefix = false;
+        unsigned selftest_long = 2048, selftest_prefix_long = 0;
         bool prefill_chunk_mtp = true, selftest_skip_basic = false;
         bool serve_mtp = true;
         std::uint32_t max_tokens = 4096;
@@ -729,6 +771,11 @@ int main(int argc, char** argv) {
             else if (a == "--mtp-cycles") mtp_cycles = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--prefill-chunk") prefill_chunk = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--prefill-chunk-mtp") prefill_chunk_mtp = std::stoul(next()) != 0;
+            else if (a == "--prefix-cache-gib") {
+                prefix_cache_bytes = gs::prefix_budget_bytes(next());
+            }
+            else if (a == "--selftest-prefix") selftest_prefix = true;
+            else if (a == "--selftest-prefix-long") selftest_prefix_long = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--selftest-long") selftest_long = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--selftest-skip-basic") selftest_skip_basic = true;
             else if (a == "--heartbeat-ms") heartbeat_ms = static_cast<unsigned>(std::stoul(next()));
@@ -768,6 +815,9 @@ int main(int argc, char** argv) {
             return import_gate_empty(import_gate);  // --import-gate "" or ",": an explicit empty suite FAILs before loading
         if (import_gate_on && (opt.rank != 0 || rtx_prefill.empty()))  // before the follower dispatch: rank 1 must not exit 0
             throw std::invalid_argument("--import-gate: rank 0 with --rtx-prefill (arm A imports, arm B prefills itself)");
+        if (selftest_prefix && (!selftest || !prefix_cache_bytes || selftest_tokens == 0))
+            throw std::invalid_argument("--selftest-prefix needs --selftest N, --selftest-tokens > 0 and --prefix-cache-gib > 0");
+        if (selftest_prefix_long > 0 && !selftest_prefix) throw std::invalid_argument("--selftest-prefix-long L needs --selftest-prefix");
         if (selftest > 32) throw std::invalid_argument("--selftest N: 1..32");
 
         // Engine configuration: the rank app's resolution of a normal decode (MTP self-speculation and its exact chunked
@@ -856,6 +906,7 @@ int main(int argc, char** argv) {
         }
         gs::Channel ch(std::move(wire), opt.rank);
         gs::Hello hello;
+        hello.prefix_cache_bytes = prefix_cache_bytes;
         hello.model_hash = model_hash(opt.model_dir);
         {
             std::string ident = rd::print(eff);
@@ -995,6 +1046,8 @@ int main(int argc, char** argv) {
         lc.slots = opt.slots;
         lc.capacity = opt.capacity;
         lc.batch = !serial;
+        lc.prefix_cache_bytes = prefix_cache_bytes;
+        lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
         lc.mtp = mtp_on;
@@ -1257,7 +1310,14 @@ int main(int argc, char** argv) {
                     if (!hooks.long_prompts.empty())
                         std::printf("selftest long prompts: %zu x ~%zu tokens (chunk %u)\n", hooks.long_prompts.size(),
                                     hooks.long_prompts[0].size(), prefill_chunk);
-                    result = gs::run_selftest(queue, prompts, selftest_tokens, gs::default_stop_ids(), serial ? 1U : opt.slots,
+                    if (selftest_prefix) {
+                        // --selftest-prefix-long L: multi-chunk first turns (L tokens each) so the timing lines measure a real restore.
+                        const auto prefix_prompts =
+                            selftest_prefix_long > 0 ? selftest_long_prompts(*tokenizer, std::min(selftest, opt.slots), selftest_prefix_long) : prompts;
+                        result.exact = gs::run_prefix_selftest(queue, prefix_prompts, selftest_tokens, gs::default_stop_ids(), tokenizer->encode("\nPlease continue briefly.", false),
+                            [&lead] { lead.clear_prefix_cache(); }, [&lead] { return lead.stats().prefix_hits; },
+                            [](const std::string& line) { std::printf("%s\n", line.c_str()); });
+                    } else result = gs::run_selftest(queue, prompts, selftest_tokens, gs::default_stop_ids(), serial ? 1U : opt.slots,
                                               [](const std::string& line) { std::printf("%s\n", line.c_str()); }, hooks);
                 } catch (const std::exception& e) {
                     driver_error = e.what();
@@ -1342,7 +1402,7 @@ int main(int argc, char** argv) {
             g.set("gap_steps", sv::Json(st.gap_steps));
             status.set("glm_serve", std::move(g));
         };
-        config.metrics_extra = [&lead]() {
+        config.metrics_extra = [&lead, prefix_cache_bytes]() {
             const auto st = lead.stats();
             std::ostringstream m;
             auto counter = [&](const char* name, const char* help, auto v) {
@@ -1365,6 +1425,13 @@ int main(int argc, char** argv) {
             counter("strix_glm_serve_g2_rows_total", "Rows of the batched self-speculation verifies.", st.g2_rows);
             counter("strix_glm_serve_g2_drafts_total", "Drafts verified in batched self-speculation.", st.g2_drafts);
             counter("strix_glm_serve_g2_accepted_total", "Drafts accepted in batched self-speculation.", st.g2_accepted);
+            if (prefix_cache_bytes) {
+                counter("strix_glm_serve_prefix_hits_total", "Prefix cache hits.", st.prefix_hits);
+                counter("strix_glm_serve_prefix_misses_total", "Prefix cache misses.", st.prefix_misses);
+                counter("strix_glm_serve_prefix_stores_total", "Paired prefix stores.", st.prefix_stores);
+                counter("strix_glm_serve_prefix_evictions_total", "Prefix LRU evictions.", st.prefix_evictions);
+                m << "# TYPE strix_glm_serve_prefix_bytes gauge\nstrix_glm_serve_prefix_bytes " << st.prefix_bytes << '\n';
+            }
             counter("strix_glm_serve_imports_total", "Prompts restored from the RTX prefill state (per request: strix.prefill_route).", st.imports);
             counter("strix_glm_serve_import_fallbacks_total", "RTX imports abandoned for the pair's own prefill.", st.import_fallbacks);
             counter("strix_glm_serve_imported_tokens_total", "Prompt tokens restored from the RTX prefill state.", st.imported_tokens);

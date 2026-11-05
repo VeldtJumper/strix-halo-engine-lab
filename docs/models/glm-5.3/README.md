@@ -46,6 +46,18 @@ chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole p
 request at a time; `--api-key-file F` requires a bearer key. `--selftest N` on rank 0 (no HTTP) runs N built-in
 prompts together and each alone and reports EXACT/FAIL with tok/s per concurrency level.
 
+`--prefix-cache-gib G` sets the host-RAM prompt snapshot LRU to G GiB per rank (default 4;
+`--prefix-cache-gib 0` turns it off; set the same budget on both ranks). Stores require both ranks to snapshot successfully and each rank to have
+at least 16 GiB MemAvailable; missing memory readings and oversize snapshots refuse the store. A hit restores
+the longest strict prompt-prefix key, then prefills the suffix through the usual chunk scheduler. With MTP,
+the key includes the prompt's first greedy output token and restores at the original prompt frontier.
+The contract is exact trunk restoration and unchanged emitted tokens; MTP rows retain the existing
+chunk scheduling rule. `strix.prefix_cache` reports `hit_tokens`, `prefill_tokens`, and `restore_ms` when
+the cache is on. `--selftest N --selftest-prefix` compares two-turn streams against cleared-cache replays
+and requires hits; `--selftest-prefix-long L` uses first turns of about L tokens and prints the turn-2
+admit-to-ready time from the cache and cold. The other selftests also restore repeated prompts from the
+cache; pass `--prefix-cache-gib 0` for cache-off figures.
+
 ## Run: one RTX PRO 6000
 
 Windows only, opt-in: build with `pwsh src/glm/rtxpf/producer/build.ps1` against a tierstream source export, build
@@ -108,8 +120,9 @@ admission headroom and the final value with its source. See the [catalog](../../
 | Decode step flag checked with the head (default) | C1 decode `--mtp 0` and R8 batch, fresh-process ABBA | **−0.2 %** C1, R8 within noise | tokens and R8 equal the reference on both ranks; `STRIX_GLM_STEP_FLAG=0` restores the mid-step host sync |
 | Latest decode, all defaults (#332 `ec76191f2`) | C1 decode `--mtp 0` and R8 batch, two runs | **39.00–39.03 ms/token** (25.6 tok/s, 57 % of the 44.7 tok/s ceiling); R8 **112.14–112.31 ms/step** (71.3 tok/s aggregate, calculated) | 24/24 exact on both ranks |
 | Latest exact chunked prefill, all defaults (#300 `32ec66bd3`) | 1K / 8K / 32K benchmark prompts, 8192-row chunks | TTFT **2.83 / 15.15 / 61.96 s** (541 / 529 tok/s at 8K / 32K); MoE remainder tiles 8K 15.35 → 15.15 s (−1.3 %, alternating pairs), 32K −1.2 % over both run orders (62.58 → 61.96 s, −1.0 %, in one; −1.4 % in the other) | logits bitwise on both ranks |
-| Served, `strix-glm5-serve --selftest 8` (defaults) | Concurrent streams C1 / C2 / C4 / C6 / C8, steady state (all streams decoding); 8 built-in short chat prompts in the GLM chat template, 22–59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, cache off, the server has no prompt cache | **C1 40.0 / C2 53.0 (G2 off 37.8) / C4 59.9 (53.6) / C6 62.5 (62.4) / C8 69.5 (69.4) tok/s aggregate**; per stream 40.1 / 26.5 / 15.0 / 10.4 / 8.7; C1 plain (MTP off) 25.30; engine CLI `--batch` R8 69–71 | RESULT EXACT: every stream's tokens equal the same prompt run alone (C=1 plain reference) at every level, G2 on and off |
+| Served, `strix-glm5-serve --selftest 8` (defaults) | Concurrent streams C1 / C2 / C4 / C6 / C8, steady state (all streams decoding); 8 built-in short chat prompts in the GLM chat template, 22–59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start, prefix cache off | **C1 40.0 / C2 53.0 (G2 off 37.8) / C4 59.9 (53.6) / C6 62.5 (62.4) / C8 69.5 (69.4) tok/s aggregate**; per stream 40.1 / 26.5 / 15.0 / 10.4 / 8.7; C1 plain (MTP off) 25.30; engine CLI `--batch` R8 69–71 | RESULT EXACT: every stream's tokens equal the same prompt run alone (C=1 plain reference) at every level, G2 on and off |
 | Served, decode-first chunked prefill (`--prefill-chunk 512`, default) | 4 prompts of ~1,830 tokens arriving every 16 decode rounds into 4 running streams, 128 generated tokens each, cache off | Longest decode stall **6.65 → 2.67 s (−60 %)** vs `--prefill-chunk 0`; a lone request is prefilled whole | exact |
+| Served prompt-prefix cache (default, 4 GiB per rank) | Two-turn conversations, first turn ~4,100 tokens, turn 2 adds 53 tokens; alone and batched, against the same request after clearing the cache | Turn-2 admit-to-ready **8.57–8.98 s → 0.82–0.89 s (~10x)** for the 4,120-token prompt (459–481 → 4,629–5,024 tok/s); restore 9–11 ms; 4,067 of 4,120 prompt tokens restored | tokens equal the cleared-cache replay (8/8; 16/16 on short prompts) on both ranks |
 | Exact chunked prefill, MLA scores v7 (on the PR #279 defaults) | 8K / 32K benchmark prompts, 8192-row chunks | rank-0 scores kernel **2.60 → 2.27 s** at 32K (−12 %) and **0.533 → 0.485 s** at 8K (−9 %); TTFT not slower: 32K 65.68 → 65.54 s (−0.2 %, mean of both run orders: 65.574 → 65.524 new first, 65.778 → 65.549 previous first), 8K 16.23 → 16.12 s (−0.6 %, 4 arms) | logits bitwise equal v6 on both ranks; same binary, v6 via `STRIX_GLM_PF_SCORES=6`; rank 0 under the kernel tracer; the TTFT change is inside the ~1 s run-to-run spread at 32K |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 

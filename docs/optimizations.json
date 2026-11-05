@@ -2369,6 +2369,17 @@
     "doc_anchor": "docs/optimizations.md#glm-serve-prefill-chunk"
   },
   {
+    "engine": "glm",
+    "name": "Server prompt-prefix state cache",
+    "flag_or_env": "--prefix-cache-gib",
+    "default": "4 (GiB per rank)",
+    "exact": "Turn-2 tokens equal the same request replayed after clearing the cache, alone and batched, on both ranks; MTP prefix restore equals a cold run.",
+    "gain": "Two-turn conversations, first turn ~4,100 tokens, turn 2 adds 53 (4,120-token prompt, 4,067 restored): turn-2 admit-to-ready 8.57-8.98 -> 0.82-0.89 s (459-481 -> 4,629-5,024 tok/s, ~10x); restore 9-11 ms",
+    "preconditions": "strix-glm5-serve; the same budget on both ranks; stores need 16 GiB MemAvailable per rank.",
+    "off_switch": "--prefix-cache-gib 0",
+    "doc_anchor": "docs/optimizations.md#glm-serve-prefix-cache"
+  },
+  {
     "engine": "qwen",
     "name": "Master baseline",
     "flag_or_env": "--baseline / STRIX_BASELINE",
