@@ -948,8 +948,12 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.hasher = std::make_unique<ds41::EngramHasher>(m.model.engram);
     const std::size_t H = c.hidden_size, hc = c.hc_mult, I = c.moe_intermediate_size, K = c.num_experts_per_tok;
     const std::size_t QA = c.q_lora_rank, QH = std::size_t{c.num_attention_heads} * c.head_dim, OL = std::size_t{c.o_groups} * c.o_lora_rank;
-    m.streams[0] = Dev<float>(T * hc * H);
-    m.streams[1] = Dev<float>(T * hc * H);
+    // the residual streams hold local rows only (every access is by local row): with the row split one rank's windows of
+    // a split run, or a whole run below split_min_rows (the half sums' bound below); otherwise every row
+    const std::size_t split_stream_rows = ((T + 2U * W - 1U) / (2U * W)) * W;
+    const std::size_t stream_rows = m.distributed() && options.row_split ? std::max(split_stream_rows, std::min<std::size_t>(T, m.split_min_rows)) : T;
+    m.streams[0] = Dev<float>(stream_rows * hc * H);
+    m.streams[1] = Dev<float>(stream_rows * hc * H);
     if (options.draft_rows != 0U) {
         if (options.layers < 4U) throw std::invalid_argument("deepseek41 prefill: draft_rows needs at least 4 layers");
         for (int j = 0; j < 3; ++j) {
@@ -1628,6 +1632,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     const auto owner_window = [&](std::uint32_t k) { return split ? k / 2U : k; };  // index among its owner's windows
     const auto global_window = [&](std::uint32_t j) { return split ? 2U * j + me : j; };  // of this rank's local window j
     const std::uint32_t Tn = rows_of(me), Tp = split ? rows_of(peer) : 0U;
+    if (std::size_t{Tn} * c.hc_mult * c.hidden_size > m.streams[0].n) throw std::logic_error("deepseek41 prefill: local rows exceed the residual streams");
     const bool last_local = window_owner(nw - 1U) == me;
     std::vector<std::uint32_t> global_row(Tn);
     for (std::uint32_t l = 0; l < Tn; ++l) global_row[l] = global_window(l / W) * W + l % W;

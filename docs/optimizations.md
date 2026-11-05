@@ -1354,6 +1354,22 @@ Resolve timeout 120, device prefill, 8 slots and `--prefill-rows auto`: the larg
 - **Measured gain:** Pair, context 49152, fresh prompts: 8,399 tokens 14.57 -> 10.34 s, 32,499 tokens 60.8 -> 39.1 s (16384 vs 2048 rows), same logits and tokens.
 - **Implementation / evidence:** [Resolver](../src/deepseek41_pair_defaults.cpp), [contract](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-pf-pieces"></a>
+
+### 16384-row prefill pieces and local-row residual streams
+
+**Engine:** `deepseek`. **Control:** `--prefill-rows`. **Default:** auto.
+
+`--prefill-rows auto` stops at 16384-row pieces (candidates 16384 / 8192 / 4096): since the deferred decoder cone of non-final pieces, 32768-row pieces are slower on the pair. The two residual streams hold only this rank's rows of a row-split run (or a whole run below the split threshold), 80 KiB per row less (1.25 GiB at 16384-row pieces), so the auto estimate drops from 352 to 272 KiB per row. Same kernels, same bits.
+
+- **Preconditions:** Two-node pair prefill with `--prefill-rows auto` (the serving default); an explicit `--prefill-rows N` is used as given.
+- **Automatic selection:** The largest of 16384 / 8192 / 4096 rows that both ranks admit after the weights load; the residual sizing always applies.
+- **Fallback notice:** None; explicit sizes keep their own errors.
+- **Exactness evidence:** Pair logits digests and generated ids unchanged at 8,399 / 32,499 / 44,699 tokens.
+- **Off switch:** --prefill-rows 32768 restores 32768-row pieces; the residual sizing has no switch (allocation only)
+- **Measured gain:** Pair server TTFT, 16384 vs 32768-row pieces: 8,399 tokens 8.01 -> 7.94 s, 32,499 tokens 28.30 -> 27.44 s, 44,699 tokens 39.94 -> 38.98 s (1,049 -> 1,058, 1,148 -> 1,184, 1,119 -> 1,147 tok/s); --profile fast at 32,499 tokens 25.03 -> 24.44 s
+- **Implementation / evidence:** [Resolver](../src/deepseek41_pair_defaults.cpp), [prefill](../src/hip_deepseek41_prefill.hip), [contract](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-draft"></a>
 
 ### Automatic DSpark and vocabulary

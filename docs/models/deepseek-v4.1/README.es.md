@@ -188,6 +188,15 @@ lanzamiento (`STRIX_DS41_PREFILL_O_B_ONE=0` restablece los dos lanzamientos; tod
 TTFT del servidor en el par, ambos órdenes de ejecución, mismos logits e ids generados: 8.4K 8.069 → 7.935 s (−1.7 %),
 32.5K 27.41 → 27.18 s (−0.8 %). La tabla anterior es previa a este cambio y no se volvió a medir con él.
 
+`--prefill-rows auto` se detiene ahora en piezas de 16384 filas: desde el cono del decodificador diferido, las piezas de
+32768 filas son más lentas en el par (8.01 / 28.30 / 39.94 s frente a 7.94 / 27.44 / 38.98 s con 8,399 / 32,499 / 44,699
+tokens, mismo binario, una carga por brazo; 25.03 frente a 24.44 s con 32,499 en `--profile fast`); un
+`--prefill-rows 32768` explícito sigue funcionando. Los flujos residuales guardan ahora solo las filas de este rank
+(80 KiB menos por fila, 1.25 GiB con piezas de 16384 filas; sin efecto en la velocidad). Mismos logits e ids generados.
+Con ambos, TTFT del servidor, un cliente, caché desactivada: **7.94 / 27.73 / 38.61 s** (1,057 / 1,172 / 1,158 tok/s)
+en `default` y 7.05 / 24.32 / 32.95 s (1,192 / 1,336 / 1,357 tok/s) con `--profile fast` en la misma ejecución
+(−11.3 / −12.3 / −14.7 %).
+
 <a id="deepseek-rtx-pipeline"></a>
 
 ## Resultados medidos: RTX PRO + par (división en pipeline)

@@ -907,6 +907,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "16384-row prefill pieces and local-row residual streams",
+    "flag_or_env": "--prefill-rows",
+    "default": "auto",
+    "exact": "Pair logits digests and generated ids unchanged at 8,399 / 32,499 / 44,699 tokens.",
+    "gain": "Pair server TTFT, 16384 vs 32768-row pieces: 8,399 tokens 8.01 -> 7.94 s, 32,499 tokens 28.30 -> 27.44 s, 44,699 tokens 39.94 -> 38.98 s (1,049 -> 1,058, 1,148 -> 1,184, 1,119 -> 1,147 tok/s); --profile fast at 32,499 tokens 25.03 -> 24.44 s",
+    "preconditions": "Two-node pair prefill with `--prefill-rows auto` (the serving default); an explicit `--prefill-rows N` is used as given.",
+    "off_switch": "--prefill-rows 32768 restores 32768-row pieces; the residual sizing has no switch (allocation only)",
+    "doc_anchor": "docs/optimizations.md#ds-pf-pieces"
+  },
+  {
+    "engine": "deepseek",
     "name": "Automatic DSpark and vocabulary",
     "flag_or_env": "--dspark; --dspark-vocab",
     "default": "auto",

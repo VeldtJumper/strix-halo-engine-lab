@@ -139,21 +139,24 @@ inline Options options_from_env(bool device_prefill) {
 // --prefill-rows auto (serve): the device prefill's piece size. Each piece re-reads every routed expert and replays the
 // decoder cone, so fewer, larger pieces are faster (pieces are bitwise-exact for any size).
 // prefill_piece_bytes: the device prefill's row scratch for pieces of `rows` rows at `context` positions (DevicePrefill's
-// T-sized buffers, deepseek41 shapes, row split: 352 KiB per row + the context's candidate bits per row + 1.2 GiB of
-// row-independent buffers, rounded up; measured 6.37 GiB at 16384 rows and 11.69 GiB at 32768 rows, context 49152).
+// T-sized buffers, deepseek41 shapes, row split: 272 KiB per row + the context's candidate bits per row + 1.2 GiB of
+// row-independent buffers, rounded up; measured 6.37 GiB at 16384 rows and 11.69 GiB at 32768 rows, context 49152, while
+// the two residual streams held every row (80 KiB per row more; they hold one rank's rows since).
 [[nodiscard]] constexpr std::uint64_t prefill_piece_bytes(std::uint32_t rows, std::uint32_t context) noexcept {
-    return (std::uint64_t{rows} + 32U) * ((std::uint64_t{352} << 10U) + (std::uint64_t{context} + 8U) / 8U) + (std::uint64_t{1229} << 20U);
+    return (std::uint64_t{rows} + 32U) * ((std::uint64_t{272} << 10U) + (std::uint64_t{context} + 8U) / 8U) + (std::uint64_t{1229} << 20U);
 }
 struct AutoPrefillRoom {
     std::uint64_t device_free = 0, mem_available = 0;  // after the batch forward's weights (mem_available 0: unknown)
     std::uint64_t own_weights = 0;                     // DevicePrefill::owned_weight_bytes
     std::uint64_t drafter = 0;                         // a drafter still to load on this rank (its peak: device + host copy); the serve loads it first
     std::uint64_t margin = std::uint64_t{3} << 30U;
-    // the 32768-row candidate: only where prefill_piece_bytes was measured (context <= 65536, the default attention
-    // window rows, no large slabs); elsewhere other row buffers can exceed the estimate
+    // candidates above 16384 rows (none in kAutoPrefillRows today): only where prefill_piece_bytes was measured (context
+    // <= 65536, the default attention window rows, no large slabs); elsewhere other row buffers can exceed the estimate
     bool wide_pieces = false;
 };
-inline constexpr std::uint32_t kAutoPrefillRows[] = {32768U, 16384U, 8192U, 4096U};
+// 32768-row pieces are no longer a candidate: with the deferred decoder cone of non-final pieces they measured slower
+// than 16384 (exact pair server TTFT 8.01 / 28.30 / 39.94 s vs 7.94 / 27.44 / 38.98 s at 8,399 / 32,499 / 44,699 tokens)
+inline constexpr std::uint32_t kAutoPrefillRows[] = {16384U, 8192U, 4096U};
 inline constexpr std::uint32_t kAutoPrefillFallback = 2048U;
 // AutoPrefillRoom::wide_pieces for a serve configuration: the context and prefill switches prefill_piece_bytes was
 // measured with (context <= 65536, the default attention window rows, no large slabs, and none of the opt-in prefill
