@@ -1740,10 +1740,16 @@ __global__ __launch_bounds__(256) void select_direct_seg_kernel(SegmentLaunch<Se
     const uint3 b = segment_block(s, k);
     select_direct_body(s.v[k], b);
 }
-template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold, unsigned Lean>
-__global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(AttentionView v) { attention_chunk_body<kAttnHpw, Swizzle, Half, Fold, Lean>(v, own_block()); }
-template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold, unsigned Lean>
-__global__ __launch_bounds__(kAttnThreads) void attention_chunk_seg_kernel(SegmentLaunch<AttentionView> s) {
+// Cap (STRIX_DS41_ATTN_WAVE_CAP, lean 3, 4 heads per wave): compiled for at least 6 waves per SIMD, i.e. at most 240 VGPRs
+// (243 without it: 5 waves per SIMD). gfx1151 prefill-attention bench: -9..-14 % per call with compressed keys and at 64
+// heads, while 32-head window-only calls are faster uncapped. The register budget changes the allocation only, not the
+// operations: the same bits either way.
+template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold, unsigned Lean, bool Cap = false>
+__global__ __launch_bounds__(kAttnThreads) __attribute__((amdgpu_waves_per_eu(Cap ? 6 : 1)))
+void attention_chunk_kernel(AttentionView v) { attention_chunk_body<kAttnHpw, Swizzle, Half, Fold, Lean>(v, own_block()); }
+template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold, unsigned Lean, bool Cap = false>
+__global__ __launch_bounds__(kAttnThreads) __attribute__((amdgpu_waves_per_eu(Cap ? 6 : 1)))
+void attention_chunk_seg_kernel(SegmentLaunch<AttentionView> s) {
     unsigned k;
     const uint3 b = segment_block(s, k);
     attention_chunk_body<kAttnHpw, Swizzle, Half, Fold, Lean>(s.v[k], b);
@@ -1937,6 +1943,13 @@ static bool attention_tile_f16() {
     static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_TILE_F16"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
     return attention_tile_f16_mode < 0 ? env : attention_tile_f16_mode != 0;
 }
+int attention_wave_cap_mode = -1;
+void set_attention_wave_cap(int mode) { attention_wave_cap_mode = mode; }
+// the 6-wave form for a call: lean 3 at 4 heads per wave with compressed keys or 64 heads (default on, =0 off)
+static bool attention_wave_cap(const AttentionView& v) {
+    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_WAVE_CAP"); return !(e && e[0] == '0' && e[1] == 0); }();
+    return (attention_wave_cap_mode < 0 ? env : attention_wave_cap_mode != 0) && (v.idx_count != nullptr || v.heads >= 64U);
+}
 int attention_lean_mode = -1;
 void set_attention_lean(int mode) { attention_lean_mode = mode; }
 int attention_lean() {
@@ -1954,7 +1967,9 @@ static void launch_attention(const AttentionView& v, hipStream_t stream) {
     const unsigned hpw = attention_hpw(v);
     const dim3 grid(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows);
     // the f16 tile at 1 and 2 heads per wave only (at 4 its two tile forms exceed the register file)
-    if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
+    if (hpw == 4U && Lean >= 3U && attention_wave_cap(v))
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean, true>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
     else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<2, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<1, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
     if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
@@ -2104,12 +2119,16 @@ template <bool Swizzle, bool Half, bool Fold, unsigned Lean>
 static void launch_attention_segments(std::span<const AttentionView> views, hipStream_t stream) {
     for (const auto& v : views) (void)attention_hpw(v);  // the per-call checks
     const unsigned shared = shared_segment_hpw(views);
+    bool cap = Lean >= 3U;  // the 6-wave form when every segment takes it
+    for (const auto& v : views) cap = cap && attention_wave_cap(v);
     for (const unsigned hpw : {4U, 2U, 1U}) {  // each segment keeps its own heads per wave (its kernel form), or the shared one
         const auto grid = [hpw, shared](const AttentionView& v) {
             return (shared != 0U ? shared : attention_hpw(v)) == hpw ? dim3(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows) : dim3(0);
         };
         for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
-            if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            if (hpw == 4U && cap)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean, true>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
             else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<2, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
             else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<1, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
         }, grid);

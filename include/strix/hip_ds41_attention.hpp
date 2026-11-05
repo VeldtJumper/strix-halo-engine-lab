@@ -158,6 +158,10 @@ void set_attention_window_fold(int mode);
 // one address per PV key, the rescale skipped when the running max holds (factor exactly 1), and the probabilities
 // evaluated once per (head, key). Test override: 0..3, or -1 environment.
 void set_attention_lean(int mode);
+// STRIX_DS41_ATTN_WAVE_CAP (default on, =0 off): lean 3 calls at 4 heads per wave with compressed keys or 64 heads use a
+// kernel compiled for 6 waves per SIMD (240 VGPRs on gfx1151 with this toolchain; 243 and 5 waves without); same bits.
+// Test override: 0 / 1, or -1 environment.
+void set_attention_wave_cap(int mode);
 [[nodiscard]] int attention_lean();
 
 // Segment launches (several requests of a batch step per launch, STRIX_DS41_BATCH_SEGMENTS): one view per request

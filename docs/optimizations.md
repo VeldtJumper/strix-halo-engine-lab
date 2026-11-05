@@ -1877,6 +1877,26 @@ lane-0 floats the previous form used.
 - **Measured gain:** Level 2 (previous default): Two-node serve TTFT at 8,399 / 32,499 / 44,699 tokens (one binary, cache off, one load per arm, separate GPU turns): STRIX_DS41_ATTN_LEAN=0 9.99 / 35.20 / 50.29 s vs default 9.80 / 34.70 / 49.09 s (-1.9 / -1.4 / -2.4 %); prefill window bench -11.8 % (32 heads) / -13.5 % (64 heads) per 8-row window. Level 3 vs level 2, prefill window bench (8-row windows, 640 keys): -7.0 % (32 heads) / -9.2 % (64 heads), window-only -24 % (32 heads), 64-row windows -7 / -9 %.
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-attn-wave-cap"></a>
+
+### Attention wave cap for lean 3 chunk calls
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ATTN_WAVE_CAP`. **Default:** on.
+
+The lean 3 fixed-register QK block keeps 243 vector registers in the 4-heads-per-wave chunk kernel, and on gfx1151
+that is five waves per SIMD. The capped instantiation compiles the same kernel with a six-waves-per-SIMD hint (240
+registers, no spills, measured on this target and toolchain), so the sixth wave slot stays usable. It is selected per
+call where it pays: lean 3 at four heads per wave with compressed keys or 64 heads. 32-head window-only calls keep the
+uncapped build, which measured faster there; a segment launch caps only when every view qualifies.
+
+- **Preconditions:** HIP chunk kernels at lean 3, four heads per wave, compressed keys (index selection) or 64 heads.
+- **Automatic selection:** On for every qualifying call; the predicate covers segment launches conservatively (all views must qualify).
+- **Fallback notice:** None.
+- **Exactness evidence:** Bitwise: the same source, one instantiation compiled with an occupancy hint. HIP attention device tests compare lean 3 with the cap on and off against the lean 0 bytes (output, A8 and ticket bytes, adversarial inputs) and the full attention suite passes. Two-node serve at 1,999 / 8,399 / 32,499 tokens, cap on vs off in both orders: logits digests (34e831d144b7ca5f / c8cea8a7482dd80a / e5c6bb49b1d5d8b3) and generated ids identical.
+- **Off switch:** STRIX_DS41_ATTN_WAVE_CAP=0
+- **Measured gain:** Prefill window bench (8-row windows, 640 keys, cap vs the same lean 3 uncapped): -12.6 % (32 heads, compressed keys) / -10.3 % (64 heads) per 8-row window, -11.3 % (64 heads, positions 1000), -13.8 % on 64-row windows (64 heads). Two-node serve TTFT at 1,999 / 8,399 / 32,499 tokens (one binary, cache off, one load per arm, two GPU turns in alternating arm order, mean of the two orders): 2.722 / 8.004 / 27.568 s with STRIX_DS41_ATTN_WAVE_CAP=0 vs 2.712 / 7.921 / 27.503 s default (-0.4 / -1.0 / -0.2 %; the arm order moved single runs by up to 1.5 % at 32K). Attention is a small share of the pair prefill, so the serve gain is a fraction of the per-dispatch one.
+- **Public evidence:** [Attention lean chunk kernel](#ds-attn-lean)
+
 <a id="ds-warm"></a>
 
 ### Server warm-up and DSpark calibration
