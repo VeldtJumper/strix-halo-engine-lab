@@ -106,9 +106,11 @@ private:
     int nth_, calls_ = 0;
 };
 
-__global__ void delay_kernel(unsigned cycles) {
-    const auto start = clock64();
-    while (clock64() - start < cycles) {}
+// wall_clock64(), not clock64(): clock64() does not advance reliably on gfx11 (HIP docs), which made this loop endless and
+// stalled the uncached direct wrap/delays case (rank 1's producer never published). Ticks of the constant wall clock.
+__global__ void delay_kernel(unsigned ticks) {
+    const auto start = wall_clock64();
+    while (wall_clock64() - start < ticks) {}
 }
 
 struct Case {
