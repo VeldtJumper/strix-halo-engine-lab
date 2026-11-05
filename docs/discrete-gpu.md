@@ -82,6 +82,10 @@ changes. Service build and protocol: [Qwen CUDA prefill service](engine/serving/
 tool calls, exact greedy output at any slot count. Windows build with `-DSTRIX_CUDA_QWEN_ONLY=ON`; Strix Halo builds
 do not compile these files. Build, flags, defaults and switches: [Qwen RTX serve](models/qwen3.8/rtx-serve.md).
 
+An exact prompt prefix cache is ON by default (`--prefix-cache off` or `STRIX_QRTX_PREFIX_CACHE=0` disables it):
+follow-up agent turns restore their cached prefix and prefill only the new tokens.
+[Prompt prefix cache](models/qwen3.8/rtx-serve.md#prompt-prefix-cache).
+
 ## GLM-5.3 Flash on one RTX (draft)
 
 Build, then the measured run (exactness and speed; an HTTP server for this route is not tested end to end yet):

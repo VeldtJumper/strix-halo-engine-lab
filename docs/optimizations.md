@@ -3910,6 +3910,25 @@ Unit-file reads in flight in a three-tier open; `auto` picks 4 / 6 / 8 from the 
 - **Measured gain:** Auto vs 1 at about 76 % file share (24 GiB VRAM + 32 GiB RAM) was never slower in the latest measured decode cell means: 1K cold / warm +42 / +35 %, 8K cold / warm +33 / +16 %. Earlier one-drive cells were +9..+42 % in seven of eight (remaining -3.4 % traced to drive read phases); two-drive stripes +26..+38 %. Single loads vary up to 2x, so the gain size is uncertain. At about 61 % (48 GiB + 32 GiB), one earlier night observed cold-1K decode -32 % against the queue-1 mean; warm 1K +3 %, cold 8K +7 %, warm 8K +1 %. A later set at the same budget reversed the cold-1K result: auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff: 61 % stays at 1. Full card (about 1-4 % at tile 2048) tied in TTFT (8K +0.6..+2 %, 32K equal), so it stays at 1.
 - **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md)
 
+## Qwen RTX PRO standalone
+
+<a id="qwen-rtx-prefix-cache"></a>
+
+### Prompt prefix cache
+
+**Engine:** `qwen-rtx`. **Control:** `--prefix-cache`, `STRIX_QRTX_PREFIX_CACHE`. **Default:** ON.
+
+`strix-cuda-qwen-serve` keeps exact checkpoints of the prompt state in blocks of 256 tokens; a request restores
+the longest cached prefix of its token ids and prefills only the rest.
+
+- **Preconditions:** `strix-cuda-qwen-serve`; a request whose token ids share at least one 256-token block with an earlier prompt in the same process and the same compatibility key.
+- **Automatic selection:** On for every request; checkpoints at the last block boundary before the final prompt token and every 16,384 tokens, in pinned host RAM (`--prefix-cache-host-mb`, default min(8192 MiB, 25 % of available RAM)), LRU-evicted. A capture that does not fit is skipped.
+- **Fallback notice:** A miss, a key mismatch or a skipped capture runs the full prefill; a request never fails because of the cache.
+- **Exactness evidence:** `qwen_prefix_cache_e2e` 16/16: state digests, 64 ids and logit hashes of a fresh prefill equal checkpoint-continue, restore into another session, changed suffix and changed boundary token, sync and overlapped prefill. HTTP on vs off, 48-50K-token agent turns: outputs identical 8/8.
+- **Off switch:** `--prefix-cache off`; `STRIX_QRTX_PREFIX_CACHE=0`
+- **Measured gain:** Pending the on/off window (20 alternating pairs). Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
+- **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
+
 ## Platform (kernel)
 
 <a id="platform-perfopt"></a>

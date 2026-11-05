@@ -224,6 +224,7 @@ se leen en el nodo.
 
 **Servicio solo desde la RTX PRO.** `strix-cuda-qwen-serve` sirve el modelo desde una RTX PRO 6000 con prefill
 exacto y decode MTP greedy exacto, las mismas API que el servidor del nodo y batching continuo sobre 4 slots.
+Una caché exacta de prefijos del prompt está activada por defecto (`--prefix-cache off` la desactiva).
 [Compilación, ejecución y valores predeterminados](rtx-serve.md).
 
 **Build `0117a140`** (medida frente a la compilación publicada en la misma sesión, ejecuciones intercaladas,
