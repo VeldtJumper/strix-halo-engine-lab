@@ -134,31 +134,55 @@ def main():
         else:
             raise AssertionError('invalid parameters were accepted: ' + str(change))
 
-    # Disconnect after actual generated tokens, then demand a healthy completed request.
+    # Stop strings must actually truncate a sampled response, not just be accepted.
+    stop_marker = query('/detokenize', {'tokens': first[:8]})['text']
+    assert stop_marker
+    stopped = query('/v1/completions', {**sampled, 'stop': [stop_marker]})
+    assert stopped['choices'][0]['finish_reason'] == 'stop'
+    assert stopped['choices'][0]['text'] == ''
+    assert stopped['strix']['sampling_effective'] == 'sample'
+    save('stop-string.json', stopped)
+
+    # Token-ID receipts may arrive only at completion. Disconnect on streamed text,
+    # prove the request is still active, and require an observed cancellation.
+    cancel_before = query('/api/status')['queue']
+    assert cancel_before['running'] == 0 and cancel_before['queued'] == 0
     request = urllib.request.Request(args.url.rstrip('/') + '/v1/completions',
         data=json.dumps({**sampled, 'max_tokens': 4096, 'stream': True}).encode(), headers=headers)
-    received = 0
+    received_chars = 0
+    active_at_disconnect = False
     with urllib.request.urlopen(request, timeout=600) as response:
         for raw_line in response:
             line = raw_line.decode().strip()
             if not line.startswith('data:'): continue
             payload = line[5:].strip()
-            if payload == '[DONE]': break
+            assert payload != '[DONE]', 'request finished before the cancellation gate'
             event = json.loads(payload)
-            received += len((event.get('strix') or {}).get('token_ids') or [])
-            if received >= 8: break
-    assert received >= 8
+            assert 'error' not in event, event
+            assert all(c.get('finish_reason') is None for c in event.get('choices', []))
+            received_chars += sum(len(c.get('text') or '') for c in event.get('choices', []))
+            if received_chars >= 64:
+                active_at_disconnect = query('/api/status')['queue']['running'] > 0
+                assert active_at_disconnect, 'request was not running at disconnect'
+                break
+    assert received_chars >= 64 and active_at_disconnect
+    disconnect_time = time.monotonic()
     deadline = time.monotonic() + 60
-    while query('/api/status')['queue']['running']:
+    while (cancel_after := query('/api/status')['queue'])['running']:
         assert time.monotonic() < deadline, 'cancelled request did not drain'
         threading.Event().wait(0.1)
+    assert cancel_after['cancelled'] > cancel_before['cancelled'], 'no cancellation was recorded'
+    save('cancellation.json', {'before': cancel_before, 'after': cancel_after,
+         'received_chars': received_chars, 'active_at_disconnect': active_at_disconnect,
+         'drain_seconds': time.monotonic() - disconnect_time})
     assert ask('greedy-smoke-after-cancel', smoke) == reference['token_ids']
     final = query('/api/status')
     assert final['queue']['running'] == 0
     summary = {'passed': True, 'request_receipts': len(records), 'seed_variants': len({tuple(x) for x in [first, *variants]}),
                'greedy_reference_equal': True, 'top_k_one_equal_to_greedy': True, 'seed_replay_equal': True,
                'stream_replay_equal': True, 'peak_busy': peak_busy, 'mixed_observed': peak_busy >= 2,
-               'cancellation_drained': True, 'slots': final['slots']['total']}
+               'stop_string_verified': True, 'active_at_disconnect': active_at_disconnect,
+               'cancellation_recorded': True, 'cancellation_drained': True, 'slots': final['slots']['total']}
     save('summary.json', summary)
     print(json.dumps(summary, indent=2))
 
