@@ -153,6 +153,9 @@ public:
     void commit(std::uint32_t slot, std::uint32_t kept);
     // slice_logits: row r's logits of this rank's vocabulary slice; gather_logits: row r's full logits.
     [[nodiscard]] std::span<const float> row_logits(std::uint32_t row) const;
+    // Between steps, identically on both ranks: gather full scores only for a sampled batch.
+    // Allocates host scratch lazily; leaves all target arithmetic and greedy decisions unchanged.
+    void set_gather_logits(bool enabled);
     [[nodiscard]] const BatchStepStats& last_stats() const noexcept { return stats_; }
     // capture_main_hidden: the input streams of layers layers-3, layers-2, layers-1 of the last step's rows, device
     // memory [rows][hc][hidden] each in the order of the step's rows (as DeviceForward::captured_streams); valid until

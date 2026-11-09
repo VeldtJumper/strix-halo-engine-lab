@@ -1581,9 +1581,17 @@ void BatchForward::commit(std::uint32_t slot, std::uint32_t kept) {
     if (!m.compress_ring) check(hipStreamSynchronize(m.stream), "rollback");
 }
 
+void BatchForward::set_gather_logits(bool enabled) {
+    auto& m = *impl_;
+    if (enabled && !m.distributed()) throw std::invalid_argument("deepseek41 batch forward: gather_logits is a world-2 option");
+    m.options.gather_logits = enabled;
+    if (enabled) m.logits_host.resize(std::size_t{row_limit()} * m.model.config.vocab_size);
+}
+
 std::span<const float> BatchForward::row_logits(std::uint32_t row) const {
     const auto& m = *impl_;
-    if (m.logits_host.empty()) throw std::logic_error("deepseek41 batch forward: logits are kept only with slice_logits or gather_logits");
+    if (!m.options.slice_logits && !m.options.gather_logits)
+        throw std::logic_error("deepseek41 batch forward: logits are kept only with slice_logits or gather_logits");
     if (row >= stats_.rows) throw std::out_of_range("deepseek41 batch forward: no such row in the last step");
     const std::size_t n = m.options.gather_logits ? m.model.config.vocab_size : m.head_slice.count;
     return {m.logits_host.data() + std::size_t{row} * n, n};

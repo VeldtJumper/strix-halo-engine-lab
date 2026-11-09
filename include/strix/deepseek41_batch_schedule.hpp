@@ -19,7 +19,8 @@ struct BatchSequence {
     std::uint32_t position = 0;           // tokens in the slot's state
     std::vector<std::uint32_t> prompt;
     std::size_t fed = 0;                  // prompt tokens already fed
-    std::vector<std::uint32_t> generated;  // greedy tokens; the last one is the next row's input
+    std::vector<std::uint32_t> generated;  // selected tokens; the last one is the next row's input
+    bool sampled = false;                // sampled requests use target-only batches, never greedy draft verification
     [[nodiscard]] bool reading_prompt() const noexcept { return fed < prompt.size(); }
 };
 

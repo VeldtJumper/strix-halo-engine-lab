@@ -1553,6 +1553,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-token-sampling-tests)
     add_test(NAME strix-token-sampling-tests COMMAND strix-token-sampling-tests)
 
+    add_executable(strix-deepseek41-sampling-tests tests/deepseek41_sampling_tests.cpp)
+    target_link_libraries(strix-deepseek41-sampling-tests PRIVATE strix_core)
+    strix_target_warnings(strix-deepseek41-sampling-tests)
+    add_test(NAME strix-deepseek41-sampling-tests COMMAND strix-deepseek41-sampling-tests)
+
     add_executable(strix-speculation-rng-tests tests/speculation_rng_tests.cpp)
     target_link_libraries(strix-speculation-rng-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-rng-tests)

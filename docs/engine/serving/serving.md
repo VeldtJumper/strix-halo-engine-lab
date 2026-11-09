@@ -222,7 +222,8 @@ from these commands.
 
 Each sampling filter resolves independently: a non-null request value, then the configured server default,
 then the built-in value (`temperature: 0`, `top_k: 0`, `top_p: 1`, `min_p: 0`). The four default-filter flags
-are available on the Qwen command; the DeepSeek command remains greedy with built-in defaults.
+are available on the Qwen command. The native DeepSeek pair keeps these built-in defaults but
+executes positive-temperature requests with target-only sampling; temperature zero remains greedy.
 Temperature, top-p and min-p must be finite numbers in their advertised ranges, even during greedy decoding.
 Top-k must be a non-negative integer in uint32 range. Seed must be an integer in [0, 2^63); strings,
 fractions and negative seeds are refused with a 400 naming the field before submission.
@@ -233,6 +234,42 @@ configured downgrade or rejection policy.
 A sampled request without a seed receives an API-generated 63-bit seed. The engine uses that seed and
 the policy receipt echoes it. Reusing it reproduces the run with the same model, numerical identity,
 sampler and position-keyed uniforms. Greedy receipts omit the seed.
+
+### DeepSeek pair: target-only sampling
+
+The native two-rank server executes positive-temperature requests using the shared
+`sampling-v1` transform (temperature, top-k, top-p, min-p and a per-request seed).
+Rank 0 samples the gathered target scores; its selected tokens are the subsequent
+inputs on both ranks. The first output token is sampled too. Prefix lookups leave
+the device prefill's minimum tail to recompute its scores instead of reusing a
+cached greedy next token.
+
+Sampled requests use plain target batches, without DSpark or prompt-lookup drafts.
+Greedy requests retain their existing speculative route; mixed traffic is split
+into separate steps. The numerical profile and model assets are unchanged. The
+final receipt reports `sampling_effective: sample` and
+`sampling_route: target-only-host`. No sampling-speed equivalence to speculative
+greedy decoding is claimed.
+
+The heterogeneous pipeline remains greedy-only and rejects positive temperature.
+Sampled named-session checkpoints are not supported yet; they return an error.
+Ordinary prompt-prefix caching remains available. This does not add logit biases,
+repetition penalties or thinking-budget enforcement.
+
+Host contract tests: `strix-deepseek41-sampling-tests` and the existing
+`strix-token-sampling-tests`. Before promoting a deployment, exercise the live
+two-rank endpoint (use at least two slots for the mixed-traffic gate):
+
+```sh
+python3 tests/deepseek41_sampling_http_gate.py --url http://127.0.0.1:8080 \
+  --out /path/to/private/qualification --require-mixed
+```
+
+This checks the published greedy token reference, top-k-one equivalence, seed
+replay and variation, cached-prefix and short-prompt paths, streamed token
+identity, mixed greedy/sampled traffic, invalid parameters and cancellation.
+Assess model-level repetition and task quality separately with representative
+long contexts; successful sampling plumbing does not establish a model-quality gain.
 
 ## Batched decoding
 
